@@ -1,40 +1,21 @@
-# CDC Infra Subagent
+# Infra subagent
 
-## Scope
-
-Docker, Kafka, MariaDB test/prod GTID, setup scripts, pacman (con escalación si conflictos).
-
-## Comandos frecuentes
+## Stack (single path)
 
 ```bash
-# Kafka + UI (topics auto-create al publicar)
-docker compose -f scripts/cdc_kafka/docker/docker-compose.kafka.yml up -d
-
-# GTID prod (sudo — escalar al usuario)
-sudo scripts/enable_mariadb_gtid.sh
-
-# Setup completo
-./scripts/setup_all.sh
+cp config.json.example config.json   # edit password
+./install.sh
 ```
 
-## Puertos
+- Compose: `docker-compose.yml` (Kafka + DataSync daemon)
+- DataSync uses **`network_mode: host`** on Linux → `localhost:5432` (PG) + `localhost:9092` (Kafka)
+- Kafka UI: http://localhost:8080
 
-| Servicio | Puerto |
-|----------|--------|
-| Kafka | 9092 |
-| Kafka UI | 8080 |
-| MariaDB prod | 3306 |
-| MariaDB test | 3307 |
-| PostgreSQL lake | 5432 |
+## MariaDB GTID (host, not in compose)
 
-## Reglas
+Enable on source MariaDB manually when onboarding prod sources.
 
-- No forzar `pacman -S gcc/mariadb` si conflictos libgccjit (solo instalar faltantes)
-- Test MariaDB bootstrap: auth socket con `$USER`, no `root` TCP
-- `libpq` no existe en Arch → usar `postgresql-libs`
+## Config
 
-## Done criteria
-
-- `docker ps` muestra kafka + kafka-ui
-- `mariadb -P 3307` + `USE nation` OK
-- GTID ROW binlog ON en prod (verificar con SHOW VARIABLES)
+- `config.json` at repo root (copy from `config.json.example`)
+- PostgreSQL is **external** (host or remote)

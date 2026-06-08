@@ -1,28 +1,11 @@
-# CDC QA Subagent
+# QA subagent
 
-## Scope
-
-Stress test CDC: daemon + `cdc_stress_load.sh` (carga + métricas integradas).
-
-Ver Obsidian [[CDC Kafka Architecture]] § Stress test CDC.
-
-## Comandos
+## Smoke
 
 ```bash
-cd ~/Downloads/project
-export PYTHONUNBUFFERED=1 PGPASSWORD=Yucaquemada1 MARIADB_PASSWORD=Yucaquemada1
-
-# T1
-python3 -m cdc_kafka daemon --tier hot --config cpp/config.cdc-test.json --worker-count 4
-
-# T2 (load + metrics cada 5s)
-scripts/cdc_kafka/cdc_stress_load.sh
+./install.sh
 ```
 
-## Criterios
+## Stress (manual)
 
-| Check | Esperado |
-|-------|----------|
-| load rows/s | estable |
-| `metrics errors=` | 0 |
-| `stress_lag` | no crece sin tope bajo carga |
+Use `docker compose run --rm datasync` with load on source DBs; monitor `cdc_catalog.apply_batch_stats` and Kafka UI.

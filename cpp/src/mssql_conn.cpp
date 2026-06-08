@@ -154,9 +154,17 @@ MssqlConn::MssqlConn(const MssqlSource& src) {
     DBSETLAPP(login, "DataSync");
     DBSETLENCRYPT(login, FALSE);
     DBSETLVERSION(login, DBVERSION_74);
+#ifdef DBSETLPORT
     DBSETLPORT(login, static_cast<int>(src.port));
+#endif
 
-    handle = dbopen(login, src.host.c_str());
+    const std::string server =
+#ifdef DBSETLPORT
+        src.host;
+#else
+        src.host + "," + std::to_string(src.port);
+#endif
+    handle = dbopen(login, server.c_str());
     dbloginfree(login);
     if (!handle) {
         throw std::runtime_error(

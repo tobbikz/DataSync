@@ -37,7 +37,7 @@ FullLoadRunStats run_mongo_full_load(
             LogEvent{
                 .level = LogLevel::Warning,
                 .component = "mongo_load",
-                .message = "full load skipped: rebuild with libmongoc (scripts/cdc_kafka/install_libmongoc.sh)",
+                .message = "full load skipped: rebuild with libmongoc (docker build via ./install.sh)",
                 .batch_id = batch_id,
                 .context = {{"hint", "install libmongoc"}}});
     }

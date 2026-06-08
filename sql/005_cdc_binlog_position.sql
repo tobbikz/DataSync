@@ -1,2 +1,0 @@
--- Obsolete: MariaDB binlog cursor lives in cdc_catalog.capture_position (sql/007).
--- Existing DBs: sql/035_drop_cdc_binlog_position.sql migrates and drops cdc_binlog_position.

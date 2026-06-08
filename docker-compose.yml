@@ -1,3 +1,8 @@
+# DataSync — Kafka + DataSync daemon only (no PG/MariaDB/MSSQL/Mongo).
+# Install: ./install.sh — external databases via config.json
+
+name: datasync
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
@@ -23,14 +28,42 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "kafka:29092"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
 
   kafka-ui:
     image: provectuslabs/kafka-ui:v0.7.2
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     ports:
       - "8080:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
       DYNAMIC_CONFIG_ENABLED: "true"
+
+  datasync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: datasync:local
+    network_mode: host
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      DATASYNC_ROOT: /app
+      DATASYNC_CONFIG: /app/config.json
+      DATASYNC_RUN_MIGRATIONS: "0"
+      DATASYNC_HOST_NETWORK: "1"
+      KAFKA_BOOTSTRAP: localhost:9092
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./sql:/app/sql:ro
+    restart: unless-stopped
+    command: ["daemon"]

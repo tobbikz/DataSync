@@ -1,0 +1,13 @@
+.git
+.github
+.cursor
+**/__pycache__
+**/.pytest_cache
+**/*.log
+config.json
+**/config.cdc-test.json
+cpp/build
+cpp/build-rdkafka
+cpp/deps
+.idea
+.vscode

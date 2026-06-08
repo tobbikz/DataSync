@@ -55,15 +55,14 @@ Run DEV + QA **in parallel** only for independent work. Delegation prompt must i
 
 1. Read state → propose one sprint (DEV + QA tasks)
 2. DEV implements top item
-3. QA runs `scripts/cdc_kafka/run_full_manual_test.sh` (target **0 failed**)
+3. QA runs `./install.sh` smoke + `docker compose run --rm datasync discover`
 4. Update PROJECT-STATE → report pass/fail
 
 ## Key paths
 
 - Python: `cdc_kafka/` — capture, apply, fairness, recovery, `topics.py`
 - Config test: `cpp/config.cdc-test.json` | prod: `cpp/config.json`
-- Tests: `tests/cdc_kafka/` (23+ unit), `scripts/cdc_kafka/run_full_manual_test.sh`
-- Kafka: `scripts/cdc_kafka/docker/docker-compose.kafka.yml`, UI http://localhost:8080
+- Install: `./install.sh` | Kafka: `docker-compose.yml`, UI http://localhost:8080
 - Scale SQL: `sql/011_cdc_scale_runtime.sql`
 
 ## Report format

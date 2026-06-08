@@ -1448,7 +1448,7 @@ int run_kafka_apply_native_cli(
     (void)service_tier;
     (void)worker_id;
     (void)worker_count;
-    std::cerr << "kafka-apply requires librdkafka (run scripts/build_librdkafka.sh and rebuild)\n";
+    std::cerr << "kafka-apply requires librdkafka (rebuild Docker image: ./install.sh)\n";
     return 2;
 }
 #endif

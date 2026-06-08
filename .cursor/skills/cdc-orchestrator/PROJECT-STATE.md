@@ -37,12 +37,12 @@ Config: **`config.json`** en raíz del repo (PG DataSync + DataLake). Fuentes OL
 ## Daemon 24/7
 
 ```bash
-# config.json en raíz del repo
-./cpp/build/DataSync discover
-./cpp/build/DataSync daemon --once   # full-load auto si needs_full_load=true
+cp config.json.example config.json   # edit credentials
+./install.sh                         # Kafka + DataSync daemon (Docker)
 
-sudo deploy/systemd/install-systemd.sh
-sudo systemctl enable --now DataSync
+docker compose run --rm datasync discover
+docker compose run --rm datasync daemon --once   # full-load auto si needs_full_load=true
+docker compose logs -f datasync
 ```
 
 El daemon ejecuta **full-load aislado** (subprocess) cuando el catálogo tiene `needs_full_load=true` para ese tier+conn; en ese ciclo **no** mezcla capture/apply.
@@ -57,7 +57,7 @@ psql ... -d DataLake -f sql/031_datasync_connections.sql
 ./cpp/build/DataSync discover
 
 # 3. Daemon (full-load + CDC automático por tier)
-sudo systemctl enable --now DataSync
+./install.sh
 ```
 
 Manual full-load (opcional):
@@ -71,6 +71,10 @@ Manual full-load (opcional):
 2. Migración prod — DB `DataSync` separada de `DataLake`; discover schemas reales
 3. Prometheus exporter sobre métricas PG
 
-## Env vars requeridas
+## Env vars (Docker)
 
-Ver `deploy/systemd/DataSync.env.example` y resumen en Obsidian [[Systemd Deployment]].
+| Variable | Default | Use |
+|----------|---------|-----|
+| `DATASYNC_CONFIG` | `/app/config.json` | PG credentials |
+| `DATASYNC_RUN_MIGRATIONS` | `0` | `1` = apply catalog DDL on start |
+| `KAFKA_BOOTSTRAP` | — | Patch `runtime_config.kafka_bootstrap_servers` |

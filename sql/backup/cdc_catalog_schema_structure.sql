@@ -1,7 +1,7 @@
 --
 -- CDC catalog schema-only backup (no data)
 -- Source: local DataLake @ 2025-06-06
--- Regenerate: see sql/backup/README.md
+-- Regenerate: pg_dump --schema-only --schema=cdc_catalog ...
 --
 -- PostgreSQL database dump
 --
