@@ -18,7 +18,7 @@ On first run, `./install.sh` copies `config.json.example` → `config.json` if m
 
 1. Builds the **DataSync** image
 2. Ensures **`cdc_catalog`** in `config.json` → `datasync.database` and **`lake`** helpers in `datalake.database` (creates DBs if missing; idempotent)
-3. Starts **Zookeeper + Kafka**
+3. Starts **Kafka** (KRaft — no Zookeeper)
 4. Starts the **DataSync daemon**
 5. **Discover** — skipped in install; run manually after onboarding sources
 6. Optional **systemd** when sudo is available

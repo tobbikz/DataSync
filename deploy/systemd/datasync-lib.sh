@@ -19,21 +19,9 @@ DATASYNC_DEPLOY_MODE="${DATASYNC_DEPLOY_MODE:-docker}"
 # shellcheck source=scripts/container-compose.sh
 source "${DATASYNC_ROOT}/scripts/container-compose.sh"
 
-wait_zookeeper() {
-  local i h
-  for i in $(seq 1 30); do
-    h=$(docker_compose ps zookeeper --format '{{.Health}}' 2>/dev/null | head -1 || true)
-    if [[ "$h" == "healthy" ]]; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
-}
-
 wait_kafka() {
   local i h state
-  for i in $(seq 1 60); do
+  for i in $(seq 1 90); do
     state=$(docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true)
     h=$(docker_compose ps kafka --format '{{.Health}}' 2>/dev/null | head -1 || true)
     if [[ "$state" == "running" && "$h" == "healthy" ]]; then

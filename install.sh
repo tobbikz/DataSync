@@ -93,22 +93,9 @@ apply_catalog_schema() {
   fi
 }
 
-wait_zookeeper() {
-  local i h
-  for i in $(seq 1 30); do
-    h=$(docker_compose ps zookeeper --format '{{.Health}}' 2>/dev/null | head -1 || true)
-    if [[ "$h" == "healthy" ]]; then
-      return 0
-    fi
-    sleep 1
-  done
-  warn "Zookeeper not ready — check: $(container_runtime_label) compose logs zookeeper --tail 30"
-  return 1
-}
-
 wait_kafka() {
   local i h state
-  for i in $(seq 1 60); do
+  for i in $(seq 1 90); do
     state=$(docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true)
     h=$(docker_compose ps kafka --format '{{.Health}}' 2>/dev/null | head -1 || true)
     if [[ "$state" == "running" && "$h" == "healthy" ]]; then
@@ -124,11 +111,9 @@ wait_kafka() {
   return 1
 }
 
-# Kafka must register in ZK after ZK is up. If Kafka alone restarts while ZK keeps a
-# stale /brokers/ids/* ephemeral, startup fails with NodeExists — restart ZK first.
-start_zookeeper_kafka() {
-  docker_compose up -d --remove-orphans zookeeper
-  wait_zookeeper || return 1
+start_kafka() {
+  docker_compose stop zookeeper 2>/dev/null || true
+  docker_compose rm -f zookeeper 2>/dev/null || true
 
   local kstate khealth
   kstate=$(docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true)
@@ -140,10 +125,7 @@ start_zookeeper_kafka() {
     return $?
   fi
 
-  docker_compose stop kafka 2>/dev/null || true
-  docker_compose restart zookeeper
-  wait_zookeeper || return 1
-  docker_compose up -d --force-recreate kafka
+  docker_compose up -d --force-recreate --remove-orphans kafka
   wait_kafka
 }
 
@@ -220,7 +202,7 @@ ensure_config
 build_image
 apply_catalog_schema
 
-run_quiet "Zookeeper + Kafka starting" start_zookeeper_kafka
+run_quiet "Kafka starting" start_kafka
 
 run_quiet "DataSync daemon" docker_compose up -d --no-recreate datasync
 
