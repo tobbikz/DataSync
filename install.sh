@@ -1,14 +1,5 @@
 #!/usr/bin/env bash
-# DataSync — Docker-only install (Kafka + DataSync daemon).
-#
-# Does everything: config bootstrap, build, schema, daemon, discover, log tail.
-# Does NOT provision PostgreSQL, MariaDB, MSSQL, or MongoDB — use config.json.
-#
-# Requires: Docker + Docker Compose v2
-#
-# Usage:
-#   ./install.sh
-#
+# DataSync — Docker install (Kafka + daemon). Idempotent schema bootstrap.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,15 +8,14 @@ cd "$ROOT"
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
-      sed -n '2,11p' "$0"
+      sed -n '2,8p' "$0"
       exit 0
       ;;
     *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
 done
 
-log() { printf '==> %s\n' "$*"; }
-warn() { printf 'WARN: %s\n' "$*" >&2; }
+warn() { printf '✖ %s\n' "$*" >&2; }
 
 docker_compose() {
   if docker info >/dev/null 2>&1; then
@@ -35,13 +25,28 @@ docker_compose() {
   fi
 }
 
+run_quiet() {
+  local label="$1"; shift
+  local err
+  err="$(mktemp)"
+  if "$@" >"$err" 2>&1; then
+    rm -f "$err"
+    printf '✔ %s\n' "$label"
+    return 0
+  fi
+  printf '✖ %s\n' "$label" >&2
+  tail -20 "$err" >&2 || true
+  rm -f "$err"
+  return 1
+}
+
 ensure_docker() {
   if ! command -v docker >/dev/null 2>&1; then
-    echo "docker is required — install Docker Engine and re-run ./install.sh" >&2
+    warn "docker required"
     exit 1
   fi
   if ! docker compose version >/dev/null 2>&1 && ! sudo docker compose version >/dev/null 2>&1; then
-    echo "docker compose v2 plugin is required" >&2
+    warn "docker compose v2 required"
     exit 1
   fi
 }
@@ -49,127 +54,241 @@ ensure_docker() {
 ensure_config() {
   if [[ ! -f "$ROOT/config.json" ]]; then
     if [[ -f "$ROOT/config.json.example" ]]; then
-      log "Creating config.json from config.json.example"
       cp "$ROOT/config.json.example" "$ROOT/config.json"
-      warn "Edit $ROOT/config.json (password) and re-run ./install.sh"
+      warn "edit config.json (password) and re-run"
       exit 1
     fi
-    echo "Missing config.json — copy config.json.example" >&2
+    warn "missing config.json"
     exit 1
   fi
   if grep -q 'CHANGE_ME' "$ROOT/config.json" 2>/dev/null; then
-    warn "config.json still has CHANGE_ME — edit credentials first"
+    warn "config.json still has CHANGE_ME"
     exit 1
   fi
 }
 
-wait_service() {
-  local svc="$1" max="${2:-60}"
-  log "Waiting for $svc"
-  local i
-  for i in $(seq 1 "$max"); do
-    if docker_compose ps --status running "$svc" 2>/dev/null | grep -q "$svc"; then
-      local health
-      health=$(docker_compose ps "$svc" 2>/dev/null | awk -v s="$svc" '$1 == s {print $4}' || true)
-      if [[ "$health" == *"(healthy)"* ]] || [[ "$health" != *"health"* ]]; then
-        log "$svc ready"
-        return 0
-      fi
-    fi
-    sleep 2
-  done
-  warn "$svc not ready — check: docker compose ps"
+build_image() {
+  local t0=$SECONDS err
+  err="$(mktemp)"
+  if docker_compose build --quiet datasync >"$err" 2>&1; then
+    rm -f "$err"
+    printf '✔ Image datasync built %ss\n' "$((SECONDS - t0))"
+    return 0
+  fi
+  if docker_compose build datasync >"$err" 2>&1; then
+    rm -f "$err"
+    printf '✔ Image datasync built %ss\n' "$((SECONDS - t0))"
+    return 0
+  fi
+  printf '✖ Image datasync build failed\n' >&2
+  tail -30 "$err" >&2 || true
+  rm -f "$err"
   return 1
 }
 
+verify_source_connectivity() {
+  local err rc
+  err="$(mktemp)"
+  docker_compose run --rm --no-deps --remove-orphans \
+    -e DATASYNC_INSTALL_QUIET=1 \
+    -e DATASYNC_HOST_NETWORK=1 \
+    datasync verify-sources >"$err" 2>&1
+  rc=$?
+  grep -vE 'Container datasync-datasync-run|^$' "$err" || true
+  rm -f "$err"
+  return "$rc"
+}
+
 apply_catalog_schema() {
-  log "Applying catalog schema (Docker, idempotent)"
-  docker_compose run --rm --no-deps \
+  [[ -f "$ROOT/sql/backup/cdc_catalog_schema_structure.sql" ]] || { warn "missing catalog schema sql"; exit 1; }
+  local err rc
+  err="$(mktemp)"
+  docker_compose run --rm --no-deps --remove-orphans \
     -e DATASYNC_RUN_MIGRATIONS=1 \
+    -e DATASYNC_INSTALL_QUIET=1 \
     -e DATASYNC_HOST_NETWORK=1 \
     -e KAFKA_BOOTSTRAP=localhost:9092 \
-    datasync schema-only
+    datasync schema-only >"$err" 2>&1
+  rc=$?
+  grep -vE 'Container datasync-datasync-run|^$' "$err" || true
+  rm -f "$err"
+  if [[ "$rc" -ne 0 ]]; then
+    exit "$rc"
+  fi
+}
+
+wait_zookeeper() {
+  local i h
+  for i in $(seq 1 30); do
+    h=$(docker_compose ps zookeeper --format '{{.Health}}' 2>/dev/null | head -1 || true)
+    if [[ "$h" == "healthy" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  warn "Zookeeper not ready — check: docker compose logs zookeeper --tail 30"
+  return 1
+}
+
+wait_kafka() {
+  local i h state
+  for i in $(seq 1 60); do
+    state=$(docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true)
+    h=$(docker_compose ps kafka --format '{{.Health}}' 2>/dev/null | head -1 || true)
+    if [[ "$state" == "running" && "$h" == "healthy" ]]; then
+      printf '✔ Kafka ready\n'
+      return 0
+    fi
+    if [[ "$state" == "exited" || "$state" == "dead" ]]; then
+      break
+    fi
+    sleep 2
+  done
+  warn "Kafka not ready — check: docker compose logs kafka --tail 40"
+  return 1
+}
+
+# Kafka must register in ZK after ZK is up. If Kafka alone restarts while ZK keeps a
+# stale /brokers/ids/* ephemeral, startup fails with NodeExists — restart ZK first.
+start_zookeeper_kafka() {
+  docker_compose up -d --remove-orphans zookeeper
+  wait_zookeeper || return 1
+
+  local kstate khealth
+  kstate=$(docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true)
+  khealth=$(docker_compose ps kafka --format '{{.Health}}' 2>/dev/null | head -1 || true)
+
+  if [[ "$kstate" == "running" && "$khealth" == "healthy" ]]; then
+    docker_compose up -d kafka
+    wait_kafka
+    return $?
+  fi
+
+  docker_compose stop kafka 2>/dev/null || true
+  docker_compose restart zookeeper
+  wait_zookeeper || return 1
+  docker_compose up -d --force-recreate kafka
+  wait_kafka
 }
 
 run_discover() {
-  log "Running catalog discover"
-  if docker_compose run --rm \
+  if ! python3 - "$ROOT/config.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    cfg = json.load(f)
+def has_conn(item):
+    return isinstance(item, dict) and (item.get("conn_id") or item.get("alias"))
+sources = cfg.get("sources") or []
+if any(has_conn(s) for s in sources if isinstance(s, dict)):
+    sys.exit(0)
+for key in ("mariadb", "mssql", "mongodb"):
+    val = cfg.get(key)
+    if isinstance(val, list) and any(has_conn(v) for v in val):
+        sys.exit(0)
+    if isinstance(val, dict) and has_conn(val):
+        sys.exit(0)
+sys.exit(1)
+PY
+  then
+    printf '✔ Discover skipped (no sources in config.json)\n'
+    return 0
+  fi
+
+  local err rc
+  err="$(mktemp)"
+  docker_compose run --rm --remove-orphans \
       -e DATASYNC_HOST_NETWORK=1 \
       -e KAFKA_BOOTSTRAP=localhost:9092 \
-      datasync discover; then
-    log "Discover completed"
+      datasync discover >"$err" 2>&1
+  rc=$?
+  grep -vE 'Container datasync-datasync-run' "$err" >/dev/null || true
+  if [[ "$rc" -eq 0 ]]; then
+    rm -f "$err"
+    printf '✔ Discover\n'
+    return 0
+  fi
+  printf '✖ Discover (check sources in config.json and source DB reachability)\n' >&2
+  grep -vE 'Container datasync-datasync-run' "$err" | tail -15 >&2 || true
+  rm -f "$err"
+  return 1
+}
+
+post_install_health() {
+  local err rc
+  err="$(mktemp)"
+  docker_compose run --rm --no-deps --remove-orphans \
+    -e DATASYNC_INSTALL_QUIET=1 \
+    -e DATASYNC_HOST_NETWORK=1 \
+    -e KAFKA_BOOTSTRAP=localhost:9092 \
+    datasync health-only >"$err" 2>&1
+  rc=$?
+  grep -vE 'Container datasync-datasync-run|^$' "$err" || true
+  rm -f "$err"
+  if [[ "$rc" -eq 0 ]]; then
+    printf '✔ Post-install health\n'
+    return 0
+  fi
+  warn "post-install health failed"
+  return 1
+}
+
+install_and_enable_systemd() {
+  [[ "${SKIP_SYSTEMD:-0}" == "1" ]] && return 0
+  [[ -x "$ROOT/deploy/systemd/install-systemd.sh" ]] || return 0
+
+  run_systemctl() {
+    if [[ "${EUID}" -eq 0 ]]; then
+      "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo "$@"
+    else
+      return 1
+    fi
+  }
+
+  local err rc
+  err="$(mktemp)"
+  if run_systemctl "$ROOT/deploy/systemd/install-systemd.sh" >"$err" 2>&1; then
+    rm -f "$err"
   else
-    warn "Discover finished with errors — seed cdc_catalog.connections if empty, then re-run ./install.sh"
-  fi
-}
-
-show_daemon_logs() {
-  log "DataSync daemon logs (recent — follow with: docker compose logs -f datasync)"
-  docker_compose logs datasync --tail 40
-}
-
-install_systemd_units() {
-  if [[ "${SKIP_SYSTEMD:-0}" == "1" ]]; then
-    warn "SKIP_SYSTEMD=1 — skipping systemd install"
+    rc=$?
+    warn "systemd install failed — run: sudo deploy/systemd/install-systemd.sh"
+    if [[ "$rc" -eq 1 ]] && grep -q 'Run as root' "$err" 2>/dev/null; then
+      warn "needs root (sudo password when prompted, or run the command above)"
+    fi
+    tail -8 "$err" >&2 || true
+    rm -f "$err"
     return 0
   fi
-  if [[ ! -x "$ROOT/deploy/systemd/install-systemd.sh" ]]; then
-    warn "deploy/systemd/install-systemd.sh missing — skip systemd"
-    return 0
-  fi
-  log "Installing systemd units (requires root — rebuild on every restart)"
-  if [[ "${EUID}" -eq 0 ]]; then
-    "$ROOT/deploy/systemd/install-systemd.sh"
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo "$ROOT/deploy/systemd/install-systemd.sh"
+  printf '✔ systemd units installed\n'
+
+  if run_systemctl systemctl enable --now DataSync >/dev/null 2>&1; then
+    printf '✔ systemd DataSync enabled\n'
   else
-    warn "Run manually: sudo deploy/systemd/install-systemd.sh"
-    return 0
+    warn "systemctl enable DataSync failed (sudo required)"
   fi
-  log "Optional: sudo systemctl enable --now DataSync DataSync-reconcile.timer"
-}
 
-echo "=========================================="
-echo " DataSync install (Docker) — $(date '+%Y-%m-%d %H:%M')"
-echo "=========================================="
+  if run_systemctl systemctl enable --now DataSync-reconcile.timer >/dev/null 2>&1; then
+    printf '✔ systemd reconcile.timer enabled\n'
+  else
+    warn "systemctl enable DataSync-reconcile.timer failed"
+  fi
+}
 
 ensure_docker
 ensure_config
 
-log "Building images"
-docker_compose build datasync
-
-log "Starting Kafka stack (Zookeeper + Kafka)"
-docker_compose up -d zookeeper kafka
-
-wait_service kafka 90 || true
-
+build_image
 apply_catalog_schema
 
-log "Starting DataSync daemon"
-docker_compose up -d datasync
+run_quiet "Zookeeper + Kafka starting" start_zookeeper_kafka
+
+run_quiet "DataSync daemon" docker_compose up -d --no-recreate datasync
 
 sleep 2
+run_quiet "Post-install health" post_install_health
+run_quiet "Source connectivity" verify_source_connectivity
 run_discover
-show_daemon_logs
-install_systemd_units
+install_and_enable_systemd
 
-echo ""
-echo "=========================================="
-echo " READY"
-echo "=========================================="
-echo "  Config:      $ROOT/config.json"
-echo "  Catalog DDL: sql/backup/cdc_catalog_schema_structure.sql"
-echo "  Kafka:       localhost:9092"
-echo ""
-echo "  Databases (PG, MariaDB, MSSQL, Mongo) are external — not created by Docker."
-echo "  PG in config.json: localhost:5432 when on the same host (network_mode: host)."
-echo ""
-echo "  Follow daemon:"
-echo "    docker compose logs -f datasync"
-echo ""
-echo "  systemd (rebuild + restart):"
-echo "    sudo systemctl enable --now DataSync"
-echo "    sudo systemctl restart DataSync   # rebuilds image/binary first"
-echo "    sudo systemctl enable --now DataSync-reconcile.timer"
-echo ""
+printf '✔ Install complete — status: docker compose ps | systemd: systemctl status DataSync\n'

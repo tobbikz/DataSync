@@ -2,6 +2,7 @@
 
 #include "capture_common.hpp"
 #include "mongo_conn.hpp"
+#include "mongo_preflight.hpp"
 #include "mongo_kafka_capture.hpp"
 #include "mongo_lake.hpp"
 #include "obs_log.hpp"
@@ -631,6 +632,38 @@ FullLoadRunStats run_mongo_full_load(
                     t.source_database,
                     t.source_table);
             }
+            continue;
+        }
+
+        MongoConn preflight_db(*src);
+        const auto preflight = check_mongo_cdc_ready(preflight_db, *src);
+        for (const auto& w : preflight.warnings) {
+            log_fl(
+                log_pg,
+                nullptr,
+                LogLevel::Warning,
+                batch_id,
+                "mongo CDC preflight warning",
+                {{"warning", w}},
+                conn_id);
+        }
+        if (!preflight.ok) {
+            nlohmann::json err_ctx = nlohmann::json::array();
+            for (const auto& e : preflight.errors) {
+                err_ctx.push_back(e);
+            }
+            for (const auto& t : conn_targets) {
+                stats.tables_processed += 1;
+                stats.tables_failed += 1;
+            }
+            log_fl(
+                log_pg,
+                nullptr,
+                LogLevel::Error,
+                batch_id,
+                "full load conn skipped: mongo CDC preflight failed",
+                {{"errors", err_ctx}},
+                conn_id);
             continue;
         }
 

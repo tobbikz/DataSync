@@ -67,6 +67,19 @@ int run_discover(const AppConfig& cfg, PGconn* log_pg, const std::string& batch_
                      {"mongo_sources", cfg.mongo_sources.size()}},
     });
 
+    if (cfg.mariadb_sources.empty() && cfg.mssql_sources.empty() && cfg.mongo_sources.empty()) {
+        emit_or_stderr(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "catalog",
+            .message = "discover skipped: no active connections",
+            .batch_id = batch_id,
+            .conn_id = std::nullopt,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+        });
+        return 0;
+    }
+
     int failures = sync_all_catalogs(cfg, log_pg, batch_id);
 
     int total = 0;

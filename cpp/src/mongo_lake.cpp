@@ -234,7 +234,7 @@ void ensure_mongo_lake_table_base(
     const char* part_vals[] = {pg_schema.c_str(), pg_table.c_str(), months.c_str()};
     PGresult* part_res = PQexecParams(
         pg,
-        "SELECT cdc_catalog.ensure_monthly_partitions($1::text, $2::text, $3::integer)",
+        "SELECT lake.ensure_monthly_partitions($1::text, $2::text, $3::integer)",
         3,
         nullptr,
         part_vals,

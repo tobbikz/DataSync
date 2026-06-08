@@ -1172,6 +1172,22 @@ int run_kafka_apply_native_cli(
             }
         }
         stop_reason = reason.empty() ? "slice_complete" : reason;
+        if (stop_reason == "all_quarantined") {
+            log_write(log_pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_kafka_apply",
+                .message = "apply slice skipped: all tables quarantined",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"tier", service_tier.value_or("")},
+                    {"quarantined_tables", static_cast<int>(quarantined.size())},
+                    {"wanted_tables", static_cast<int>(wanted.size())},
+                },
+            });
+        }
         loop_exited_early = true;
         return true;
     };

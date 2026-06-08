@@ -10,6 +10,7 @@ struct PgConfig {
     std::string database{"DataLake"};
     std::string user;
     std::string password;
+    std::string sslmode;
     std::string conn_string() const;
 };
 
@@ -39,6 +40,7 @@ struct MongoSource {
     std::string user;
     std::string password;
     std::string replica_set;
+    bool replica_set_in_extras{false};
 };
 
 /** CDC daemon tuning — config.json only (not runtime_config / service_tiers table). */

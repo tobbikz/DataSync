@@ -458,6 +458,26 @@ void mark_catalog_full_load_in_progress(PGconn* pg, long long catalog_id) {
         vals);
 }
 
+void mark_catalog_skipped(PGconn* pg, long long catalog_id, const std::string& reason) {
+    const std::string id = std::to_string(catalog_id);
+    const std::string trunc = reason.substr(0, 1000);
+    const char* vals[] = {id.c_str(), trunc.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET status = 'skipped',
+            needs_full_load = false,
+            cdc_enabled = false,
+            last_error = $2,
+            last_error_at = now(),
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+        )",
+        2,
+        vals);
+}
+
 void mark_catalog_cdc_in_progress(PGconn* pg, long long catalog_id) {
     const std::string id = std::to_string(catalog_id);
     const char* vals[] = {id.c_str()};

@@ -123,6 +123,9 @@ void flag_table_for_full_load(
 /** Set catalog.status while a table is actively loading (full load COPY). */
 void mark_catalog_full_load_in_progress(PGconn* pg, long long catalog_id);
 
+/** Mark table skipped (no PK, unsupported) — clears in_progress, disables CDC for this table. */
+void mark_catalog_skipped(PGconn* pg, long long catalog_id, const std::string& reason);
+
 /** Set catalog.status while CDC capture or apply is processing a table. */
 void mark_catalog_cdc_in_progress(PGconn* pg, long long catalog_id);
 

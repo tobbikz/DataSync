@@ -107,63 +107,10 @@ CREATE TYPE cdc_catalog.service_tier AS ENUM (
 
 
 --
--- Name: ensure_monthly_partitions(text, text, integer); Type: FUNCTION; Schema: cdc_catalog; Owner: -
---
-
-CREATE FUNCTION cdc_catalog.ensure_monthly_partitions(p_schema text, p_table text, p_months_ahead integer DEFAULT 3) RETURNS integer
-    LANGUAGE plpgsql
-    AS $$
-DECLARE
-    m date;
-    end_m date;
-    part_name text;
-    start_d date;
-    end_d date;
-    created integer := 0;
-BEGIN
-    m := date_trunc('month', CURRENT_DATE)::date;
-    end_m := (date_trunc('month', CURRENT_DATE) + make_interval(months => p_months_ahead + 1))::date;
-
-    WHILE m < end_m LOOP
-        SELECT lb.start_date, lb.end_date INTO start_d, end_d FROM cdc_catalog.month_bounds(m) lb;
-        part_name := format('%s_%s', p_table, to_char(start_d, 'YYYY_MM'));
-
-        IF to_regclass(format('%I.%I', p_schema, part_name)) IS NULL THEN
-            EXECUTE format(
-                'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.%I FOR VALUES FROM (%L) TO (%L)',
-                p_schema, part_name, p_schema, p_table, start_d, end_d
-            );
-            created := created + 1;
-        END IF;
-        m := (m + interval '1 month')::date;
-    END LOOP;
-    RETURN created;
-END;
-$$;
-
-
---
--- Name: FUNCTION ensure_monthly_partitions(p_schema text, p_table text, p_months_ahead integer); Type: COMMENT; Schema: cdc_catalog; Owner: -
---
-
-COMMENT ON FUNCTION cdc_catalog.ensure_monthly_partitions(p_schema text, p_table text, p_months_ahead integer) IS 'Create monthly RANGE partitions on _dl_load_date for a partitioned lake table.';
-
-
---
--- Name: month_bounds(date); Type: FUNCTION; Schema: cdc_catalog; Owner: -
---
-
-CREATE FUNCTION cdc_catalog.month_bounds(p_month date) RETURNS TABLE(start_date date, end_date date)
-    LANGUAGE sql IMMUTABLE
-    AS $$
-    SELECT date_trunc('month', p_month)::date,
-           (date_trunc('month', p_month) + interval '1 month')::date;
-$$;
-
-
---
 -- Name: prune_applied_events(integer); Type: FUNCTION; Schema: cdc_catalog; Owner: -
 --
+-- Lake partition helpers (lake.month_bounds, lake.ensure_monthly_partitions) live in
+-- sql/backup/datalake_lake_schema.sql → config.json datalake.database only.
 
 CREATE FUNCTION cdc_catalog.prune_applied_events(p_retention_days integer DEFAULT 7) RETURNS bigint
     LANGUAGE plpgsql
@@ -1273,6 +1220,25 @@ ALTER TABLE ONLY cdc_catalog.apply_position
 
 ALTER TABLE ONLY cdc_catalog.reconciliation_result
     ADD CONSTRAINT reconciliation_result_run_id_fkey FOREIGN KEY (run_id) REFERENCES cdc_catalog.reconciliation_run(run_id) ON DELETE CASCADE;
+
+
+--
+-- Name: schema_migrations; Type: TABLE; Schema: cdc_catalog; Owner: -
+--
+
+CREATE TABLE cdc_catalog.schema_migrations (
+    version integer NOT NULL,
+    description text NOT NULL,
+    applied_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: schema_migrations schema_migrations_pkey; Type: CONSTRAINT; Schema: cdc_catalog; Owner: -
+--
+
+ALTER TABLE ONLY cdc_catalog.schema_migrations
+    ADD CONSTRAINT schema_migrations_pkey PRIMARY KEY (version);
 
 
 --

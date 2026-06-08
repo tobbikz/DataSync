@@ -17,12 +17,12 @@ On first run, `./install.sh` copies `config.json.example` → `config.json` if m
 `install.sh` runs the full bootstrap:
 
 1. Builds the **DataSync** image
-2. Starts **Zookeeper + Kafka**
-3. Applies **`sql/backup/cdc_catalog_schema_structure.sql`** via container (`schema-only`)
+2. Ensures **`cdc_catalog`** in `config.json` → `datasync.database` and **`lake`** helpers in `datalake.database` (creates DBs if missing; idempotent)
+3. Starts **Zookeeper + Kafka**
 4. Starts the **DataSync daemon**
 5. Runs **`discover`**
 6. Prints recent **daemon logs**
-7. Installs **systemd** units when run with sudo (`DataSync.service`, reconcile timer)
+7. Installs and **enables** **systemd** (`DataSync` + `DataSync-reconcile.timer`) when sudo is available
 
 | Service | URL |
 |---------|-----|
@@ -31,30 +31,28 @@ On first run, `./install.sh` copies `config.json.example` → `config.json` if m
 
 The DataSync container uses **`network_mode: host`** (Linux) so it reaches host PostgreSQL and Kafka (`localhost:9092`) without extra PG configuration.
 
-## systemd (optional)
+## systemd
 
-Every **`systemctl restart DataSync`** runs **`ExecStartPre`** first → rebuild (`docker compose build datasync` by default), then recreates the daemon container.
+`./install.sh` runs `systemctl enable --now DataSync` and `DataSync-reconcile.timer` (needs sudo).
+
+Every **`systemctl restart DataSync`** runs **`ExecStartPre`** first → rebuild, then recreates the daemon container.
 
 ```bash
-sudo systemctl enable --now DataSync
-sudo systemctl restart DataSync
-sudo systemctl enable --now DataSync-reconcile.timer
-
-deploy/systemd/datasync-cli.sh discover
+systemctl status DataSync
+docker compose ps
 docker compose logs -f datasync
 ```
 
-Native binary (no Docker daemon): `sudo deploy/systemd/install-systemd.sh --native`
-
 ## SQL
 
-Only one DDL file is kept:
+Bootstrap idempotente (`./install.sh`):
 
-```
-sql/backup/cdc_catalog_schema_structure.sql
-```
+| File | Target DB | Contenido |
+|------|-----------|-----------|
+| `sql/backup/cdc_catalog_schema_structure.sql` | `config.json` → **datasync** | Catálogo, logs, runtime_config, dedup, offsets |
+| `sql/backup/datalake_lake_schema.sql` | `config.json` → **datalake** | Schema `lake` + particiones mensuales |
 
-Structure only (no seed data). After apply, insert `cdc_catalog.connections` and `cdc_catalog.runtime_config` rows as needed.
+Sin seed data. Tras apply, insertar `cdc_catalog.connections` y `runtime_config` según necesidad.
 
 ## CLI (optional)
 

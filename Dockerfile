@@ -57,6 +57,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /opt/rdkafka/lib /opt/rdkafka/lib
 COPY --from=builder /src/build/DataSync /usr/local/bin/DataSync
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/catalog_bootstrap.py /app/docker/catalog_bootstrap.py
+COPY docker/verify_sources.py /app/docker/verify_sources.py
 COPY sql/ /app/sql/
 
 RUN chmod +x /usr/local/bin/entrypoint.sh

@@ -300,7 +300,7 @@ void ensure_mssql_lake_table_base(
     const char* part_vals[] = {pg_schema.c_str(), pg_table.c_str(), months.c_str()};
     pg_exec_params_simple(
         pg,
-        "SELECT cdc_catalog.ensure_monthly_partitions($1::text, $2::text, $3::integer)",
+        "SELECT lake.ensure_monthly_partitions($1::text, $2::text, $3::integer)",
         3,
         part_vals);
 }

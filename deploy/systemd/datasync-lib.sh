@@ -24,6 +24,34 @@ docker_compose() {
   fi
 }
 
+wait_zookeeper() {
+  local i h
+  for i in $(seq 1 30); do
+    h=$(docker_compose ps zookeeper --format '{{.Health}}' 2>/dev/null | head -1 || true)
+    if [[ "$h" == "healthy" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+wait_kafka() {
+  local i h state
+  for i in $(seq 1 60); do
+    state=$(docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true)
+    h=$(docker_compose ps kafka --format '{{.Health}}' 2>/dev/null | head -1 || true)
+    if [[ "$state" == "running" && "$h" == "healthy" ]]; then
+      return 0
+    fi
+    if [[ "$state" == "exited" || "$state" == "dead" ]]; then
+      return 1
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 native_build() {
   local build_dir="${DATASYNC_ROOT}/cpp/build"
   cmake -S "${DATASYNC_ROOT}/cpp" -B "${build_dir}" -DCMAKE_BUILD_TYPE=Release

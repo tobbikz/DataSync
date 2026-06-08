@@ -1,6 +1,8 @@
 #include "catalog_sync.hpp"
 
 #include "mariadb_conn.hpp"
+#include "mariadb_preflight.hpp"
+#include "mongo_preflight.hpp"
 #include "mssql_conn.hpp"
 #include "mongo_conn.hpp"
 #include "obs_log.hpp"
@@ -824,6 +826,31 @@ CatalogSyncStats sync_mariadb_catalog(
         {{"db_engine", "mariadb"}, {"host", source.host}, {"port", source.port}, {"schema_filter", source.db_name}});
 
     MariaDbConn mariadb(source);
+    const MariaDbPreflightResult preflight = check_mariadb_cdc_ready(mariadb.handle);
+    for (const auto& w : preflight.warnings) {
+        log_checkpoint(
+            log_pg,
+            LogLevel::Warning,
+            batch_id,
+            source.conn_id,
+            "mariadb cdc preflight warning",
+            {{"detail", w}});
+    }
+    if (!preflight.ok) {
+        nlohmann::json err_ctx = nlohmann::json::array();
+        for (const auto& e : preflight.errors) {
+            err_ctx.push_back(e);
+        }
+        log_checkpoint(
+            log_pg,
+            LogLevel::Error,
+            batch_id,
+            source.conn_id,
+            "mariadb cdc preflight failed",
+            {{"errors", err_ctx}});
+        throw std::runtime_error("MariaDB CDC preflight failed for " + source.conn_id);
+    }
+
     const auto discovered = fetch_mariadb_objects(mariadb.handle, source.db_name);
     log_checkpoint(
         log_pg,
@@ -883,6 +910,15 @@ CatalogSyncStats sync_mssql_catalog(
     }
 
     const auto discovered = fetch_mssql_objects(mssql, source.db_name);
+    if (discovered.empty()) {
+        log_checkpoint(
+            log_pg,
+            LogLevel::Warning,
+            batch_id,
+            source.conn_id,
+            "mssql discover empty scan",
+            {{"database_filter", source.db_name.empty() ? "cdc_enabled_databases" : source.db_name}});
+    }
     log_checkpoint(
         log_pg,
         LogLevel::Info,
@@ -922,6 +958,31 @@ CatalogSyncStats sync_mongo_catalog(
         {{"db_engine", "mongodb"}, {"host", source.host}, {"port", source.port}, {"database", source.db_name}});
 
     MongoConn mongo(source);
+    const auto preflight = check_mongo_cdc_ready(mongo, source);
+    if (!preflight.ok) {
+        nlohmann::json err_ctx = nlohmann::json::array();
+        for (const auto& e : preflight.errors) {
+            err_ctx.push_back(e);
+        }
+        log_checkpoint(
+            log_pg,
+            LogLevel::Error,
+            batch_id,
+            source.conn_id,
+            "mongo CDC preflight failed",
+            {{"errors", err_ctx}});
+        throw std::runtime_error("mongo CDC preflight failed for " + source.conn_id);
+    }
+    for (const auto& warning : preflight.warnings) {
+        log_checkpoint(
+            log_pg,
+            LogLevel::Warning,
+            batch_id,
+            source.conn_id,
+            "mongo CDC preflight warning",
+            {{"warning", warning}});
+    }
+
     const auto discovered = fetch_mongo_objects(mongo, source.db_name);
     log_checkpoint(
         log_pg,

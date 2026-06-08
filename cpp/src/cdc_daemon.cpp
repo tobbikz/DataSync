@@ -1,5 +1,6 @@
 #include "cdc_daemon.hpp"
 #include "catalog_sync.hpp"
+#include "capture_common.hpp"
 #include "cdc_pre_apply.hpp"
 #include "config.hpp"
 #include "daemon_full_load.hpp"
@@ -279,6 +280,22 @@ int run_cdc_daemon(
     }
 
     const std::string batch_id = make_batch_id();
+
+    for (const auto& conn_id : conn_ids) {
+        const std::string db_engine = conn_engine(cfg, conn_id);
+        clear_stale_full_load_in_progress(log_pg, conn_id, db_engine);
+        clear_stale_cdc_in_progress(log_pg, conn_id, std::nullopt, db_engine);
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_daemon",
+            .message = "stale in_progress flags cleared",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"db_engine", db_engine}},
+        });
+    }
 
     log_write(log_pg, {
         .level = LogLevel::Info,

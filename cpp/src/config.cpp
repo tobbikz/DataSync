@@ -30,6 +30,7 @@ PgConfig parse_pg(const nlohmann::json& j, const PgConfig& defaults = {}) {
     pg.database = j.value("database", defaults.database.empty() ? "DataLake" : defaults.database);
     pg.user = j.value("user", defaults.user);
     pg.password = j.value("password", defaults.password);
+    pg.sslmode = j.value("sslmode", defaults.sslmode);
     if (pg.user.empty()) {
         throw std::runtime_error("config.json: postgres user is required");
     }
@@ -145,11 +146,15 @@ void parse_cdc_config(const nlohmann::json& root, CdcConfig& cdc) {
 }  // namespace
 
 std::string PgConfig::conn_string() const {
-    return "host=" + host +
-           " port=" + std::to_string(port) +
-           " dbname=" + database +
-           " user=" + user +
-           " password=" + password;
+    std::string s = "host=" + host +
+                    " port=" + std::to_string(port) +
+                    " dbname=" + database +
+                    " user=" + user +
+                    " password=" + password;
+    if (!sslmode.empty()) {
+        s += " sslmode=" + sslmode;
+    }
+    return s;
 }
 
 AppConfig load_config(const std::string& path) {
@@ -178,6 +183,19 @@ AppConfig load_config(const std::string& path) {
     }
 
     parse_cdc_config(root, cfg.cdc);
+
+    if (const char* env = std::getenv("DATASYNC_PG_PASSWORD")) {
+        cfg.datasync.password = env;
+    }
+    if (const char* env = std::getenv("DATALAKE_PG_PASSWORD")) {
+        cfg.datalake.password = env;
+    }
+    if (const char* env = std::getenv("DATASYNC_PG_SSLMODE")) {
+        cfg.datasync.sslmode = env;
+    }
+    if (const char* env = std::getenv("DATALAKE_PG_SSLMODE")) {
+        cfg.datalake.sslmode = env;
+    }
 
     return cfg;
 }

@@ -375,7 +375,7 @@ void ensure_partitions(PGconn* pg, const std::string& schema, const std::string&
 
     const char* vals[] = {schema.c_str(), table.c_str(), "3"};
     PGresult* res = PQexecParams(
-        pg, "SELECT cdc_catalog.ensure_monthly_partitions($1, $2, $3::integer)", 3, nullptr, vals, nullptr, nullptr, 0);
+        pg, "SELECT lake.ensure_monthly_partitions($1, $2, $3::integer)", 3, nullptr, vals, nullptr, nullptr, 0);
     if (res) {
         PQclear(res);
     }

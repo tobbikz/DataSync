@@ -634,6 +634,7 @@ bool load_one_table(
     mark_catalog_full_load_in_progress(app_pg.raw, target.catalog_id);
 
     if (!target.has_pk || target.pk_columns.empty()) {
+        mark_catalog_skipped(app_pg.raw, target.catalog_id, "no primary key");
         log_fl(
             log_pg,
             log_mtx,

@@ -17,6 +17,7 @@ set(DATASYNC_SOURCES
     src/service_tiers.cpp
     src/catalog_sync.cpp
     src/mariadb_conn.cpp
+    src/mariadb_preflight.cpp
     src/mariadb_schema.cpp
     src/mariadb_datetime.cpp
     src/mariadb_ddl_sync.cpp
@@ -62,7 +63,7 @@ endif()
 pkg_check_modules(MONGOC libmongoc-1.0)
 if(MONGOC_FOUND)
     message(STATUS "libmongoc found: ${MONGOC_LIBRARIES}")
-    list(APPEND DATASYNC_SOURCES src/mongo_conn.cpp)
+    list(APPEND DATASYNC_SOURCES src/mongo_conn.cpp src/mongo_preflight.cpp)
     set(HAVE_MONGOC TRUE)
 else()
     message(WARNING "libmongoc not found — MongoDB C++ full-load disabled. Install: pacman -S libmongoc")

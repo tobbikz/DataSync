@@ -28,7 +28,7 @@ std::string sanitize_pg_identifier_part(const std::string& name, std::size_t max
         out.erase(out.begin());
     }
     if (out.empty()) {
-        out = "x";
+        out.push_back('x');
     }
     if (std::isdigit(static_cast<unsigned char>(out.front()))) {
         out = "t_" + out;

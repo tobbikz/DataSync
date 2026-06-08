@@ -13,10 +13,10 @@ struct LogEvent {
     LogLevel level{LogLevel::Info};
     std::string component;
     std::string message;
-    std::optional<std::string> batch_id;
-    std::optional<std::string> conn_id;
-    std::optional<std::string> source_schema;
-    std::optional<std::string> source_table;
+    std::optional<std::string> batch_id{std::nullopt};
+    std::optional<std::string> conn_id{std::nullopt};
+    std::optional<std::string> source_schema{std::nullopt};
+    std::optional<std::string> source_table{std::nullopt};
     nlohmann::json context{nlohmann::json::object()};
 };
 

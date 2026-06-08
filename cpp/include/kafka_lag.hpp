@@ -2,7 +2,10 @@
 
 #ifdef HAVE_RDKAFKA
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wignored-qualifiers"
 #include <librdkafka/rdkafka.h>
+#pragma GCC diagnostic pop
 
 #include <memory>
 #include <string>

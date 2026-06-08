@@ -14,6 +14,16 @@ case "${DATASYNC_DEPLOY_MODE}" in
     exec "${BIN}" daemon
     ;;
   docker|*)
-    docker_compose up -d --force-recreate --no-deps datasync
+    docker_compose up -d --remove-orphans zookeeper
+    wait_zookeeper || {
+      echo "Zookeeper not ready — check: docker compose logs zookeeper --tail 30" >&2
+      exit 1
+    }
+    docker_compose up -d kafka
+    wait_kafka || {
+      echo "Kafka not ready — check: docker compose logs kafka --tail 40" >&2
+      exit 1
+    }
+    docker_compose up -d --force-recreate datasync
     ;;
 esac

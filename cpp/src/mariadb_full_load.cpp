@@ -5,6 +5,7 @@
 #include "mariadb_conn.hpp"
 #include "mariadb_ddl_sync.hpp"
 #include "mariadb_datetime.hpp"
+#include "mariadb_preflight.hpp"
 #include "mariadb_schema.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
@@ -719,6 +720,7 @@ bool load_one_table(
     mark_catalog_full_load_in_progress(app_pg.raw, target.catalog_id);
 
     if (!target.has_pk || target.pk_columns.empty()) {
+        mark_catalog_skipped(app_pg.raw, target.catalog_id, "no primary key");
         log_fl(
             log_pg,
             log_mtx,
@@ -877,6 +879,37 @@ FullLoadRunStats run_mariadb_full_load(
         }
 
         MariaDbConn order_db(*src);
+        const MariaDbPreflightResult preflight = check_mariadb_cdc_ready(order_db.handle);
+        for (const auto& w : preflight.warnings) {
+            log_fl(
+                log_pg,
+                nullptr,
+                LogLevel::Warning,
+                batch_id,
+                "mariadb cdc preflight warning",
+                {{"detail", w}},
+                conn_id);
+        }
+        if (!preflight.ok) {
+            nlohmann::json err_ctx = nlohmann::json::array();
+            for (const auto& e : preflight.errors) {
+                err_ctx.push_back(e);
+            }
+            for (const auto& t : conn_targets) {
+                stats.tables_processed += 1;
+                stats.tables_failed += 1;
+            }
+            log_fl(
+                log_pg,
+                nullptr,
+                LogLevel::Error,
+                batch_id,
+                "full load conn skipped: mariadb cdc preflight failed",
+                {{"errors", err_ctx}},
+                conn_id);
+            continue;
+        }
+
         const int parallel_tables = std::max(1, runtime.get_int("full_load_parallel_tables", 1, "mariadb_load", conn_id));
 
         try {

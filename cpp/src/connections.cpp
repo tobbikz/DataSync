@@ -52,11 +52,11 @@ MongoSource row_to_mongo(PGresult* res, int row) {
     src.db_name = PQgetvalue(res, row, 4) ? PQgetvalue(res, row, 4) : "";
     src.user = PQgetvalue(res, row, 5) ? PQgetvalue(res, row, 5) : "";
     src.password = PQgetvalue(res, row, 6) ? PQgetvalue(res, row, 6) : "";
-    src.replica_set = "rs0";
     const auto extras = nlohmann::json::parse(extras_string(res, row), nullptr, false);
     if (extras.is_object()) {
         if (const auto it = extras.find("replica_set"); it != extras.end() && it->is_string()) {
             src.replica_set = it->get<std::string>();
+            src.replica_set_in_extras = true;
         }
     }
     return src;
