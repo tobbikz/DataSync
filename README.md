@@ -17,7 +17,7 @@ On first run, `./install.sh` copies `config.json.example` → `config.json` if m
 `install.sh` runs the full bootstrap:
 
 1. Builds the **DataSync** image
-2. Starts **Zookeeper + Kafka + Kafka UI**
+2. Starts **Zookeeper + Kafka**
 3. Applies **`sql/backup/cdc_catalog_schema_structure.sql`** via container (`schema-only`)
 4. Starts the **DataSync daemon**
 5. Runs **`discover`**
@@ -25,7 +25,6 @@ On first run, `./install.sh` copies `config.json.example` → `config.json` if m
 
 | Service | URL |
 |---------|-----|
-| Kafka UI | http://localhost:8080 |
 | Kafka | `localhost:9092` |
 | PostgreSQL | external — from `config.json` |
 

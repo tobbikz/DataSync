@@ -572,6 +572,67 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     return stats;
 }
 
+bool seed_mssql_cdc_lsn_for_table_if_absent(
+    PGconn* log_pg,
+    MssqlConn& mssql,
+    const std::string& conn_id,
+    const std::string& database,
+    const std::string& schema,
+    const std::string& table) {
+    if (!get_stored_lsn(log_pg, conn_id, database, schema, table).empty()) {
+        return false;
+    }
+
+    const char* vals[] = {conn_id.c_str(), database.c_str(), schema.c_str(), table.c_str()};
+    PGresult* meta_res = PQexecParams(
+        log_pg,
+        R"(
+        SELECT engine_meta::text FROM cdc_catalog.catalog
+        WHERE conn_id = $1 AND source_database = $2 AND source_schema = $3 AND source_table = $4
+          AND db_engine = 'mssql'
+        LIMIT 1
+        )",
+        4,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!meta_res || PQresultStatus(meta_res) != PGRES_TUPLES_OK || PQntuples(meta_res) == 0) {
+        if (meta_res) {
+            PQclear(meta_res);
+        }
+        return false;
+    }
+    const char* meta_txt = PQgetvalue(meta_res, 0, 0);
+    nlohmann::json meta = nlohmann::json::object();
+    if (meta_txt && *meta_txt) {
+        meta = nlohmann::json::parse(meta_txt, nullptr, false);
+        if (meta.is_discarded()) {
+            meta = nlohmann::json::object();
+        }
+    }
+    PQclear(meta_res);
+
+    const std::string cap = meta.value("capture_instance", "");
+    if (!validate_capture_instance(cap)) {
+        return false;
+    }
+
+    cdc_scan(mssql, database);
+    mssql.use_database(database);
+    const auto max_rows = mssql.query("SELECT sys.fn_cdc_get_max_lsn()");
+    if (max_rows.rows.empty() || max_rows.rows[0].empty()) {
+        return false;
+    }
+    const auto max_lsn = lsn_as_bytes(max_rows.rows[0][0]);
+    if (max_lsn.empty()) {
+        return false;
+    }
+    upsert_lsn(log_pg, conn_id, database, schema, table, max_lsn, {});
+    return true;
+}
+
 int seed_mssql_cdc_lsn_for_conn(
     const AppConfig& cfg,
     PGconn* log_pg,
@@ -644,6 +705,11 @@ int seed_mssql_cdc_lsn_for_conn(
             }
             const std::string cap = meta.value("capture_instance", "");
             if (!validate_capture_instance(cap)) {
+                skipped += 1;
+                continue;
+            }
+
+            if (!get_stored_lsn(log_pg, conn_id, database, schema, table).empty()) {
                 skipped += 1;
                 continue;
             }

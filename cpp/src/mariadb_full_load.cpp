@@ -879,6 +879,37 @@ FullLoadRunStats run_mariadb_full_load(
         MariaDbConn order_db(*src);
         const int parallel_tables = std::max(1, runtime.get_int("full_load_parallel_tables", 1, "mariadb_load", conn_id));
 
+        try {
+            if (capture_binlog_position_t0_if_absent(app_pg.raw, order_db.handle, conn_id)) {
+                log_fl(
+                    log_pg,
+                    nullptr,
+                    LogLevel::Info,
+                    batch_id,
+                    "binlog T0 captured at full load start",
+                    {},
+                    conn_id);
+            } else {
+                log_fl(
+                    log_pg,
+                    nullptr,
+                    LogLevel::Info,
+                    batch_id,
+                    "binlog T0 already set — skip",
+                    {},
+                    conn_id);
+            }
+        } catch (const std::exception& ex) {
+            log_fl(
+                log_pg,
+                nullptr,
+                LogLevel::Warning,
+                batch_id,
+                "binlog T0 capture failed",
+                {{"error", ex.what()}},
+                conn_id);
+        }
+
         std::map<std::string, std::vector<CatalogTableRow>> by_schema;
         for (const auto& t : conn_targets) {
             by_schema[t.source_schema].push_back(t);
@@ -958,35 +989,6 @@ FullLoadRunStats run_mariadb_full_load(
             }
         }
 
-        log_fl(
-            log_pg,
-            nullptr,
-            LogLevel::Info,
-            batch_id,
-            "fk load order resolved",
-            {{"tables", conn_targets.size()}, {"fk_levels", fk_levels}, {"parallel_tables", parallel_tables}},
-            conn_id);
-
-        try {
-            capture_binlog_position_t0(app_pg.raw, order_db.handle, conn_id);
-            log_fl(
-                log_pg,
-                nullptr,
-                LogLevel::Info,
-                batch_id,
-                "binlog T0 captured after full load",
-                {},
-                conn_id);
-        } catch (const std::exception& ex) {
-            log_fl(
-                log_pg,
-                nullptr,
-                LogLevel::Warning,
-                batch_id,
-                "binlog T0 capture failed",
-                {{"error", ex.what()}},
-                conn_id);
-        }
     }
 
     log_fl(

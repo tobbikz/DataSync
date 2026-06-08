@@ -25,8 +25,6 @@
 
 namespace {
 
-std::string mariadb_scalar_safe(MYSQL* mysql, const char* sql);
-
 struct ApplyPositionRow {
     long long catalog_id{0};
     std::string kafka_topic;
@@ -45,70 +43,6 @@ int table_lag_seconds(PGconn* pg, const char* last_applied, int lag_col, int def
         return default_stale + 1;
     }
     return default_stale + 1;
-}
-
-void sync_mariadb_capture_position(PGconn* pg, MYSQL* mysql, const std::string& conn_id) {
-    if (mysql_query(mysql, "SHOW MASTER STATUS") != 0) {
-        throw std::runtime_error(std::string("SHOW MASTER STATUS failed: ") + mysql_error(mysql));
-    }
-    MYSQL_RES* res = mysql_store_result(mysql);
-    if (!res) {
-        throw std::runtime_error("SHOW MASTER STATUS empty");
-    }
-    MYSQL_ROW row = mysql_fetch_row(res);
-    if (!row || !row[0]) {
-        mysql_free_result(res);
-        throw std::runtime_error("SHOW MASTER STATUS no row");
-    }
-    const std::string file_name = row[0];
-    const long long position = row[1] ? std::atoll(row[1]) : 0;
-    std::string gtid = row[2] ? row[2] : "";
-    mysql_free_result(res);
-
-    if (gtid.empty()) {
-        gtid = mariadb_scalar_safe(mysql, "SELECT @@gtid_binlog_state");
-    }
-    std::string uuid = mariadb_scalar_safe(mysql, "SELECT @@server_uuid");
-    if (uuid.empty()) {
-        uuid = mariadb_scalar_safe(mysql, "SELECT @@server_uid");
-    }
-
-    const std::string pos_str = std::to_string(position);
-    const char* vals[] = {conn_id.c_str(), gtid.c_str(), file_name.c_str(), pos_str.c_str(), uuid.c_str()};
-    pg_exec_params_simple(
-        pg,
-        R"(
-        INSERT INTO cdc_catalog.capture_position
-          (conn_id, gtid_set, binlog_file, binlog_position, server_uuid, status, last_error, updated_at)
-        VALUES ($1, $2, $3, $4::bigint, $5, 'healthy', NULL, now())
-        ON CONFLICT (conn_id) DO UPDATE SET
-          gtid_set = EXCLUDED.gtid_set,
-          binlog_file = EXCLUDED.binlog_file,
-          binlog_position = EXCLUDED.binlog_position,
-          server_uuid = EXCLUDED.server_uuid,
-          status = 'healthy'::cdc_catalog.cdc_health_status,
-          last_error = NULL,
-          updated_at = now()
-        )",
-        5,
-        vals);
-}
-
-std::string mariadb_scalar_safe(MYSQL* mysql, const char* sql) {
-    if (mysql_query(mysql, sql) != 0) {
-        return {};
-    }
-    MYSQL_RES* res = mysql_store_result(mysql);
-    if (!res) {
-        return {};
-    }
-    MYSQL_ROW row = mysql_fetch_row(res);
-    std::string out;
-    if (row && row[0]) {
-        out = row[0];
-    }
-    mysql_free_result(res);
-    return out;
 }
 
 ApplyPositionRow fetch_apply_position(
@@ -242,18 +176,10 @@ CatchupResult run_table_catchup(
 
     if (db_engine == "mssql") {
         run_mssql_full_load(cfg, log_pg, batch_id, svc_tier);
-#ifdef HAVE_FREETDS
-        seed_mssql_cdc_lsn_for_conn(cfg, log_pg, conn_id, svc_tier, batch_id);
-#endif
     } else if (db_engine == "mongodb") {
         run_mongo_full_load(cfg, log_pg, batch_id, svc_tier);
     } else {
         run_mariadb_full_load(cfg, log_pg, batch_id, svc_tier);
-        const MariaDbSource* src = find_mariadb_source(cfg, conn_id);
-        if (src) {
-            MariaDbConn mariadb(*src);
-            sync_mariadb_capture_position(log_pg, mariadb.handle, conn_id);
-        }
     }
 
 #ifdef HAVE_RDKAFKA

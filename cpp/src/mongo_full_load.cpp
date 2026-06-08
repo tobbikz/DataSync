@@ -2,6 +2,7 @@
 
 #include "capture_common.hpp"
 #include "mongo_conn.hpp"
+#include "mongo_kafka_capture.hpp"
 #include "mongo_lake.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
@@ -438,6 +439,35 @@ bool load_one_collection(
         target.conn_id,
         target.source_database,
         target.source_table);
+
+#ifdef HAVE_MONGOC
+    try {
+        if (seed_mongo_cdc_resume_for_collection_if_absent(
+                log_pg, mongo, target.conn_id, target.source_database, target.source_table)) {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Info,
+                batch_id,
+                "mongo resume T0 captured at full load start",
+                {},
+                target.conn_id,
+                target.source_database,
+                target.source_table);
+        }
+    } catch (const std::exception& ex) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Warning,
+            batch_id,
+            "mongo resume T0 capture failed",
+            {{"error", ex.what()}},
+            target.conn_id,
+            target.source_database,
+            target.source_table);
+    }
+#endif
 
     mark_catalog_full_load_in_progress(app_pg.raw, target.catalog_id);
 

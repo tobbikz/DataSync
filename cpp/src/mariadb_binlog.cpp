@@ -94,6 +94,37 @@ void upsert_capture_position_full(
 
 }  // namespace
 
+bool capture_binlog_position_t0_if_absent(PGconn* pg, MYSQL* mysql, const std::string& conn_id) {
+    const char* vals[] = {conn_id.c_str()};
+    PGresult* chk = PQexecParams(
+        pg,
+        R"(
+        SELECT 1 FROM cdc_catalog.capture_position
+        WHERE conn_id = $1
+          AND binlog_file IS NOT NULL
+          AND length(trim(binlog_file)) > 0
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!chk || PQresultStatus(chk) != PGRES_TUPLES_OK) {
+        if (chk) {
+            PQclear(chk);
+        }
+        throw std::runtime_error("failed to read capture_position");
+    }
+    const bool exists = PQntuples(chk) > 0;
+    PQclear(chk);
+    if (exists) {
+        return false;
+    }
+    capture_binlog_position_t0(pg, mysql, conn_id);
+    return true;
+}
+
 void capture_binlog_position_t0(PGconn* pg, MYSQL* mysql, const std::string& conn_id) {
     const MasterStatus master = read_master_status(mysql);
     std::string uuid = mariadb_scalar_safe(mysql, "SELECT @@server_uuid");

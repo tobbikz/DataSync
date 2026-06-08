@@ -70,4 +70,4 @@ Prompt de delegación debe incluir: paths, credenciales dev (`:3307`, `config.cd
 
 - Python CDC: `cdc_kafka/`
 - C++ catalog: `cpp/`
-- Install: `./install.sh` | Kafka: `docker-compose.yml`, UI http://localhost:8080
+- Install: `./install.sh` | Kafka: `docker-compose.yml` (`localhost:9092`)

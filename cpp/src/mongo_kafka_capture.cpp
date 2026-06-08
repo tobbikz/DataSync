@@ -380,6 +380,43 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
     return stats;
 }
 
+bool seed_mongo_cdc_resume_for_collection_if_absent(
+    PGconn* log_pg,
+    MongoConn& mongo,
+    const std::string& conn_id,
+    const std::string& database,
+    const std::string& collection) {
+    const nlohmann::json existing = get_stored_resume_token(log_pg, conn_id, database, collection);
+    if (!existing.is_null()) {
+        return false;
+    }
+
+    mongoc_collection_t* coll = mongoc_client_get_collection(mongo.client, database.c_str(), collection.c_str());
+    bson_t pipeline = BSON_INITIALIZER;
+    bson_t* opts = BCON_NEW("fullDocument", BCON_UTF8("updateLookup"));
+    mongoc_change_stream_t* stream = mongoc_collection_watch(coll, &pipeline, opts);
+    bson_destroy(opts);
+
+    if (!stream) {
+        mongoc_collection_destroy(coll);
+        return false;
+    }
+
+    bool seeded = false;
+    const bson_t* token_bson = mongoc_change_stream_get_resume_token(stream);
+    if (token_bson) {
+        const nlohmann::json token = bson_to_json(token_bson);
+        if (!token.is_null()) {
+            upsert_resume_token(log_pg, conn_id, database, collection, token);
+            seeded = true;
+        }
+    }
+
+    mongoc_change_stream_destroy(stream);
+    mongoc_collection_destroy(coll);
+    return seeded;
+}
+
 int seed_mongo_cdc_resume_for_conn(
     const AppConfig& cfg,
     PGconn* log_pg,
@@ -438,6 +475,10 @@ int seed_mongo_cdc_resume_for_conn(
         for (int i = 0; i < PQntuples(res); ++i) {
             const std::string database = PQgetvalue(res, i, 0);
             const std::string collection = PQgetvalue(res, i, 1);
+
+            if (!get_stored_resume_token(log_pg, conn_id, database, collection).is_null()) {
+                continue;
+            }
 
             mongoc_collection_t* coll =
                 mongoc_client_get_collection(mongo.client, database.c_str(), collection.c_str());

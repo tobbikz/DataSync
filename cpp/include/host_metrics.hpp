@@ -11,6 +11,12 @@ struct HostMetricsSlice {
     long long process_rss_mb{-1};
 };
 
+/** Process RSS in MB from /proc/self/status (VmRSS). Returns -1 if unavailable. */
+long long process_rss_mb();
+
+/** Hint glibc to return freed heap pages to the OS (Linux only). */
+void trim_process_heap();
+
 /** Samples /proc (Linux) from mark_start through current_snapshot(). */
 class HostMetricsSampler {
 public:

@@ -4,7 +4,27 @@
 #include <sstream>
 #include <string>
 
+#if defined(__linux__)
+#include <malloc.h>
+#endif
+
 namespace {
+
+bool read_process_rss_kb(long long& rss_kb) {
+    std::ifstream in("/proc/self/status");
+    if (!in) {
+        return false;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            std::istringstream iss(line.substr(6));
+            iss >> rss_kb;
+            return rss_kb > 0;
+        }
+    }
+    return false;
+}
 
 bool read_cpu_jiffies(long long& total, long long& idle) {
     std::ifstream in("/proc/stat");
@@ -99,23 +119,21 @@ bool read_net_bytes(long long& rx_bytes, long long& tx_bytes) {
     return true;
 }
 
-bool read_process_rss_kb(long long& rss_kb) {
-    std::ifstream in("/proc/self/status");
-    if (!in) {
-        return false;
+}  // namespace
+
+long long process_rss_mb() {
+    long long rss_kb = 0;
+    if (!read_process_rss_kb(rss_kb)) {
+        return -1;
     }
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.rfind("VmRSS:", 0) == 0) {
-            std::istringstream iss(line.substr(6));
-            iss >> rss_kb;
-            return rss_kb > 0;
-        }
-    }
-    return false;
+    return rss_kb / 1024;
 }
 
-}  // namespace
+void trim_process_heap() {
+#if defined(__linux__)
+    malloc_trim(0);
+#endif
+}
 
 void HostMetricsSampler::mark_start() {
     start_ = {};

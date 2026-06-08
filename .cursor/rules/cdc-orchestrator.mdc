@@ -62,7 +62,7 @@ Run DEV + QA **in parallel** only for independent work. Delegation prompt must i
 
 - Python: `cdc_kafka/` — capture, apply, fairness, recovery, `topics.py`
 - Config test: `cpp/config.cdc-test.json` | prod: `cpp/config.json`
-- Install: `./install.sh` | Kafka: `docker-compose.yml`, UI http://localhost:8080
+- Install: `./install.sh` | Kafka: `docker-compose.yml` (`localhost:9092`)
 - Scale SQL: `sql/011_cdc_scale_runtime.sql`
 
 ## Report format

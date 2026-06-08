@@ -118,8 +118,8 @@ ensure_config
 log "Building images"
 docker_compose build datasync
 
-log "Starting Kafka stack (Zookeeper + Kafka + Kafka UI)"
-docker_compose up -d zookeeper kafka kafka-ui
+log "Starting Kafka stack (Zookeeper + Kafka)"
+docker_compose up -d zookeeper kafka
 
 wait_service kafka 90 || true
 
@@ -138,7 +138,6 @@ echo " READY"
 echo "=========================================="
 echo "  Config:      $ROOT/config.json"
 echo "  Catalog DDL: sql/backup/cdc_catalog_schema_structure.sql"
-echo "  Kafka UI:    http://localhost:8080"
 echo "  Kafka:       localhost:9092"
 echo ""
 echo "  Databases (PG, MariaDB, MSSQL, Mongo) are external — not created by Docker."

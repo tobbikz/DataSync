@@ -8,8 +8,7 @@ cp config.json.example config.json   # edit password
 ```
 
 - Compose: `docker-compose.yml` (Kafka + DataSync daemon)
-- DataSync uses **`network_mode: host`** on Linux → `localhost:5432` (PG) + `localhost:9092` (Kafka)
-- Kafka UI: http://localhost:8080
+- Kafka: `localhost:9092` (console only — no UI)
 
 ## MariaDB GTID (host, not in compose)
 

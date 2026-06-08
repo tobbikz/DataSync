@@ -31,6 +31,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -854,6 +855,20 @@ int run_kafka_apply_native_cli(
     const bool audit_enabled = runtime.get_bool("apply_audit_enabled", true, "cdc_kafka_apply", conn_id);
     const int queued_min_messages = runtime.get_int("apply_queued_min_messages", 100000, "cdc_kafka_apply", conn_id);
     const int fetch_wait_max_ms = runtime.get_int("apply_fetch_wait_max_ms", 500, "cdc_kafka_apply", conn_id);
+    const long long memory_cap_mb =
+        runtime.get_int("apply_process_rss_cap_mb", 10240, "cdc_kafka_apply", conn_id);
+    long long memory_resume_mb =
+        runtime.get_int("apply_process_rss_resume_mb", 9728, "cdc_kafka_apply", conn_id);
+    const int memory_wait_ms =
+        runtime.get_int("apply_memory_backpressure_wait_ms", 100, "cdc_kafka_apply", conn_id);
+    if (memory_cap_mb > 0) {
+        if (memory_resume_mb <= 0 || memory_resume_mb >= memory_cap_mb) {
+            memory_resume_mb = memory_cap_mb - 512;
+            if (memory_resume_mb < 1) {
+                memory_resume_mb = memory_cap_mb * 9 / 10;
+            }
+        }
+    }
     const int topic_partitions = (db_engine == "mssql")
         ? runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mssql_capture", conn_id)
         : (db_engine == "mongodb")
@@ -970,6 +985,15 @@ int run_kafka_apply_native_cli(
         sizeof(errstr));
     rd_kafka_conf_set(conf, "queued.min.messages", std::to_string(queued_min_messages).c_str(), errstr, sizeof(errstr));
     rd_kafka_conf_set(conf, "fetch.wait.max.ms", std::to_string(fetch_wait_max_ms).c_str(), errstr, sizeof(errstr));
+    if (memory_cap_mb > 0) {
+        const long long kafka_queue_kb = std::max(65536LL, memory_cap_mb * 256);
+        rd_kafka_conf_set(
+            conf,
+            "queued.max.messages.kbytes",
+            std::to_string(kafka_queue_kb).c_str(),
+            errstr,
+            sizeof(errstr));
+    }
     // After Kafka topic purge, apply may subscribe before capture recreates buckets.
     rd_kafka_conf_set(conf, "allow.auto.create.topics", "true", errstr, sizeof(errstr));
 
@@ -1030,6 +1054,8 @@ int run_kafka_apply_native_cli(
     std::string stop_reason = "unknown";
     bool loop_exited_early = false;
     int empty_polls = 0;
+    int memory_backpressure_waits = 0;
+    bool memory_backpressure_logged = false;
     std::vector<ApplyEvent> pending_batch;
     HostMetricsSampler host_sampler;
     host_sampler.mark_start();
@@ -1083,6 +1109,48 @@ int run_kafka_apply_native_cli(
         }
     };
 
+    auto relieve_memory_pressure = [&]() {
+        if (memory_cap_mb <= 0) {
+            return;
+        }
+        const long long rss = process_rss_mb();
+        if (rss >= 0 && rss < memory_cap_mb) {
+            return;
+        }
+        flush_batch();
+        trim_process_heap();
+        int spins = 0;
+        while (spins < 300) {
+            const long long now_rss = process_rss_mb();
+            if (now_rss >= 0 && now_rss < memory_resume_mb) {
+                break;
+            }
+            flush_batch();
+            trim_process_heap();
+            rd_kafka_consumer_poll(rk, 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(memory_wait_ms));
+            memory_backpressure_waits += 1;
+            spins += 1;
+        }
+        if (!memory_backpressure_logged) {
+            memory_backpressure_logged = true;
+            log_write(log_pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_kafka_apply_cpp",
+                .message = "apply memory backpressure active",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"process_rss_mb", process_rss_mb()},
+                    {"cap_mb", memory_cap_mb},
+                    {"resume_mb", memory_resume_mb},
+                },
+            });
+        }
+    };
+
     auto stop_slice_if_ready = [&](bool allow_quiet) -> bool {
         auto [stop, reason] = should_stop_slice(
             wanted,
@@ -1110,6 +1178,8 @@ int run_kafka_apply_native_cli(
 
     try {
         while (std::chrono::steady_clock::now() < deadline && events_seen < max_events) {
+            relieve_memory_pressure();
+
             rd_kafka_message_t* msg = rd_kafka_consumer_poll(rk, poll_timeout_ms);
             if (!msg) {
                 empty_polls += 1;
@@ -1233,7 +1303,15 @@ int run_kafka_apply_native_cli(
             }
 
             pending_batch.push_back(std::move(event));
-            if (static_cast<int>(pending_batch.size()) >= batch_size) {
+            if (memory_cap_mb > 0) {
+                const long long rss = process_rss_mb();
+                if (rss >= memory_cap_mb) {
+                    flush_batch();
+                    trim_process_heap();
+                } else if (static_cast<int>(pending_batch.size()) >= batch_size) {
+                    flush_batch();
+                }
+            } else if (static_cast<int>(pending_batch.size()) >= batch_size) {
                 flush_batch();
             }
 
@@ -1346,6 +1424,11 @@ int run_kafka_apply_native_cli(
         stats["errors"] = errors;
         stats["stop_reason"] = stop_reason;
         stats["duration_ms"] = duration_ms;
+        if (memory_cap_mb > 0) {
+            stats["memory_cap_mb"] = memory_cap_mb;
+            stats["memory_backpressure_waits"] = memory_backpressure_waits;
+            stats["process_rss_mb"] = process_rss_mb();
+        }
 
         log_write(log_pg, {
             .level = (errors > 0 || parse_skipped > 0) ? LogLevel::Warning : LogLevel::Info,

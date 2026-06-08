@@ -597,6 +597,40 @@ bool load_one_table(
         target.source_schema,
         target.source_table);
 
+#ifdef HAVE_FREETDS
+    try {
+        if (seed_mssql_cdc_lsn_for_table_if_absent(
+                log_pg,
+                mssql,
+                target.conn_id,
+                target.source_database,
+                target.source_schema,
+                target.source_table)) {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Info,
+                batch_id,
+                "mssql LSN T0 captured at full load start",
+                {},
+                target.conn_id,
+                target.source_schema,
+                target.source_table);
+        }
+    } catch (const std::exception& ex) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Warning,
+            batch_id,
+            "mssql LSN T0 capture failed",
+            {{"error", ex.what()}},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
+    }
+#endif
+
     mark_catalog_full_load_in_progress(app_pg.raw, target.catalog_id);
 
     if (!target.has_pk || target.pk_columns.empty()) {
@@ -924,18 +958,6 @@ FullLoadRunStats run_mssql_full_load(
             }
         }
 
-        log_fl(
-            log_pg,
-            nullptr,
-            LogLevel::Info,
-            batch_id,
-            "fk load order resolved",
-            {{"tables", conn_targets.size()}, {"fk_levels", fk_levels}, {"parallel_tables", parallel_tables}},
-            conn_id);
-
-#ifdef HAVE_FREETDS
-        seed_mssql_cdc_lsn_for_conn(cfg, log_pg, conn_id, service_tier, batch_id);
-#endif
     }
 
     log_fl(
