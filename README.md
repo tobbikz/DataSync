@@ -8,8 +8,6 @@ Requires **Docker** or **Podman** + **Compose v2** on any Linux distro. `./insta
 
 Docker **does not** create PostgreSQL, MariaDB, MSSQL, or MongoDB — only Kafka + the DataSync daemon. Point `config.json` at your existing databases.
 
-The **DataSync image uses Arch Linux + pacman** (same package names as a host Arch install). Build uses host DNS: `podman compose build --network=host datasync`. Fallback on Arch hosts: `NATIVE_BUILD=1 ./install.sh`.
-
 ```bash
 ./install.sh
 ```
