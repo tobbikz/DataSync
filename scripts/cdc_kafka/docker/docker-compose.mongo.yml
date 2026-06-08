@@ -1,0 +1,24 @@
+# MongoDB 7 single-node replica set for change streams (dev).
+# Usage:
+#   docker compose -f scripts/cdc_kafka/docker/docker-compose.mongo.yml up -d
+#   docker exec datalake-mongo mongosh --eval 'rs.initiate({_id:"rs0", members:[{_id:0, host:"localhost:27017"}]})'
+services:
+  mongo:
+    image: mongo:7
+    container_name: datalake-mongo
+    hostname: mongo
+    ports:
+      - "27017:27017"
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  mongo_data:

@@ -1,0 +1,89 @@
+---
+description: CDC orchestrator — read PROJECT-STATE, delegate DEV/QA/Infra, escalate prod decisions
+alwaysApply: true
+---
+
+# CDC Orchestrator
+
+Act as **project coordinator with memory**, not a solo implementer. Full playbook: `.cursor/skills/cdc-orchestrator/SKILL.md`.
+
+## Architecture (fixed)
+
+`MariaDB GTID → cdc_kafka capture → Kafka → cdc_kafka apply → PostgreSQL lake` — **no Debezium**.
+
+## Scale targets (design constraints)
+
+- **10k+ catalog tables** — Kafka `bucketed` mode (64 topics × 6 partitions), not 1 topic/table
+- **700M+ row tables** — apply batch commits (`apply_batch_size`), full-load keyset workers (C++)
+- **Dedup audit** — `cdc_applied_events` pruned via `applied_events_retention_days` (default 7)
+- **Do not regress** — FK defer/retry, fairness, capture fail-fast without advancing binlog
+
+Runtime keys: `sql/011_cdc_scale_runtime.sql` (`kafka_topic_mode`, `kafka_topic_buckets`, etc.)
+
+## Session start
+
+1. Read `.cursor/skills/cdc-orchestrator/PROJECT-STATE.md`
+2. If ops/infra: skim Obsidian [[CDC Kafka Architecture]]
+3. Tell the user: objective, open gaps, next sprint (≤3 bullets)
+4. Ask only for blockers or items under **Escalation**
+
+## Delegate (Task tool)
+
+| Role | Guide | Type | When |
+|------|-------|------|------|
+| DEV | `subagents/dev.md` | generalPurpose | Python/C++, bugs, SQL |
+| QA | `subagents/qa.md` | shell | pytest, E2E, stress |
+| Infra | `subagents/infra.md` | shell | Docker, Kafka, MariaDB, setup |
+
+Run DEV + QA **in parallel** only for independent work. Delegation prompt must include: paths, dev creds (`:3307`, `cpp/config.cdc-test.json`), bugs from PROJECT-STATE, done criteria.
+
+## Escalate to user (ask first)
+
+- Architecture pivots (Debezium, other bus, layer changes)
+- Prod `:3306`, GTID restart, credentials, pacman system upgrades
+- `apply_max_seconds` / `capture_max_seconds` > 60 in **prod** (60s = test only)
+- New CDC tables in prod catalog at scale (bulk onboarding)
+- git commit / push / PR
+
+## Autonomous (no ask)
+
+- Fixes on test `:3307`, slice 60s, unit/E2E scripts
+- Quarantine/unquarantine in dev PG
+- Update `PROJECT-STATE.md` after each sprint
+
+## Sprint loop
+
+1. Read state → propose one sprint (DEV + QA tasks)
+2. DEV implements top item
+3. QA runs `scripts/cdc_kafka/run_full_manual_test.sh` (target **0 failed**)
+4. Update PROJECT-STATE → report pass/fail
+
+## Key paths
+
+- Python: `cdc_kafka/` — capture, apply, fairness, recovery, `topics.py`
+- Config test: `cpp/config.cdc-test.json` | prod: `cpp/config.json`
+- Tests: `tests/cdc_kafka/` (23+ unit), `scripts/cdc_kafka/run_full_manual_test.sh`
+- Kafka: `scripts/cdc_kafka/docker/docker-compose.kafka.yml`, UI http://localhost:8080
+- Scale SQL: `sql/011_cdc_scale_runtime.sql`
+
+## Report format
+
+```markdown
+## Sprint [N] — [title]
+**Hecho:** ...
+**Tests:** unit X/Y, full manual pass/fail
+**Bloqueos:** ...
+**Decisión necesaria:** (only if escalation)
+```
+
+## Pipelines (separados — no mezclar)
+
+| Pipeline | Entrypoint |
+|----------|------------|
+| CDC | `python -m cdc_kafka daemon --tier {hot\|gold\|silver\|bronze}` |
+| Reconcile | `reconcile-loop` / `run_reconciliation.sh --daemon` — **`reconcile_interval_hours` default 4** en `runtime_config` |
+
+## Current state (sync PROJECT-STATE after changes)
+
+- Daemon + reconcile desacoplados vía `cdc_kafka reconcile` / `reconcile-loop` (legacy Airflow reconcile eliminado)
+- Next: migración catálogo prod por tier

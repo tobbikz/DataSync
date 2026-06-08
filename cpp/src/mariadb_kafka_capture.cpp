@@ -1,0 +1,423 @@
+#include "mariadb_kafka_capture.hpp"
+
+#include "capture_common.hpp"
+#include "cdc_envelope.hpp"
+#include "kafka_producer.hpp"
+#include "kafka_topics.hpp"
+#include "mariadb_binlog.hpp"
+#include "mariadb_binlog_cli.hpp"
+#include "mariadb_conn.hpp"
+#include "mariadb_schema.hpp"
+#include "obs_log.hpp"
+#include "runtime_config.hpp"
+
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+
+namespace {
+
+struct CapturePosition {
+    std::string binlog_file;
+    long long binlog_position{0};
+    std::string server_uuid;
+    bool from_capture_position{false};
+};
+
+std::string mariadb_scalar(MYSQL* mysql, const std::string& sql) {
+    if (mysql_query(mysql, sql.c_str()) != 0) {
+        throw std::runtime_error(std::string("MariaDB query failed: ") + mysql_error(mysql));
+    }
+    MYSQL_RES* res = mysql_store_result(mysql);
+    if (!res) {
+        return {};
+    }
+    MYSQL_ROW row = mysql_fetch_row(res);
+    std::string out;
+    if (row && row[0]) {
+        out = row[0];
+    }
+    mysql_free_result(res);
+    return out;
+}
+
+std::vector<std::string> fetch_table_columns(MYSQL* mysql, const std::string& schema, const std::string& table) {
+    std::ostringstream sql;
+    sql << "SELECT column_name FROM information_schema.columns "
+        << "WHERE table_schema='" << schema << "' AND table_name='" << table
+        << "' ORDER BY ordinal_position";
+    if (mysql_query(mysql, sql.str().c_str()) != 0) {
+        throw std::runtime_error(std::string("MariaDB columns query failed: ") + mysql_error(mysql));
+    }
+    std::vector<std::string> cols;
+    MYSQL_RES* res = mysql_store_result(mysql);
+    if (!res) {
+        return cols;
+    }
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res)) != nullptr) {
+        if (row[0]) {
+            cols.emplace_back(row[0]);
+        }
+    }
+    mysql_free_result(res);
+    return cols;
+}
+
+std::string mariadb_server_uuid(MYSQL* mysql) {
+    for (const char* sql : {"SELECT @@server_uuid", "SELECT @@server_uid", "SELECT @@server_id"}) {
+        try {
+            const std::string val = mariadb_scalar(mysql, sql);
+            if (!val.empty()) {
+                return val;
+            }
+        } catch (...) {
+        }
+    }
+    return {};
+}
+
+std::string mariadb_gtid_binlog_state(MYSQL* mysql) {
+    for (const char* sql : {"SELECT @@gtid_binlog_state", "SELECT @@gtid_current_pos"}) {
+        try {
+            const std::string val = mariadb_scalar(mysql, sql);
+            if (!val.empty()) {
+                return val;
+            }
+        } catch (...) {
+        }
+    }
+    if (mysql_query(mysql, "SHOW MASTER STATUS") != 0) {
+        return {};
+    }
+    MYSQL_RES* res = mysql_store_result(mysql);
+    if (!res) {
+        return {};
+    }
+    MYSQL_ROW row = mysql_fetch_row(res);
+    std::string gtid;
+    if (row && row[2]) {
+        gtid = row[2];
+    }
+    mysql_free_result(res);
+    return gtid;
+}
+
+CapturePosition read_capture_position(PGconn* pg, const std::string& conn_id) {
+    const char* vals[] = {conn_id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        "SELECT binlog_file, binlog_position, server_uuid FROM cdc_catalog.capture_position WHERE conn_id = $1",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        throw std::runtime_error("failed to read capture_position");
+    }
+
+    if (PQntuples(res) == 0 || !PQgetvalue(res, 0, 0) || !PQgetvalue(res, 0, 0)[0]) {
+        PQclear(res);
+        throw std::runtime_error("no capture position; run full-load first");
+    }
+
+    CapturePosition pos;
+    pos.binlog_file = PQgetvalue(res, 0, 0);
+    pos.binlog_position = std::atoll(PQgetvalue(res, 0, 1));
+    if (PQgetvalue(res, 0, 2)) {
+        pos.server_uuid = PQgetvalue(res, 0, 2);
+    }
+    pos.from_capture_position = true;
+    PQclear(res);
+    return pos;
+}
+
+void upsert_capture_position(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& gtid_set,
+    const std::string& binlog_file,
+    long long binlog_pos,
+    const std::string& server_uuid_val,
+    const std::string& status = "healthy",
+    const std::string& last_error = "") {
+    const std::string pos_str = std::to_string(binlog_pos);
+    const char* vals1[] = {
+        conn_id.c_str(),
+        gtid_set.c_str(),
+        binlog_file.c_str(),
+        pos_str.c_str(),
+        server_uuid_val.c_str(),
+        status.c_str(),
+        last_error.empty() ? nullptr : last_error.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        INSERT INTO cdc_catalog.capture_position
+            (conn_id, gtid_set, binlog_file, binlog_position, server_uuid, status, last_error, last_event_ts, updated_at)
+        VALUES ($1, $2, $3, $4::bigint, $5, $6::cdc_catalog.cdc_health_status, $7, now(), now())
+        ON CONFLICT (conn_id) DO UPDATE SET
+            gtid_set = EXCLUDED.gtid_set,
+            binlog_file = EXCLUDED.binlog_file,
+            binlog_position = EXCLUDED.binlog_position,
+            server_uuid = EXCLUDED.server_uuid,
+            status = EXCLUDED.status,
+            last_error = EXCLUDED.last_error,
+            last_event_ts = now(),
+            updated_at = now()
+        )",
+        7,
+        vals1);
+}
+
+long long now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+}  // namespace
+
+MariaDbCaptureStats run_mariadb_kafka_capture_slice(
+    const AppConfig& cfg,
+    PGconn* log_pg,
+    const std::string& conn_id,
+    const std::optional<std::string>& service_tier,
+    const std::string& batch_id,
+    int worker_id,
+    int worker_count) {
+    MariaDbCaptureStats stats;
+    stats.batch_id = batch_id;
+    const auto start = std::chrono::steady_clock::now();
+
+    const MariaDbSource* source = find_mariadb_source(cfg, conn_id);
+    if (!source) {
+        throw std::runtime_error("MariaDB source not found: " + conn_id);
+    }
+
+    RuntimeConfig runtime;
+    const CaptureRuntimeConfig rcfg =
+        load_mariadb_capture_runtime(runtime, log_pg, conn_id, &cfg.cdc);
+
+    // One binlog cursor per conn: serialize capture when daemon runs tiers in parallel.
+    static std::mutex g_mariadb_capture_mu;
+    std::lock_guard<std::mutex> capture_lock(g_mariadb_capture_mu);
+
+    const auto tables =
+        fetch_capture_catalog_tables(log_pg, conn_id, service_tier, worker_id, worker_count, "mariadb");
+    clear_stale_cdc_in_progress(log_pg, conn_id, service_tier, "mariadb");
+    if (tables.empty()) {
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_kafka_capture",
+            .message = "capture skipped: no tables",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+        });
+        return stats;
+    }
+
+    std::set<std::pair<std::string, std::string>> wanted;
+    std::map<std::pair<std::string, std::string>, std::string> pk_by_table;
+    std::map<std::pair<std::string, std::string>, long long> catalog_id_by_table;
+    for (const auto& tbl : tables) {
+        const auto key = std::make_pair(tbl.source_schema, tbl.source_table);
+        wanted.insert(key);
+        pk_by_table[key] = tbl.pk_columns;
+        catalog_id_by_table[key] = tbl.catalog_id;
+    }
+    std::set<long long> cdc_active_catalog_ids;
+
+    MariaDbConn mariadb(*source);
+    std::map<std::pair<std::string, std::string>, std::vector<std::string>> col_cache;
+    for (const auto& key : wanted) {
+        col_cache[key] = fetch_table_columns(mariadb.handle, key.first, key.second);
+    }
+
+    CapturePosition start_pos = read_capture_position(log_pg, conn_id);
+    const std::string live_uuid = mariadb_server_uuid(mariadb.handle);
+    if (!start_pos.server_uuid.empty() && !live_uuid.empty() && start_pos.server_uuid != live_uuid) {
+        upsert_capture_position(
+            log_pg,
+            conn_id,
+            mariadb_gtid_binlog_state(mariadb.handle),
+            start_pos.binlog_file,
+            start_pos.binlog_position,
+            live_uuid,
+            "gap_detected",
+            "server_uuid changed " + start_pos.server_uuid + " -> " + live_uuid);
+        throw std::runtime_error("server_uuid changed; gap_detected — run recovery");
+    }
+
+    KafkaProducer producer(rcfg.bootstrap, rcfg.linger_ms, rcfg.producer_batch);
+    if (!producer.available()) {
+        throw std::runtime_error("Kafka producer unavailable for capture");
+    }
+
+    BinlogPosition binlog_start{start_pos.binlog_file, start_pos.binlog_position};
+    const auto publish_row = [&](
+                               const std::string& schema,
+                               const std::string& table,
+                               const std::string& op,
+                               const std::vector<std::string>& col_values) {
+        const auto key = std::make_pair(schema, table);
+        if (!wanted.count(key)) {
+            return;
+        }
+        if (auto cid_it = catalog_id_by_table.find(key); cid_it != catalog_id_by_table.end()) {
+            if (cdc_active_catalog_ids.insert(cid_it->second).second) {
+                mark_catalog_cdc_in_progress(log_pg, cid_it->second);
+            }
+        }
+        const auto cols_it = col_cache.find(key);
+        if (cols_it == col_cache.end()) {
+            return;
+        }
+        const std::string op_char = op_char_from_mysql(op);
+        nlohmann::json before = nullptr;
+        nlohmann::json after = nullptr;
+        const nlohmann::json row_json = row_dict_from_columns(cols_it->second, col_values);
+        if (op == "DELETE") {
+            before = row_json;
+        } else {
+            after = row_json;
+        }
+
+        CdcEvent event;
+        event.op = op_char;
+        event.conn_id = conn_id;
+        event.schema_name = schema;
+        event.table_name = table;
+        event.before = before;
+        event.after = after;
+        event.binlog_file = binlog_start.file;
+        event.binlog_pos = binlog_start.position;
+        event.ts_ms = now_ms();
+        event.ingestion_ts = utc_iso_timestamp_now();
+
+        const std::string topic = topic_for_catalog(
+            rcfg.topic_prefix, schema, table, rcfg.topic_mode, rcfg.topic_buckets);
+        const nlohmann::json* row_for_key = (op_char == "d") ? &before : &after;
+        const std::string msg_key = kafka_message_key_for_row(
+            schema, table, row_for_key, pk_by_table[key]);
+        producer.produce(topic, msg_key, event.to_kafka_dict().dump());
+    };
+
+    const auto slice_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(1, rcfg.max_seconds));
+    auto last_heartbeat = std::chrono::steady_clock::now() - std::chrono::hours(24);
+    BinlogCliStats read_stats;
+    read_stats.last_file = start_pos.binlog_file;
+    read_stats.last_position = start_pos.binlog_position;
+
+    while (read_stats.events < rcfg.max_events && std::chrono::steady_clock::now() < slice_deadline) {
+        const auto remaining_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                                       slice_deadline - std::chrono::steady_clock::now())
+                                       .count();
+        if (remaining_sec <= 0) {
+            break;
+        }
+        const int chunk_sec = std::max(
+            1,
+            std::min(rcfg.idle_poll_seconds > 0 ? rcfg.idle_poll_seconds : 3, static_cast<int>(remaining_sec)));
+        const int events_left = rcfg.max_events - static_cast<int>(read_stats.events);
+
+        const BinlogCliStats chunk = read_remote_binlog_cli(
+            *source,
+            binlog_start,
+            chunk_sec,
+            events_left,
+            publish_row,
+            [&]() { return std::chrono::steady_clock::now() >= slice_deadline; });
+
+        read_stats.events += chunk.events;
+        read_stats.upserts += chunk.upserts;
+        read_stats.deletes += chunk.deletes;
+        if (!chunk.last_file.empty()) {
+            read_stats.last_file = chunk.last_file;
+            read_stats.last_position = chunk.last_position;
+            binlog_start = BinlogPosition{chunk.last_file, chunk.last_position};
+        }
+
+        if (chunk.events == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (rcfg.heartbeat_seconds > 0 &&
+                std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat).count() >=
+                    rcfg.heartbeat_seconds) {
+                bump_mariadb_capture_heartbeat(mariadb.handle);
+                bump_capture_heartbeat_pg(log_pg, conn_id, "mariadb");
+                last_heartbeat = now;
+            }
+            break;
+        }
+        last_heartbeat = std::chrono::steady_clock::now();
+    }
+
+    const int queued = producer.flush(120);
+    const KafkaProducerStats pstats = producer.stats();
+    if (pstats.errors > 0 || queued > 0 || pstats.pending > 0) {
+        const std::string err_detail =
+            !pstats.first_error.empty() ? pstats.first_error : std::to_string(queued) + " messages still queued";
+        upsert_capture_position(
+            log_pg,
+            conn_id,
+            mariadb_gtid_binlog_state(mariadb.handle),
+            start_pos.binlog_file,
+            start_pos.binlog_position,
+            live_uuid,
+            "failed",
+            "kafka publish failed: " + err_detail.substr(0, 2000));
+        throw std::runtime_error("kafka publish failed: " + err_detail);
+    }
+
+    const std::string gtid_state = mariadb_gtid_binlog_state(mariadb.handle);
+    for (long long catalog_id : cdc_active_catalog_ids) {
+        mark_catalog_cdc_success(log_pg, catalog_id);
+    }
+    upsert_capture_position(
+        log_pg,
+        conn_id,
+        gtid_state,
+        read_stats.last_file,
+        read_stats.last_position,
+        live_uuid);
+
+    stats.events_published = pstats.events_published;
+    stats.errors = pstats.errors;
+    stats.binlog_file = read_stats.last_file;
+    stats.binlog_position = read_stats.last_position;
+    stats.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_kafka_capture",
+        .message = "capture slice completed",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"events_published", stats.events_published},
+            {"ddl_recorded", stats.ddl_recorded},
+            {"binlog_file", stats.binlog_file},
+            {"binlog_position", stats.binlog_position},
+            {"gtid_set", gtid_state},
+            {"duration_ms", stats.duration_ms},
+            {"tier", service_tier.value_or("all")},
+        },
+    });
+
+    return stats;
+}

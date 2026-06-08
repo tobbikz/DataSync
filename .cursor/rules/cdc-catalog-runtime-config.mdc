@@ -1,0 +1,58 @@
+---
+description: Runtime knobs live in cdc_catalog.runtime_config (hot reload)
+alwaysApply: true
+---
+
+# Runtime config (cdc_catalog.runtime_config)
+
+All tunables (batch size, workers, parallelism, retention, DDL flags) come from **`cdc_catalog.runtime_config`**.
+
+`config.json` is **credentials only** (postgres + mariadb connections).
+
+## Rules
+
+- **Never hardcode** production tuning in C++ — read via `RuntimeConfig` with JSON/file value as fallback default only.
+- **Reload before each run** and **before each table/batch** in long jobs (`runtime.reload(pg)`).
+- **Scope lookup**: `(component, conn_id)` → `(component, '')` → `(global, '')`.
+- **Per-conn override**: same `config_key`, set `conn_id = 'MARIADB_LOCAL'`.
+
+## Table
+
+DDL: `sql/004_cdc_catalog_runtime_config.sql`
+
+| Key | Component | Example |
+|-----|-----------|---------|
+| `full_load_batch_size` | mariadb_load | `5000` |
+| `full_load_workers` | mariadb_load | `1` |
+| `full_load_parallel_tables` | mariadb_load | `1` |
+| `catalog_chunk_size` | catalog | `500` |
+| `logs_retention_days` | global | `7` |
+| `ddl_sync_indexes` | mariadb_load | `true` |
+| `ddl_sync_foreign_keys` | mariadb_load | `true` |
+
+## Change at runtime (no redeploy)
+
+```sql
+UPDATE cdc_catalog.runtime_config
+SET config_value = '10000'::jsonb, updated_at = now()
+WHERE config_key = 'full_load_batch_size'
+  AND component = 'mariadb_load'
+  AND conn_id = '';
+```
+
+Next `full-load` run picks up the new value automatically.
+
+## C++ pattern
+
+```cpp
+RuntimeConfig runtime;
+runtime.reload(pg);  // before each table in full load
+const auto batch = runtime.get_size_t("full_load_batch_size", 5000, "mariadb_load", conn_id);
+const int workers = runtime.get_int("full_load_workers", 1, "mariadb_load", conn_id);
+const int parallel_tables = runtime.get_int("full_load_parallel_tables", 1, "mariadb_load", conn_id);
+```
+
+## Parallelism (implemented)
+
+- **`full_load_parallel_tables`**: tables at the same FK dependency level load concurrently (each with own PG + MariaDB connection). Levels run sequentially (parents before children).
+- **`full_load_workers`**: splits numeric single-column PK into ranges; each worker runs keyset COPY on its segment. Composite or non-numeric PK → sequential fallback with log checkpoint.

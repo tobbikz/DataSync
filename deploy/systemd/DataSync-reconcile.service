@@ -1,0 +1,16 @@
+[Unit]
+Description=DataSync reconcile loop (light/auto pipeline + periodic full)
+Documentation=file:///home/iks/Downloads/project/docs/CDC_KAFKA.md
+After=network-online.target postgresql.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/iks/Downloads/project
+ExecStart=/home/iks/Downloads/project/cpp/build/DataSync reconcile-loop --once
+RemainAfterExit=no
+KillSignal=SIGTERM
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

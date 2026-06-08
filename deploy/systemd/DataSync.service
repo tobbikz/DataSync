@@ -1,0 +1,17 @@
+[Unit]
+Description=DataSync CDC daemon (all tiers, all engines)
+Documentation=file:///home/iks/Downloads/project/docs/CDC_KAFKA.md
+After=network-online.target postgresql.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/iks/Downloads/project
+ExecStart=/home/iks/Downloads/project/cpp/build/DataSync daemon
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

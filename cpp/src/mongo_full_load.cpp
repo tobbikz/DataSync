@@ -1,0 +1,672 @@
+#include "mongo_full_load.hpp"
+
+#include "capture_common.hpp"
+#include "mongo_conn.hpp"
+#include "mongo_lake.hpp"
+#include "obs_log.hpp"
+#include "pg_conn.hpp"
+#include "runtime_config.hpp"
+
+#include <chrono>
+#include <exception>
+#include <iomanip>
+#include <map>
+#include <set>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+
+#ifndef HAVE_MONGOC
+
+FullLoadRunStats run_mongo_full_load(
+    const AppConfig& cfg,
+    PGconn* log_pg,
+    const std::string& batch_id,
+    const std::optional<std::string>& service_tier,
+    const std::optional<std::string>& conn_id_filter) {
+    (void)cfg;
+    (void)service_tier;
+    (void)conn_id_filter;
+    if (log_pg) {
+        log_write(
+            log_pg,
+            LogEvent{
+                .level = LogLevel::Warning,
+                .component = "mongo_load",
+                .message = "full load skipped: rebuild with libmongoc (scripts/cdc_kafka/install_libmongoc.sh)",
+                .batch_id = batch_id,
+                .context = {{"hint", "install libmongoc"}}});
+    }
+    return {};
+}
+
+#else
+
+#include <bson/bson.h>
+#include <mongoc/mongoc.h>
+
+namespace {
+
+struct MongoCatalogTableRow {
+    long long catalog_id{0};
+    std::string conn_id;
+    std::string source_database;
+    std::string source_schema;
+    std::string source_table;
+};
+
+void log_fl(
+    PGconn* log_pg,
+    std::mutex* log_mtx,
+    LogLevel level,
+    const std::string& batch_id,
+    const std::string& message,
+    const nlohmann::json& context,
+    const std::string& conn_id = {},
+    const std::string& schema = {},
+    const std::string& table = {}) {
+    if (!log_pg) {
+        return;
+    }
+    LogEvent ev;
+    ev.level = level;
+    ev.component = "mongo_load";
+    ev.message = message;
+    ev.batch_id = batch_id;
+    if (!conn_id.empty()) {
+        ev.conn_id = conn_id;
+    }
+    if (!schema.empty()) {
+        ev.source_schema = schema;
+    }
+    if (!table.empty()) {
+        ev.source_table = table;
+    }
+    ev.context = context;
+    if (log_mtx) {
+        std::lock_guard<std::mutex> lock(*log_mtx);
+        log_write(log_pg, ev);
+    } else {
+        log_write(log_pg, ev);
+    }
+}
+
+long long elapsed_ms(const std::chrono::steady_clock::time_point& start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+}
+
+std::string csv_escape(const std::string& value) {
+    bool quote = value.empty();
+    for (char c : value) {
+        if (c == ',' || c == '"' || c == '\n' || c == '\r') {
+            quote = true;
+            break;
+        }
+    }
+    if (!quote) {
+        return value;
+    }
+    std::string out = "\"";
+    for (char c : value) {
+        out += (c == '"') ? "\"\"" : std::string(1, c);
+    }
+    out += "\"";
+    return out;
+}
+
+std::string utc_now_ts() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S+00");
+    return oss.str();
+}
+
+std::string utc_now_date() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%d");
+    return oss.str();
+}
+
+nlohmann::json bson_to_json(const bson_t* doc) {
+    char* json_str = bson_as_relaxed_extended_json(doc, nullptr);
+    if (!json_str) {
+        return nlohmann::json::object();
+    }
+    nlohmann::json out = nlohmann::json::parse(json_str);
+    bson_free(json_str);
+    return out;
+}
+
+std::string json_cell_csv(const nlohmann::json& v) {
+    if (v.is_null()) {
+        return "";
+    }
+    if (v.is_boolean()) {
+        return csv_escape(v.get<bool>() ? "true" : "false");
+    }
+    if (v.is_number_integer()) {
+        return csv_escape(std::to_string(v.get<long long>()));
+    }
+    if (v.is_number_float()) {
+        return csv_escape(std::to_string(v.get<double>()));
+    }
+    if (v.is_string()) {
+        return csv_escape(v.get<std::string>());
+    }
+    return csv_escape(v.dump());
+}
+
+std::vector<MongoCatalogTableRow> fetch_full_load_targets(PGconn* pg, const std::optional<std::string>& service_tier) {
+    const char* sql_tier = R"(
+        SELECT catalog_id, conn_id, source_database, source_schema, source_table
+        FROM cdc_catalog.catalog
+        WHERE db_engine = 'mongodb'
+          AND active = true
+          AND needs_full_load = true
+          AND status NOT IN ('skipped', 'disabled')
+          AND service_tier::text = lower($1)
+        ORDER BY conn_id, source_database, source_table
+    )";
+    const char* sql_all = R"(
+        SELECT catalog_id, conn_id, source_database, source_schema, source_table
+        FROM cdc_catalog.catalog
+        WHERE db_engine = 'mongodb'
+          AND active = true
+          AND needs_full_load = true
+          AND status NOT IN ('skipped', 'disabled')
+        ORDER BY conn_id, source_database, source_table
+    )";
+
+    PGresult* res = nullptr;
+    if (service_tier && !service_tier->empty()) {
+        const char* vals[] = {service_tier->c_str()};
+        res = PQexecParams(pg, sql_tier, 1, nullptr, vals, nullptr, nullptr, 0);
+    } else {
+        res = PQexec(pg, sql_all);
+    }
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        throw std::runtime_error("failed to fetch MongoDB full load targets");
+    }
+
+    std::vector<MongoCatalogTableRow> out;
+    for (int i = 0; i < PQntuples(res); ++i) {
+        MongoCatalogTableRow row;
+        row.catalog_id = std::atoll(PQgetvalue(res, i, 0));
+        row.conn_id = PQgetvalue(res, i, 1);
+        row.source_database = PQgetvalue(res, i, 2);
+        row.source_schema = PQgetvalue(res, i, 3);
+        row.source_table = PQgetvalue(res, i, 4);
+        out.push_back(std::move(row));
+    }
+    PQclear(res);
+    return out;
+}
+
+void mark_catalog_success(PGconn* pg, long long catalog_id) {
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET needs_full_load = false,
+            cdc_enabled = true,
+            status = 'success',
+            last_full_load_at = now(),
+            last_error_at = NULL,
+            last_error = NULL,
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+        )",
+        1,
+        vals);
+}
+
+void mark_catalog_failed(PGconn* pg, long long catalog_id, const std::string& error) {
+    const std::string trunc = error.substr(0, 1000);
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str(), trunc.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET status = 'failed',
+            last_error_at = now(),
+            last_error = $2,
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+        )",
+        2,
+        vals);
+}
+
+long long copy_collection_batches(
+    mongoc_collection_t* coll,
+    PGconn* pg,
+    const std::string& pg_schema,
+    const std::string& pg_table,
+    const std::vector<std::string>& all_cols,
+    std::size_t batch_size,
+    int source_sleep_ms,
+    const std::string& snapshot_id) {
+    const std::string load_ts = utc_now_ts();
+    const std::string load_date = utc_now_date();
+
+    std::ostringstream copy_cols;
+    for (const auto& c : all_cols) {
+        copy_cols << pg_ident(c) << ", ";
+    }
+    copy_cols << pg_ident("_dl_load_timestamp") << ", " << pg_ident("_dl_load_date") << ", "
+              << pg_ident("_dl_source_system") << ", " << pg_ident("_dl_snapshot_id");
+
+    const std::string fq = pg_ident(pg_schema) + "." + pg_ident(pg_table);
+    const std::string copy_sql = "COPY " + fq + " (" + copy_cols.str() + ") FROM STDIN WITH (FORMAT csv)";
+
+    long long total_rows = 0;
+    bson_value_t* last_id_value = nullptr;
+
+    while (true) {
+        bson_t query = BSON_INITIALIZER;
+        if (last_id_value) {
+            bson_t id_wrap;
+            bson_append_document_begin(&query, "_id", 3, &id_wrap);
+            bson_append_value(&id_wrap, "$gt", 3, last_id_value);
+            bson_append_document_end(&query, &id_wrap);
+        }
+
+        bson_t opts = BSON_INITIALIZER;
+        bson_t sort_doc;
+        BSON_APPEND_DOCUMENT_BEGIN(&opts, "sort", &sort_doc);
+        BSON_APPEND_INT32(&sort_doc, "_id", 1);
+        bson_append_document_end(&opts, &sort_doc);
+        BSON_APPEND_INT32(&opts, "limit", static_cast<int>(batch_size));
+
+        mongoc_cursor_t* cursor = mongoc_collection_find_with_opts(coll, &query, &opts, nullptr);
+        bson_destroy(&query);
+        bson_destroy(&opts);
+
+        std::vector<std::string> batch_lines;
+        const bson_t* doc = nullptr;
+        while (mongoc_cursor_next(cursor, &doc)) {
+            bson_iter_t iter;
+            if (bson_iter_init_find(&iter, doc, "_id")) {
+                if (last_id_value) {
+                    bson_value_destroy(last_id_value);
+                    delete last_id_value;
+                }
+                last_id_value = new bson_value_t();
+                bson_value_copy(bson_iter_value(&iter), last_id_value);
+            }
+
+            const auto j = bson_to_json(doc);
+            const auto flat = flatten_mongo_document(j);
+            std::ostringstream line;
+            for (std::size_t i = 0; i < all_cols.size(); ++i) {
+                if (i) {
+                    line << ',';
+                }
+                const auto it = flat.find(all_cols[i]);
+                if (it != flat.end()) {
+                    line << json_cell_csv(it->second);
+                }
+            }
+            line << ',' << csv_escape(load_ts) << ',' << csv_escape(load_date) << ",MongoDB," << csv_escape(snapshot_id);
+            batch_lines.push_back(line.str());
+        }
+        mongoc_cursor_destroy(cursor);
+
+        if (batch_lines.empty()) {
+            break;
+        }
+
+        PGresult* copy_res = PQexec(pg, copy_sql.c_str());
+        if (!copy_res || PQresultStatus(copy_res) != PGRES_COPY_IN) {
+            const std::string err = PQerrorMessage(pg);
+            if (copy_res) {
+                PQclear(copy_res);
+            }
+            if (last_id_value) {
+                bson_value_destroy(last_id_value);
+                delete last_id_value;
+                last_id_value = nullptr;
+            }
+            throw std::runtime_error("COPY start failed: " + err);
+        }
+        PQclear(copy_res);
+
+        for (const auto& line : batch_lines) {
+            if (PQputCopyData(pg, line.c_str(), static_cast<int>(line.size())) != 1) {
+                if (last_id_value) {
+                    bson_value_destroy(last_id_value);
+                    delete last_id_value;
+                    last_id_value = nullptr;
+                }
+                throw std::runtime_error(std::string("COPY data failed: ") + PQerrorMessage(pg));
+            }
+            if (PQputCopyData(pg, "\n", 1) != 1) {
+                if (last_id_value) {
+                    bson_value_destroy(last_id_value);
+                    delete last_id_value;
+                    last_id_value = nullptr;
+                }
+                throw std::runtime_error(std::string("COPY newline failed: ") + PQerrorMessage(pg));
+            }
+        }
+        if (PQputCopyEnd(pg, nullptr) != 1) {
+            if (last_id_value) {
+                bson_value_destroy(last_id_value);
+            }
+            throw std::runtime_error(std::string("COPY end failed: ") + PQerrorMessage(pg));
+        }
+        PGresult* end_res = PQgetResult(pg);
+        if (!end_res || PQresultStatus(end_res) != PGRES_COMMAND_OK) {
+            const std::string err = PQerrorMessage(pg);
+            if (end_res) {
+                PQclear(end_res);
+            }
+            if (last_id_value) {
+                bson_value_destroy(last_id_value);
+            }
+            throw std::runtime_error("COPY commit failed: " + err);
+        }
+        PQclear(end_res);
+
+        total_rows += static_cast<long long>(batch_lines.size());
+        if (batch_lines.size() < batch_size) {
+            break;
+        }
+        if (source_sleep_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(source_sleep_ms));
+        }
+    }
+
+    if (last_id_value) {
+        bson_value_destroy(last_id_value);
+        delete last_id_value;
+    }
+    return total_rows;
+}
+
+bool load_one_collection(
+    const AppConfig& cfg,
+    PGconn* log_pg,
+    std::mutex* log_mtx,
+    const MongoSource& source,
+    const MongoCatalogTableRow& target,
+    const std::string& batch_id,
+    long long& rows_out) {
+    const auto start = std::chrono::steady_clock::now();
+    rows_out = 0;
+
+    PgConn app_pg(cfg.datasync.conn_string());
+    PgConn lake_pg(cfg.datalake.conn_string());
+    MongoConn mongo(source);
+
+    RuntimeConfig runtime;
+    runtime.reload(app_pg.raw);
+
+    const std::size_t batch_size = runtime.get_size_t(
+        "full_load_batch_size", 5000, "mongo_load", target.conn_id);
+    const int source_sleep_ms = runtime.get_int("full_load_source_sleep_ms", 0, "mongo_load", target.conn_id);
+    const int partition_months =
+        runtime.get_int("lake_partition_months_ahead", 3, "mongo_load", target.conn_id);
+    const bool ddl_sync = runtime.get_bool("ddl_sync_columns", true, "mongo_load", target.conn_id);
+
+    log_fl(
+        log_pg,
+        log_mtx,
+        LogLevel::Info,
+        batch_id,
+        "table full load started",
+        {{"batch_size", batch_size}, {"source_database", target.source_database}},
+        target.conn_id,
+        target.source_database,
+        target.source_table);
+
+    mark_catalog_full_load_in_progress(app_pg.raw, target.catalog_id);
+
+    mongoc_collection_t* coll = mongo.collection(target.source_database, target.source_table);
+    const auto sample = sample_flattened_mongo_docs(coll, 1000);
+    const auto pg_cols = infer_schema_from_flat_rows(sample);
+
+    const std::string pg_schema = mongo_pg_schema_name(target.source_database);
+    const std::string pg_table = mongo_pg_table_name(target.source_table);
+
+    ensure_mongo_lake_table_base(lake_pg.raw, pg_schema, pg_table, pg_cols, partition_months);
+    truncate_lake_table(lake_pg.raw, pg_schema, pg_table);
+
+    log_fl(
+        log_pg,
+        log_mtx,
+        LogLevel::Info,
+        batch_id,
+        "lake table truncated",
+        {},
+        target.conn_id,
+        target.source_database,
+        target.source_table);
+
+    int columns_added = 0;
+    int columns_widened = 0;
+    if (ddl_sync) {
+        columns_added = sync_missing_mongo_columns(lake_pg.raw, pg_schema, pg_table, pg_cols);
+        columns_widened = sync_mongo_column_types(lake_pg.raw, pg_schema, pg_table, pg_cols);
+    }
+
+    log_fl(
+        log_pg,
+        log_mtx,
+        LogLevel::Info,
+        batch_id,
+        "ddl sync completed",
+        {{"columns_added", columns_added}, {"columns_widened", columns_widened}},
+        target.conn_id,
+        target.source_database,
+        target.source_table);
+
+    std::vector<std::string> all_cols = {"mongo_id"};
+    for (const auto& [name, _] : pg_cols) {
+        if (name != "mongo_id") {
+            all_cols.push_back(name);
+        }
+    }
+
+    rows_out = copy_collection_batches(
+        coll,
+        lake_pg.raw,
+        pg_schema,
+        pg_table,
+        all_cols,
+        batch_size,
+        source_sleep_ms,
+        batch_id);
+
+    mongoc_collection_destroy(coll);
+
+    mark_catalog_success(app_pg.raw, target.catalog_id);
+
+    log_fl(
+        log_pg,
+        log_mtx,
+        LogLevel::Info,
+        batch_id,
+        "table COPY done",
+        {{"rows_loaded", rows_out}, {"duration_ms", elapsed_ms(start)}},
+        target.conn_id,
+        target.source_database,
+        target.source_table);
+    return true;
+}
+
+}  // namespace
+
+FullLoadRunStats run_mongo_full_load(
+    const AppConfig& cfg,
+    PGconn* log_pg,
+    const std::string& batch_id,
+    const std::optional<std::string>& service_tier,
+    const std::optional<std::string>& conn_id_filter) {
+    const auto run_start = std::chrono::steady_clock::now();
+    FullLoadRunStats stats;
+
+    if (cfg.mongo_sources.empty()) {
+        return stats;
+    }
+
+    mongoc_init();
+
+    PgConn app_pg(cfg.datasync.conn_string());
+    RuntimeConfig runtime;
+    runtime.reload(app_pg.raw);
+
+    log_fl(
+        log_pg,
+        nullptr,
+        LogLevel::Info,
+        batch_id,
+        "full load started",
+        {{"service_tier", service_tier.value_or("all")},
+         {"batch_size", runtime.get_size_t("full_load_batch_size", 5000, "mongo_load")},
+         {"parallel_tables", runtime.get_int("full_load_parallel_tables", 1, "mongo_load")}});
+
+    const auto targets_all = fetch_full_load_targets(app_pg.raw, service_tier);
+    std::vector<MongoCatalogTableRow> targets;
+    targets.reserve(targets_all.size());
+    for (const auto& row : targets_all) {
+        if (conn_id_filter && !conn_id_filter->empty() && row.conn_id != *conn_id_filter) {
+            continue;
+        }
+        targets.push_back(row);
+    }
+    log_fl(log_pg, nullptr, LogLevel::Info, batch_id, "full load targets loaded", {{"table_count", targets.size()}});
+
+    std::set<std::string> conn_ids;
+    for (const auto& t : targets) {
+        conn_ids.insert(t.conn_id);
+    }
+    for (const auto& cid : conn_ids) {
+        clear_stale_full_load_in_progress(app_pg.raw, cid, "mongodb");
+    }
+
+    if (targets.empty()) {
+        log_fl(
+            log_pg,
+            nullptr,
+            LogLevel::Info,
+            batch_id,
+            "full load completed",
+            {{"tables_processed", 0}, {"duration_ms", elapsed_ms(run_start)}});
+        mongoc_cleanup();
+        return stats;
+    }
+
+    std::map<std::string, std::vector<MongoCatalogTableRow>> by_conn;
+    for (const auto& t : targets) {
+        by_conn[t.conn_id].push_back(t);
+    }
+
+    std::mutex log_mtx;
+    std::mutex stats_mtx;
+
+    for (auto& [conn_id, conn_targets] : by_conn) {
+        const MongoSource* src = find_mongo_source(cfg, conn_id);
+        if (!src) {
+            for (const auto& t : conn_targets) {
+                stats.tables_processed += 1;
+                stats.tables_failed += 1;
+                log_fl(
+                    log_pg,
+                    nullptr,
+                    LogLevel::Error,
+                    batch_id,
+                    "unknown conn_id in runtime config scope",
+                    {{"conn_id", conn_id}},
+                    conn_id,
+                    t.source_database,
+                    t.source_table);
+            }
+            continue;
+        }
+
+        const int parallel_tables =
+            std::max(1, runtime.get_int("full_load_parallel_tables", 1, "mongo_load", conn_id));
+
+        std::size_t idx = 0;
+        while (idx < conn_targets.size()) {
+            const std::size_t end = std::min(conn_targets.size(), idx + static_cast<std::size_t>(parallel_tables));
+            std::vector<std::thread> threads;
+            threads.reserve(end - idx);
+
+            for (std::size_t i = idx; i < end; ++i) {
+                threads.emplace_back([&, i]() {
+                    long long rows = 0;
+                    try {
+                        const bool ok =
+                            load_one_collection(cfg, log_pg, &log_mtx, *src, conn_targets[i], batch_id, rows);
+                        std::lock_guard<std::mutex> lock(stats_mtx);
+                        stats.tables_processed += 1;
+                        if (ok) {
+                            stats.tables_success += 1;
+                            stats.total_rows += rows;
+                        } else {
+                            stats.tables_failed += 1;
+                        }
+                    } catch (const std::exception& ex) {
+                        PgConn mark_pg(cfg.datasync.conn_string());
+                        mark_catalog_failed(mark_pg.raw, conn_targets[i].catalog_id, ex.what());
+                        log_fl(
+                            log_pg,
+                            &log_mtx,
+                            LogLevel::Error,
+                            batch_id,
+                            "table full load failed",
+                            {{"error", ex.what()}},
+                            conn_targets[i].conn_id,
+                            conn_targets[i].source_database,
+                            conn_targets[i].source_table);
+                        std::lock_guard<std::mutex> lock(stats_mtx);
+                        stats.tables_processed += 1;
+                        stats.tables_failed += 1;
+                    }
+                });
+            }
+            for (auto& th : threads) {
+                th.join();
+            }
+            idx = end;
+        }
+    }
+
+    log_fl(
+        log_pg,
+        nullptr,
+        stats.tables_failed == 0 ? LogLevel::Info : LogLevel::Warning,
+        batch_id,
+        stats.tables_failed == 0 ? "full load completed" : "full load completed with errors",
+        {{"tables_processed", stats.tables_processed},
+         {"tables_success", stats.tables_success},
+         {"tables_failed", stats.tables_failed},
+         {"total_rows", stats.total_rows},
+         {"duration_ms", elapsed_ms(run_start)}});
+
+    mongoc_cleanup();
+    return stats;
+}
+
+#endif

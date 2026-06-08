@@ -1,0 +1,29 @@
+{
+  "datasync": {
+    "host": "localhost",
+    "port": 5432,
+    "database": "DataLake",
+    "user": "tomy.berrios",
+    "password": "CHANGE_ME"
+  },
+  "datalake": {
+    "host": "localhost",
+    "port": 5432,
+    "database": "DataLake",
+    "user": "tomy.berrios",
+    "password": "CHANGE_ME"
+  },
+  "cdc": {
+    "round_idle_seconds": 5,
+    "slice_max_seconds": 60,
+    "slice_max_events": 10000000,
+    "tiers": [
+      { "code": "platinum", "apply_workers": 4, "active": true, "sort_order": 1 },
+      { "code": "gold", "apply_workers": 2, "active": true, "sort_order": 2 },
+      { "code": "silver", "apply_workers": 1, "active": true, "sort_order": 3 },
+      { "code": "bronze", "apply_workers": 1, "active": true, "sort_order": 4 },
+      { "code": "trash", "apply_workers": 1, "active": true, "sort_order": 5 },
+      { "code": "firehose", "apply_workers": 2, "active": true, "sort_order": 6 }
+    ]
+  }
+}

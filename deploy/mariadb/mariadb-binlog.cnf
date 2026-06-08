@@ -1,0 +1,9 @@
+# Drop-in for /etc/my.cnf.d/ — enables ROW binlog for CDC.
+# Install: sudo scripts/enable_mariadb_binlog.sh
+#   or: sudo cp deploy/mariadb/mariadb-binlog.cnf /etc/my.cnf.d/datalake-binlog.cnf
+
+[mysqld]
+log_bin = /var/lib/mysql/mysql-bin
+binlog_format = ROW
+binlog_row_image = FULL
+expire_logs_days = 7

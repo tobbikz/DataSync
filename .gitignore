@@ -1,0 +1,26 @@
+# Credentials — use config.json.example
+config.json
+cpp/config.json
+**/config.cdc-test.json
+
+# C++ build artifacts
+cpp/build/
+cpp/build-rdkafka/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs / temp
+*.log
+/tmp/
