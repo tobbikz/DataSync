@@ -3,6 +3,7 @@
 #include "capture_common.hpp"
 #include "cdc_pre_apply.hpp"
 #include "config.hpp"
+#include "connections.hpp"
 #include "daemon_full_load.hpp"
 #include "kafka_apply.hpp"
 #include "obs_log.hpp"
@@ -237,88 +238,17 @@ int round_idle_seconds(const CdcConfig& cdc) {
     return cdc.round_idle_seconds > 0 ? cdc.round_idle_seconds : 5;
 }
 
-}  // namespace
+std::vector<std::string> reload_daemon_conn_ids(PGconn* log_pg, AppConfig& cfg) {
+    reload_connections(log_pg, cfg);
+    return all_conn_ids(cfg);
+}
 
-int run_cdc_daemon(
+void run_startup_full_load_sweep(
     const AppConfig& cfg,
     PGconn* log_pg,
-    bool once) {
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
-
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
-    const int retention_days = runtime.get_int("logs_retention_days", 7, "global");
-    purge_logs(log_pg, retention_days);
-
-    const auto conn_ids = all_conn_ids(cfg);
-    if (conn_ids.empty()) {
-        log_write(log_pg, {
-            .level = LogLevel::Error,
-            .component = "cdc_daemon",
-            .message = "daemon failed: no sources configured in environment",
-            .batch_id = make_batch_id(),
-            .conn_id = std::nullopt,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-        });
-        return 1;
-    }
-
-    const auto tiers = load_service_tiers(cfg);
-    if (tiers.empty()) {
-        log_write(log_pg, {
-            .level = LogLevel::Error,
-            .component = "cdc_daemon",
-            .message = "daemon failed: no active tiers in config.json cdc.tiers",
-            .batch_id = make_batch_id(),
-            .conn_id = std::nullopt,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-        });
-        return 1;
-    }
-
-    const std::string batch_id = make_batch_id();
-
-    for (const auto& conn_id : conn_ids) {
-        const std::string db_engine = conn_engine(cfg, conn_id);
-        clear_stale_full_load_in_progress(log_pg, conn_id, db_engine);
-        clear_stale_cdc_in_progress(log_pg, conn_id, std::nullopt, db_engine);
-        log_write(log_pg, {
-            .level = LogLevel::Info,
-            .component = "cdc_daemon",
-            .message = "stale in_progress flags cleared",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {{"db_engine", db_engine}},
-        });
-    }
-
-    log_write(log_pg, {
-        .level = LogLevel::Info,
-        .component = "cdc_daemon",
-        .message = "daemon started",
-        .batch_id = batch_id,
-        .conn_id = std::nullopt,
-        .source_schema = std::nullopt,
-        .source_table = std::nullopt,
-        .context = {
-            {"tiers", tiers.size()},
-            {"conn_ids", conn_ids.size()},
-            {"once", once},
-            {"parallel_tiers", true},
-            {"round_idle_seconds", round_idle_seconds(cfg.cdc)},
-            {"slice_max_seconds", cfg.cdc.slice_max_seconds},
-            {"slice_max_events", cfg.cdc.slice_max_events},
-        },
-    });
-
-    int cycles = 0;
-    int exit_code = 0;
-
+    const std::vector<std::string>& conn_ids,
+    const std::vector<ServiceTier>& tiers,
+    int& exit_code) {
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_daemon",
@@ -337,8 +267,8 @@ int run_cdc_daemon(
                 break;
             }
             try {
-                const DaemonFullLoadOutcome sweep =
-                    run_daemon_full_load_isolated(cfg, log_pg, conn_id, tier.tier_code, make_batch_id());
+                const DaemonFullLoadOutcome sweep = run_daemon_full_load_isolated(
+                    cfg, log_pg, conn_id, tier.tier_code, make_batch_id());
                 if (sweep.ran && sweep.exit_code != 0) {
                     exit_code = 1;
                 }
@@ -366,10 +296,136 @@ int run_cdc_daemon(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
     });
+}
+
+std::vector<std::string> wait_for_daemon_connections(PGconn* log_pg, AppConfig& cfg) {
+    auto conn_ids = reload_daemon_conn_ids(log_pg, cfg);
+    while (conn_ids.empty() && !g_shutdown.load()) {
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_daemon",
+            .message = "daemon waiting for active cdc_catalog.connections",
+            .batch_id = make_batch_id(),
+            .conn_id = std::nullopt,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"hint", "add sources to config.json and restart container, or INSERT connections"}},
+        });
+        sleep_interruptible(30);
+        conn_ids = reload_daemon_conn_ids(log_pg, cfg);
+    }
+    return conn_ids;
+}
+
+}  // namespace
+
+int run_cdc_daemon(
+    AppConfig& cfg,
+    PGconn* log_pg,
+    bool once) {
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+
+    RuntimeConfig runtime;
+    runtime.reload(log_pg);
+    const int retention_days = runtime.get_int("logs_retention_days", 7, "global");
+    purge_logs(log_pg, retention_days);
+
+    const auto conn_ids_initial = wait_for_daemon_connections(log_pg, cfg);
+    if (conn_ids_initial.empty()) {
+        return 0;
+    }
+
+    const auto tiers = load_service_tiers(cfg);
+    if (tiers.empty()) {
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_daemon",
+            .message = "daemon failed: no active tiers in config.json cdc.tiers",
+            .batch_id = make_batch_id(),
+            .conn_id = std::nullopt,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+        });
+        return 1;
+    }
+
+    const std::string batch_id = make_batch_id();
+
+    for (const auto& conn_id : conn_ids_initial) {
+        const std::string db_engine = conn_engine(cfg, conn_id);
+        clear_stale_full_load_in_progress(log_pg, conn_id, db_engine);
+        clear_stale_cdc_in_progress(log_pg, conn_id, std::nullopt, db_engine);
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_daemon",
+            .message = "stale in_progress flags cleared",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"db_engine", db_engine}},
+        });
+    }
+
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_daemon",
+        .message = "daemon started",
+        .batch_id = batch_id,
+        .conn_id = std::nullopt,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"tiers", tiers.size()},
+            {"conn_ids", conn_ids_initial.size()},
+            {"once", once},
+            {"parallel_tiers", true},
+            {"round_idle_seconds", round_idle_seconds(cfg.cdc)},
+            {"slice_max_seconds", cfg.cdc.slice_max_seconds},
+            {"slice_max_events", cfg.cdc.slice_max_events},
+        },
+    });
+
+    int cycles = 0;
+    int exit_code = 0;
+    std::size_t last_conn_count = conn_ids_initial.size();
+
+    run_startup_full_load_sweep(cfg, log_pg, conn_ids_initial, tiers, exit_code);
 
     while (!g_shutdown.load()) {
-        if (run_parallel_daemon_round(cfg, conn_ids, tiers) != 0) {
-            exit_code = 1;
+        auto conn_ids = reload_daemon_conn_ids(log_pg, cfg);
+        if (conn_ids.empty()) {
+            log_write(log_pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_daemon",
+                .message = "daemon idle: no active connections",
+                .batch_id = make_batch_id(),
+                .conn_id = std::nullopt,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+            });
+        } else {
+            if (conn_ids.size() > last_conn_count) {
+                log_write(log_pg, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_daemon",
+                    .message = "daemon connections reloaded",
+                    .batch_id = make_batch_id(),
+                    .conn_id = std::nullopt,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {
+                        {"conn_ids", static_cast<int>(conn_ids.size())},
+                        {"previous_conn_ids", static_cast<int>(last_conn_count)},
+                    },
+                });
+                run_startup_full_load_sweep(cfg, log_pg, conn_ids, tiers, exit_code);
+                last_conn_count = conn_ids.size();
+            }
+            if (run_parallel_daemon_round(cfg, conn_ids, tiers) != 0) {
+                exit_code = 1;
+            }
         }
 
         if (g_shutdown.load()) {

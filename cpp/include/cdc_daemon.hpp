@@ -5,8 +5,8 @@
 #include <libpq-fe.h>
 #include <string>
 
-// Unified CDC daemon: all tiers × all conn_ids from env (MariaDB + MSSQL + MongoDB).
+// Unified CDC daemon: all tiers × all conn_ids from cdc_catalog.connections.
 int run_cdc_daemon(
-    const AppConfig& cfg,
+    AppConfig& cfg,
     PGconn* log_pg,
     bool once);

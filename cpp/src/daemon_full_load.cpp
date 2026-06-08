@@ -9,6 +9,7 @@
 
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cstdlib>
 #include <vector>
 
 namespace {
@@ -86,6 +87,23 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
     const std::string db_engine = conn_engine(cfg, conn_id);
     outcome.pending_tables = count_full_load_pending(log_pg, conn_id, tier, db_engine);
     if (outcome.pending_tables <= 0) {
+        const int pending_any_tier = count_full_load_pending_any_tier(log_pg, conn_id, db_engine);
+        if (pending_any_tier > 0) {
+            log_write(log_pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_daemon",
+                .message = "full-load skipped: tables pending on another service_tier",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"tier", tier},
+                    {"db_engine", db_engine},
+                    {"pending_any_tier", pending_any_tier},
+                },
+            });
+        }
         return outcome;
     }
 
@@ -108,7 +126,7 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
     });
 
     const std::string binary = self_binary_path();
-    outcome.exit_code = spawn_wait({
+    std::vector<std::string> args = {
         binary,
         "full-load",
         "--tier",
@@ -116,7 +134,12 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
         "--conn-id",
         conn_id,
         "--skip-onboard",
-    });
+    };
+    if (const char* config_path = std::getenv("DATASYNC_CONFIG")) {
+        args.push_back("--config");
+        args.push_back(config_path);
+    }
+    outcome.exit_code = spawn_wait(args);
 
     if (outcome.exit_code == 0) {
         if (!onboard_conn_after_full_load(cfg, log_pg, conn_id, tier, db_engine, batch_id)) {

@@ -148,6 +148,12 @@ int count_full_load_pending(
     const std::string& tier,
     const std::string& db_engine);
 
+/** Pending full-load rows for conn across any tier (tier-mismatch diagnostics). */
+int count_full_load_pending_any_tier(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine);
+
 struct FullLoadKafkaResetStats {
     int tables{0};
     int topics_reset{0};

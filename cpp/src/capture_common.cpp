@@ -586,6 +586,38 @@ int count_full_load_pending(
     return count;
 }
 
+int count_full_load_pending_any_tier(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine) {
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT COUNT(*)::int
+        FROM cdc_catalog.catalog
+        WHERE conn_id = $1
+          AND db_engine = $2::cdc_catalog.db_engine
+          AND active = true
+          AND needs_full_load = true
+          AND status NOT IN ('skipped', 'disabled')
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    int count = 0;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        count = std::atoi(PQgetvalue(res, 0, 0));
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return count;
+}
+
 void ensure_apply_positions_for_tier(
     PGconn* pg,
     RuntimeConfig& runtime,
