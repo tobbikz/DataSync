@@ -1,0 +1,21 @@
+[Unit]
+Description=DataSync CDC daemon (native binary — rebuild on restart)
+Documentation=file://@DATASYNC_ROOT@/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@DATASYNC_ROOT@
+EnvironmentFile=-/etc/datasync/datasync.env
+ExecStartPre=@DATASYNC_ROOT@/deploy/systemd/datasync-build.sh
+ExecStart=@DATASYNC_ROOT@/deploy/systemd/datasync-start.sh
+ExecStop=@DATASYNC_ROOT@/deploy/systemd/datasync-stop.sh
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGTERM
+TimeoutStopSec=120
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

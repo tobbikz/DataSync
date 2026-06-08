@@ -108,6 +108,27 @@ show_daemon_logs() {
   docker_compose logs datasync --tail 40
 }
 
+install_systemd_units() {
+  if [[ "${SKIP_SYSTEMD:-0}" == "1" ]]; then
+    warn "SKIP_SYSTEMD=1 — skipping systemd install"
+    return 0
+  fi
+  if [[ ! -x "$ROOT/deploy/systemd/install-systemd.sh" ]]; then
+    warn "deploy/systemd/install-systemd.sh missing — skip systemd"
+    return 0
+  fi
+  log "Installing systemd units (requires root — rebuild on every restart)"
+  if [[ "${EUID}" -eq 0 ]]; then
+    "$ROOT/deploy/systemd/install-systemd.sh"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$ROOT/deploy/systemd/install-systemd.sh"
+  else
+    warn "Run manually: sudo deploy/systemd/install-systemd.sh"
+    return 0
+  fi
+  log "Optional: sudo systemctl enable --now DataSync DataSync-reconcile.timer"
+}
+
 echo "=========================================="
 echo " DataSync install (Docker) — $(date '+%Y-%m-%d %H:%M')"
 echo "=========================================="
@@ -131,6 +152,7 @@ docker_compose up -d datasync
 sleep 2
 run_discover
 show_daemon_logs
+install_systemd_units
 
 echo ""
 echo "=========================================="
@@ -145,4 +167,9 @@ echo "  PG in config.json: localhost:5432 when on the same host (network_mode: h
 echo ""
 echo "  Follow daemon:"
 echo "    docker compose logs -f datasync"
+echo ""
+echo "  systemd (rebuild + restart):"
+echo "    sudo systemctl enable --now DataSync"
+echo "    sudo systemctl restart DataSync   # rebuilds image/binary first"
+echo "    sudo systemctl enable --now DataSync-reconcile.timer"
 echo ""

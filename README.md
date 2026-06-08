@@ -4,7 +4,7 @@ CDC Data Lake pipeline — C++ ingest from MariaDB, MSSQL, and MongoDB into Post
 
 ## Install (Docker only)
 
-Requires **Docker Engine** + **Compose v2** on any Linux distro. No host `psql`, no systemd, no native build.
+Requires **Docker Engine** + **Compose v2** on any Linux distro. Optional **systemd** units for `enable`/`restart` with automatic rebuild.
 
 Docker **does not** create PostgreSQL, MariaDB, MSSQL, or MongoDB — only Kafka + the DataSync daemon. Point `config.json` at your existing databases.
 
@@ -22,6 +22,7 @@ On first run, `./install.sh` copies `config.json.example` → `config.json` if m
 4. Starts the **DataSync daemon**
 5. Runs **`discover`**
 6. Prints recent **daemon logs**
+7. Installs **systemd** units when run with sudo (`DataSync.service`, reconcile timer)
 
 | Service | URL |
 |---------|-----|
@@ -29,6 +30,21 @@ On first run, `./install.sh` copies `config.json.example` → `config.json` if m
 | PostgreSQL | external — from `config.json` |
 
 The DataSync container uses **`network_mode: host`** (Linux) so it reaches host PostgreSQL and Kafka (`localhost:9092`) without extra PG configuration.
+
+## systemd (optional)
+
+Every **`systemctl restart DataSync`** runs **`ExecStartPre`** first → rebuild (`docker compose build datasync` by default), then recreates the daemon container.
+
+```bash
+sudo systemctl enable --now DataSync
+sudo systemctl restart DataSync
+sudo systemctl enable --now DataSync-reconcile.timer
+
+deploy/systemd/datasync-cli.sh discover
+docker compose logs -f datasync
+```
+
+Native binary (no Docker daemon): `sudo deploy/systemd/install-systemd.sh --native`
 
 ## SQL
 
