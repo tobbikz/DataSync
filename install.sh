@@ -153,47 +153,25 @@ post_install_health() {
   return 1
 }
 
-install_and_enable_systemd() {
+print_systemd_instructions() {
   [[ "${SKIP_SYSTEMD:-0}" == "1" ]] && return 0
   [[ -x "$ROOT/deploy/systemd/install-systemd.sh" ]] || return 0
 
-  run_systemctl() {
-    if [[ "${EUID}" -eq 0 ]]; then
-      "$@"
-    elif command -v sudo >/dev/null 2>&1; then
-      sudo "$@"
-    else
-      return 1
-    fi
-  }
+  cat <<EOF
 
-  local err rc
-  err="$(mktemp)"
-  if run_systemctl "$ROOT/deploy/systemd/install-systemd.sh" >"$err" 2>&1; then
-    rm -f "$err"
-  else
-    rc=$?
-    warn "systemd install failed — run: sudo deploy/systemd/install-systemd.sh"
-    if [[ "$rc" -eq 1 ]] && grep -q 'Run as root' "$err" 2>/dev/null; then
-      warn "needs root (sudo password when prompted, or run the command above)"
-    fi
-    tail -8 "$err" >&2 || true
-    rm -f "$err"
-    return 0
-  fi
-  printf '✔ systemd units installed\n'
+── systemd (optional, run once with sudo) ──
+  sudo $ROOT/deploy/systemd/install-systemd.sh
 
-  if run_systemctl systemctl enable --now DataSync >/dev/null 2>&1; then
-    printf '✔ systemd DataSync enabled\n'
-  else
-    warn "systemctl enable DataSync failed (sudo required)"
-  fi
+  Installs + enables DataSync (CDC daemon) and reconcile timer (auto light/full every 4h).
+  Uses your user ($USER) for rootless podman — no port 9092 conflict.
 
-  if run_systemctl systemctl enable --now DataSync-reconcile.timer >/dev/null 2>&1; then
-    printf '✔ systemd reconcile.timer enabled\n'
-  else
-    warn "systemctl enable DataSync-reconcile.timer failed"
-  fi
+  After git pull or config change:
+  sudo systemctl restart DataSync
+
+  Status:
+  systemctl status DataSync DataSync-reconcile.timer
+
+EOF
 }
 
 ensure_container_engine
@@ -209,7 +187,7 @@ run_quiet "DataSync daemon" docker_compose up -d --no-recreate datasync
 sleep 2
 run_quiet "Post-install health" post_install_health
 run_discover
-install_and_enable_systemd
+print_systemd_instructions
 
 printf '✔ Install complete — status: %s compose ps | discover: %s compose run --rm datasync discover\n' \
   "$(container_runtime_label)" "$(container_runtime_label)"

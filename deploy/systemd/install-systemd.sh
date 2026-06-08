@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install DataSync systemd units and optional env file.
-# Usage: sudo deploy/systemd/install-systemd.sh [--native]
+# Install DataSync systemd units and enable CDC + reconcile timer.
+# Usage: sudo deploy/systemd/install-systemd.sh [--native] [--no-enable]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,12 +9,22 @@ SYSTEMD_DIR="/etc/systemd/system"
 ENV_DIR="/etc/datasync"
 ENV_FILE="${ENV_DIR}/datasync.env"
 CLI_DEPLOY_MODE=""
+DO_ENABLE=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --native) CLI_DEPLOY_MODE="native"; shift ;;
+    --no-enable) DO_ENABLE=0; shift ;;
     -h|--help)
-      sed -n '2,4p' "$0"
+      cat <<EOF
+Usage: sudo $0 [--native] [--no-enable]
+
+Installs DataSync.service + DataSync-reconcile.timer for the repo owner
+(rootless podman/docker). By default enables and starts both.
+
+  --native     native binary instead of Docker/Podman compose
+  --no-enable  install units only (no systemctl enable --now)
+EOF
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
@@ -25,6 +35,11 @@ if [[ "${EUID}" -ne 0 ]]; then
   echo "Run as root: sudo $0" >&2
   exit 1
 fi
+
+DATASYNC_USER="${SUDO_USER:-$(stat -c '%U' "${ROOT}")}"
+DATASYNC_GROUP="$(id -gn "${DATASYNC_USER}")"
+DATASYNC_UID="$(id -u "${DATASYNC_USER}")"
+RUNTIME_DIR="/run/user/${DATASYNC_UID}"
 
 disable_legacy_units() {
   local unit removed=0
@@ -60,7 +75,38 @@ disable_legacy_units() {
 
 render_unit() {
   local src="$1" dst="$2"
-  sed "s|@DATASYNC_ROOT@|${ROOT}|g" "${src}" > "${dst}"
+  sed -e "s|@DATASYNC_ROOT@|${ROOT}|g" \
+      -e "s|@DATASYNC_USER@|${DATASYNC_USER}|g" \
+      -e "s|@DATASYNC_GROUP@|${DATASYNC_GROUP}|g" \
+      -e "s|@DATASYNC_UID@|${DATASYNC_UID}|g" \
+      "${src}" > "${dst}"
+}
+
+ensure_podman_user_socket() {
+  command -v podman >/dev/null 2>&1 || return 0
+  [[ -S "${RUNTIME_DIR}/podman/podman.sock" ]] && return 0
+
+  loginctl enable-linger "${DATASYNC_USER}" 2>/dev/null || true
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "${DATASYNC_USER}" -- \
+      env XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+      systemctl --user start podman.socket 2>/dev/null || true
+  fi
+}
+
+write_env_file() {
+  local deploy_mode="$1"
+  render_unit "${SCRIPT_DIR}/DataSync.env.example" "${ENV_FILE}"
+  sed -i "s/^DATASYNC_DEPLOY_MODE=.*/DATASYNC_DEPLOY_MODE=${deploy_mode}/" "${ENV_FILE}"
+  if command -v podman >/dev/null 2>&1; then
+    local podman_sock="unix://${RUNTIME_DIR}/podman/podman.sock"
+    if grep -q '^DOCKER_HOST=' "${ENV_FILE}"; then
+      sed -i "s|^DOCKER_HOST=.*|DOCKER_HOST=${podman_sock}|" "${ENV_FILE}"
+    else
+      echo "DOCKER_HOST=${podman_sock}" >> "${ENV_FILE}"
+    fi
+  fi
+  chmod 0644 "${ENV_FILE}"
 }
 
 chmod +x "${SCRIPT_DIR}"/datasync-*.sh
@@ -68,25 +114,28 @@ chmod +x "${SCRIPT_DIR}"/datasync-*.sh
 mkdir -p "${ENV_DIR}"
 if [[ ! -f "${ENV_FILE}" ]]; then
   DEPLOY_MODE="${CLI_DEPLOY_MODE:-docker}"
-  sed "s|@DATASYNC_ROOT@|${ROOT}|g" "${SCRIPT_DIR}/DataSync.env.example" > "${ENV_FILE}"
-  if [[ "${DEPLOY_MODE}" == "native" ]]; then
-    sed -i 's/^DATASYNC_DEPLOY_MODE=.*/DATASYNC_DEPLOY_MODE=native/' "${ENV_FILE}"
-  fi
-  chmod 0640 "${ENV_FILE}"
-  echo "Created ${ENV_FILE}"
+  write_env_file "${DEPLOY_MODE}"
+  echo "Created ${ENV_FILE} (user=${DATASYNC_USER})"
 else
   echo "Keeping existing ${ENV_FILE}"
   if [[ -n "${CLI_DEPLOY_MODE}" ]]; then
     DEPLOY_MODE="${CLI_DEPLOY_MODE}"
-    if grep -q '^DATASYNC_DEPLOY_MODE=' "${ENV_FILE}"; then
-      sed -i "s/^DATASYNC_DEPLOY_MODE=.*/DATASYNC_DEPLOY_MODE=${DEPLOY_MODE}/" "${ENV_FILE}"
-    else
-      echo "DATASYNC_DEPLOY_MODE=${DEPLOY_MODE}" >> "${ENV_FILE}"
-    fi
+    sed -i "s/^DATASYNC_DEPLOY_MODE=.*/DATASYNC_DEPLOY_MODE=${DEPLOY_MODE}/" "${ENV_FILE}"
   elif grep -q '^DATASYNC_DEPLOY_MODE=' "${ENV_FILE}"; then
     DEPLOY_MODE="$(grep '^DATASYNC_DEPLOY_MODE=' "${ENV_FILE}" | cut -d= -f2- | tr -d '"')"
   else
     DEPLOY_MODE="docker"
+  fi
+  if ! grep -q '^DATASYNC_RUN_USER=' "${ENV_FILE}"; then
+    echo "DATASYNC_RUN_USER=${DATASYNC_USER}" >> "${ENV_FILE}"
+  fi
+  if command -v podman >/dev/null 2>&1; then
+    podman_sock="unix://${RUNTIME_DIR}/podman/podman.sock"
+    if grep -q '^DOCKER_HOST=' "${ENV_FILE}"; then
+      sed -i "s|^DOCKER_HOST=.*|DOCKER_HOST=${podman_sock}|" "${ENV_FILE}"
+    else
+      echo "DOCKER_HOST=${podman_sock}" >> "${ENV_FILE}"
+    fi
   fi
 fi
 
@@ -94,6 +143,7 @@ if [[ "${DEPLOY_MODE}" == "native" ]]; then
   SERVICE_SRC="${SCRIPT_DIR}/DataSync-native.service"
 else
   SERVICE_SRC="${SCRIPT_DIR}/DataSync-docker.service"
+  ensure_podman_user_socket
 fi
 
 render_unit "${SERVICE_SRC}" "${SYSTEMD_DIR}/DataSync.service"
@@ -105,9 +155,19 @@ disable_legacy_units
 systemctl daemon-reload
 systemctl reset-failed DataSync.service 2>/dev/null || true
 
+if [[ "${DO_ENABLE}" -eq 1 ]]; then
+  systemctl enable --now DataSync.service
+  systemctl enable --now DataSync-reconcile.timer
+  echo ""
+  echo "Enabled: DataSync.service + DataSync-reconcile.timer (user=${DATASYNC_USER}, uid=${DATASYNC_UID})"
+else
+  echo ""
+  echo "Units installed (not enabled — pass default install or omit --no-enable)."
+fi
+
 cat <<EOF
 
-Installed (mode=${DEPLOY_MODE}):
+Installed (mode=${DEPLOY_MODE}, user=${DATASYNC_USER}):
   ${SYSTEMD_DIR}/DataSync.service
   ${SYSTEMD_DIR}/DataSync-reconcile.service
   ${SYSTEMD_DIR}/DataSync-reconcile.timer
@@ -115,20 +175,18 @@ Installed (mode=${DEPLOY_MODE}):
 
 Every start/restart rebuilds first (ExecStartPre → datasync-build.sh).
 
-Enable CDC daemon:
-  sudo systemctl enable --now DataSync
-
 Restart with rebuild:
   sudo systemctl restart DataSync
 
-Enable reconcile every 4h:
-  sudo systemctl enable --now DataSync-reconcile.timer
+Status:
+  systemctl status DataSync
+  systemctl status DataSync-reconcile.timer
 
 CLI smoke:
   ${ROOT}/deploy/systemd/datasync-cli.sh daemon --once
 
-Logs (docker):
-  docker compose -f ${ROOT}/docker-compose.yml logs -f datasync
+Logs (docker/podman):
+  cd ${ROOT} && podman compose logs -f datasync
 
 Logs (native):
   journalctl -u DataSync -f

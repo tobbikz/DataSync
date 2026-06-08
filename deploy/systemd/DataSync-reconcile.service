@@ -1,12 +1,15 @@
 [Unit]
 Description=DataSync reconcile loop (light/auto + periodic full)
 Documentation=file://@DATASYNC_ROOT@/README.md
-After=network-online.target docker.service DataSync.service
+After=network-online.target DataSync.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
+User=@DATASYNC_USER@
+Group=@DATASYNC_GROUP@
 WorkingDirectory=@DATASYNC_ROOT@
+Environment=XDG_RUNTIME_DIR=/run/user/@DATASYNC_UID@
 EnvironmentFile=-/etc/datasync/datasync.env
 ExecStart=@DATASYNC_ROOT@/deploy/systemd/datasync-reconcile.sh
 TimeoutStopSec=300

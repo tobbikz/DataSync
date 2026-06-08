@@ -1,13 +1,16 @@
 [Unit]
 Description=DataSync CDC daemon (Docker — rebuild on restart)
 Documentation=file://@DATASYNC_ROOT@/README.md
-After=network-online.target docker.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+User=@DATASYNC_USER@
+Group=@DATASYNC_GROUP@
 WorkingDirectory=@DATASYNC_ROOT@
+Environment=XDG_RUNTIME_DIR=/run/user/@DATASYNC_UID@
 EnvironmentFile=-/etc/datasync/datasync.env
 ExecStartPre=@DATASYNC_ROOT@/deploy/systemd/datasync-build.sh
 ExecStart=@DATASYNC_ROOT@/deploy/systemd/datasync-start.sh
