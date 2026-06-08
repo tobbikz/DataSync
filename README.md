@@ -4,7 +4,7 @@ CDC Data Lake pipeline — C++ ingest from MariaDB, MSSQL, and MongoDB into Post
 
 ## Install (Docker only)
 
-Requires **Docker Engine** + **Compose v2** on any Linux distro. Optional **systemd** units for `enable`/`restart` with automatic rebuild.
+Requires **Docker** or **Podman** + **Compose v2** on any Linux distro. `./install.sh` prefers **podman** when the `docker` CLI is a podman shim. Rootless podman: `systemctl --user start podman.socket` if the socket is down.
 
 Docker **does not** create PostgreSQL, MariaDB, MSSQL, or MongoDB — only Kafka + the DataSync daemon. Point `config.json` at your existing databases.
 
@@ -20,9 +20,8 @@ On first run, `./install.sh` copies `config.json.example` → `config.json` if m
 2. Ensures **`cdc_catalog`** in `config.json` → `datasync.database` and **`lake`** helpers in `datalake.database` (creates DBs if missing; idempotent)
 3. Starts **Zookeeper + Kafka**
 4. Starts the **DataSync daemon**
-5. Runs **`discover`**
-6. Prints recent **daemon logs**
-7. Installs and **enables** **systemd** (`DataSync` + `DataSync-reconcile.timer`) when sudo is available
+5. **Discover** — skipped in install; run manually after onboarding sources
+6. Optional **systemd** when sudo is available
 
 | Service | URL |
 |---------|-----|

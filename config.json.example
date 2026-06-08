@@ -15,18 +15,6 @@
     "password": "CHANGE_ME",
     "sslmode": "prefer"
   },
-  "sources": [
-    {
-      "conn_id": "MARIADB_LOCAL",
-      "engine": "mariadb",
-      "host": "localhost",
-      "port": 3307,
-      "database": "test",
-      "user": "root",
-      "password": "CHANGE_ME",
-      "active": true
-    }
-  ],
   "cdc": {
     "round_idle_seconds": 5,
     "slice_max_seconds": 60,

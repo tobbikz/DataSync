@@ -16,13 +16,8 @@ fi
 DATASYNC_ROOT="${DATASYNC_ROOT:-$(cd "${DATASYNC_LIB_DIR}/../.." && pwd)}"
 DATASYNC_DEPLOY_MODE="${DATASYNC_DEPLOY_MODE:-docker}"
 
-docker_compose() {
-  if docker info >/dev/null 2>&1; then
-    docker compose "$@"
-  else
-    sudo docker compose "$@"
-  fi
-}
+# shellcheck source=scripts/container-compose.sh
+source "${DATASYNC_ROOT}/scripts/container-compose.sh"
 
 wait_zookeeper() {
   local i h

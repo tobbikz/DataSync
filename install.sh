@@ -17,13 +17,8 @@ done
 
 warn() { printf '✖ %s\n' "$*" >&2; }
 
-docker_compose() {
-  if docker info >/dev/null 2>&1; then
-    docker compose "$@"
-  else
-    sudo docker compose "$@"
-  fi
-}
+# shellcheck source=scripts/container-compose.sh
+source "$ROOT/scripts/container-compose.sh"
 
 run_quiet() {
   local label="$1"; shift
@@ -40,29 +35,23 @@ run_quiet() {
   return 1
 }
 
-ensure_docker() {
-  if ! command -v docker >/dev/null 2>&1; then
-    warn "docker required"
-    exit 1
+ensure_container_engine() {
+  if ensure_container_runtime; then
+    printf '✔ Container runtime (%s)\n' "$(container_runtime_label)"
+    return 0
   fi
-  if ! docker compose version >/dev/null 2>&1 && ! sudo docker compose version >/dev/null 2>&1; then
-    warn "docker compose v2 required"
-    exit 1
-  fi
+  warn "podman or docker required — start rootless podman: systemctl --user start podman.socket"
+  exit 1
 }
 
 ensure_config() {
   if [[ ! -f "$ROOT/config.json" ]]; then
     if [[ -f "$ROOT/config.json.example" ]]; then
       cp "$ROOT/config.json.example" "$ROOT/config.json"
-      warn "edit config.json (password) and re-run"
+      warn "created config.json from example — edit passwords and re-run"
       exit 1
     fi
     warn "missing config.json"
-    exit 1
-  fi
-  if grep -q 'CHANGE_ME' "$ROOT/config.json" 2>/dev/null; then
-    warn "config.json still has CHANGE_ME"
     exit 1
   fi
 }
@@ -84,19 +73,6 @@ build_image() {
   tail -30 "$err" >&2 || true
   rm -f "$err"
   return 1
-}
-
-verify_source_connectivity() {
-  local err rc
-  err="$(mktemp)"
-  docker_compose run --rm --no-deps --remove-orphans \
-    -e DATASYNC_INSTALL_QUIET=1 \
-    -e DATASYNC_HOST_NETWORK=1 \
-    datasync verify-sources >"$err" 2>&1
-  rc=$?
-  grep -vE 'Container datasync-datasync-run|^$' "$err" || true
-  rm -f "$err"
-  return "$rc"
 }
 
 apply_catalog_schema() {
@@ -126,7 +102,7 @@ wait_zookeeper() {
     fi
     sleep 1
   done
-  warn "Zookeeper not ready — check: docker compose logs zookeeper --tail 30"
+  warn "Zookeeper not ready — check: $(container_runtime_label) compose logs zookeeper --tail 30"
   return 1
 }
 
@@ -144,7 +120,7 @@ wait_kafka() {
     fi
     sleep 2
   done
-  warn "Kafka not ready — check: docker compose logs kafka --tail 40"
+  warn "Kafka not ready — check: $(container_runtime_label) compose logs kafka --tail 40"
   return 1
 }
 
@@ -172,45 +148,8 @@ start_zookeeper_kafka() {
 }
 
 run_discover() {
-  if ! python3 - "$ROOT/config.json" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    cfg = json.load(f)
-def has_conn(item):
-    return isinstance(item, dict) and (item.get("conn_id") or item.get("alias"))
-sources = cfg.get("sources") or []
-if any(has_conn(s) for s in sources if isinstance(s, dict)):
-    sys.exit(0)
-for key in ("mariadb", "mssql", "mongodb"):
-    val = cfg.get(key)
-    if isinstance(val, list) and any(has_conn(v) for v in val):
-        sys.exit(0)
-    if isinstance(val, dict) and has_conn(val):
-        sys.exit(0)
-sys.exit(1)
-PY
-  then
-    printf '✔ Discover skipped (no sources in config.json)\n'
-    return 0
-  fi
-
-  local err rc
-  err="$(mktemp)"
-  docker_compose run --rm --remove-orphans \
-      -e DATASYNC_HOST_NETWORK=1 \
-      -e KAFKA_BOOTSTRAP=localhost:9092 \
-      datasync discover >"$err" 2>&1
-  rc=$?
-  grep -vE 'Container datasync-datasync-run' "$err" >/dev/null || true
-  if [[ "$rc" -eq 0 ]]; then
-    rm -f "$err"
-    printf '✔ Discover\n'
-    return 0
-  fi
-  printf '✖ Discover (check sources in config.json and source DB reachability)\n' >&2
-  grep -vE 'Container datasync-datasync-run' "$err" | tail -15 >&2 || true
-  rm -f "$err"
-  return 1
+  printf '✔ Discover skipped (run manually after onboarding sources)\n'
+  return 0
 }
 
 post_install_health() {
@@ -275,7 +214,7 @@ install_and_enable_systemd() {
   fi
 }
 
-ensure_docker
+ensure_container_engine
 ensure_config
 
 build_image
@@ -287,8 +226,8 @@ run_quiet "DataSync daemon" docker_compose up -d --no-recreate datasync
 
 sleep 2
 run_quiet "Post-install health" post_install_health
-run_quiet "Source connectivity" verify_source_connectivity
 run_discover
 install_and_enable_systemd
 
-printf '✔ Install complete — status: docker compose ps | systemd: systemctl status DataSync\n'
+printf '✔ Install complete — status: %s compose ps | discover: %s compose run --rm datasync discover\n' \
+  "$(container_runtime_label)" "$(container_runtime_label)"
