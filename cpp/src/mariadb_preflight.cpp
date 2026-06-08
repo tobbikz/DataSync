@@ -68,7 +68,6 @@ MariaDbPreflightResult check_mariadb_cdc_ready(MYSQL* mysql) {
 
     const std::string log_bin = require("log_bin");
     const std::string binlog_format = require("binlog_format");
-    const std::string gtid_mode = require("gtid_mode");
     if (!result.ok) {
         return result;
     }
@@ -81,8 +80,13 @@ MariaDbPreflightResult check_mariadb_cdc_ready(MYSQL* mysql) {
         result.ok = false;
         result.errors.push_back("binlog_format=" + binlog_format + " (required ROW)");
     }
-    if (upper_ascii(gtid_mode) != "ON") {
-        result.warnings.push_back("gtid_mode=" + gtid_mode + " (recommended ON for CDC)");
+
+    // gtid_mode is optional — missing on some MariaDB builds; warn only (same as verify_sources.py).
+    const auto gtid_it = vars.find("gtid_mode");
+    if (gtid_it == vars.end()) {
+        result.warnings.push_back("gtid_mode variable not found (recommended ON for prod failover)");
+    } else if (upper_ascii(gtid_it->second) != "ON") {
+        result.warnings.push_back("gtid_mode=" + gtid_it->second + " (recommended ON for CDC)");
     }
 
     return result;
