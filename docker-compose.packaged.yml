@@ -1,0 +1,5 @@
+# Overlay when host binary is pre-built (NATIVE_BUILD=1 or Arch fallback)
+services:
+  datasync:
+    build:
+      dockerfile: Dockerfile.packaged

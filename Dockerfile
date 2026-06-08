@@ -1,60 +1,61 @@
-# DataSync — multi-stage image (C++ CDC daemon + CLI)
-# Build: docker build -t datasync:local .
+# DataSync — Arch Linux multi-stage image (pacman — same deps as host Arch install)
+# Build: podman compose build --network=host datasync
 # Install: ./install.sh
 
-FROM debian:bookworm-slim AS builder
+FROM docker.io/archlinux/archlinux:latest AS builder
 
-ARG RDKAFKA_VERSION=v2.6.1
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+RUN pacman-key --init \
+ && pacman-key --populate archlinux \
+ && pacman -Sy archlinux-keyring --noconfirm \
+ && pacman -Syu --noconfirm \
+ && pacman -S --noconfirm --needed \
+    base-devel \
     ca-certificates \
     cmake \
     git \
-    libmariadb-dev \
-    libmongoc-dev \
-    libpq-dev \
-    libssl-dev \
-    nlohmann-json3-dev \
-    pkg-config \
-    freetds-dev \
-    zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /usr/include/mysql \
-    && ln -sf ../mariadb/mysql.h /usr/include/mysql/mysql.h
-
-RUN git clone --depth 1 --branch "${RDKAFKA_VERSION}" \
-      https://github.com/confluentinc/librdkafka.git /tmp/librdkafka \
-    && cd /tmp/librdkafka \
-    && ./configure --prefix=/opt/rdkafka --disable-sasl --disable-ssl \
-    && make -j"$(nproc)" \
-    && make install
+    mariadb-libs \
+    libmongoc-1.0 \
+    postgresql-libs \
+    openssl \
+    nlohmann-json \
+    pkgconf \
+    freetds \
+    zlib \
+    librdkafka \
+ && pacman -Scc --noconfirm \
+ && mkdir -p /usr/include/mysql \
+ && ln -sf ../mariadb/mysql.h /usr/include/mysql/mysql.h
 
 WORKDIR /src
 COPY cpp/ cpp/
 
-# CMakeLists expects vendored rdkafka under cpp/deps/rdkafka
-RUN mkdir -p cpp/deps && cp -a /opt/rdkafka cpp/deps/rdkafka
+RUN mkdir -p cpp/deps/rdkafka/lib cpp/deps/rdkafka/include \
+ && cp -a /usr/lib/librdkafka*.so* cpp/deps/rdkafka/lib/ \
+ && cp -a /usr/include/librdkafka cpp/deps/rdkafka/include/
 
 RUN cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build --target DataSync -j"$(nproc)"
 
 # -----------------------------------------------------------------------------
 
-FROM debian:bookworm-slim AS runtime
+FROM docker.io/archlinux/archlinux:latest AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN pacman-key --init \
+ && pacman-key --populate archlinux \
+ && pacman -Sy archlinux-keyring --noconfirm \
+ && pacman -Syu --noconfirm \
+ && pacman -S --noconfirm --needed \
     ca-certificates \
-    freetds-common \
-    libmongoc-1.0-0 \
-    libmariadb3 \
-    libpq5 \
-    libsybdb5 \
-    postgresql-client \
-    python3 \
-    && rm -rf /var/lib/apt/lists/*
+    freetds \
+    mariadb-libs \
+    libmongoc-1.0 \
+    postgresql-libs \
+    postgresql \
+    python \
+    librdkafka \
+ && pacman -Scc --noconfirm
 
-COPY --from=builder /opt/rdkafka/lib /opt/rdkafka/lib
+COPY --from=builder /usr/lib/librdkafka*.so* /usr/lib/
 COPY --from=builder /src/build/DataSync /usr/local/bin/DataSync
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/catalog_bootstrap.py /app/docker/catalog_bootstrap.py
@@ -63,7 +64,6 @@ COPY sql/ /app/sql/
 
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-ENV LD_LIBRARY_PATH=/opt/rdkafka/lib
 ENV DATASYNC_ROOT=/app
 ENV DATASYNC_CONFIG=/app/config.json
 ENV DATASYNC_BIN=/usr/local/bin/DataSync

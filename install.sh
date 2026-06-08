@@ -59,20 +59,52 @@ ensure_config() {
 build_image() {
   local t0=$SECONDS err
   err="$(mktemp)"
-  if docker_compose build --quiet datasync >"$err" 2>&1; then
+  if docker_compose build --network=host --quiet datasync >"$err" 2>&1; then
     rm -f "$err"
     printf '✔ Image datasync built %ss\n' "$((SECONDS - t0))"
     return 0
   fi
-  if docker_compose build datasync >"$err" 2>&1; then
+  if docker_compose build --network=host datasync >"$err" 2>&1; then
     rm -f "$err"
     printf '✔ Image datasync built %ss\n' "$((SECONDS - t0))"
     return 0
+  fi
+  if [[ "${NATIVE_BUILD:-0}" == "1" ]] || [[ -f /etc/arch-release ]]; then
+    if build_image_native >"$err" 2>&1; then
+      rm -f "$err"
+      err="$(mktemp)"
+      if COMPOSE_FILE="docker-compose.yml:docker-compose.packaged.yml" \
+         docker_compose build --network=host datasync >"$err" 2>&1; then
+        rm -f "$err"
+        printf '✔ DataSync packaged image (native binary) %ss\n' "$((SECONDS - t0))"
+        export DATASYNC_NATIVE_BINARY=1
+        return 0
+      fi
+      tail -20 "$err" >&2 || true
+      rm -f "$err"
+    fi
   fi
   printf '✖ Image datasync build failed\n' >&2
   tail -30 "$err" >&2 || true
   rm -f "$err"
+  warn "retry with host DNS: podman compose build --network=host datasync"
+  warn "or native: NATIVE_BUILD=1 ./install.sh (pacman deps on Arch host)"
   return 1
+}
+
+build_image_native() {
+  command -v cmake >/dev/null 2>&1 || return 1
+  command -v g++ >/dev/null 2>&1 || return 1
+  if command -v pacman >/dev/null 2>&1; then
+    pacman -Q mariadb-libs postgresql-libs cmake base-devel >/dev/null 2>&1 || {
+      printf 'install deps: sudo pacman -S base-devel cmake mariadb-libs postgresql-libs nlohmann-json freetds libmongoc-1.0 librdkafka\n' >&2
+      return 1
+    }
+  fi
+  local build_dir="$ROOT/cpp/build"
+  cmake -S "$ROOT/cpp" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release
+  cmake --build "$build_dir" --target DataSync -j"$(nproc)"
+  [[ -x "$build_dir/DataSync" ]]
 }
 
 apply_catalog_schema() {
