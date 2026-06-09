@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 
+#include <atomic>
 #include <libpq-fe.h>
 
 #include <optional>
@@ -19,4 +20,5 @@ int run_reconcile_loop(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::optional<std::string>& tier,
-    bool once = false);
+    bool once = false,
+    std::atomic<bool>* shutdown = nullptr);

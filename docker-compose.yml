@@ -40,9 +40,6 @@ services:
       dockerfile: Dockerfile
     image: datasync:local
     network_mode: host
-    depends_on:
-      kafka:
-        condition: service_healthy
     environment:
       DATASYNC_ROOT: /app
       DATASYNC_CONFIG: /app/config.json

@@ -2,6 +2,7 @@
 #include "capture_common.hpp"
 #include "catalog_sync.hpp"
 #include "cdc_pre_apply.hpp"
+#include "cdc_reconcile.hpp"
 #include "config.hpp"
 #include "connections.hpp"
 #include "daemon_full_load.hpp"
@@ -397,6 +398,7 @@ int run_cdc_daemon(
             {"kafka_bootstrap", kafka.bootstrap},
             {"kafka_bootstrap_source", kafka.source},
             {"topic_prefix_mode", "conn_id"},
+            {"reconcile_embedded", true},
         },
     });
 
@@ -405,6 +407,18 @@ int run_cdc_daemon(
     std::size_t last_conn_count = conn_ids_initial.size();
 
     run_startup_full_load_sweep(cfg, log_pg, conn_ids_initial, tiers, exit_code);
+
+    std::thread reconcile_thread([&cfg]() {
+        try {
+            PgConn pg(cfg.datasync.conn_string());
+            if (!pg.raw) {
+                return;
+            }
+            (void)run_reconcile_loop(cfg, pg.raw, std::nullopt, false, &g_shutdown);
+        } catch (const std::exception&) {
+            // reconcile errors are logged inside run_reconcile_loop
+        }
+    });
 
     while (!g_shutdown.load()) {
         auto conn_ids = reload_daemon_conn_ids(log_pg, cfg);
@@ -452,6 +466,10 @@ int run_cdc_daemon(
         if (once) {
             break;
         }
+    }
+
+    if (reconcile_thread.joinable()) {
+        reconcile_thread.join();
     }
 
     log_write(log_pg, {

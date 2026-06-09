@@ -1,22 +1,20 @@
 [Unit]
-Description=DataSync CDC daemon (native binary — rebuild on restart)
+Description=DataSync CDC daemon (Docker — rebuild on restart, reconcile embedded)
 Documentation=file://@DATASYNC_ROOT@/README.md
-After=network-online.target postgresql.service
-Wants=network-online.target
+After=network-online.target DataSync-kafka.service
+Wants=network-online.target DataSync-kafka.service
 
 [Service]
-Type=simple
+Type=oneshot
+RemainAfterExit=yes
 User=datalake
 Group=datalake
 WorkingDirectory=@DATASYNC_ROOT@
+Environment=XDG_RUNTIME_DIR=/run/user/@DATASYNC_UID@
 EnvironmentFile=-/etc/datasync/datasync.env
 ExecStartPre=@DATASYNC_ROOT@/deploy/systemd/datasync-build.sh
 ExecStart=@DATASYNC_ROOT@/deploy/systemd/datasync-start.sh
 ExecStop=@DATASYNC_ROOT@/deploy/systemd/datasync-stop.sh
-Restart=on-failure
-RestartSec=30
-KillSignal=SIGTERM
-TimeoutStopSec=120
 TimeoutStartSec=900
 
 [Install]

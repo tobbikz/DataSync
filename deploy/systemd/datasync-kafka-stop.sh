@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Stop DataSync daemon container (systemd DataSync.service).
+# Stop Kafka (systemd DataSync-kafka.service).
 set -euo pipefail
 # shellcheck source=deploy/systemd/datasync-lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/datasync-lib.sh"
 
 cd "${DATASYNC_ROOT}"
-docker_compose stop datasync || true
+docker_compose stop kafka || true

@@ -1266,9 +1266,13 @@ int run_reconcile_loop(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::optional<std::string>& tier_filter,
-    bool once) {
-    std::signal(SIGINT, on_reconcile_signal);
-    std::signal(SIGTERM, on_reconcile_signal);
+    bool once,
+    std::atomic<bool>* external_shutdown) {
+    std::atomic<bool>* shutdown = external_shutdown ? external_shutdown : &g_reconcile_shutdown;
+    if (!external_shutdown) {
+        std::signal(SIGINT, on_reconcile_signal);
+        std::signal(SIGTERM, on_reconcile_signal);
+    }
 
     RuntimeConfig runtime;
     runtime.reload(log_pg);
@@ -1297,10 +1301,10 @@ int run_reconcile_loop(
         .context = {{"conn_ids", static_cast<int>(conn_ids.size())}},
     });
 
-    while (!g_reconcile_shutdown.load()) {
+    while (!shutdown->load()) {
         runtime.reload(log_pg);
         for (const auto& conn_id : conn_ids) {
-            if (g_reconcile_shutdown.load()) {
+            if (shutdown->load()) {
                 break;
             }
             std::string tier = tier_filter.value_or("");
@@ -1322,7 +1326,7 @@ int run_reconcile_loop(
                     0);
                 if (res && PQresultStatus(res) == PGRES_TUPLES_OK) {
                     for (int i = 0; i < PQntuples(res); ++i) {
-                        if (g_reconcile_shutdown.load()) {
+                        if (shutdown->load()) {
                             break;
                         }
                         try {
@@ -1368,7 +1372,7 @@ int run_reconcile_loop(
         const int interval_hours =
             runtime.get_int("reconcile_interval_hours", 4, "cdc_kafka_reconcile", "");
         const int sleep_sec = std::max(60, interval_hours * 3600);
-        for (int i = 0; i < sleep_sec && !g_reconcile_shutdown.load(); ++i) {
+        for (int i = 0; i < sleep_sec && !shutdown->load(); ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }

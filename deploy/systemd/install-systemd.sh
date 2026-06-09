@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install DataSync systemd units and enable CDC + reconcile timer.
-# Usage: sudo deploy/systemd/install-systemd.sh [--native] [--no-enable]
+# Install DataSync systemd units: Kafka + CDC daemon (reconcile embedded in daemon).
+# Usage: sudo deploy/systemd/install-systemd.sh [--no-enable]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,24 +8,25 @@ ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SYSTEMD_DIR="/etc/systemd/system"
 ENV_DIR="/etc/datasync"
 ENV_FILE="${ENV_DIR}/datasync.env"
-CLI_DEPLOY_MODE=""
 DO_ENABLE=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --native) CLI_DEPLOY_MODE="native"; shift ;;
     --no-enable) DO_ENABLE=0; shift ;;
     -h|--help)
       cat <<EOF
-Usage: sudo $0 [--native] [--no-enable]
+Usage: sudo $0 [--no-enable]
 
-Installs DataSync.service + DataSync-reconcile.timer for user datalake
-(rootless podman/docker). By default enables and starts both.
+Installs DataSync-kafka.service + DataSync.service for user datalake
+(rootless podman/docker). Reconcile runs inside the daemon (no separate timer).
 
-  --native     native binary instead of Docker/Podman compose
   --no-enable  install units only (no systemctl enable --now)
 EOF
       exit 0
+      ;;
+    --native)
+      echo "Removed: --native mode. Use Docker/Podman units only." >&2
+      exit 2
       ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
@@ -49,7 +50,7 @@ RUNTIME_DIR="/run/user/${DATASYNC_UID}"
 
 disable_legacy_units() {
   local unit removed=0
-  for unit in datalake-cdc.service; do
+  for unit in datalake-cdc.service DataSync-reconcile.service DataSync-reconcile.timer; do
     if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
       systemctl disable --now "${unit}" 2>/dev/null || true
       rm -f "${SYSTEMD_DIR}/${unit}"
@@ -99,9 +100,7 @@ ensure_podman_user_socket() {
 }
 
 sync_env_file() {
-  local deploy_mode="$1"
   render_unit "${SCRIPT_DIR}/DataSync.env.example" "${ENV_FILE}"
-  sed -i "s/^DATASYNC_DEPLOY_MODE=.*/DATASYNC_DEPLOY_MODE=${deploy_mode}/" "${ENV_FILE}"
   if command -v podman >/dev/null 2>&1; then
     local podman_sock="unix://${RUNTIME_DIR}/podman/podman.sock"
     if grep -q '^DOCKER_HOST=' "${ENV_FILE}"; then
@@ -118,70 +117,54 @@ sync_env_file() {
 chmod +x "${SCRIPT_DIR}"/datasync-*.sh
 
 mkdir -p "${ENV_DIR}"
-if [[ -n "${CLI_DEPLOY_MODE}" ]]; then
-  DEPLOY_MODE="${CLI_DEPLOY_MODE}"
-elif [[ -f "${ENV_FILE}" ]] && grep -q '^DATASYNC_DEPLOY_MODE=' "${ENV_FILE}"; then
-  DEPLOY_MODE="$(grep '^DATASYNC_DEPLOY_MODE=' "${ENV_FILE}" | cut -d= -f2- | tr -d '"')"
-else
-  DEPLOY_MODE="docker"
-fi
-sync_env_file "${DEPLOY_MODE}"
+sync_env_file
 echo "Synced ${ENV_FILE} (DATASYNC_ROOT=${ROOT}, user=${DATASYNC_USER})"
 
-if [[ "${DEPLOY_MODE}" == "native" ]]; then
-  SERVICE_SRC="${SCRIPT_DIR}/DataSync-native.service"
-else
-  SERVICE_SRC="${SCRIPT_DIR}/DataSync-docker.service"
-  ensure_podman_user_socket
-fi
+ensure_podman_user_socket
 
-render_unit "${SERVICE_SRC}" "${SYSTEMD_DIR}/DataSync.service"
-render_unit "${SCRIPT_DIR}/DataSync-reconcile.service" "${SYSTEMD_DIR}/DataSync-reconcile.service"
-install -m 0644 "${SCRIPT_DIR}/DataSync-reconcile.timer" "${SYSTEMD_DIR}/"
+render_unit "${SCRIPT_DIR}/DataSync-kafka.service" "${SYSTEMD_DIR}/DataSync-kafka.service"
+render_unit "${SCRIPT_DIR}/DataSync.service" "${SYSTEMD_DIR}/DataSync.service"
 
 disable_legacy_units
 
 systemctl daemon-reload
-systemctl reset-failed DataSync.service 2>/dev/null || true
+systemctl reset-failed DataSync-kafka.service DataSync.service 2>/dev/null || true
 
 # shellcheck source=deploy/systemd/datasync-lib.sh
 source "${SCRIPT_DIR}/datasync-lib.sh"
-ensure_single_daemon
+stop_compose_datasync
 
 if [[ "${DO_ENABLE}" -eq 1 ]]; then
+  systemctl enable --now DataSync-kafka.service
   systemctl enable --now DataSync.service
-  systemctl enable --now DataSync-reconcile.timer
   echo ""
-  echo "Enabled: DataSync.service + DataSync-reconcile.timer (user=${DATASYNC_USER}, uid=${DATASYNC_UID})"
+  echo "Enabled: DataSync-kafka.service + DataSync.service (user=${DATASYNC_USER}, uid=${DATASYNC_UID})"
 else
   echo ""
-  echo "Units installed (not enabled — pass default install or omit --no-enable)."
+  echo "Units installed (not enabled — omit --no-enable to start)."
 fi
 
 cat <<EOF
 
-Installed (mode=${DEPLOY_MODE}, user=datalake):
+Installed (user=datalake):
+  ${SYSTEMD_DIR}/DataSync-kafka.service
   ${SYSTEMD_DIR}/DataSync.service
-  ${SYSTEMD_DIR}/DataSync-reconcile.service
-  ${SYSTEMD_DIR}/DataSync-reconcile.timer
   ${ENV_FILE}
 
-Every start/restart rebuilds first (ExecStartPre → datasync-build.sh).
+Reconcile runs inside the daemon (reconcile_interval_hours in runtime_config).
 
-Restart with rebuild:
-  sudo systemctl restart DataSync
+Restart:
+  sudo systemctl restart DataSync-kafka    # Kafka only
+  sudo systemctl restart DataSync          # rebuild image + recreate daemon
 
 Status:
-  systemctl status DataSync
-  systemctl status DataSync-reconcile.timer
+  systemctl status DataSync-kafka DataSync
 
 CLI smoke:
   ${ROOT}/deploy/systemd/datasync-cli.sh daemon --once
 
-Logs (docker/podman):
+Logs:
+  cd ${ROOT} && podman compose logs -f kafka
   cd ${ROOT} && podman compose logs -f datasync
-
-Logs (native):
-  journalctl -u DataSync -f
 
 EOF

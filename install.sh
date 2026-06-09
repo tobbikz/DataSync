@@ -112,6 +112,11 @@ wait_kafka() {
 }
 
 start_kafka() {
+  if systemctl is-enabled --quiet DataSync-kafka.service 2>/dev/null; then
+    printf '✔ Kafka managed by systemd (skip compose up)\n'
+    return 0
+  fi
+
   docker_compose stop zookeeper 2>/dev/null || true
   docker_compose rm -f zookeeper 2>/dev/null || true
 
@@ -140,7 +145,6 @@ stop_host_native_datasync() {
     [[ -z "${pid}" ]] && continue
     cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
     [[ "${cmd}" == *"DataSync daemon"* ]] || continue
-    [[ "${cmd}" == *"/usr/local/bin/DataSync"* ]] && continue
     kill "${pid}" 2>/dev/null || true
   done < <(pgrep -f 'DataSync daemon' 2>/dev/null || true)
 }
@@ -173,23 +177,39 @@ post_install_health() {
   return 1
 }
 
-print_systemd_instructions() {
+systemd_units_installed() {
+  [[ -f /etc/systemd/system/DataSync.service && -f /etc/systemd/system/DataSync-kafka.service ]]
+}
+
+install_systemd_if_missing() {
+  [[ "${SKIP_SYSTEMD:-0}" == "1" ]] && return 1
+  [[ -x "$ROOT/deploy/systemd/install-systemd.sh" ]] || return 1
+  if systemd_units_installed; then
+    return 0
+  fi
+
+  printf '→ Installing systemd units (DataSync-kafka + DataSync)...\n'
+  if [[ "${EUID}" -eq 0 ]]; then
+    "$ROOT/deploy/systemd/install-systemd.sh"
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$ROOT/deploy/systemd/install-systemd.sh"
+    return 0
+  fi
+  warn "sudo required — run: sudo $ROOT/deploy/systemd/install-systemd.sh"
+  return 1
+}
+
+print_systemd_hint() {
   [[ "${SKIP_SYSTEMD:-0}" == "1" ]] && return 0
+  systemd_units_installed && return 0
   [[ -x "$ROOT/deploy/systemd/install-systemd.sh" ]] || return 0
 
   cat <<EOF
 
-── systemd (optional, run once with sudo) ──
+── systemd (not installed — run once with sudo) ──
   sudo $ROOT/deploy/systemd/install-systemd.sh
-
-  Installs + enables DataSync (CDC daemon) and reconcile timer (auto light/full every 4h).
-  Uses your user ($USER) for rootless podman — no port 9092 conflict.
-
-  After git pull or config change:
-  sudo systemctl restart DataSync
-
-  Status:
-  systemctl status DataSync DataSync-reconcile.timer
 
 EOF
 }
@@ -200,14 +220,24 @@ ensure_config
 build_image
 apply_catalog_schema
 
-run_quiet "Kafka starting" start_kafka
+install_systemd_if_missing || true
 
-run_quiet "DataSync daemon" start_datasync_daemon
+if systemctl is-enabled --quiet DataSync-kafka.service 2>/dev/null; then
+  printf '✔ Kafka managed by systemd\n'
+else
+  run_quiet "Kafka starting" start_kafka
+fi
+
+if systemctl is-enabled --quiet DataSync.service 2>/dev/null; then
+  printf '✔ DataSync daemon managed by systemd\n'
+else
+  run_quiet "DataSync daemon" start_datasync_daemon
+fi
 
 sleep 2
 run_quiet "Post-install health" post_install_health
 run_discover
-print_systemd_instructions
+print_systemd_hint
 
 printf '✔ Install complete — status: %s compose ps | discover: %s compose run --rm datasync discover\n' \
   "$(container_runtime_label)" "$(container_runtime_label)"

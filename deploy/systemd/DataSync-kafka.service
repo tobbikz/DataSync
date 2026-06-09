@@ -1,5 +1,5 @@
 [Unit]
-Description=DataSync CDC daemon (Docker — rebuild on restart)
+Description=DataSync Kafka broker (Docker/Podman compose)
 Documentation=file://@DATASYNC_ROOT@/README.md
 After=network-online.target
 Wants=network-online.target
@@ -12,10 +12,9 @@ Group=datalake
 WorkingDirectory=@DATASYNC_ROOT@
 Environment=XDG_RUNTIME_DIR=/run/user/@DATASYNC_UID@
 EnvironmentFile=-/etc/datasync/datasync.env
-ExecStartPre=@DATASYNC_ROOT@/deploy/systemd/datasync-build.sh
-ExecStart=@DATASYNC_ROOT@/deploy/systemd/datasync-start.sh
-ExecStop=@DATASYNC_ROOT@/deploy/systemd/datasync-stop.sh
-TimeoutStartSec=900
+ExecStart=@DATASYNC_ROOT@/deploy/systemd/datasync-kafka-start.sh
+ExecStop=@DATASYNC_ROOT@/deploy/systemd/datasync-kafka-stop.sh
+TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target

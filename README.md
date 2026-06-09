@@ -23,7 +23,7 @@ On first run, `./install.sh` copies `config.json.example` → `config.json` if m
 5. **Discover** — skipped in install; run manually after onboarding sources
 6. **Discover** — skipped in install; run manually after onboarding sources
 
-No sudo during install. To enable auto-start + reconcile timer, run the command printed at the end.
+No sudo required for a normal install. If systemd units are missing and `sudo` is available, `./install.sh` installs them automatically (`DataSync-kafka` + `DataSync`).
 
 | Service | URL |
 |---------|-----|
@@ -34,18 +34,23 @@ The DataSync container uses **`network_mode: host`** (Linux) so it reaches host 
 
 ## systemd
 
-`./install.sh` does **not** call sudo. After install, run once:
+`./install.sh` installs **DataSync-kafka** + **DataSync** systemd units automatically when they are missing (requires `sudo` and system user `datalake`). To skip: `SKIP_SYSTEMD=1 ./install.sh`.
+
+Manual (re-sync units after moving the repo):
 
 ```bash
 sudo ./deploy/systemd/install-systemd.sh
 ```
 
-That installs units for **`datalake`** user/group, enables **DataSync** + **DataSync-reconcile.timer** (auto light/full every 4h), and starts both. Requires system user `datalake` (see `install-systemd.sh` if missing).
+That installs units for **`datalake`** user/group: **DataSync-kafka** + **DataSync** (reconcile runs inside the daemon). Requires system user `datalake` (see `install-systemd.sh` if missing).
 
 Every **`sudo systemctl restart DataSync`** runs **`ExecStartPre`** first → rebuild, then recreates the daemon container.
 
 ```bash
-systemctl status DataSync
+sudo systemctl restart DataSync-kafka   # Kafka only
+sudo systemctl restart DataSync         # CDC + reconcile (embedded)
+
+systemctl status DataSync-kafka DataSync
 docker compose ps
 docker compose logs -f datasync
 ```
