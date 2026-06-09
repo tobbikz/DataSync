@@ -127,6 +127,13 @@ long long reset_apply_offset_to_end(
     const std::string& topic,
     int partition);
 
+long long reset_apply_consumer_offset(
+    const std::string& bootstrap,
+    const std::string& consumer_group,
+    const std::string& topic,
+    int partition,
+    long long offset);
+
 // Create Kafka topics if missing (idempotent; TOPIC_ALREADY_EXISTS is OK).
 void ensure_kafka_topics_exist(
     const std::string& bootstrap,
@@ -147,7 +154,17 @@ void flag_table_for_full_load(
     const std::string& conn_id,
     const std::string& schema,
     const std::string& table,
-    const std::string& db_engine);
+    const std::string& db_engine,
+    const std::string& batch_id = "");
+
+/** Bookmark Kafka offsets in catalog.engine_meta when capture_during_full_load is set. */
+bool seed_stream_capture_bookmark_if_needed(
+    PGconn* pg,
+    RuntimeConfig& runtime,
+    const std::string& conn_id,
+    long long catalog_id,
+    const std::string& db_engine,
+    const std::string& batch_id);
 
 /** Set catalog.status while a table is actively loading (full load COPY). */
 void mark_catalog_full_load_in_progress(PGconn* pg, long long catalog_id);

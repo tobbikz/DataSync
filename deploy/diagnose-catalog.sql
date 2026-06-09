@@ -14,18 +14,19 @@ SELECT
     active,
     cdc_enabled,
     needs_full_load,
+    capture_during_full_load,
     has_pk,
     status,
     service_tier,
     (active
      AND cdc_enabled
-     AND NOT needs_full_load
+     AND (NOT needs_full_load OR capture_during_full_load)
      AND has_pk
      AND status NOT IN ('skipped', 'disabled')) AS capture_ready,
     CASE
         WHEN NOT active THEN 'active=false'
         WHEN NOT cdc_enabled THEN 'cdc_enabled=false'
-        WHEN needs_full_load THEN 'needs_full_load=true'
+        WHEN needs_full_load AND NOT capture_during_full_load THEN 'needs_full_load=true'
         WHEN NOT has_pk THEN 'has_pk=false'
         WHEN status IN ('skipped', 'disabled') THEN 'status=' || status::text
         ELSE 'ok'
@@ -42,11 +43,12 @@ SELECT
     COUNT(*) FILTER (WHERE active) AS active,
     COUNT(*) FILTER (WHERE cdc_enabled) AS cdc_enabled,
     COUNT(*) FILTER (WHERE needs_full_load) AS needs_full_load,
+    COUNT(*) FILTER (WHERE capture_during_full_load) AS capture_during_full_load,
     COUNT(*) FILTER (WHERE status = 'success') AS status_success,
     COUNT(*) FILTER (
         WHERE active
           AND cdc_enabled
-          AND NOT needs_full_load
+          AND (NOT needs_full_load OR capture_during_full_load)
           AND has_pk
           AND status NOT IN ('skipped', 'disabled')
     ) AS capture_ready

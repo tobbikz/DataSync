@@ -472,6 +472,13 @@ bool load_one_collection(
 
     mark_catalog_full_load_in_progress(app_pg.raw, target.catalog_id);
 
+    {
+        RuntimeConfig bookmark_runtime;
+        bookmark_runtime.reload(app_pg.raw);
+        seed_stream_capture_bookmark_if_needed(
+            app_pg.raw, bookmark_runtime, target.conn_id, target.catalog_id, "mongodb", batch_id);
+    }
+
     mongoc_collection_t* coll = mongo.collection(target.source_database, target.source_table);
     const auto sample = sample_flattened_mongo_docs(coll, 1000);
     const auto pg_cols = infer_schema_from_flat_rows(sample);

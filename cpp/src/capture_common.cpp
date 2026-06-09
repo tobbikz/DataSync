@@ -9,6 +9,7 @@
 #include "mongo_kafka_capture.hpp"
 #endif
 #include "kafka_topics.hpp"
+#include "cdc_envelope.hpp"
 #include "mariadb_conn.hpp"
 #include "mariadb_schema.hpp"
 #include "mssql_lake.hpp"
@@ -263,7 +264,7 @@ std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
               AND conn_id = $1
               AND active = true
               AND cdc_enabled = true
-              AND needs_full_load = false
+              AND (NOT needs_full_load OR capture_during_full_load = true)
               AND has_pk = true
               AND status NOT IN ('skipped', 'disabled')
         )";
@@ -275,7 +276,7 @@ std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
               AND conn_id = $1
               AND active = true
               AND cdc_enabled = true
-              AND needs_full_load = false
+              AND (NOT needs_full_load OR capture_during_full_load = true)
               AND has_pk = true
               AND status NOT IN ('skipped', 'disabled')
         )";
@@ -287,7 +288,7 @@ std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
               AND conn_id = $1
               AND active = true
               AND cdc_enabled = true
-              AND needs_full_load = false
+              AND (NOT needs_full_load OR capture_during_full_load = true)
               AND has_pk = true
               AND status NOT IN ('skipped', 'disabled')
         )";
@@ -372,12 +373,210 @@ std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
     return out;
 }
 
+namespace {
+
+bool engine_meta_has_stream_bookmark(const std::string& engine_meta_text) {
+    if (engine_meta_text.empty()) {
+        return false;
+    }
+    try {
+        const auto meta = nlohmann::json::parse(engine_meta_text);
+        return meta.contains("stream_kafka_offsets") && meta["stream_kafka_offsets"].is_object() &&
+               !meta["stream_kafka_offsets"].empty();
+    } catch (...) {
+        return false;
+    }
+}
+
+}  // namespace
+
+void ensure_apply_positions_for_tier(
+    PGconn* pg,
+    RuntimeConfig& runtime,
+    const std::string& conn_id,
+    const std::string& tier,
+    const std::string& db_engine);
+
+bool seed_stream_capture_bookmark_if_needed(
+    PGconn* pg,
+    RuntimeConfig& runtime,
+    const std::string& conn_id,
+    long long catalog_id,
+    const std::string& db_engine,
+    const std::string& batch_id) {
+    const std::string cid = std::to_string(catalog_id);
+    const char* vals[] = {cid.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT service_tier::text, source_database, source_schema, source_table,
+               capture_during_full_load, engine_meta::text
+        FROM cdc_catalog.catalog
+        WHERE catalog_id = $1::bigint
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+        if (res) {
+            PQclear(res);
+        }
+        return false;
+    }
+    const std::string tier = PQgetvalue(res, 0, 0);
+    const std::string source_database = PQgetvalue(res, 0, 1);
+    const std::string source_schema = PQgetvalue(res, 0, 2);
+    const std::string source_table = PQgetvalue(res, 0, 3);
+    const bool streaming = std::string(PQgetvalue(res, 0, 4)) == "t";
+    const std::string engine_meta_text = PQgetvalue(res, 0, 5);
+    PQclear(res);
+    if (!streaming) {
+        return false;
+    }
+    if (engine_meta_has_stream_bookmark(engine_meta_text)) {
+        return true;
+    }
+
+    ensure_apply_positions_for_tier(pg, runtime, conn_id, tier, db_engine);
+
+    std::string lake_schema;
+    std::string lake_table;
+    if (db_engine == "mssql") {
+        lake_schema = mssql_pg_schema_name(source_database, source_schema);
+        lake_table = mssql_pg_table_name(source_table);
+    } else if (db_engine == "mongodb") {
+        lake_schema = mongo_pg_schema_name(source_database);
+        lake_table = mongo_pg_table_name(source_table);
+    } else {
+        lake_schema = source_schema;
+        lake_table = source_table;
+    }
+
+    const std::string topic_prefix = runtime_topic_prefix(runtime, pg, conn_id, db_engine);
+    const std::string topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
+    const int topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_capture", conn_id);
+    const std::string topic = topic_for_catalog(topic_prefix, lake_schema, lake_table, topic_mode, topic_buckets);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
+
+    nlohmann::json partition_offsets = nlohmann::json::object();
+#ifdef HAVE_RDKAFKA
+    const int topic_partitions = (db_engine == "mssql")
+        ? runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mssql_capture", conn_id)
+        : (db_engine == "mongodb")
+            ? runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mongo_capture", conn_id)
+            : runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_capture", conn_id);
+
+    char errstr[512];
+    rd_kafka_conf_t* conf = rd_kafka_conf_new();
+    rd_kafka_conf_set(conf, "bootstrap.servers", kafka.bootstrap.c_str(), errstr, sizeof(errstr));
+    rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
+    if (!rk) {
+        log_write(pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_catalog_onboard",
+            .message = "stream capture bookmark skipped: kafka client failed",
+            .batch_id = batch_id.empty() ? std::nullopt : std::make_optional(batch_id),
+            .conn_id = conn_id,
+            .source_schema = source_schema,
+            .source_table = source_table,
+            .context = {{"error", errstr}, {"topic", topic}},
+        });
+        return false;
+    }
+
+    nlohmann::json topic_offsets = nlohmann::json::object();
+    for (int partition = 0; partition < topic_partitions; ++partition) {
+        int64_t low = 0;
+        int64_t high = 0;
+        const rd_kafka_resp_err_t err =
+            rd_kafka_query_watermark_offsets(rk, topic.c_str(), partition, &low, &high, 15000);
+        if (err == RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION) {
+            continue;
+        }
+        if (err != RD_KAFKA_RESP_ERR_NO_ERROR) {
+            rd_kafka_destroy(rk);
+            throw std::runtime_error(std::string("stream bookmark watermark failed: ") + rd_kafka_err2str(err));
+        }
+        topic_offsets[std::to_string(partition)] = high;
+    }
+    rd_kafka_destroy(rk);
+    if (!topic_offsets.empty()) {
+        partition_offsets[topic] = std::move(topic_offsets);
+    }
+#else
+    (void)topic;
+    log_write(pg, {
+        .level = LogLevel::Warning,
+        .component = "cdc_catalog_onboard",
+        .message = "stream capture bookmark skipped: built without HAVE_RDKAFKA",
+        .batch_id = batch_id.empty() ? std::nullopt : std::make_optional(batch_id),
+        .conn_id = conn_id,
+        .source_schema = source_schema,
+        .source_table = source_table,
+    });
+    return false;
+#endif
+
+    if (partition_offsets.empty()) {
+        return false;
+    }
+
+    nlohmann::json patch = {
+        {"stream_kafka_offsets", partition_offsets},
+        {"stream_bookmarked_at", utc_iso_timestamp_now()},
+    };
+    const std::string patch_text = patch.dump();
+    const char* upd_vals[] = {patch_text.c_str(), cid.c_str()};
+    PGresult* upd = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET engine_meta = engine_meta || $1::jsonb,
+            updated_at = now()
+        WHERE catalog_id = $2::bigint
+        )",
+        2,
+        nullptr,
+        upd_vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!upd || PQresultStatus(upd) != PGRES_COMMAND_OK) {
+        if (upd) {
+            PQclear(upd);
+        }
+        return false;
+    }
+    PQclear(upd);
+
+    log_write(pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_catalog_onboard",
+        .message = "stream capture bookmark seeded before full load",
+        .batch_id = batch_id.empty() ? std::nullopt : std::make_optional(batch_id),
+        .conn_id = conn_id,
+        .source_schema = source_schema,
+        .source_table = source_table,
+        .context = {
+            {"catalog_id", catalog_id},
+            {"topic", topic},
+            {"kafka_bootstrap", kafka.bootstrap},
+            {"stream_kafka_offsets", partition_offsets},
+        },
+    });
+    return true;
+}
+
 void flag_table_for_full_load(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& schema,
     const std::string& table,
-    const std::string& db_engine) {
+    const std::string& db_engine,
+    const std::string& batch_id) {
     const char* vals1[] = {conn_id.c_str(), db_engine.c_str(), schema.c_str(), table.c_str()};
     PGresult* res = PQexecParams(
         pg,
@@ -405,7 +604,8 @@ void flag_table_for_full_load(
         UPDATE cdc_catalog.catalog
         SET active = true,
             needs_full_load = true,
-            cdc_enabled = false,
+            cdc_enabled = true,
+            capture_during_full_load = true,
             status = 'pending',
             updated_at = now()
         WHERE conn_id = $1
@@ -422,6 +622,41 @@ void flag_table_for_full_load(
     if (res) {
         PQclear(res);
     }
+
+    const char* lookup_vals[] = {conn_id.c_str(), db_engine.c_str(), schema.c_str(), table.c_str()};
+    res = PQexecParams(
+        pg,
+        R"(
+        SELECT catalog_id FROM cdc_catalog.catalog
+        WHERE conn_id = $1 AND db_engine = $2::cdc_catalog.db_engine
+          AND source_schema = $3 AND source_table = $4
+        )",
+        4,
+        nullptr,
+        lookup_vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        const long long catalog_id = std::atoll(PQgetvalue(res, 0, 0));
+        RuntimeConfig runtime;
+        runtime.reload(pg);
+        seed_stream_capture_bookmark_if_needed(pg, runtime, conn_id, catalog_id, db_engine, batch_id);
+    }
+    if (res) {
+        PQclear(res);
+    }
+
+    log_write(pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_catalog_onboard",
+        .message = "table flagged for full load with concurrent kafka stream capture",
+        .batch_id = batch_id.empty() ? std::nullopt : std::make_optional(batch_id),
+        .conn_id = conn_id,
+        .source_schema = schema,
+        .source_table = table,
+        .context = {{"db_engine", db_engine}},
+    });
 }
 
 void enable_cdc_after_full_load(
@@ -1018,17 +1253,75 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
         }
     }
 
+    std::map<std::pair<std::string, int>, long long> bookmark_targets;
+    std::vector<long long> stream_catalog_ids;
+    PGresult* stream_res = PQexecParams(
+        pg,
+        R"(
+        SELECT c.catalog_id, c.engine_meta::text, ap.kafka_topic
+        FROM cdc_catalog.catalog c
+        JOIN cdc_catalog.apply_position ap ON ap.catalog_id = c.catalog_id
+        WHERE c.conn_id = $1
+          AND c.service_tier::text = lower($2)
+          AND c.db_engine = $3::cdc_catalog.db_engine
+          AND c.capture_during_full_load = true
+          AND NOT c.needs_full_load
+          AND c.status = 'success'
+        )",
+        3,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (stream_res && PQresultStatus(stream_res) == PGRES_TUPLES_OK) {
+        for (int i = 0; i < PQntuples(stream_res); ++i) {
+            const long long catalog_id = std::atoll(PQgetvalue(stream_res, i, 0));
+            const std::string meta_text = PQgetvalue(stream_res, i, 1);
+            const std::string topic = PQgetvalue(stream_res, i, 2);
+            stream_catalog_ids.push_back(catalog_id);
+            try {
+                const auto meta = nlohmann::json::parse(meta_text);
+                if (!meta.contains("stream_kafka_offsets") || !meta["stream_kafka_offsets"].is_object()) {
+                    continue;
+                }
+                const auto& topics = meta["stream_kafka_offsets"];
+                if (topics.contains(topic) && topics[topic].is_object()) {
+                    for (auto it = topics[topic].begin(); it != topics[topic].end(); ++it) {
+                        const int partition = std::stoi(it.key());
+                        const long long offset = it.value().get<long long>();
+                        const auto key = std::make_pair(topic, partition);
+                        const auto existing = bookmark_targets.find(key);
+                        if (existing == bookmark_targets.end() || offset < existing->second) {
+                            bookmark_targets[key] = offset;
+                        }
+                    }
+                }
+            } catch (...) {
+                stats.errors += 1;
+            }
+        }
+    }
+    if (stream_res) {
+        PQclear(stream_res);
+    }
+
     std::map<std::pair<std::string, int>, long long> topic_offsets;
     for (const auto& topic_key : unique_topics) {
         const auto& topic = topic_key.first;
         const int partition = topic_key.second;
+        const auto bookmark_it = bookmark_targets.find(topic_key);
+        const bool use_bookmark = bookmark_it != bookmark_targets.end();
         bool reset_ok = false;
         for (int attempt = 0; attempt < 3; ++attempt) {
             try {
-                const long long end_offset =
-                    reset_apply_offset_to_end(bootstrap, consumer_group, topic, partition);
-                if (end_offset >= 0) {
-                    topic_offsets.emplace(topic_key, end_offset);
+                const long long stored_offset =
+                    use_bookmark
+                        ? reset_apply_consumer_offset(
+                              bootstrap, consumer_group, topic, partition, bookmark_it->second)
+                        : reset_apply_offset_to_end(bootstrap, consumer_group, topic, partition);
+                if (stored_offset >= 0) {
+                    topic_offsets.emplace(topic_key, stored_offset);
                     stats.topics_reset += 1;
                 }
                 reset_ok = true;
@@ -1039,12 +1332,19 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
                     log_write(pg, {
                         .level = LogLevel::Warning,
                         .component = "cdc_catalog_onboard",
-                        .message = "full-load kafka offset reset failed after retries",
+                        .message = use_bookmark
+                                       ? "stream replay kafka offset reset failed after retries"
+                                       : "full-load kafka offset reset failed after retries",
                         .batch_id = batch_id,
                         .conn_id = conn_id,
                         .source_schema = std::nullopt,
                         .source_table = std::nullopt,
-                        .context = {{"topic", topic}, {"partition", partition}, {"error", ex.what()}},
+                        .context = {
+                            {"topic", topic},
+                            {"partition", partition},
+                            {"use_stream_bookmark", use_bookmark},
+                            {"error", ex.what()},
+                        },
                     });
                 } else {
                     std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -1106,6 +1406,47 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
         if (upd) {
             PQclear(upd);
         }
+    }
+
+    if (!stream_catalog_ids.empty()) {
+        for (long long catalog_id : stream_catalog_ids) {
+            const std::string cid = std::to_string(catalog_id);
+            const char* clr_vals[] = {cid.c_str()};
+            PGresult* clr = PQexecParams(
+                pg,
+                R"(
+                UPDATE cdc_catalog.catalog
+                SET capture_during_full_load = false,
+                    engine_meta = engine_meta - 'stream_kafka_offsets' - 'stream_bookmarked_at',
+                    updated_at = now()
+                WHERE catalog_id = $1::bigint
+                )",
+                1,
+                nullptr,
+                clr_vals,
+                nullptr,
+                nullptr,
+                0);
+            if (!clr || PQresultStatus(clr) != PGRES_COMMAND_OK) {
+                stats.errors += 1;
+            }
+            if (clr) {
+                PQclear(clr);
+            }
+        }
+        log_write(pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_catalog_onboard",
+            .message = "stream capture replay offsets applied after full load",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"stream_tables", static_cast<int>(stream_catalog_ids.size())},
+                {"bookmark_partitions", static_cast<int>(bookmark_targets.size())},
+            },
+        });
     }
 #else
     (void)bootstrap;
@@ -1332,6 +1673,77 @@ long long reset_apply_offset_to_end(
     return new_offset;
 }
 
+long long reset_apply_consumer_offset(
+    const std::string& bootstrap,
+    const std::string& consumer_group,
+    const std::string& topic,
+    int partition,
+    long long offset) {
+    char errstr[512];
+    rd_kafka_conf_t* conf = rd_kafka_conf_new();
+    rd_kafka_conf_set(conf, "bootstrap.servers", bootstrap.c_str(), errstr, sizeof(errstr));
+
+    rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
+    if (!rk) {
+        throw std::runtime_error(std::string("kafka client create failed: ") + errstr);
+    }
+
+    const long long new_offset = std::max<int64_t>(0, offset - 1);
+    rd_kafka_topic_partition_list_t* parts = rd_kafka_topic_partition_list_new(1);
+    rd_kafka_topic_partition_list_add(parts, topic.c_str(), partition)->offset = offset;
+
+    rd_kafka_AlterConsumerGroupOffsets_t* alter =
+        rd_kafka_AlterConsumerGroupOffsets_new(consumer_group.c_str(), parts);
+    rd_kafka_AdminOptions_t* options =
+        rd_kafka_AdminOptions_new(rk, RD_KAFKA_ADMIN_OP_ALTERCONSUMERGROUPOFFSETS);
+    if (rd_kafka_AdminOptions_set_request_timeout(options, 30000, errstr, sizeof(errstr)) !=
+        RD_KAFKA_RESP_ERR_NO_ERROR) {
+        rd_kafka_AdminOptions_destroy(options);
+        rd_kafka_AlterConsumerGroupOffsets_destroy(alter);
+        rd_kafka_topic_partition_list_destroy(parts);
+        rd_kafka_destroy(rk);
+        throw std::runtime_error(std::string("admin options failed: ") + errstr);
+    }
+
+    rd_kafka_queue_t* queue = rd_kafka_queue_new(rk);
+    rd_kafka_AlterConsumerGroupOffsets(rk, &alter, 1, options, queue);
+    rd_kafka_AlterConsumerGroupOffsets_destroy(alter);
+    rd_kafka_AdminOptions_destroy(options);
+    rd_kafka_topic_partition_list_destroy(parts);
+
+    rd_kafka_event_t* event = rd_kafka_queue_poll(queue, 30000);
+    rd_kafka_queue_destroy(queue);
+    rd_kafka_destroy(rk);
+
+    if (!event) {
+        throw std::runtime_error("kafka alter consumer group offsets timed out");
+    }
+    if (rd_kafka_event_error(event)) {
+        const std::string msg = rd_kafka_event_error_string(event);
+        rd_kafka_event_destroy(event);
+        throw std::runtime_error(std::string("kafka alter offsets failed: ") + msg);
+    }
+
+    const rd_kafka_AlterConsumerGroupOffsets_result_t* result =
+        rd_kafka_event_AlterConsumerGroupOffsets_result(event);
+    if (result) {
+        size_t group_count = 0;
+        const rd_kafka_group_result_t* const* groups =
+            rd_kafka_AlterConsumerGroupOffsets_result_groups(result, &group_count);
+        for (size_t i = 0; i < group_count; ++i) {
+            const rd_kafka_error_t* group_err = rd_kafka_group_result_error(groups[i]);
+            if (group_err) {
+                const std::string msg = rd_kafka_error_string(group_err);
+                rd_kafka_event_destroy(event);
+                throw std::runtime_error(std::string("kafka alter offsets group failed: ") + msg);
+            }
+        }
+    }
+    rd_kafka_event_destroy(event);
+
+    return new_offset;
+}
+
 void ensure_capture_kafka_topics(
     PGconn* pg,
     const std::string& component,
@@ -1471,6 +1883,15 @@ long long reset_apply_offset_to_end(
     const std::string&,
     const std::string&,
     int) {
+    return 0;
+}
+
+long long reset_apply_consumer_offset(
+    const std::string&,
+    const std::string&,
+    const std::string&,
+    int,
+    long long) {
     return 0;
 }
 

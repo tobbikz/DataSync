@@ -467,6 +467,7 @@ CREATE TABLE cdc_catalog.catalog (
     active boolean DEFAULT false NOT NULL,
     cdc_enabled boolean DEFAULT false NOT NULL,
     needs_full_load boolean DEFAULT true NOT NULL,
+    capture_during_full_load boolean DEFAULT false NOT NULL,
     service_tier cdc_catalog.service_tier DEFAULT 'bronze'::cdc_catalog.service_tier NOT NULL,
     status cdc_catalog.replication_status DEFAULT 'pending'::cdc_catalog.replication_status NOT NULL,
     last_full_load_at timestamp with time zone,
