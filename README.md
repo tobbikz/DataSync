@@ -40,7 +40,7 @@ The DataSync container uses **`network_mode: host`** (Linux) so it reaches host 
 sudo ./deploy/systemd/install-systemd.sh
 ```
 
-That installs units for your Linux user (rootless podman), enables **DataSync** + **DataSync-reconcile.timer** (auto light/full every 4h), and starts both.
+That installs units for **`datalake`** user/group, enables **DataSync** + **DataSync-reconcile.timer** (auto light/full every 4h), and starts both. Requires system user `datalake` (see `install-systemd.sh` if missing).
 
 Every **`sudo systemctl restart DataSync`** runs **`ExecStartPre`** first → rebuild, then recreates the daemon container.
 

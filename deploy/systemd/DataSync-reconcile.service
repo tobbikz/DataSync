@@ -6,8 +6,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=@DATASYNC_USER@
-Group=@DATASYNC_GROUP@
+User=datalake
+Group=datalake
 WorkingDirectory=@DATASYNC_ROOT@
 Environment=XDG_RUNTIME_DIR=/run/user/@DATASYNC_UID@
 EnvironmentFile=-/etc/datasync/datasync.env

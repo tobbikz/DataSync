@@ -19,7 +19,7 @@ while [[ $# -gt 0 ]]; do
       cat <<EOF
 Usage: sudo $0 [--native] [--no-enable]
 
-Installs DataSync.service + DataSync-reconcile.timer for the repo owner
+Installs DataSync.service + DataSync-reconcile.timer for user datalake
 (rootless podman/docker). By default enables and starts both.
 
   --native     native binary instead of Docker/Podman compose
@@ -36,8 +36,14 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-DATASYNC_USER="${SUDO_USER:-$(stat -c '%U' "${ROOT}")}"
-DATASYNC_GROUP="$(id -gn "${DATASYNC_USER}")"
+DATASYNC_USER="datalake"
+DATASYNC_GROUP="datalake"
+if ! id "${DATASYNC_USER}" &>/dev/null; then
+  echo "System user ${DATASYNC_USER} not found. Create it first, e.g.:" >&2
+  echo "  sudo useradd -r -m -d /opt/datalake -s /bin/bash ${DATASYNC_USER}" >&2
+  echo "  sudo usermod -aG docker ${DATASYNC_USER}   # if using docker group" >&2
+  exit 1
+fi
 DATASYNC_UID="$(id -u "${DATASYNC_USER}")"
 RUNTIME_DIR="/run/user/${DATASYNC_UID}"
 
@@ -76,8 +82,6 @@ disable_legacy_units() {
 render_unit() {
   local src="$1" dst="$2"
   sed -e "s|@DATASYNC_ROOT@|${ROOT}|g" \
-      -e "s|@DATASYNC_USER@|${DATASYNC_USER}|g" \
-      -e "s|@DATASYNC_GROUP@|${DATASYNC_GROUP}|g" \
       -e "s|@DATASYNC_UID@|${DATASYNC_UID}|g" \
       "${src}" > "${dst}"
 }
@@ -156,7 +160,7 @@ fi
 
 cat <<EOF
 
-Installed (mode=${DEPLOY_MODE}, user=${DATASYNC_USER}):
+Installed (mode=${DEPLOY_MODE}, user=datalake):
   ${SYSTEMD_DIR}/DataSync.service
   ${SYSTEMD_DIR}/DataSync-reconcile.service
   ${SYSTEMD_DIR}/DataSync-reconcile.timer

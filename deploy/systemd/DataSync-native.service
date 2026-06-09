@@ -6,8 +6,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=@DATASYNC_USER@
-Group=@DATASYNC_GROUP@
+User=datalake
+Group=datalake
 WorkingDirectory=@DATASYNC_ROOT@
 EnvironmentFile=-/etc/datasync/datasync.env
 ExecStartPre=@DATASYNC_ROOT@/deploy/systemd/datasync-build.sh
