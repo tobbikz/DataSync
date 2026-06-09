@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install DataSync systemd: Podman Kafka + Podman DataSync daemon (User=datalake).
+# Install DataSync systemd: Podman Kafka + CDC daemon (single unit, User=datalake).
 # Usage: sudo deploy/systemd/install-systemd.sh [--no-enable]
 set -euo pipefail
 
@@ -17,7 +17,7 @@ while [[ $# -gt 0 ]]; do
       cat <<EOF
 Usage: sudo $0 [--no-enable]
 
-Podman Kafka (DataSync-kafka) + Podman CDC daemon (DataSync) as user datalake.
+Podman Kafka + CDC daemon as one stack (DataSync.service), user datalake.
 Run once on prod, then: git pull && ./install.sh
 
   --no-enable  install units only
@@ -44,7 +44,8 @@ RUNTIME_DIR="/run/user/${DATASYNC_UID}"
 
 disable_legacy_units() {
   local unit removed=0
-  for unit in datalake-cdc.service DataSync-reconcile.service DataSync-reconcile.timer datasync.service; do
+  for unit in datalake-cdc.service DataSync-reconcile.service DataSync-reconcile.timer \
+              datasync.service DataSync-kafka.service; do
     if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
       systemctl disable --now "${unit}" 2>/dev/null || true
       rm -f "${SYSTEMD_DIR}/${unit}"
@@ -66,10 +67,9 @@ prepare_datalake_host() {
   echo "Preparing host for User=${DATASYNC_USER}..." >&2
   loginctl enable-linger "${DATASYNC_USER}" 2>/dev/null || true
   chown -R "${DATASYNC_USER}:${DATASYNC_GROUP}" "${ROOT}"
-  chmod +x "${ROOT}/deploy/systemd/"*.sh "${ROOT}/deploy/systemd/kafka-force-clean.sh" 2>/dev/null || true
+  chmod +x "${ROOT}/deploy/container-compose.sh" "${ROOT}/deploy/validate-stack.sh" "${ROOT}/deploy/systemd/"*.sh "${ROOT}/deploy/systemd/kafka-force-clean.sh" 2>/dev/null || true
 
-  # Stop native Kafka if a previous install used /opt/kafka
-  systemctl stop DataSync-kafka.service 2>/dev/null || true
+  systemctl stop DataSync.service DataSync-kafka.service 2>/dev/null || true
 
   if command -v runuser >/dev/null 2>&1; then
     runuser -u "${DATASYNC_USER}" -- \
@@ -96,29 +96,28 @@ sync_env_file() {
   chmod 0644 "${ENV_FILE}"
 }
 
-chmod +x "${SCRIPT_DIR}"/datasync-*.sh "${SCRIPT_DIR}"/kafka-force-clean.sh 2>/dev/null || true
+chmod +x "${SCRIPT_DIR}"/datasync-*.sh "${SCRIPT_DIR}"/kafka-force-clean.sh "${ROOT}/deploy/container-compose.sh" 2>/dev/null || true
 
 mkdir -p "${ENV_DIR}"
 sync_env_file
 prepare_datalake_host
 
-render_unit "${SCRIPT_DIR}/DataSync-kafka.service" "${SYSTEMD_DIR}/DataSync-kafka.service"
 render_unit "${SCRIPT_DIR}/DataSync.service" "${SYSTEMD_DIR}/DataSync.service"
 
 disable_legacy_units
 systemctl daemon-reload
-systemctl reset-failed DataSync-kafka.service DataSync.service 2>/dev/null || true
+systemctl reset-failed DataSync.service 2>/dev/null || true
 
 if [[ ! -r "${ROOT}/config.json" ]]; then
   echo "WARN: ${DATASYNC_USER} cannot read ${ROOT}/config.json" >&2
 fi
 
 if [[ "${DO_ENABLE}" -eq 1 ]]; then
-  systemctl enable DataSync-kafka.service DataSync.service
-  systemctl restart DataSync-kafka.service
-  sleep 5
-  if ! systemctl is-active --quiet DataSync-kafka.service; then
-    echo "ERROR: DataSync-kafka failed — journalctl -u DataSync-kafka -n 40 --no-pager" >&2
+  systemctl enable DataSync.service
+  systemctl restart DataSync.service
+  sleep 3
+  if ! systemctl is-active --quiet DataSync.service; then
+    echo "ERROR: DataSync failed — journalctl -u DataSync -n 40 --no-pager" >&2
     exit 1
   fi
   # shellcheck source=deploy/systemd/datasync-lib.sh
@@ -127,33 +126,27 @@ if [[ "${DO_ENABLE}" -eq 1 ]]; then
     echo "ERROR: Kafka not on localhost:9092" >&2
     exit 1
   fi
-  systemctl restart DataSync.service
-  if ! systemctl is-active --quiet DataSync.service; then
-    echo "ERROR: DataSync failed — journalctl -u DataSync -n 40 --no-pager" >&2
-    exit 1
-  fi
   echo ""
-  echo "OK: DataSync-kafka + DataSync (user=${DATASYNC_USER}, uid=${DATASYNC_UID})"
+  echo "OK: DataSync stack (Kafka + daemon, user=${DATASYNC_USER}, uid=${DATASYNC_UID})"
 fi
 
 cat <<EOF
 
 Installed (Podman, user=datalake):
-  ${SYSTEMD_DIR}/DataSync-kafka.service
   ${SYSTEMD_DIR}/DataSync.service
   ${ENV_FILE}
 
 Prod updates:  cd ${ROOT} && git pull && ./install.sh
 
 Restart:
-  sudo systemctl restart DataSync-kafka
   sudo systemctl restart DataSync
 
 Status:
-  systemctl status DataSync-kafka DataSync
+  systemctl status DataSync
   sudo -u datalake env XDG_RUNTIME_DIR=${RUNTIME_DIR} DOCKER_HOST=unix://${RUNTIME_DIR}/podman/podman.sock podman compose -f ${ROOT}/docker-compose.yml ps
 
 Logs:
+  journalctl -u DataSync -n 50 --no-pager
   sudo -u datalake ... podman compose logs -f kafka
   sudo -u datalake ... podman compose logs -f datasync
 

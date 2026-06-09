@@ -1268,6 +1268,53 @@ long long reset_apply_offset_to_end(
     return new_offset;
 }
 
+void ensure_capture_kafka_topics(
+    PGconn* pg,
+    const std::string& component,
+    const std::string& batch_id,
+    const std::string& conn_id,
+    const CaptureRuntimeConfig& rcfg,
+    const std::vector<std::pair<std::string, std::string>>& tables) {
+    if (tables.empty()) {
+        return;
+    }
+    const auto topics =
+        topics_for_tables(rcfg.topic_prefix, tables, rcfg.topic_mode, rcfg.topic_buckets);
+    try {
+        ensure_kafka_topics_exist(rcfg.bootstrap, topics, rcfg.topic_partitions, 1);
+    } catch (const std::exception& ex) {
+        log_write(pg, {
+            .level = LogLevel::Error,
+            .component = component,
+            .message = "capture kafka ensure topics failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"error", ex.what()},
+                {"topic_count", static_cast<int>(topics.size())},
+                {"kafka_bootstrap", rcfg.bootstrap},
+            },
+        });
+        throw;
+    }
+    log_write(pg, {
+        .level = LogLevel::Info,
+        .component = component,
+        .message = "capture kafka topics ready",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"topic_count", static_cast<int>(topics.size())},
+            {"kafka_bootstrap", rcfg.bootstrap},
+            {"topic_mode", rcfg.topic_mode},
+        },
+    });
+}
+
 void ensure_kafka_topics_exist(
     const std::string& bootstrap,
     const std::vector<std::string>& topics,
@@ -1368,5 +1415,14 @@ void ensure_kafka_topics_exist(
     const std::vector<std::string>&,
     int,
     int) {}
+
+void ensure_capture_kafka_topics(
+    PGconn*,
+    const std::string&,
+    const std::string&,
+    const std::string&,
+    const std::string&,
+    const CaptureRuntimeConfig&,
+    const std::vector<std::pair<std::string, std::string>>&) {}
 
 #endif

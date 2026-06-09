@@ -62,7 +62,7 @@ def check_mariadb(src: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
         "-N",
         "-B",
         "-e",
-        "SELECT @@log_bin, @@binlog_format, @@gtid_mode;",
+        "SELECT @@log_bin, @@binlog_format;",
         database,
     ]
     env = os.environ.copy()
@@ -83,14 +83,11 @@ def check_mariadb(src: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
         return False, errors, warnings
 
     log_bin, binlog_format = parts[0].upper(), parts[1].upper()
-    gtid_mode = parts[2].upper() if len(parts) > 2 else ""
 
     if log_bin not in ("ON", "1"):
         errors.append(f"log_bin={log_bin} (required ON)")
     if binlog_format != "ROW":
         errors.append(f"binlog_format={binlog_format} (required ROW)")
-    if gtid_mode and gtid_mode not in ("ON", "1"):
-        warnings.append(f"gtid_mode={gtid_mode} (recommended ON for prod failover)")
 
     binlog_bin = shutil.which("mariadb-binlog") or shutil.which("mysqlbinlog")
     if not binlog_bin:

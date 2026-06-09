@@ -68,6 +68,20 @@ KafkaProducer::KafkaProducer(const std::string& bootstrap, int linger_ms, int ba
         impl_->body.available = false;
         return;
     }
+
+    const struct rd_kafka_metadata* metadata = nullptr;
+    const rd_kafka_resp_err_t md_err =
+        rd_kafka_metadata(impl_->body.producer, 0, nullptr, &metadata, 10000);
+    if (md_err != RD_KAFKA_RESP_ERR_NO_ERROR) {
+        impl_->body.first_error = std::string("broker metadata: ") + rd_kafka_err2str(md_err);
+        rd_kafka_destroy(impl_->body.producer);
+        impl_->body.producer = nullptr;
+        impl_->body.available = false;
+        return;
+    }
+    if (metadata) {
+        rd_kafka_metadata_destroy(metadata);
+    }
     impl_->body.available = true;
 #else
     (void)bootstrap;

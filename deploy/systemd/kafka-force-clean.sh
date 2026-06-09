@@ -16,8 +16,8 @@ if [[ -f "${ENV_FILE}" ]]; then
   set +a
 fi
 
-# shellcheck source=scripts/container-compose.sh
-source "${DATASYNC_ROOT}/scripts/container-compose.sh"
+# shellcheck source=deploy/container-compose.sh
+source "${DATASYNC_ROOT}/deploy/container-compose.sh"
 
 kafka_port_busy() {
   (echo >/dev/tcp/127.0.0.1/"${KAFKA_PORT}") 2>/dev/null
@@ -67,7 +67,7 @@ wait_port_free() {
 }
 
 stop_native_kafka() {
-  systemctl stop DataSync-kafka.service 2>/dev/null || true
+  systemctl stop DataSync.service DataSync-kafka.service 2>/dev/null || true
   if kafka_port_busy && command -v fuser >/dev/null 2>&1; then
     echo "Stopping processes on TCP ${KAFKA_PORT}..." >&2
     fuser -k "${KAFKA_PORT}/tcp" 2>/dev/null || true

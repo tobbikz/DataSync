@@ -295,6 +295,14 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         col_cache[key] = fetch_table_columns(mariadb.handle, key.first, key.second);
     }
 
+    std::vector<std::pair<std::string, std::string>> table_pairs;
+    table_pairs.reserve(wanted.size());
+    for (const auto& key : wanted) {
+        table_pairs.emplace_back(key.first, key.second);
+    }
+    ensure_capture_kafka_topics(
+        log_pg, "cdc_kafka_capture", batch_id, conn_id, rcfg, table_pairs);
+
     CapturePosition start_pos = read_capture_position(log_pg, conn_id);
     log_write(log_pg, {
         .level = LogLevel::Info,
@@ -604,6 +612,23 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                             std::chrono::steady_clock::now() - start)
                             .count();
 
+    if (read_stats.events > 0 && pstats.events_published == 0) {
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_kafka_capture",
+            .message = "capture binlog events read but none published to kafka",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"binlog_events_read", read_stats.events},
+                {"events_published", pstats.events_published},
+                {"kafka_bootstrap", rcfg.bootstrap},
+            },
+        });
+    }
+
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_kafka_capture",
@@ -614,6 +639,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         .source_table = std::nullopt,
         .context = {
             {"events_published", stats.events_published},
+            {"binlog_events_read", read_stats.events},
             {"ddl_recorded", stats.ddl_recorded},
             {"binlog_file", stats.binlog_file},
             {"binlog_position", stats.binlog_position},

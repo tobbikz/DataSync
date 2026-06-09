@@ -17,8 +17,8 @@ done
 
 warn() { printf '✖ %s\n' "$*" >&2; }
 
-# shellcheck source=scripts/container-compose.sh
-source "$ROOT/scripts/container-compose.sh"
+# shellcheck source=deploy/container-compose.sh
+source "$ROOT/deploy/container-compose.sh"
 
 run_quiet() {
   local label="$1"; shift
@@ -83,7 +83,7 @@ apply_catalog_schema() {
     -e DATASYNC_RUN_MIGRATIONS=1 \
     -e DATASYNC_INSTALL_QUIET=1 \
     -e DATASYNC_HOST_NETWORK=1 \
-    -e KAFKA_BOOTSTRAP=localhost:9092 \
+    -e KAFKA_BOOTSTRAP=127.0.0.1:9092 \
     datasync schema-only >"$err" 2>&1
   rc=$?
   grep -vE 'Container datasync-datasync-run|^$' "$err" || true
@@ -94,7 +94,7 @@ apply_catalog_schema() {
 }
 
 kafka_tcp_ok() {
-  (echo >/dev/tcp/localhost/9092) 2>/dev/null
+  (echo >/dev/tcp/127.0.0.1/9092) 2>/dev/null
 }
 
 wait_kafka_tcp() {
@@ -107,7 +107,7 @@ wait_kafka_tcp() {
 }
 
 start_kafka_dev() {
-  if systemctl is-enabled --quiet DataSync-kafka.service 2>/dev/null; then
+  if systemctl is-enabled --quiet DataSync.service 2>/dev/null; then
     return 0
   fi
   docker_compose stop zookeeper 2>/dev/null || true
@@ -129,7 +129,7 @@ post_install_health() {
   docker_compose run --rm --no-deps --remove-orphans \
     -e DATASYNC_INSTALL_QUIET=1 \
     -e DATASYNC_HOST_NETWORK=1 \
-    -e KAFKA_BOOTSTRAP=localhost:9092 \
+    -e KAFKA_BOOTSTRAP=127.0.0.1:9092 \
     datasync health-only >"$err" 2>&1
   rc=$?
   grep -vE 'Container datasync-datasync-run|^$' "$err" || true
@@ -146,7 +146,7 @@ sync_systemd_prod() {
   [[ "${SKIP_SYSTEMD:-0}" == "1" ]] && return 1
   [[ -x "$ROOT/deploy/systemd/install-systemd.sh" ]] || return 1
 
-  printf '→ Syncing prod systemd (Podman Kafka + DataSync)...\n'
+  printf '→ Syncing prod systemd (DataSync stack: Kafka + daemon)...\n'
   if [[ "${EUID}" -eq 0 ]]; then
     "$ROOT/deploy/systemd/install-systemd.sh"
     return 0

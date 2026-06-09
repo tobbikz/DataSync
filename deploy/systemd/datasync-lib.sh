@@ -15,8 +15,8 @@ fi
 
 DATASYNC_ROOT="${DATASYNC_ROOT:-$(cd "${DATASYNC_LIB_DIR}/../.." && pwd)}"
 
-# shellcheck source=scripts/container-compose.sh
-source "${DATASYNC_ROOT}/scripts/container-compose.sh"
+# shellcheck source=deploy/container-compose.sh
+source "${DATASYNC_ROOT}/deploy/container-compose.sh"
 
 ensure_podman_ready() {
   local uid="${DATASYNC_UID:-$(id -u)}"

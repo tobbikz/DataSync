@@ -1,6 +1,8 @@
-# DataSync — Kafka (KRaft) + DataSync daemon in Podman/Docker.
-# Prod: systemd User=datalake + install-systemd.sh (rootless podman).
+# DataSync — Kafka (KRaft) + CDC daemon in one compose stack.
+# Prod: single systemd DataSync.service (User=datalake, rootless podman).
 # Dev: ./install.sh without sudo (compose only, current user).
+# Both services use host network so localhost:9092 / PG / MariaDB work the same
+# on rootful Docker and rootless Podman (no rootlessport bridge gap).
 
 name: datasync
 
@@ -8,15 +10,14 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.6.1
     restart: unless-stopped
-    ports:
-      - "9092:9092"
+    network_mode: host
     environment:
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@127.0.0.1:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://127.0.0.1:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
@@ -43,9 +44,12 @@ services:
       DATASYNC_CONFIG: /app/config.json
       DATASYNC_RUN_MIGRATIONS: "0"
       DATASYNC_HOST_NETWORK: "1"
-      KAFKA_BOOTSTRAP: localhost:9092
+      KAFKA_BOOTSTRAP: 127.0.0.1:9092
     volumes:
-      - ./config.json:/app/config.json:ro
-      - ./sql:/app/sql:ro
+      - ./config.json:/app/config.json:ro,z
+      - ./sql:/app/sql:ro,z
     restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
     command: ["daemon"]

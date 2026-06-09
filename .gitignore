@@ -6,6 +6,7 @@ cpp/config.json
 # C++ build artifacts
 cpp/build/
 cpp/build-rdkafka/
+cpp/deps/
 
 # Python
 __pycache__/

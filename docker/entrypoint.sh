@@ -544,6 +544,9 @@ if [[ -n "${KAFKA_BOOTSTRAP:-}" ]]; then
     fi
     sleep 2
   done
+  if ! kafka_tcp_ok; then
+    fail "Kafka unreachable at ${KAFKA_BOOTSTRAP} — start kafka first (systemctl restart DataSync)"
+  fi
 fi
 
 apply_catalog_schema

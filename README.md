@@ -35,15 +35,11 @@ Do **not** run `podman compose up` as your personal user on prod after systemd i
 
 ## systemd
 
-| Unit | Role |
-|------|------|
-| `DataSync-kafka.service` | `podman compose up kafka` |
-| `DataSync.service` | rebuild image + `podman compose up datasync` (reconcile embedded) |
+Un solo unit **`DataSync.service`**: levanta Kafka + daemon (`podman compose up kafka datasync`).
 
 ```bash
-sudo systemctl restart DataSync-kafka
 sudo systemctl restart DataSync
-systemctl status DataSync-kafka DataSync
+systemctl status DataSync
 ```
 
 ## SQL

@@ -221,6 +221,14 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
         return stats;
     }
 
+    std::vector<std::pair<std::string, std::string>> table_pairs;
+    table_pairs.reserve(collections.size());
+    for (const auto& tbl : collections) {
+        table_pairs.emplace_back(tbl.source_schema, tbl.source_table);
+    }
+    ensure_capture_kafka_topics(
+        log_pg, "cdc_kafka_mongo_capture", batch_id, conn_id, rcfg, table_pairs);
+
     KafkaProducer producer(rcfg.bootstrap, rcfg.linger_ms, rcfg.producer_batch);
     if (!producer.available()) {
         log_write(log_pg, {

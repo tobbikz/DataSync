@@ -33,7 +33,7 @@ RUN git clone --depth 1 --branch "${RDKAFKA_VERSION}" \
 WORKDIR /src
 COPY cpp/ cpp/
 
-# CMakeLists expects vendored rdkafka under cpp/deps/rdkafka
+# CMakeLists expects librdkafka under cpp/deps/rdkafka (built in this stage, not from host)
 RUN mkdir -p cpp/deps && cp -a /opt/rdkafka cpp/deps/rdkafka
 
 RUN cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release \

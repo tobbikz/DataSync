@@ -362,6 +362,14 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         return stats;
     }
 
+    std::vector<std::pair<std::string, std::string>> table_pairs;
+    table_pairs.reserve(tables.size());
+    for (const auto& tbl : tables) {
+        table_pairs.emplace_back(tbl.source_schema, tbl.source_table);
+    }
+    ensure_capture_kafka_topics(
+        log_pg, "cdc_kafka_mssql_capture", batch_id, conn_id, rcfg, table_pairs);
+
     KafkaProducer producer(rcfg.bootstrap, rcfg.linger_ms, rcfg.producer_batch);
     if (!producer.available()) {
         log_write(log_pg, {

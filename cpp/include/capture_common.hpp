@@ -106,6 +106,14 @@ std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
 
 std::vector<std::string> split_pk_columns(const std::string& pk_columns);
 
+void ensure_capture_kafka_topics(
+    PGconn* pg,
+    const std::string& component,
+    const std::string& batch_id,
+    const std::string& conn_id,
+    const CaptureRuntimeConfig& rcfg,
+    const std::vector<std::pair<std::string, std::string>>& tables);
+
 #ifdef HAVE_RDKAFKA
 long long kafka_backlog_messages(
     const std::string& bootstrap,
