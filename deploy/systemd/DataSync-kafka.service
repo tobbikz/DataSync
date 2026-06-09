@@ -13,8 +13,8 @@ WorkingDirectory=@DATASYNC_ROOT@
 Environment=XDG_RUNTIME_DIR=/run/user/@DATASYNC_UID@
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@DATASYNC_UID@/bus
 EnvironmentFile=-/etc/datasync/datasync.env
-ExecStart=@DATASYNC_ROOT@/deploy/systemd/datasync-kafka-start.sh
-ExecStop=@DATASYNC_ROOT@/deploy/systemd/datasync-kafka-stop.sh
+ExecStart=/bin/bash @DATASYNC_ROOT@/deploy/systemd/datasync-kafka-start.sh
+ExecStop=/bin/bash @DATASYNC_ROOT@/deploy/systemd/datasync-kafka-stop.sh
 TimeoutStartSec=300
 
 [Install]

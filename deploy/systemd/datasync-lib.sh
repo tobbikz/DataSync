@@ -52,20 +52,16 @@ kafka_compose_health() {
 }
 
 kafka_is_ready() {
-  local state health
-  state="$(kafka_compose_state)"
-  health="$(kafka_compose_health | tr '()' ' ')"
-
-  if [[ "$state" != "running" ]]; then
-    return 1
-  fi
-
-  # Podman compose often omits Health — TCP to published 9092 is authoritative.
+  # TCP wins — Kafka may run in another user's rootless podman on the same host.
   if kafka_tcp_ok; then
     return 0
   fi
 
-  [[ "$health" == *healthy* ]]
+  local state health
+  state="$(kafka_compose_state)"
+  health="$(kafka_compose_health | tr '()' ' ')"
+
+  [[ "$state" == "running" ]] && [[ "$health" == *healthy* ]]
 }
 
 wait_kafka() {
@@ -80,29 +76,54 @@ wait_kafka() {
     fi
     sleep 2
   done
-  return 1
+  kafka_tcp_ok
 }
 
 start_kafka_compose() {
   ensure_podman_ready
   cd "${DATASYNC_ROOT}"
+
+  if kafka_tcp_ok; then
+    echo "Kafka already listening on ${KAFKA_BOOTSTRAP:-localhost:9092} — skip compose up" >&2
+    return 0
+  fi
+
   docker_compose stop zookeeper 2>/dev/null || true
   docker_compose rm -f zookeeper 2>/dev/null || true
-  docker_compose up -d --remove-orphans kafka
+  if docker_compose up -d --remove-orphans kafka; then
+    return 0
+  fi
+
+  if kafka_tcp_ok; then
+    echo "Port 9092 in use by existing Kafka — continuing (shared host broker)" >&2
+    return 0
+  fi
+
+  echo "Kafka compose up failed and :9092 is not reachable" >&2
+  return 1
 }
 
 ensure_kafka_ready() {
   ensure_podman_ready
   cd "${DATASYNC_ROOT}"
 
+  if kafka_tcp_ok; then
+    echo "Kafka reachable at ${KAFKA_BOOTSTRAP:-localhost:9092}" >&2
+    return 0
+  fi
+
   if wait_kafka; then
     return 0
   fi
 
   echo "Kafka not ready — starting compose kafka service..." >&2
-  start_kafka_compose
+  start_kafka_compose || return 1
 
   if wait_kafka; then
+    return 0
+  fi
+
+  if kafka_tcp_ok; then
     return 0
   fi
 

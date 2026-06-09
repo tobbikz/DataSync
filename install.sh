@@ -120,6 +120,11 @@ start_kafka() {
     return 0
   fi
 
+  if (echo >/dev/tcp/localhost/9092) 2>/dev/null; then
+    printf '✔ Kafka already listening on localhost:9092\n'
+    return 0
+  fi
+
   docker_compose stop zookeeper 2>/dev/null || true
   docker_compose rm -f zookeeper 2>/dev/null || true
 
