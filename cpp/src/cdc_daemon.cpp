@@ -108,12 +108,16 @@ int run_one_cycle(
     });
 
     const DaemonFullLoadOutcome full_load = run_daemon_full_load_isolated(cfg, log_pg, conn_id, tier.tier_code, batch_id);
+    int cycle_errors = 0;
     if (full_load.ran) {
+        const bool partial_ok = full_load.tables_loaded > 0 && full_load.exit_code != 0;
         log_write(log_pg, {
             .level = full_load.exit_code == 0 ? LogLevel::Info : LogLevel::Warning,
             .component = "cdc_daemon",
-            .message = full_load.exit_code == 0 ? "daemon cycle skipped capture/apply after full-load"
-                                               : "daemon cycle skipped capture/apply after full-load errors",
+            .message = full_load.exit_code == 0
+                           ? "daemon full-load finished; continuing apply for cdc-ready tables"
+                           : (partial_ok ? "daemon full-load partial; continuing apply for cdc-ready tables"
+                                         : "daemon full-load failed; continuing apply for cdc-ready tables"),
             .batch_id = batch_id,
             .conn_id = conn_id,
             .source_schema = std::nullopt,
@@ -123,20 +127,24 @@ int run_one_cycle(
                 {"db_engine", db_engine},
                 {"full_load_exit", full_load.exit_code},
                 {"pending_tables", full_load.pending_tables},
+                {"pending_after", full_load.pending_after},
+                {"tables_loaded", full_load.tables_loaded},
             },
         });
-        return full_load.exit_code == 0 ? 0 : 1;
+        if (full_load.exit_code != 0) {
+            cycle_errors += 1;
+        }
     }
 
     const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, tier.tier_code, batch_id);
     const int pre_rc = pre.errors > 0 ? 1 : 0;
     const int apply_rc = run_apply_workers(cfg, conn_id, tier.tier_code, tier.apply_worker_count);
-    const int errors = (pre_rc != 0 ? 1 : 0) + (apply_rc != 0 ? 1 : 0);
+    cycle_errors += (pre_rc != 0 ? 1 : 0) + (apply_rc != 0 ? 1 : 0);
 
     log_write(log_pg, {
-        .level = errors ? LogLevel::Warning : LogLevel::Info,
+        .level = cycle_errors ? LogLevel::Warning : LogLevel::Info,
         .component = "cdc_daemon",
-        .message = errors ? "daemon cycle completed with errors" : "daemon cycle completed",
+        .message = cycle_errors ? "daemon cycle completed with errors" : "daemon cycle completed",
         .batch_id = batch_id,
         .conn_id = conn_id,
         .source_schema = std::nullopt,
@@ -146,11 +154,11 @@ int run_one_cycle(
             {"db_engine", db_engine},
             {"pre_apply_exit", pre_rc},
             {"apply_exit", apply_rc},
-            {"errors", errors},
+            {"errors", cycle_errors},
         },
     });
 
-    return errors == 0 ? 0 : 1;
+    return cycle_errors == 0 ? 0 : 1;
 }
 
 int run_parallel_daemon_round(

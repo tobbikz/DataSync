@@ -1,5 +1,7 @@
 #include "mariadb_datetime.hpp"
 
+#include "mariadb_schema.hpp"
+
 #include <cctype>
 #include <ctime>
 #include <iomanip>
@@ -179,7 +181,10 @@ std::string normalize_text_for_pg(const std::string& s, const std::string& pg_ty
         }
         return t;
     }
-    return s;
+    if (pg_type == "BYTEA") {
+        return s;
+    }
+    return sanitize_mariadb_text_for_pg(s);
 }
 
 std::string pg_escape_literal(const std::string& value) {

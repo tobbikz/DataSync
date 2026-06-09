@@ -9,6 +9,7 @@
 
 #include <sys/wait.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cstdlib>
 #include <vector>
 
@@ -67,14 +68,14 @@ int run_conn_full_load(
 
     if (engine == "mssql") {
         const auto stats = run_mssql_full_load(cfg, log_pg, batch_id, service_tier, conn_filter);
-        return stats.tables_failed == 0 ? 0 : 1;
+        return full_load_process_exit_code(stats);
     }
     if (engine == "mongodb") {
         const auto stats = run_mongo_full_load(cfg, log_pg, batch_id, service_tier, conn_filter);
-        return stats.tables_failed == 0 ? 0 : 1;
+        return full_load_process_exit_code(stats);
     }
     const auto stats = run_mariadb_full_load(cfg, log_pg, batch_id, service_tier, conn_filter);
-    return stats.tables_failed == 0 ? 0 : 1;
+    return full_load_process_exit_code(stats);
 }
 
 DaemonFullLoadOutcome run_daemon_full_load_isolated(
@@ -147,10 +148,17 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
     }
     outcome.exit_code = spawn_wait(args);
 
-    if (outcome.exit_code == 0) {
+    outcome.pending_after = count_full_load_pending(log_pg, conn_id, tier, db_engine);
+    outcome.tables_loaded = std::max(0, outcome.pending_tables - outcome.pending_after);
+
+    if (outcome.tables_loaded > 0) {
         if (!onboard_conn_after_full_load(cfg, log_pg, conn_id, tier, db_engine, batch_id)) {
-            outcome.exit_code = 1;
+            if (outcome.exit_code == 0) {
+                outcome.exit_code = 1;
+            }
         }
+    } else if (outcome.exit_code == 0 && outcome.pending_tables > 0) {
+        outcome.exit_code = 1;
     }
 
     log_write(log_pg, {
@@ -166,6 +174,8 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
             {"tier", tier},
             {"db_engine", db_engine},
             {"pending_tables", outcome.pending_tables},
+            {"pending_after", outcome.pending_after},
+            {"tables_loaded", outcome.tables_loaded},
             {"exit_code", outcome.exit_code},
             {"phase", "full_load"},
         },

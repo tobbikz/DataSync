@@ -13,6 +13,14 @@ struct FullLoadRunStats {
     long long total_rows{0};
 };
 
+/** Exit 0 when at least one table loaded or nothing to do; 1 only when every table failed. */
+inline int full_load_process_exit_code(const FullLoadRunStats& stats) {
+    if (stats.tables_processed == 0) {
+        return 0;
+    }
+    return stats.tables_success > 0 ? 0 : 1;
+}
+
 FullLoadRunStats run_mariadb_full_load(
     const AppConfig& cfg,
     PGconn* log_pg,

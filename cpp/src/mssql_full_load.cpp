@@ -552,6 +552,7 @@ void mark_catalog_failed(PGconn* pg, long long catalog_id, const std::string& er
         R"(
         UPDATE cdc_catalog.catalog
         SET status = 'failed',
+            needs_full_load = true,
             last_error_at = now(),
             last_error = $2,
             updated_at = now()

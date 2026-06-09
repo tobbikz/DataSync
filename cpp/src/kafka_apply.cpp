@@ -309,6 +309,12 @@ std::string json_cell_csv(const json& val_in, const std::string& pg_type = "", b
     if (val.is_number_float()) {
         return std::to_string(val.get<double>());
     }
+    if (pg_type == "BYTEA") {
+        if (val.is_string()) {
+            return mariadb_bytea_to_copy_csv(val.get<std::string>());
+        }
+        return "";
+    }
     std::string s = val.is_string() ? val.get<std::string>() : val.dump();
     if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || pg_type == "DATE") {
         const std::string norm = normalize_text_for_pg(s, pg_type);
@@ -316,9 +322,10 @@ std::string json_cell_csv(const json& val_in, const std::string& pg_type = "", b
             return "";
         }
         s = norm;
-    }
-    if (mssql_text) {
+    } else if (mssql_text) {
         s = sanitize_mssql_text_for_pg(s);
+    } else {
+        s = sanitize_mariadb_text_for_pg(s);
     }
     return csv_escape_local(s);
 }
@@ -353,11 +360,17 @@ std::string json_cell_sql(const json& val_in, const std::string& pg_type = "") {
     if (val.is_number_float()) {
         return std::to_string(val.get<double>());
     }
+    if (pg_type == "BYTEA") {
+        if (val.is_string()) {
+            return mariadb_bytea_to_sql_literal(val.get<std::string>());
+        }
+        return "NULL";
+    }
     std::string s = val.is_string() ? val.get<std::string>() : val.dump();
     if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || pg_type == "DATE") {
         return normalize_pg_sql_literal(pg_escape_literal(s), pg_type);
     }
-    return pg_escape_literal(s);
+    return pg_escape_literal(sanitize_mariadb_text_for_pg(s));
 }
 
 std::vector<std::string> split_pk(const std::string& pk_columns) {

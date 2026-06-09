@@ -10,10 +10,12 @@ struct DaemonFullLoadOutcome {
     bool ran{false};
     int exit_code{0};
     int pending_tables{0};
+    int pending_after{0};
+    int tables_loaded{0};
 };
 
 // Isolated full-load phase for daemon: fork+exec `DataSync full-load --tier --conn-id`.
-// When ran=true the caller should skip capture/apply for the same cycle.
+// Caller should continue capture/apply in the same cycle (apply skips needs_full_load tables).
 DaemonFullLoadOutcome run_daemon_full_load_isolated(
     const AppConfig& cfg,
     PGconn* log_pg,

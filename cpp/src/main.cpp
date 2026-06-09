@@ -155,8 +155,11 @@ int run_full_load(
     const auto mssql_stats = run_mssql_full_load(cfg, log_pg, batch_id, tier);
     run_log_retention(log_pg, runtime, batch_id, "mongo_load");
     const auto mongo_stats = run_mongo_full_load(cfg, log_pg, batch_id, tier);
-    const int failures = mariadb_stats.tables_failed + mssql_stats.tables_failed + mongo_stats.tables_failed;
-    return failures == 0 ? 0 : 1;
+    if (full_load_process_exit_code(mariadb_stats) != 0 || full_load_process_exit_code(mssql_stats) != 0 ||
+        full_load_process_exit_code(mongo_stats) != 0) {
+        return 1;
+    }
+    return 0;
 }
 
 int run_cdc(const AppConfig& cfg, PGconn* log_pg, const std::string& batch_id, const std::optional<std::string>& tier) {

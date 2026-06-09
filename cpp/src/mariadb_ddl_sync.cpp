@@ -104,6 +104,64 @@ int sync_missing_columns(
     return added;
 }
 
+std::string pg_column_data_type(PGconn* pg, const std::string& schema, const std::string& table, const std::string& column) {
+    const char* vals[] = {schema.c_str(), table.c_str(), column.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_schema = $1 AND table_name = $2 AND column_name = $3 LIMIT 1",
+        3,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    std::string out;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        out = PQgetvalue(res, 0, 0);
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return out;
+}
+
+bool pg_type_is_text_like(const std::string& data_type) {
+    return data_type == "text" || data_type == "character varying" || data_type == "character";
+}
+
+int sync_binary_column_types(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    const std::vector<MariaDbColumn>& cols) {
+    int changed = 0;
+    for (const auto& col : cols) {
+        if (col.pg_type != "BYTEA") {
+            continue;
+        }
+        if (!pg_column_exists(pg, schema, table, col.name)) {
+            continue;
+        }
+        const std::string current = pg_column_data_type(pg, schema, table, col.name);
+        if (current == "bytea") {
+            continue;
+        }
+        if (!pg_type_is_text_like(current)) {
+            continue;
+        }
+        const std::string fq = pg_ident(schema) + "." + pg_ident(table);
+        const std::string ident = pg_ident(col.name);
+        pg_exec(
+            pg,
+            "ALTER TABLE " + fq + " ALTER COLUMN " + ident + " TYPE bytea USING (CASE WHEN " + ident +
+            " IS NULL THEN NULL::bytea ELSE decode(encode(convert_to(" + ident +
+            ", 'SQL_ASCII'), 'hex'), 'hex') END)");
+        changed += 1;
+    }
+    return changed;
+}
+
 struct IndexDef {
     std::string name;
     bool unique{false};
@@ -273,6 +331,7 @@ DdlSyncResult sync_mariadb_ddl_after_truncate(
     const std::string& conn_id) {
     DdlSyncResult result;
     result.columns_added = sync_missing_columns(pg, schema, table, cols);
+    result.columns_widened = sync_binary_column_types(pg, schema, table, cols);
 
     if (cfg.get_bool("ddl_sync_indexes", true, "mariadb_load", conn_id)) {
         result.indexes_created = sync_indexes(pg, schema, table, fetch_mariadb_indexes(mysql, schema, table));

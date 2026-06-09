@@ -105,23 +105,12 @@ std::string csv_escape(const std::string& value) {
     return out;
 }
 
-std::string bytes_to_pg_bytea_csv(const char* data, unsigned long len) {
-    static const char hex[] = "0123456789abcdef";
-    std::string out = "\\x";
-    for (unsigned long i = 0; i < len; ++i) {
-        const unsigned char b = static_cast<unsigned char>(data[i]);
-        out.push_back(hex[b >> 4]);
-        out.push_back(hex[b & 0x0f]);
-    }
-    return csv_escape(out);
-}
-
 std::string format_cell(const char* data, unsigned long len, const MariaDbColumn& col) {
     if (!data) {
         return "";
     }
-    if (is_binary_type(col.mysql_type)) {
-        return bytes_to_pg_bytea_csv(data, len);
+    if (col.pg_type == "BYTEA" || is_binary_type(col.mysql_type)) {
+        return mariadb_bytea_to_copy_csv(data, static_cast<std::size_t>(len));
     }
     const std::string s = normalize_text_for_pg(std::string(data, len), col.pg_type);
     if (col.pg_type == "DATE" && s.empty()) {
@@ -675,6 +664,7 @@ void mark_catalog_failed(PGconn* pg, long long catalog_id, const std::string& er
         R"(
         UPDATE cdc_catalog.catalog
         SET status = 'failed',
+            needs_full_load = true,
             last_error_at = now(),
             last_error = $2,
             updated_at = now()
@@ -771,6 +761,7 @@ bool load_one_table(
         batch_id,
         "ddl sync completed",
         {{"columns_added", ddl.columns_added},
+         {"columns_promoted_to_bytea", ddl.columns_widened},
          {"indexes_created", ddl.indexes_created},
          {"foreign_keys_created", ddl.foreign_keys_created}},
         target.conn_id,
