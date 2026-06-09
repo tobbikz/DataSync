@@ -164,13 +164,14 @@ stop_compose_datasync
 if [[ "${DO_ENABLE}" -eq 1 ]]; then
   systemctl enable DataSync-kafka.service DataSync.service
   systemctl restart DataSync-kafka.service
-  systemctl restart DataSync.service
-  echo ""
-  echo "Enabled: DataSync-kafka.service + DataSync.service (user=${DATASYNC_USER}, uid=${DATASYNC_UID})"
+  sleep 3
   if ! systemctl is-active --quiet DataSync-kafka.service; then
     echo "ERROR: DataSync-kafka.service failed — journalctl -u DataSync-kafka -n 40 --no-pager" >&2
     exit 1
   fi
+  systemctl restart DataSync.service
+  echo ""
+  echo "Enabled: DataSync-kafka.service + DataSync.service (user=${DATASYNC_USER}, uid=${DATASYNC_UID})"
   if ! systemctl is-active --quiet DataSync.service; then
     echo "ERROR: DataSync.service failed — journalctl -u DataSync -n 40 --no-pager" >&2
     exit 1

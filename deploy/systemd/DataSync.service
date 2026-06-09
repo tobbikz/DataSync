@@ -2,7 +2,8 @@
 Description=DataSync CDC daemon (Docker — rebuild on restart, reconcile embedded)
 Documentation=file://@DATASYNC_ROOT@/README.md
 After=network-online.target DataSync-kafka.service
-Wants=network-online.target DataSync-kafka.service
+Requires=network-online.target DataSync-kafka.service
+Wants=DataSync-kafka.service
 
 [Service]
 Type=oneshot
@@ -13,6 +14,7 @@ WorkingDirectory=@DATASYNC_ROOT@
 Environment=XDG_RUNTIME_DIR=/run/user/@DATASYNC_UID@
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@DATASYNC_UID@/bus
 EnvironmentFile=-/etc/datasync/datasync.env
+ExecStartPre=@DATASYNC_ROOT@/deploy/systemd/datasync-ensure-kafka.sh
 ExecStartPre=@DATASYNC_ROOT@/deploy/systemd/datasync-build.sh
 ExecStart=@DATASYNC_ROOT@/deploy/systemd/datasync-start.sh
 ExecStop=@DATASYNC_ROOT@/deploy/systemd/datasync-stop.sh

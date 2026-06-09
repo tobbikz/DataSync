@@ -95,19 +95,22 @@ apply_catalog_schema() {
 
 wait_kafka() {
   local i h state
-  for i in $(seq 1 90); do
+  for i in $(seq 1 120); do
     state=$(docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true)
     h=$(docker_compose ps kafka --format '{{.Health}}' 2>/dev/null | head -1 || true)
-    if [[ "$state" == "running" && "$h" == "healthy" ]]; then
-      printf '✔ Kafka ready\n'
-      return 0
+    if [[ "$state" == "running" ]]; then
+      if (echo >/dev/tcp/localhost/9092) 2>/dev/null; then
+        return 0
+      fi
+      if [[ "$h" == *healthy* ]]; then
+        return 0
+      fi
     fi
     if [[ "$state" == "exited" || "$state" == "dead" ]]; then
       break
     fi
     sleep 2
   done
-  warn "Kafka not ready — check: $(container_runtime_label) compose logs kafka --tail 40"
   return 1
 }
 
@@ -124,10 +127,12 @@ start_kafka() {
   kstate=$(docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true)
   khealth=$(docker_compose ps kafka --format '{{.Health}}' 2>/dev/null | head -1 || true)
 
-  if [[ "$kstate" == "running" && "$khealth" == "healthy" ]]; then
-    docker_compose up -d kafka
-    wait_kafka
-    return $?
+  if [[ "$kstate" == "running" ]]; then
+    if (echo >/dev/tcp/localhost/9092) 2>/dev/null || [[ "$khealth" == *healthy* ]]; then
+      docker_compose up -d kafka
+      wait_kafka
+      return $?
+    fi
   fi
 
   docker_compose up -d --force-recreate --remove-orphans kafka
