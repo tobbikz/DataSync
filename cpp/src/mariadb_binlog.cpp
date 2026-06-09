@@ -280,7 +280,25 @@ bool binlog_cursor_is_behind(const BinlogPosition& cursor, const MasterBinlogSta
     return cursor.file < master.file;
 }
 
-bool advance_binlog_cursor_to_next_file(MYSQL* mysql, BinlogPosition& cursor) {
+std::optional<long long> binlog_file_size_on_server(MYSQL* mysql, const std::string& filename) {
+    for (const auto& entry : fetch_binary_logs(mysql)) {
+        if (entry.name == filename) {
+            return entry.file_size;
+        }
+    }
+    return std::nullopt;
+}
+
+bool binlog_cursor_at_file_eof(MYSQL* mysql, const BinlogPosition& cursor) {
+    const auto file_size = binlog_file_size_on_server(mysql, cursor.file);
+    if (!file_size || *file_size <= 0) {
+        return false;
+    }
+    // Last event ends before physical file size; 4-byte header at start.
+    return cursor.position >= *file_size - 4;
+}
+
+bool advance_binlog_to_next_file(MYSQL* mysql, BinlogPosition& cursor) {
     const auto logs = fetch_binary_logs(mysql);
     if (logs.empty()) {
         return false;
@@ -299,13 +317,6 @@ bool advance_binlog_cursor_to_next_file(MYSQL* mysql, BinlogPosition& cursor) {
             " — run recovery or re-seed capture_position from SHOW MASTER STATUS");
     }
 
-    const long long file_size = logs[static_cast<std::size_t>(current_idx)].file_size;
-    const bool at_or_past_eof = file_size > 0 && cursor.position >= file_size;
-
-    if (!at_or_past_eof) {
-        return false;
-    }
-
     if (current_idx + 1 >= static_cast<int>(logs.size())) {
         return false;
     }
@@ -313,4 +324,11 @@ bool advance_binlog_cursor_to_next_file(MYSQL* mysql, BinlogPosition& cursor) {
     cursor.file = logs[static_cast<std::size_t>(current_idx + 1)].name;
     cursor.position = 4;
     return true;
+}
+
+bool advance_binlog_cursor_to_next_file(MYSQL* mysql, BinlogPosition& cursor) {
+    if (!binlog_cursor_at_file_eof(mysql, cursor)) {
+        return false;
+    }
+    return advance_binlog_to_next_file(mysql, cursor);
 }

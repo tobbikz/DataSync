@@ -33,6 +33,12 @@ bool binlog_position_caught_up(const BinlogPosition& cursor, const MasterBinlogS
 
 bool binlog_cursor_is_behind(const BinlogPosition& cursor, const MasterBinlogStatus& master);
 
+/** Last readable event position is typically below SHOW BINARY LOGS file_size. */
+bool binlog_cursor_at_file_eof(MYSQL* mysql, const BinlogPosition& cursor);
+
+/** Next file in SHOW BINARY LOGS order (position 4). */
+bool advance_binlog_to_next_file(MYSQL* mysql, BinlogPosition& cursor);
+
 /** When cursor is at/past EOF, move to the next binlog file (position 4). Preserves history drain. */
 bool advance_binlog_cursor_to_next_file(MYSQL* mysql, BinlogPosition& cursor);
 

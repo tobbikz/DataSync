@@ -17,6 +17,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 
@@ -504,6 +505,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                                   : std::max(1, std::min(idle_cap, static_cast<int>(remaining_sec)));
         const int events_left = rcfg.max_events - static_cast<int>(read_stats.events);
 
+        const BinlogPosition chunk_start = binlog_start;
         const BinlogCliStats chunk = read_remote_binlog_cli(
             *source,
             binlog_start,
@@ -540,16 +542,31 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             const BinlogPosition cursor_pos{read_stats.last_file, read_stats.last_position};
             const bool caught_up = binlog_position_caught_up(cursor_pos, master_chunk);
             const bool cli_failed = chunk.exit_code != 0 && !chunk.stderr_tail.empty();
+            const bool chunk_stalled = chunk.exit_code == 0 && chunk.last_file == chunk_start.file &&
+                                       chunk.last_position == chunk_start.position;
 
             const BinlogPosition before_advance = binlog_start;
-            const bool advanced = advance_binlog_cursor_to_next_file(mariadb.handle, binlog_start);
+            bool advanced = advance_binlog_cursor_to_next_file(mariadb.handle, binlog_start);
+            if (!advanced && chunk_stalled && binlog_cursor_is_behind(cursor_pos, master_chunk) &&
+                cursor_pos.file != master_chunk.file) {
+                advanced = advance_binlog_to_next_file(mariadb.handle, binlog_start);
+            }
             if (advanced) {
                 read_stats.last_file = binlog_start.file;
                 read_stats.last_position = binlog_start.position;
+                upsert_capture_position(
+                    log_pg,
+                    conn_id,
+                    mariadb_gtid_binlog_state(mariadb.handle),
+                    read_stats.last_file,
+                    read_stats.last_position,
+                    live_uuid);
                 log_write(log_pg, {
                     .level = LogLevel::Info,
                     .component = "cdc_kafka_capture",
-                    .message = "capture binlog advanced to next file",
+                    .message = chunk_stalled && !binlog_cursor_at_file_eof(mariadb.handle, before_advance)
+                                   ? "capture binlog advanced after idle stall"
+                                   : "capture binlog advanced to next file",
                     .batch_id = batch_id,
                     .conn_id = conn_id,
                     .source_schema = std::nullopt,
@@ -561,9 +578,14 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                         {"to_position", binlog_start.position},
                         {"master_file", master_chunk.file},
                         {"master_position", master_chunk.position},
+                        {"chunk_stalled", chunk_stalled},
                     },
                 });
                 continue;
+            }
+
+            if (lagging && chunk_stalled) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
 
             log_write(log_pg, {
