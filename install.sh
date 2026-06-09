@@ -201,6 +201,20 @@ install_systemd_if_missing() {
   return 1
 }
 
+restart_systemd_stack() {
+  if ! systemctl is-enabled --quiet DataSync.service 2>/dev/null; then
+    return 1
+  fi
+  if [[ "${EUID}" -eq 0 ]]; then
+    systemctl restart DataSync-kafka.service DataSync.service
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo systemctl restart DataSync-kafka.service DataSync.service
+  else
+    warn "sudo required to restart systemd units"
+    return 1
+  fi
+}
+
 print_systemd_hint() {
   [[ "${SKIP_SYSTEMD:-0}" == "1" ]] && return 0
   systemd_units_installed && return 0
@@ -222,15 +236,13 @@ apply_catalog_schema
 
 install_systemd_if_missing || true
 
-if systemctl is-enabled --quiet DataSync-kafka.service 2>/dev/null; then
-  printf '✔ Kafka managed by systemd\n'
+if restart_systemd_stack; then
+  printf '✔ Systemd stack restarted (DataSync-kafka + DataSync)\n'
+elif systemctl is-enabled --quiet DataSync-kafka.service 2>/dev/null; then
+  run_quiet "Kafka starting" start_kafka
+  run_quiet "DataSync daemon" start_datasync_daemon
 else
   run_quiet "Kafka starting" start_kafka
-fi
-
-if systemctl is-enabled --quiet DataSync.service 2>/dev/null; then
-  printf '✔ DataSync daemon managed by systemd\n'
-else
   run_quiet "DataSync daemon" start_datasync_daemon
 fi
 

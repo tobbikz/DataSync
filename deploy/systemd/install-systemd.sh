@@ -50,7 +50,7 @@ RUNTIME_DIR="/run/user/${DATASYNC_UID}"
 
 disable_legacy_units() {
   local unit removed=0
-  for unit in datalake-cdc.service DataSync-reconcile.service DataSync-reconcile.timer; do
+  for unit in datalake-cdc.service DataSync-reconcile.service DataSync-reconcile.timer datasync.service; do
     if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
       systemctl disable --now "${unit}" 2>/dev/null || true
       rm -f "${SYSTEMD_DIR}/${unit}"
@@ -89,13 +89,36 @@ render_unit() {
 
 ensure_podman_user_socket() {
   command -v podman >/dev/null 2>&1 || return 0
-  [[ -S "${RUNTIME_DIR}/podman/podman.sock" ]] && return 0
 
   loginctl enable-linger "${DATASYNC_USER}" 2>/dev/null || true
+
+  local dbus="unix:path=${RUNTIME_DIR}/bus"
+  local podman_sock="unix://${RUNTIME_DIR}/podman/podman.sock"
+
   if command -v runuser >/dev/null 2>&1; then
     runuser -u "${DATASYNC_USER}" -- \
-      env XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
-      systemctl --user start podman.socket 2>/dev/null || true
+      env XDG_RUNTIME_DIR="${RUNTIME_DIR}" DBUS_SESSION_BUS_ADDRESS="${dbus}" \
+      systemctl --user enable --now podman.socket 2>/dev/null || true
+  fi
+
+  local i
+  for i in $(seq 1 20); do
+    [[ -S "${RUNTIME_DIR}/podman/podman.sock" ]] && break
+    sleep 1
+  done
+
+  if command -v runuser >/dev/null 2>&1; then
+    if ! runuser -u "${DATASYNC_USER}" -- \
+        env XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+             DBUS_SESSION_BUS_ADDRESS="${dbus}" \
+             DOCKER_HOST="${podman_sock}" \
+        podman info >/dev/null 2>&1; then
+      echo "ERROR: podman not reachable as ${DATASYNC_USER} (rootless socket missing)" >&2
+      echo "  loginctl enable-linger ${DATASYNC_USER}" >&2
+      echo "  sudo -u ${DATASYNC_USER} env XDG_RUNTIME_DIR=${RUNTIME_DIR} DBUS_SESSION_BUS_ADDRESS=${dbus} \\" >&2
+      echo "    systemctl --user enable --now podman.socket" >&2
+      return 1
+    fi
   fi
 }
 
@@ -122,6 +145,10 @@ echo "Synced ${ENV_FILE} (DATASYNC_ROOT=${ROOT}, user=${DATASYNC_USER})"
 
 ensure_podman_user_socket
 
+if [[ ! -r "${ROOT}/config.json" ]]; then
+  echo "WARN: ${DATASYNC_USER} cannot read ${ROOT}/config.json — chown/chmod for systemd" >&2
+fi
+
 render_unit "${SCRIPT_DIR}/DataSync-kafka.service" "${SYSTEMD_DIR}/DataSync-kafka.service"
 render_unit "${SCRIPT_DIR}/DataSync.service" "${SYSTEMD_DIR}/DataSync.service"
 
@@ -135,10 +162,19 @@ source "${SCRIPT_DIR}/datasync-lib.sh"
 stop_compose_datasync
 
 if [[ "${DO_ENABLE}" -eq 1 ]]; then
-  systemctl enable --now DataSync-kafka.service
-  systemctl enable --now DataSync.service
+  systemctl enable DataSync-kafka.service DataSync.service
+  systemctl restart DataSync-kafka.service
+  systemctl restart DataSync.service
   echo ""
   echo "Enabled: DataSync-kafka.service + DataSync.service (user=${DATASYNC_USER}, uid=${DATASYNC_UID})"
+  if ! systemctl is-active --quiet DataSync-kafka.service; then
+    echo "ERROR: DataSync-kafka.service failed — journalctl -u DataSync-kafka -n 40 --no-pager" >&2
+    exit 1
+  fi
+  if ! systemctl is-active --quiet DataSync.service; then
+    echo "ERROR: DataSync.service failed — journalctl -u DataSync -n 40 --no-pager" >&2
+    exit 1
+  fi
 else
   echo ""
   echo "Units installed (not enabled — omit --no-enable to start)."

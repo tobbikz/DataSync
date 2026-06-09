@@ -5,6 +5,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/datasync-lib.sh"
 
 cd "${DATASYNC_ROOT}"
+ensure_podman_ready
 stop_compose_datasync
 wait_kafka || {
   echo "Kafka not ready — start DataSync-kafka.service first" >&2

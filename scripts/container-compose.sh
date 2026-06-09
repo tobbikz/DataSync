@@ -6,7 +6,19 @@ DATASYNC_CONTAINER_ENGINE="${DATASYNC_CONTAINER_ENGINE:-}"
 
 _container_compose_try_start_podman() {
   command -v systemctl >/dev/null 2>&1 || return 0
+  local uid="${DATASYNC_UID:-$(id -u)}"
+  local runtime="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
+  export XDG_RUNTIME_DIR="${runtime}"
+  export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${runtime}/bus}"
   systemctl --user start podman.socket >/dev/null 2>&1 || true
+}
+
+_container_compose_allow_sudo() {
+  # systemd / CI must not invoke sudo (no password, wrong identity).
+  [[ -z "${INVOCATION_ID:-}" ]] || return 1
+  [[ -t 0 ]] || return 1
+  command -v sudo >/dev/null 2>&1 || return 1
+  sudo -n true 2>/dev/null
 }
 
 _container_compose_podman_sock() {
@@ -21,6 +33,12 @@ ensure_container_runtime() {
   [[ -n "$DATASYNC_CONTAINER_ENGINE" ]] && return 0
 
   _container_compose_try_start_podman
+
+  if [[ -n "${DOCKER_HOST:-}" ]] && command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+    DATASYNC_CONTAINER_ENGINE=podman
+    export DATASYNC_CONTAINER_ENGINE
+    return 0
+  fi
 
   if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
     DATASYNC_CONTAINER_ENGINE=podman
@@ -45,7 +63,7 @@ ensure_container_runtime() {
     return 0
   fi
 
-  if command -v docker >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
+  if _container_compose_allow_sudo && sudo docker info >/dev/null 2>&1; then
     DATASYNC_CONTAINER_ENGINE=docker_sudo
     export DATASYNC_CONTAINER_ENGINE
     return 0
@@ -56,7 +74,11 @@ ensure_container_runtime() {
 
 docker_compose() {
   if ! ensure_container_runtime; then
-    printf '✖ need podman or docker — try: systemctl --user start podman.socket\n' >&2
+    printf '✖ need podman or docker as %s — run: sudo %s/deploy/systemd/install-systemd.sh\n' \
+      "$(id -un 2>/dev/null || echo datalake)" \
+      "${DATASYNC_ROOT:-/opt/DataSync}" >&2
+    printf '  loginctl enable-linger datalake\n' >&2
+    printf '  sudo -u datalake env XDG_RUNTIME_DIR=/run/user/$(id -u datalake) systemctl --user enable --now podman.socket\n' >&2
     return 1
   fi
 

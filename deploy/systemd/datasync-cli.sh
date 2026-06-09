@@ -12,6 +12,8 @@ if [[ ! -f "${DATASYNC_CONFIG:-${DATASYNC_ROOT}/config.json}" ]]; then
   exit 1
 fi
 
+ensure_podman_ready
+
 docker_compose run --rm \
   -e DATASYNC_HOST_NETWORK=1 \
   -e KAFKA_BOOTSTRAP="${KAFKA_BOOTSTRAP:-localhost:9092}" \
