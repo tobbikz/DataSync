@@ -240,7 +240,7 @@ std::string runtime_topic_prefix(RuntimeConfig& runtime, const std::string& conn
     if (!apply_prefix.empty()) {
         return apply_prefix;
     }
-    return runtime.get_string("capture_topic_prefix", "cdc_kafka_capture", "MARIADB_LOCAL", conn_id);
+    return runtime.get_string("capture_topic_prefix", conn_id, "cdc_kafka_capture", conn_id);
 }
 
 std::vector<CatalogMeta> fetch_catalog_tables(

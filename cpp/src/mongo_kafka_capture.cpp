@@ -102,6 +102,29 @@ nlohmann::json get_stored_resume_token(
     return token;
 }
 
+void clear_stored_resume_token(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& database,
+    const std::string& collection) {
+    const char* vals[] = {conn_id.c_str(), database.c_str(), collection.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        DELETE FROM cdc_catalog.cdc_mongo_resume
+        WHERE conn_id = $1 AND database = $2 AND collection = $3
+        )",
+        3,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res) {
+        PQclear(res);
+    }
+}
+
 void upsert_resume_token(
     PGconn* pg,
     const std::string& conn_id,
@@ -237,6 +260,41 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
             if (!mongoc_change_stream_next(stream, &change)) {
                 bson_error_t stream_err;
                 if (mongoc_change_stream_error_document(stream, &stream_err, nullptr)) {
+                    const std::string err_msg = stream_err.message ? stream_err.message : "";
+                    const bool invalidate_resume =
+                        err_msg.find("invalidate") != std::string::npos;
+                    if (invalidate_resume) {
+                        clear_stored_resume_token(
+                            log_pg, conn_id, coll.source_database, coll.source_table);
+                        log_write(log_pg, {
+                            .level = LogLevel::Warning,
+                            .component = "cdc_kafka_mongo_capture",
+                            .message = "mongo resume cleared after invalidate",
+                            .batch_id = batch_id,
+                            .conn_id = conn_id,
+                            .source_schema = coll.source_database,
+                            .source_table = coll.source_table,
+                        });
+                        mongoc_change_stream_destroy(stream);
+                        mongoc_collection_destroy(collection);
+                        bson_destroy(&pipeline);
+                        resume_after = nlohmann::json();
+                        last_token = nlohmann::json();
+                        collection = mongoc_client_get_collection(
+                            mongo.client, coll.source_database.c_str(), coll.source_table.c_str());
+                        bson_reinit(&pipeline);
+                        opts = BCON_NEW("fullDocument", BCON_UTF8("updateLookup"));
+                        BSON_APPEND_INT32(opts, "maxAwaitTimeMS", await_ms);
+                        stream = mongoc_collection_watch(collection, &pipeline, opts);
+                        bson_destroy(opts);
+                        if (!stream) {
+                            mongoc_collection_destroy(collection);
+                            bson_destroy(&pipeline);
+                            stats.errors += 1;
+                            break;
+                        }
+                        continue;
+                    }
                     stats.errors += 1;
                     log_write(log_pg, {
                         .level = LogLevel::Error,
@@ -246,7 +304,7 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
                         .conn_id = conn_id,
                         .source_schema = coll.source_database,
                         .source_table = coll.source_table,
-                        .context = {{"error", stream_err.message}},
+                        .context = {{"error", err_msg}},
                     });
                     break;
                 }
@@ -282,11 +340,7 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
                     const auto id_it = doc_key->find("_id");
                     before = nlohmann::json::object();
                     if (id_it != doc_key->end() && !id_it->is_null()) {
-                        if (id_it->is_string()) {
-                            before["mongo_id"] = id_it->get<std::string>();
-                        } else {
-                            before["mongo_id"] = id_it->dump();
-                        }
+                        before["mongo_id"] = mongo_object_id_text(*id_it);
                     } else {
                         before["mongo_id"] = nullptr;
                     }
@@ -312,8 +366,14 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
             event.collection = coll.source_table;
             event.before = before;
             event.after = after;
+            if (change_json.contains("clusterTime") && change_json["clusterTime"].is_object()) {
+                event.gtid = change_json["clusterTime"].dump();
+            } else if (change_json.contains("wallTime")) {
+                event.gtid = change_json["wallTime"].dump();
+            } else {
+                event.gtid = last_token.is_null() ? "" : last_token.dump();
+            }
             event.resume_token = last_token;
-            event.gtid = last_token.is_null() ? "" : last_token.dump();
             event.ts_ms = now_ms();
             event.ingestion_ts = utc_iso_timestamp_now();
 

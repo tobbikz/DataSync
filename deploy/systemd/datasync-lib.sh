@@ -52,3 +52,32 @@ datasync_build() {
       ;;
   esac
 }
+
+# Host-native DataSync daemon (not the /usr/local/bin binary inside the compose container).
+stop_host_native_datasync() {
+  local pid cmd
+  while read -r pid; do
+    [[ -z "${pid}" ]] && continue
+    cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
+    [[ "${cmd}" == *"DataSync daemon"* ]] || continue
+    [[ "${cmd}" == *"/usr/local/bin/DataSync"* ]] && continue
+    kill "${pid}" 2>/dev/null || true
+  done < <(pgrep -f 'DataSync daemon' 2>/dev/null || true)
+}
+
+stop_compose_datasync() {
+  cd "${DATASYNC_ROOT}"
+  docker_compose stop datasync 2>/dev/null || true
+}
+
+# Exactly one CDC daemon: docker container OR native binary — never both on Kafka.
+ensure_single_daemon() {
+  case "${DATASYNC_DEPLOY_MODE}" in
+    native)
+      stop_compose_datasync
+      ;;
+    docker|*)
+      stop_host_native_datasync
+      ;;
+  esac
+}

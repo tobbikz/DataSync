@@ -134,6 +134,26 @@ run_discover() {
   return 0
 }
 
+stop_host_native_datasync() {
+  local pid cmd
+  while read -r pid; do
+    [[ -z "${pid}" ]] && continue
+    cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
+    [[ "${cmd}" == *"DataSync daemon"* ]] || continue
+    [[ "${cmd}" == *"/usr/local/bin/DataSync"* ]] && continue
+    kill "${pid}" 2>/dev/null || true
+  done < <(pgrep -f 'DataSync daemon' 2>/dev/null || true)
+}
+
+start_datasync_daemon() {
+  if systemctl is-enabled --quiet DataSync.service 2>/dev/null; then
+    printf '✔ DataSync daemon managed by systemd (skip compose up)\n'
+    return 0
+  fi
+  stop_host_native_datasync
+  docker_compose up -d --no-recreate datasync
+}
+
 post_install_health() {
   local err rc
   err="$(mktemp)"
@@ -182,7 +202,7 @@ apply_catalog_schema
 
 run_quiet "Kafka starting" start_kafka
 
-run_quiet "DataSync daemon" docker_compose up -d --no-recreate datasync
+run_quiet "DataSync daemon" start_datasync_daemon
 
 sleep 2
 run_quiet "Post-install health" post_install_health

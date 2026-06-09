@@ -373,9 +373,9 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             break;
         }
         if (!scanned_dbs.count(tbl.source_database)) {
-            cdc_scan(mssql, tbl.source_database);
             scanned_dbs.insert(tbl.source_database);
         }
+        cdc_scan(mssql, tbl.source_database);
 
         const std::string cap = tbl.engine_meta.value("capture_instance", "");
         if (!validate_capture_instance(cap)) {
@@ -497,6 +497,7 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             event.before = before;
             event.after = after;
             event.gtid = sl.empty() ? "" : lsn_hex(sl);
+            event.mssql_seqval = sq.empty() ? "" : lsn_hex(sq);
             event.ts_ms = now_ms();
             event.ingestion_ts = utc_iso_timestamp_now();
 

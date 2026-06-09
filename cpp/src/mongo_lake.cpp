@@ -14,6 +14,28 @@ std::string mongo_pg_table_name(const std::string& collection_name) {
     return sanitize_pg_identifier_part(collection_name);
 }
 
+std::string mongo_object_id_text(const nlohmann::json& id) {
+    if (id.is_null()) {
+        return {};
+    }
+    if (id.is_string()) {
+        return id.get<std::string>();
+    }
+    if (id.is_object()) {
+        if (id.contains("$oid") && id["$oid"].is_string()) {
+            return id["$oid"].get<std::string>();
+        }
+        if (id.contains("oid") && id["oid"].is_string()) {
+            return id["oid"].get<std::string>();
+        }
+    }
+    std::string raw = id.dump();
+    if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
+        return raw.substr(1, raw.size() - 2);
+    }
+    return raw;
+}
+
 std::string mongo_catalog_source_schema(
     const std::string& source_database,
     const std::string& source_schema) {

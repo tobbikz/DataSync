@@ -5,6 +5,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/datasync-lib.sh"
 
 cd "${DATASYNC_ROOT}"
+ensure_single_daemon
 
 case "${DATASYNC_DEPLOY_MODE}" in
   native)

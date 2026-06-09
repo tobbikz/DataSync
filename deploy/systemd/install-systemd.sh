@@ -94,7 +94,7 @@ ensure_podman_user_socket() {
   fi
 }
 
-write_env_file() {
+sync_env_file() {
   local deploy_mode="$1"
   render_unit "${SCRIPT_DIR}/DataSync.env.example" "${ENV_FILE}"
   sed -i "s/^DATASYNC_DEPLOY_MODE=.*/DATASYNC_DEPLOY_MODE=${deploy_mode}/" "${ENV_FILE}"
@@ -105,6 +105,8 @@ write_env_file() {
     else
       echo "DOCKER_HOST=${podman_sock}" >> "${ENV_FILE}"
     fi
+  elif grep -q '^DOCKER_HOST=' "${ENV_FILE}"; then
+    sed -i '/^DOCKER_HOST=/d' "${ENV_FILE}"
   fi
   chmod 0644 "${ENV_FILE}"
 }
@@ -112,32 +114,15 @@ write_env_file() {
 chmod +x "${SCRIPT_DIR}"/datasync-*.sh
 
 mkdir -p "${ENV_DIR}"
-if [[ ! -f "${ENV_FILE}" ]]; then
-  DEPLOY_MODE="${CLI_DEPLOY_MODE:-docker}"
-  write_env_file "${DEPLOY_MODE}"
-  echo "Created ${ENV_FILE} (user=${DATASYNC_USER})"
+if [[ -n "${CLI_DEPLOY_MODE}" ]]; then
+  DEPLOY_MODE="${CLI_DEPLOY_MODE}"
+elif [[ -f "${ENV_FILE}" ]] && grep -q '^DATASYNC_DEPLOY_MODE=' "${ENV_FILE}"; then
+  DEPLOY_MODE="$(grep '^DATASYNC_DEPLOY_MODE=' "${ENV_FILE}" | cut -d= -f2- | tr -d '"')"
 else
-  echo "Keeping existing ${ENV_FILE}"
-  if [[ -n "${CLI_DEPLOY_MODE}" ]]; then
-    DEPLOY_MODE="${CLI_DEPLOY_MODE}"
-    sed -i "s/^DATASYNC_DEPLOY_MODE=.*/DATASYNC_DEPLOY_MODE=${DEPLOY_MODE}/" "${ENV_FILE}"
-  elif grep -q '^DATASYNC_DEPLOY_MODE=' "${ENV_FILE}"; then
-    DEPLOY_MODE="$(grep '^DATASYNC_DEPLOY_MODE=' "${ENV_FILE}" | cut -d= -f2- | tr -d '"')"
-  else
-    DEPLOY_MODE="docker"
-  fi
-  if ! grep -q '^DATASYNC_RUN_USER=' "${ENV_FILE}"; then
-    echo "DATASYNC_RUN_USER=${DATASYNC_USER}" >> "${ENV_FILE}"
-  fi
-  if command -v podman >/dev/null 2>&1; then
-    podman_sock="unix://${RUNTIME_DIR}/podman/podman.sock"
-    if grep -q '^DOCKER_HOST=' "${ENV_FILE}"; then
-      sed -i "s|^DOCKER_HOST=.*|DOCKER_HOST=${podman_sock}|" "${ENV_FILE}"
-    else
-      echo "DOCKER_HOST=${podman_sock}" >> "${ENV_FILE}"
-    fi
-  fi
+  DEPLOY_MODE="docker"
 fi
+sync_env_file "${DEPLOY_MODE}"
+echo "Synced ${ENV_FILE} (DATASYNC_ROOT=${ROOT}, user=${DATASYNC_USER})"
 
 if [[ "${DEPLOY_MODE}" == "native" ]]; then
   SERVICE_SRC="${SCRIPT_DIR}/DataSync-native.service"
@@ -154,6 +139,10 @@ disable_legacy_units
 
 systemctl daemon-reload
 systemctl reset-failed DataSync.service 2>/dev/null || true
+
+# shellcheck source=deploy/systemd/datasync-lib.sh
+source "${SCRIPT_DIR}/datasync-lib.sh"
+ensure_single_daemon
 
 if [[ "${DO_ENABLE}" -eq 1 ]]; then
   systemctl enable --now DataSync.service

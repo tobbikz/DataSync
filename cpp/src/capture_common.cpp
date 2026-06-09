@@ -44,7 +44,7 @@ std::string runtime_topic_prefix(
     if (!apply_prefix.empty()) {
         return apply_prefix;
     }
-    return runtime.get_string("capture_topic_prefix", "cdc_kafka_capture", "MARIADB_LOCAL", conn_id);
+    return runtime.get_string("capture_topic_prefix", conn_id, "cdc_kafka_capture", conn_id);
 }
 
 std::string kafka_apply_consumer_group(
@@ -906,8 +906,12 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
         bool reset_ok = false;
         for (int attempt = 0; attempt < 3; ++attempt) {
             try {
-                topic_offsets.emplace(topic_key, reset_apply_offset_to_end(bootstrap, consumer_group, topic, partition));
-                stats.topics_reset += 1;
+                const long long end_offset =
+                    reset_apply_offset_to_end(bootstrap, consumer_group, topic, partition);
+                if (end_offset >= 0) {
+                    topic_offsets.emplace(topic_key, end_offset);
+                    stats.topics_reset += 1;
+                }
                 reset_ok = true;
                 break;
             } catch (const std::exception& ex) {
@@ -1145,6 +1149,10 @@ long long reset_apply_offset_to_end(
     int64_t low = 0;
     int64_t high = 0;
     rd_kafka_resp_err_t err = rd_kafka_query_watermark_offsets(rk, topic.c_str(), partition, &low, &high, 15000);
+    if (err == RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION) {
+        rd_kafka_destroy(rk);
+        return -1;
+    }
     if (err != RD_KAFKA_RESP_ERR_NO_ERROR) {
         rd_kafka_destroy(rk);
         throw std::runtime_error(std::string("watermark query failed: ") + rd_kafka_err2str(err));

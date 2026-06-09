@@ -12,6 +12,9 @@
 std::string mongo_pg_schema_name(const std::string& database_name);
 std::string mongo_pg_table_name(const std::string& collection_name);
 
+/** Normalize Mongo _id / documentKey JSON to plain hex string for lake PK matching. */
+std::string mongo_object_id_text(const nlohmann::json& id);
+
 /** Catalog/stats key: Mongo uses source_database; normalizes legacy empty source_schema. */
 std::string mongo_catalog_source_schema(
     const std::string& source_database,

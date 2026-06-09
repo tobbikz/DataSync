@@ -16,6 +16,7 @@ struct CdcEvent {
     nlohmann::json before = nullptr;
     nlohmann::json after = nullptr;
     std::string gtid;
+    std::string mssql_seqval;
     std::string binlog_file;
     std::optional<long long> binlog_pos;
     std::optional<long long> ts_ms;

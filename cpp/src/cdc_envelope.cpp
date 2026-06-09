@@ -96,11 +96,15 @@ nlohmann::json CdcEvent::to_kafka_dict() const {
 
     if (db_engine == "mssql") {
         source["lsn"] = gtid.empty() ? nullptr : nlohmann::json(gtid);
+        if (!mssql_seqval.empty()) {
+            source["seqval"] = mssql_seqval;
+        }
         source["db_engine"] = "mssql";
     }
     if (db_engine == "mongodb") {
         source["database"] = source_database;
         source["collection"] = collection.empty() ? table_name : collection;
+        source["gtid"] = gtid.empty() ? nullptr : nlohmann::json(gtid);
         source["resume_token"] = resume_token.is_null() ? nullptr : resume_token;
         source["db_engine"] = "mongodb";
     }

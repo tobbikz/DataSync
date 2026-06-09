@@ -40,6 +40,7 @@ struct TableBatchMeta {
     std::string pk_columns;
     std::vector<std::string> lake_pk;
     std::vector<std::string> data_cols;
+    std::map<std::string, std::string> col_types;
 };
 
 struct TableHealthSnapshot {
@@ -224,7 +225,54 @@ std::string csv_escape_local(const std::string& value) {
     return out;
 }
 
-std::string json_cell_csv(const json& val, bool mssql_text = false) {
+namespace {
+
+bool is_integer_pg_type(const std::string& pg_type) {
+    return pg_type == "int2" || pg_type == "int4" || pg_type == "int8" || pg_type == "INTEGER" ||
+           pg_type == "BIGINT" || pg_type == "SMALLINT";
+}
+
+void normalize_apply_row(json& row, const std::vector<std::string>& pk_cols) {
+    if (row.contains("mongo_id") && !row["mongo_id"].is_null()) {
+        row["mongo_id"] = mongo_object_id_text(row["mongo_id"]);
+    }
+    for (const auto& col : pk_cols) {
+        if (!row.contains(col) || row[col].is_null() || !row[col].is_string()) {
+            continue;
+        }
+        const std::string s = row[col].get<std::string>();
+        if (s.empty()) {
+            continue;
+        }
+        bool numeric = true;
+        for (char c : s) {
+            if (!std::isdigit(static_cast<unsigned char>(c)) && c != '-') {
+                numeric = false;
+                break;
+            }
+        }
+        if (numeric) {
+            try {
+                row[col] = std::stoll(s);
+            } catch (...) {
+            }
+        }
+    }
+}
+
+}  // namespace
+
+std::string json_cell_csv(const json& val_in, const std::string& pg_type = "", bool mssql_text = false) {
+    json val = val_in;
+    if (val.is_string() && is_integer_pg_type(pg_type)) {
+        const std::string s = val.get<std::string>();
+        if (!s.empty()) {
+            try {
+                val = std::stoll(s);
+            } catch (...) {
+            }
+        }
+    }
     if (val.is_null()) {
         return "";
     }
@@ -232,19 +280,49 @@ std::string json_cell_csv(const json& val, bool mssql_text = false) {
         return val.get<bool>() ? "true" : "false";
     }
     if (val.is_number_integer() || val.is_number_unsigned()) {
-        return std::to_string(val.get<long long>());
+        const long long n = val.get<long long>();
+        if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP") {
+            std::string t = epoch_to_timestamptz(n);
+            if (pg_type == "TIMESTAMP") {
+                if (const auto pos = t.rfind('+'); pos != std::string::npos) {
+                    t = t.substr(0, pos);
+                }
+            }
+            return csv_escape_local(t);
+        }
+        if (pg_type == "DATE") {
+            return csv_escape_local(epoch_to_date(n));
+        }
+        return std::to_string(n);
     }
     if (val.is_number_float()) {
         return std::to_string(val.get<double>());
     }
     std::string s = val.is_string() ? val.get<std::string>() : val.dump();
+    if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || pg_type == "DATE") {
+        const std::string norm = normalize_text_for_pg(s, pg_type);
+        if (pg_type == "DATE" && norm.empty()) {
+            return "";
+        }
+        s = norm;
+    }
     if (mssql_text) {
         s = sanitize_mssql_text_for_pg(s);
     }
     return csv_escape_local(s);
 }
 
-std::string json_cell_sql(const json& val) {
+std::string json_cell_sql(const json& val_in, const std::string& pg_type = "") {
+    json val = val_in;
+    if (val.is_string() && is_integer_pg_type(pg_type)) {
+        const std::string s = val.get<std::string>();
+        if (!s.empty()) {
+            try {
+                val = std::stoll(s);
+            } catch (...) {
+            }
+        }
+    }
     if (val.is_null()) {
         return "NULL";
     }
@@ -252,12 +330,23 @@ std::string json_cell_sql(const json& val) {
         return val.get<bool>() ? "true" : "false";
     }
     if (val.is_number_integer() || val.is_number_unsigned()) {
-        return std::to_string(val.get<long long>());
+        const long long n = val.get<long long>();
+        if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP") {
+            return pg_escape_literal(epoch_to_timestamptz(n));
+        }
+        if (pg_type == "DATE") {
+            return pg_escape_literal(epoch_to_date(n));
+        }
+        return std::to_string(n);
     }
     if (val.is_number_float()) {
         return std::to_string(val.get<double>());
     }
-    return pg_escape_literal(val.is_string() ? val.get<std::string>() : val.dump());
+    std::string s = val.is_string() ? val.get<std::string>() : val.dump();
+    if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || pg_type == "DATE") {
+        return normalize_pg_sql_literal(pg_escape_literal(s), pg_type);
+    }
+    return pg_escape_literal(s);
 }
 
 std::vector<std::string> split_pk(const std::string& pk_columns) {
@@ -337,6 +426,50 @@ std::vector<std::string> fetch_lake_data_cols(PGconn* pg, const std::string& sch
     }
     for (int i = 0; i < PQntuples(res); ++i) {
         out.emplace_back(PQgetvalue(res, i, 0));
+    }
+    PQclear(res);
+    return out;
+}
+
+std::map<std::string, std::string> fetch_lake_col_types(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table) {
+    const char* vals[] = {schema.c_str(), table.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT column_name, udt_name
+        FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2
+          AND column_name NOT LIKE '_dl\_%' ESCAPE '\'
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    std::map<std::string, std::string> out;
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        return out;
+    }
+    for (int i = 0; i < PQntuples(res); ++i) {
+        const char* udt = PQgetvalue(res, i, 1);
+        std::string pg_type;
+        if (udt && std::string(udt) == "timestamptz") {
+            pg_type = "TIMESTAMPTZ";
+        } else if (udt && std::string(udt) == "timestamp") {
+            pg_type = "TIMESTAMP";
+        } else if (udt && std::string(udt) == "date") {
+            pg_type = "DATE";
+        } else {
+            pg_type = udt ? udt : "";
+        }
+        out[PQgetvalue(res, i, 0)] = pg_type;
     }
     PQclear(res);
     return out;
@@ -737,8 +870,9 @@ long long apply_table_batch(
                 where << " AND ";
             }
             const json* val = e.row.contains(delete_pk_cols[i]) ? &e.row[delete_pk_cols[i]] : nullptr;
+            const std::string pg_type = meta.col_types.count(delete_pk_cols[i]) ? meta.col_types.at(delete_pk_cols[i]) : "";
             where << pg_ident(delete_pk_cols[i]) << " IS NOT DISTINCT FROM "
-                  << (val ? json_cell_sql(*val) : std::string("NULL"));
+                  << (val ? json_cell_sql(*val, pg_type) : std::string("NULL"));
         }
         pg_exec(pg, "DELETE FROM " + fq + " WHERE " + where.str());
     }
@@ -778,7 +912,8 @@ long long apply_table_batch(
                 line << ',';
             }
             const json* val = e.row.contains(data_cols[i]) ? &e.row[data_cols[i]] : nullptr;
-            line << (val ? json_cell_csv(*val, mssql_text) : "");
+            const std::string pg_type = meta.col_types.count(data_cols[i]) ? meta.col_types.at(data_cols[i]) : "";
+            line << (val ? json_cell_csv(*val, pg_type, mssql_text) : "");
         }
         line << ',' << csv_escape_local(load_ts) << ',' << csv_escape_local(load_date) << ','
              << csv_escape_local(source_system) << ',' << csv_escape_local(batch_id);
@@ -809,7 +944,23 @@ long long apply_table_batch(
             copy_upserts_via_staging(pg, fq, col_list_str, lines, all_cols, lake_pk_cols, staging_name);
         }
     } else {
-        copy_upserts_via_staging(pg, fq, col_list_str, lines, all_cols, lake_pk_cols, staging_name);
+        for (const auto& e : upserts) {
+            std::ostringstream where;
+            for (std::size_t i = 0; i < delete_pk_cols.size(); ++i) {
+                if (i) {
+                    where << " AND ";
+                }
+                const json* val = e.row.contains(delete_pk_cols[i]) ? &e.row.at(delete_pk_cols[i]) : nullptr;
+                const std::string pg_type =
+                    meta.col_types.count(delete_pk_cols[i]) ? meta.col_types.at(delete_pk_cols[i]) : "";
+                where << pg_ident(delete_pk_cols[i]) << " IS NOT DISTINCT FROM "
+                      << (val ? json_cell_sql(*val, pg_type) : std::string("NULL"));
+            }
+            if (!delete_pk_cols.empty()) {
+                pg_exec(pg, "DELETE FROM " + fq + " WHERE " + where.str());
+            }
+        }
+        copy_csv_lines(pg, "COPY " + fq + " (" + col_list_str + ") FROM STDIN WITH (FORMAT csv)", lines);
     }
 
     return static_cast<long long>(deletes.size() + upserts.size());
@@ -875,6 +1026,7 @@ json apply_events_batch(
 
     static std::unordered_map<std::string, std::vector<std::string>> lake_pk_cache;
     static std::unordered_map<std::string, std::vector<std::string>> lake_data_cols_cache;
+    static std::unordered_map<std::string, std::map<std::string, std::string>> lake_col_types_cache;
 
     for (auto& [key, items] : by_table) {
         TableBatchMeta meta;
@@ -894,6 +1046,13 @@ json apply_events_batch(
         } else {
             meta.data_cols = fetch_lake_data_cols(lake_pg, meta.schema_name, meta.table_name);
             lake_data_cols_cache[lake_key] = meta.data_cols;
+        }
+        const auto types_it = lake_col_types_cache.find(lake_key);
+        if (types_it != lake_col_types_cache.end()) {
+            meta.col_types = types_it->second;
+        } else {
+            meta.col_types = fetch_lake_col_types(lake_pg, meta.schema_name, meta.table_name);
+            lake_col_types_cache[lake_key] = meta.col_types;
         }
 
         // Catalog ID / pk_columns lookup
@@ -1214,14 +1373,17 @@ static std::string build_event_id(
         }
         const std::string src_db = data.value("source_database", source.value("database", ""));
         pos_part = "mssql:" + src_db + ":" + lsn;
+        if (source.contains("seqval") && !source["seqval"].is_null()) {
+            pos_part += ":" + source["seqval"].get<std::string>();
+        }
     } else if (actual_engine == "mongodb") {
         std::string token;
-        if (source.contains("resume_token") && !source["resume_token"].is_null()) {
+        if (source.contains("gtid") && !source["gtid"].is_null()) {
+            token = source["gtid"].is_string() ? source["gtid"].get<std::string>() : source["gtid"].dump();
+        } else if (source.contains("resume_token") && !source["resume_token"].is_null()) {
             token = source["resume_token"].dump();
-        } else if (source.contains("gtid") && !source["gtid"].is_null()) {
-            token = source["gtid"].get<std::string>();
         } else if (data.contains("gtid") && !data["gtid"].is_null()) {
-            token = data["gtid"].get<std::string>();
+            token = data["gtid"].is_string() ? data["gtid"].get<std::string>() : data["gtid"].dump();
         }
         const std::string src_db = data.value("source_database", source.value("database", ""));
         pos_part = "mongo:" + src_db + ":" + token;
@@ -1267,6 +1429,7 @@ bool parse_kafka_payload(
 
     out.op = op_char(data);
     out.row = row_for_apply_json(data);
+    normalize_apply_row(out.row, pk_cols);
     out.topic = topic;
     out.partition = partition;
     out.offset = offset;
