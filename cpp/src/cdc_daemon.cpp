@@ -1,6 +1,6 @@
 #include "cdc_daemon.hpp"
-#include "catalog_sync.hpp"
 #include "capture_common.hpp"
+#include "catalog_sync.hpp"
 #include "cdc_pre_apply.hpp"
 #include "config.hpp"
 #include "connections.hpp"
@@ -21,6 +21,7 @@
 namespace {
 
 std::atomic<bool> g_shutdown{false};
+std::atomic<int> g_catalog_sync_round{0};
 
 void on_signal(int) {
     g_shutdown.store(true);
@@ -161,8 +162,16 @@ int run_parallel_daemon_round(
     {
         PgConn catalog_pg(cfg.datasync.conn_string());
         if (catalog_pg.raw) {
-            if (sync_all_catalogs(cfg, catalog_pg.raw, round_batch_id) != 0) {
-                failures.fetch_add(1);
+            RuntimeConfig runtime;
+            runtime.reload(catalog_pg.raw);
+            const int sync_every =
+                runtime.get_int("catalog_sync_interval_rounds", 12, "catalog", "");
+            const int round = g_catalog_sync_round.fetch_add(1) + 1;
+            const bool do_sync = sync_every <= 1 || round == 1 || (round % sync_every) == 0;
+            if (do_sync) {
+                if (sync_all_catalogs(cfg, catalog_pg.raw, round_batch_id) != 0) {
+                    failures.fetch_add(1);
+                }
             }
         } else {
             failures.fetch_add(1);

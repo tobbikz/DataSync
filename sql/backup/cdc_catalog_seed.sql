@@ -12,5 +12,6 @@ VALUES
     ('apply_max_seconds', 'cdc_kafka_apply', '', '300'::jsonb, 'Apply slice max seconds'),
     ('capture_max_seconds', 'cdc_kafka_capture', '', '300'::jsonb, 'MariaDB capture slice max'),
     ('kafka_topic_mode', 'global', '', '"bucketed"'::jsonb, 'Kafka topic layout'),
-    ('kafka_topic_buckets', 'global', '', '64'::jsonb, 'Bucket count when bucketed mode')
+    ('kafka_topic_buckets', 'global', '', '64'::jsonb, 'Bucket count when bucketed mode'),
+    ('catalog_sync_interval_rounds', 'catalog', '', '12'::jsonb, 'Daemon: run discover every N rounds (1=every round)')
 ON CONFLICT (config_key, component, conn_id) DO NOTHING;

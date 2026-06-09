@@ -618,6 +618,99 @@ int count_full_load_pending_any_tier(
     return count;
 }
 
+std::vector<std::string> list_full_load_pending_tiers(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine) {
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT DISTINCT service_tier::text
+        FROM cdc_catalog.catalog
+        WHERE conn_id = $1
+          AND db_engine = $2::cdc_catalog.db_engine
+          AND active = true
+          AND needs_full_load = true
+          AND status NOT IN ('skipped', 'disabled')
+        ORDER BY 1
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    std::vector<std::string> tiers;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK) {
+        for (int i = 0; i < PQntuples(res); ++i) {
+            const char* t = PQgetvalue(res, i, 0);
+            if (t && *t) {
+                tiers.emplace_back(t);
+            }
+        }
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return tiers;
+}
+
+ApplySkipReasonCounts fetch_apply_skip_reasons(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::optional<std::string>& tier,
+    const std::string& db_engine) {
+    ApplySkipReasonCounts out;
+    std::string sql = R"(
+        SELECT
+            count(*)::int AS active_total,
+            count(*) FILTER (WHERE needs_full_load)::int AS needs_full_load,
+            count(*) FILTER (WHERE NOT cdc_enabled)::int AS cdc_disabled,
+            count(*) FILTER (WHERE NOT has_pk)::int AS no_pk,
+            count(*) FILTER (WHERE status IN ('skipped', 'disabled'))::int AS skipped_status,
+            count(*) FILTER (
+                WHERE cdc_enabled
+                  AND NOT needs_full_load
+                  AND has_pk
+                  AND status NOT IN ('skipped', 'disabled')
+            )::int AS apply_ready
+        FROM cdc_catalog.catalog
+        WHERE conn_id = $1
+          AND db_engine = $2::cdc_catalog.db_engine
+          AND active = true
+    )";
+    std::vector<const char*> vals = {conn_id.c_str(), db_engine.c_str()};
+    std::string tier_val;
+    if (tier && !tier->empty()) {
+        sql += " AND service_tier::text = lower($3)";
+        tier_val = *tier;
+        vals.push_back(tier_val.c_str());
+    }
+
+    PGresult* res = PQexecParams(
+        pg,
+        sql.c_str(),
+        static_cast<int>(vals.size()),
+        nullptr,
+        vals.data(),
+        nullptr,
+        nullptr,
+        0);
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        out.active_total = std::atoi(PQgetvalue(res, 0, 0));
+        out.needs_full_load = std::atoi(PQgetvalue(res, 0, 1));
+        out.cdc_disabled = std::atoi(PQgetvalue(res, 0, 2));
+        out.no_pk = std::atoi(PQgetvalue(res, 0, 3));
+        out.skipped_status = std::atoi(PQgetvalue(res, 0, 4));
+        out.apply_ready = std::atoi(PQgetvalue(res, 0, 5));
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return out;
+}
+
 void ensure_apply_positions_for_tier(
     PGconn* pg,
     RuntimeConfig& runtime,

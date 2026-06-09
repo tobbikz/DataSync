@@ -89,6 +89,11 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
     if (outcome.pending_tables <= 0) {
         const int pending_any_tier = count_full_load_pending_any_tier(log_pg, conn_id, db_engine);
         if (pending_any_tier > 0) {
+            const auto pending_tiers = list_full_load_pending_tiers(log_pg, conn_id, db_engine);
+            nlohmann::json tier_list = nlohmann::json::array();
+            for (const auto& t : pending_tiers) {
+                tier_list.push_back(t);
+            }
             log_write(log_pg, {
                 .level = LogLevel::Warning,
                 .component = "cdc_daemon",
@@ -101,6 +106,7 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
                     {"tier", tier},
                     {"db_engine", db_engine},
                     {"pending_any_tier", pending_any_tier},
+                    {"pending_tiers", tier_list},
                 },
             });
         }

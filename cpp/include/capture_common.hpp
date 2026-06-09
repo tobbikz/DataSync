@@ -154,6 +154,28 @@ int count_full_load_pending_any_tier(
     const std::string& conn_id,
     const std::string& db_engine);
 
+/** Distinct service_tier values with pending full-load for conn. */
+std::vector<std::string> list_full_load_pending_tiers(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine);
+
+struct ApplySkipReasonCounts {
+    int active_total{0};
+    int needs_full_load{0};
+    int cdc_disabled{0};
+    int no_pk{0};
+    int skipped_status{0};
+    int apply_ready{0};
+};
+
+/** Why apply found zero tables (per conn + optional tier filter). */
+ApplySkipReasonCounts fetch_apply_skip_reasons(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::optional<std::string>& tier,
+    const std::string& db_engine);
+
 struct FullLoadKafkaResetStats {
     int tables{0};
     int topics_reset{0};

@@ -67,4 +67,8 @@ Sin seed data. Tras apply, insertar `cdc_catalog.connections` y `runtime_config`
 docker compose run --rm datasync full-load --tier bronze --conn-id MARIADB_LOCAL
 docker compose run --rm datasync daemon --once
 docker compose logs -f datasync
+
+# End-to-end per connection (discover → full-load → capture → apply):
+./scripts/smoke_pipeline.sh
+SMOKE_TIER=bronze SMOKE_CONN_ID=MARIADB01 ./scripts/smoke_pipeline.sh
 ```

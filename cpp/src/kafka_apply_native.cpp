@@ -885,6 +885,8 @@ int run_kafka_apply_native_cli(
     std::map<TableKey, CatalogMeta> meta_by_key;
     fetch_catalog_tables(app_pg.raw, conn_id, service_tier, worker_id, worker_count, meta_by_key, db_engine);
     if (meta_by_key.empty()) {
+        const ApplySkipReasonCounts reasons =
+            fetch_apply_skip_reasons(app_pg.raw, conn_id, service_tier, db_engine);
         log_write(log_pg, {
             .level = LogLevel::Info,
             .component = "cdc_kafka_apply_cpp",
@@ -893,8 +895,21 @@ int run_kafka_apply_native_cli(
             .conn_id = conn_id,
             .source_schema = std::nullopt,
             .source_table = std::nullopt,
+            .context = {
+                {"tier", service_tier.value_or("")},
+                {"db_engine", db_engine},
+                {"active_total", reasons.active_total},
+                {"needs_full_load", reasons.needs_full_load},
+                {"cdc_disabled", reasons.cdc_disabled},
+                {"no_pk", reasons.no_pk},
+                {"skipped_status", reasons.skipped_status},
+                {"apply_ready", reasons.apply_ready},
+            },
         });
         stats["stop_reason"] = "no_tables";
+        stats["active_total"] = reasons.active_total;
+        stats["needs_full_load"] = reasons.needs_full_load;
+        stats["apply_ready"] = reasons.apply_ready;
         stats["duration_ms"] = 0;
         std::cout << stats.dump() << std::endl;
         return 0;
