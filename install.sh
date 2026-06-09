@@ -120,9 +120,9 @@ start_kafka() {
     return 0
   fi
 
-  if (echo >/dev/tcp/localhost/9092) 2>/dev/null; then
-    printf '✔ Kafka already listening on localhost:9092\n'
-    return 0
+  local clean="${ROOT}/deploy/systemd/kafka-force-clean.sh"
+  if [[ -f "$clean" ]]; then
+    /bin/bash "$clean" 2>/dev/null || true
   fi
 
   docker_compose stop zookeeper 2>/dev/null || true
@@ -214,6 +214,14 @@ install_systemd_if_missing() {
 restart_systemd_stack() {
   if ! systemctl is-enabled --quiet DataSync.service 2>/dev/null; then
     return 1
+  fi
+  local clean="${ROOT}/deploy/systemd/kafka-force-clean.sh"
+  if [[ -x "$clean" ]]; then
+    if [[ "${EUID}" -eq 0 ]]; then
+      /bin/bash "$clean"
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo /bin/bash "$clean"
+    fi
   fi
   if [[ "${EUID}" -eq 0 ]]; then
     systemctl restart DataSync-kafka.service DataSync.service

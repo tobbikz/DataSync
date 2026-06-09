@@ -137,7 +137,7 @@ sync_env_file() {
   chmod 0644 "${ENV_FILE}"
 }
 
-chmod +x "${SCRIPT_DIR}"/datasync-*.sh
+chmod +x "${SCRIPT_DIR}"/datasync-*.sh "${SCRIPT_DIR}"/kafka-force-clean.sh
 
 mkdir -p "${ENV_DIR}"
 sync_env_file
@@ -160,6 +160,7 @@ systemctl reset-failed DataSync-kafka.service DataSync.service 2>/dev/null || tr
 # shellcheck source=deploy/systemd/datasync-lib.sh
 source "${SCRIPT_DIR}/datasync-lib.sh"
 stop_compose_datasync
+/bin/bash "${SCRIPT_DIR}/kafka-force-clean.sh"
 
 if [[ "${DO_ENABLE}" -eq 1 ]]; then
   systemctl enable DataSync-kafka.service DataSync.service
