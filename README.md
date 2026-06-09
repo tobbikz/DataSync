@@ -2,11 +2,11 @@
 
 CDC Data Lake pipeline — C++ ingest from MariaDB, MSSQL, and MongoDB into PostgreSQL.
 
-## Install (Docker only)
+## Install
 
-Requires **Docker** or **Podman** + **Compose v2** on any Linux distro. `./install.sh` prefers **podman** when the `docker` CLI is a podman shim. Rootless podman: `systemctl --user start podman.socket` if the socket is down.
+Requires **Podman** (or Docker) + **Compose v2** for the **DataSync daemon only**. **Kafka** runs **natively** via systemd (`DataSync-kafka.service`, Apache KRaft on `localhost:9092`).
 
-Docker **does not** create PostgreSQL, MariaDB, MSSQL, or MongoDB — only Kafka + the DataSync daemon. Point `config.json` at your existing databases.
+Does **not** install PostgreSQL, MariaDB, MSSQL, or MongoDB — point `config.json` at your databases.
 
 ```bash
 ./install.sh
@@ -16,18 +16,17 @@ On first run, `./install.sh` copies `config.json.example` → `config.json` if m
 
 `install.sh` runs the full bootstrap:
 
-1. Builds the **DataSync** image
-2. Ensures **`cdc_catalog`** in `config.json` → `datasync.database` and **`lake`** helpers in `datalake.database` (creates DBs if missing; idempotent)
-3. Starts **Kafka** (KRaft — no Zookeeper)
-4. Starts the **DataSync daemon**
-5. **Discover** — skipped in install; run manually after onboarding sources
-6. **Discover** — skipped in install; run manually after onboarding sources
+1. Builds the **DataSync** image (Podman)
+2. Ensures **`cdc_catalog`** and **`lake`** schemas (idempotent)
+3. Installs/starts **native Kafka** (`DataSync-kafka.service`) when `sudo` is available
+4. Starts the **DataSync daemon** (Podman or systemd)
+5. **Discover** — skipped; run manually after onboarding sources
 
 No sudo required for a normal install. If systemd units are missing and `sudo` is available, `./install.sh` installs them automatically (`DataSync-kafka` + `DataSync`).
 
 | Service | URL |
 |---------|-----|
-| Kafka | `localhost:9092` |
+| Kafka | `localhost:9092` (native systemd, user `kafka`) |
 | PostgreSQL | external — from `config.json` |
 
 The DataSync container uses **`network_mode: host`** (Linux) so it reaches host PostgreSQL and Kafka (`localhost:9092`) without extra PG configuration.

@@ -43,78 +43,33 @@ kafka_tcp_ok() {
   (echo >/dev/tcp/"$host"/"$port") 2>/dev/null
 }
 
-kafka_compose_state() {
-  docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true
-}
-
-kafka_compose_health() {
-  docker_compose ps kafka --format '{{.Health}}' 2>/dev/null | head -1 || true
-}
-
-kafka_is_ready() {
-  if ! kafka_tcp_ok; then
-    return 1
-  fi
-  local state
-  state="$(kafka_compose_state)"
-  [[ -z "$state" || "$state" == "running" ]]
-}
-
-wait_kafka() {
-  local i state
+wait_kafka_broker() {
+  local i
   for i in $(seq 1 120); do
-    state="$(kafka_compose_state)"
-    if [[ "$state" == "running" ]] && kafka_tcp_ok; then
+    if kafka_tcp_ok; then
       return 0
-    fi
-    if [[ "$state" == "exited" || "$state" == "dead" ]]; then
-      return 1
     fi
     sleep 2
   done
-  [[ "$(kafka_compose_state)" == "running" ]] && kafka_tcp_ok
-}
-
-reset_kafka_stack() {
-  ensure_podman_ready
-  cd "${DATASYNC_ROOT}"
-  if [[ -x "${DATASYNC_ROOT}/deploy/systemd/kafka-force-clean.sh" ]]; then
-    /bin/bash "${DATASYNC_ROOT}/deploy/systemd/kafka-force-clean.sh"
-    return $?
-  fi
-  docker_compose stop kafka datasync 2>/dev/null || true
-  docker_compose rm -f -s kafka 2>/dev/null || true
-  ! kafka_tcp_ok
-}
-
-start_kafka_compose() {
-  ensure_podman_ready
-  cd "${DATASYNC_ROOT}"
-  docker_compose stop zookeeper 2>/dev/null || true
-  docker_compose rm -f zookeeper 2>/dev/null || true
-  docker_compose up -d --remove-orphans kafka
+  return 1
 }
 
 ensure_kafka_ready() {
-  ensure_podman_ready
-  cd "${DATASYNC_ROOT}"
-
-  echo "Resetting Kafka stack (stop old containers, free :9092)..." >&2
-  reset_kafka_stack || {
-    echo "Port 9092 still in use — run: sudo ${DATASYNC_ROOT}/deploy/systemd/kafka-force-clean.sh" >&2
-    return 1
-  }
-
-  echo "Starting Kafka via compose..." >&2
-  start_kafka_compose || return 1
-
-  if wait_kafka; then
-    echo "Kafka ready on ${KAFKA_BOOTSTRAP:-localhost:9092}" >&2
+  if kafka_tcp_ok; then
     return 0
   fi
 
-  echo "Kafka not ready — logs:" >&2
-  docker_compose logs kafka --tail 40 >&2 || true
+  if systemctl is-active --quiet DataSync-kafka.service 2>/dev/null; then
+    wait_kafka_broker && return 0
+  fi
+
+  echo "Waiting for native Kafka on ${KAFKA_BOOTSTRAP:-localhost:9092}..." >&2
+  if wait_kafka_broker; then
+    return 0
+  fi
+
+  echo "Kafka not reachable — check: systemctl status DataSync-kafka" >&2
+  journalctl -u DataSync-kafka -n 20 --no-pager 2>/dev/null || true
   return 1
 }
 

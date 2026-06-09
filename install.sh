@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DataSync — Docker install (Kafka + daemon). Idempotent schema bootstrap.
+# DataSync — native Kafka + Podman daemon. Idempotent schema bootstrap.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -93,55 +93,53 @@ apply_catalog_schema() {
   fi
 }
 
-wait_kafka() {
-  local i h state
-  for i in $(seq 1 120); do
-    state=$(docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true)
-    h=$(docker_compose ps kafka --format '{{.Health}}' 2>/dev/null | head -1 || true)
-    if [[ "$state" == "running" ]]; then
-      if (echo >/dev/tcp/localhost/9092) 2>/dev/null; then
-        return 0
-      fi
-      if [[ "$h" == *healthy* ]]; then
-        return 0
-      fi
-    fi
-    if [[ "$state" == "exited" || "$state" == "dead" ]]; then
-      break
-    fi
+kafka_tcp_ok() {
+  (echo >/dev/tcp/localhost/9092) 2>/dev/null
+}
+
+wait_kafka_broker() {
+  local i
+  for i in $(seq 1 90); do
+    kafka_tcp_ok && return 0
     sleep 2
   done
   return 1
 }
 
-start_kafka() {
-  if systemctl is-enabled --quiet DataSync-kafka.service 2>/dev/null; then
-    printf '✔ Kafka managed by systemd (skip compose up)\n'
+ensure_native_kafka() {
+  if kafka_tcp_ok; then
+    printf '✔ Kafka listening on localhost:9092\n'
     return 0
   fi
 
-  local clean="${ROOT}/deploy/systemd/kafka-force-clean.sh"
-  if [[ -f "$clean" ]]; then
-    /bin/bash "$clean" 2>/dev/null || true
-  fi
-
-  docker_compose stop zookeeper 2>/dev/null || true
-  docker_compose rm -f zookeeper 2>/dev/null || true
-
-  local kstate khealth
-  kstate=$(docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true)
-  khealth=$(docker_compose ps kafka --format '{{.Health}}' 2>/dev/null | head -1 || true)
-
-  if [[ "$kstate" == "running" ]]; then
-    if (echo >/dev/tcp/localhost/9092) 2>/dev/null || [[ "$khealth" == *healthy* ]]; then
-      docker_compose up -d kafka
-      wait_kafka
-      return $?
+  if systemctl is-enabled --quiet DataSync-kafka.service 2>/dev/null; then
+    if [[ "${EUID}" -eq 0 ]]; then
+      systemctl start DataSync-kafka.service
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo systemctl start DataSync-kafka.service
     fi
+    wait_kafka_broker && return 0
+    warn "DataSync-kafka failed — journalctl -u DataSync-kafka -n 30"
+    return 1
   fi
 
-  docker_compose up -d --force-recreate --remove-orphans kafka
-  wait_kafka
+  if [[ ! -x "${ROOT}/deploy/kafka/install-kafka.sh" ]]; then
+    warn "native Kafka installer missing"
+    return 1
+  fi
+
+  printf '→ Installing native Kafka (sudo)...\n'
+  if [[ "${EUID}" -eq 0 ]]; then
+    DATASYNC_ROOT="${ROOT}" "${ROOT}/deploy/kafka/install-kafka.sh"
+    systemctl enable --now DataSync-kafka.service
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo env DATASYNC_ROOT="${ROOT}" "${ROOT}/deploy/kafka/install-kafka.sh"
+    sudo systemctl enable --now DataSync-kafka.service
+  else
+    warn "sudo required — run: sudo ${ROOT}/deploy/systemd/install-systemd.sh"
+    return 1
+  fi
+  wait_kafka_broker
 }
 
 run_discover() {
@@ -215,18 +213,14 @@ restart_systemd_stack() {
   if ! systemctl is-enabled --quiet DataSync.service 2>/dev/null; then
     return 1
   fi
-  local clean="${ROOT}/deploy/systemd/kafka-force-clean.sh"
-  if [[ -x "$clean" ]]; then
-    if [[ "${EUID}" -eq 0 ]]; then
-      /bin/bash "$clean"
-    elif command -v sudo >/dev/null 2>&1; then
-      sudo /bin/bash "$clean"
-    fi
-  fi
   if [[ "${EUID}" -eq 0 ]]; then
-    systemctl restart DataSync-kafka.service DataSync.service
+    systemctl restart DataSync-kafka.service
+    sleep 3
+    systemctl restart DataSync.service
   elif command -v sudo >/dev/null 2>&1; then
-    sudo systemctl restart DataSync-kafka.service DataSync.service
+    sudo systemctl restart DataSync-kafka.service
+    sleep 3
+    sudo systemctl restart DataSync.service
   else
     warn "sudo required to restart systemd units"
     return 1
@@ -255,12 +249,9 @@ apply_catalog_schema
 install_systemd_if_missing || true
 
 if restart_systemd_stack; then
-  printf '✔ Systemd stack restarted (DataSync-kafka + DataSync)\n'
-elif systemctl is-enabled --quiet DataSync-kafka.service 2>/dev/null; then
-  run_quiet "Kafka starting" start_kafka
-  run_quiet "DataSync daemon" start_datasync_daemon
+  printf '✔ Systemd stack restarted (native Kafka + DataSync)\n'
 else
-  run_quiet "Kafka starting" start_kafka
+  run_quiet "Native Kafka" ensure_native_kafka
   run_quiet "DataSync daemon" start_datasync_daemon
 fi
 
