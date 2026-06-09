@@ -66,7 +66,17 @@ wait_port_free() {
   return 1
 }
 
+stop_native_kafka() {
+  systemctl stop DataSync-kafka.service 2>/dev/null || true
+  if kafka_port_busy && command -v fuser >/dev/null 2>&1; then
+    echo "Stopping processes on TCP ${KAFKA_PORT}..." >&2
+    fuser -k "${KAFKA_PORT}/tcp" 2>/dev/null || true
+    sleep 2
+  fi
+}
+
 root_clean_all() {
+  stop_native_kafka
   local u uid runtime dbus repo_owner
   repo_owner="$(stat -c '%U' "${DATASYNC_ROOT}" 2>/dev/null || true)"
 

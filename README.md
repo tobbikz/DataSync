@@ -1,78 +1,51 @@
 # DataSync
 
-CDC Data Lake pipeline — C++ ingest from MariaDB, MSSQL, and MongoDB into PostgreSQL.
+CDC Data Lake — MariaDB, MSSQL, MongoDB → PostgreSQL.
 
 ## Install
 
-Requires **Podman** (or Docker) + **Compose v2** for the **DataSync daemon only**. **Kafka** runs **natively** via systemd (`DataSync-kafka.service`, Apache KRaft on `localhost:9092`).
-
-Does **not** install PostgreSQL, MariaDB, MSSQL, or MongoDB — point `config.json` at your databases.
+**Kafka + DataSync** run in **Podman/Docker**. Production uses systemd as user **`datalake`** (rootless podman).
 
 ```bash
 ./install.sh
 ```
 
-On first run, `./install.sh` copies `config.json.example` → `config.json` if missing (edit password, then re-run).
+Full prod checklist: **[deploy/PROD.md](deploy/PROD.md)**
 
-`install.sh` runs the full bootstrap:
+### Prod (Oracle Linux / RHEL)
 
-1. Builds the **DataSync** image (Podman)
-2. Ensures **`cdc_catalog`** and **`lake`** schemas (idempotent)
-3. Installs/starts **native Kafka** (`DataSync-kafka.service`) when `sudo` is available
-4. Starts the **DataSync daemon** (Podman or systemd)
-5. **Discover** — skipped; run manually after onboarding sources
+```bash
+cd /opt/DataSync
+git pull
+podman compose stop kafka datasync 2>/dev/null || true   # stop YOUR old containers
+./install.sh                                              # uses sudo for systemd
+```
 
-No sudo required for a normal install. If systemd units are missing and `sudo` is available, `./install.sh` installs them automatically (`DataSync-kafka` + `DataSync`).
+### What you need
 
-| Service | URL |
-|---------|-----|
-| Kafka | `localhost:9092` (native systemd, user `kafka`) |
-| PostgreSQL | external — from `config.json` |
+| Item | Value |
+|------|--------|
+| OS | Linux + Podman Compose v2 |
+| Prod user | `datalake` (systemd runs Podman as this user) |
+| Config | `config.json` (PostgreSQL + sources) |
+| Kafka | `localhost:9092` (compose container) |
+| Port | **9092 free** before install |
 
-The DataSync container uses **`network_mode: host`** (Linux) so it reaches host PostgreSQL and Kafka (`localhost:9092`) without extra PG configuration.
+Do **not** run `podman compose up` as your personal user on prod after systemd is enabled.
 
 ## systemd
 
-`./install.sh` installs **DataSync-kafka** + **DataSync** systemd units automatically when they are missing (requires `sudo` and system user `datalake`). To skip: `SKIP_SYSTEMD=1 ./install.sh`.
-
-Manual (re-sync units after moving the repo):
-
-```bash
-sudo ./deploy/systemd/install-systemd.sh
-```
-
-That installs units for **`datalake`** user/group: **DataSync-kafka** + **DataSync** (reconcile runs inside the daemon). Requires system user `datalake` (see `install-systemd.sh` if missing).
-
-Every **`sudo systemctl restart DataSync`** runs **`ExecStartPre`** first → rebuild, then recreates the daemon container.
+| Unit | Role |
+|------|------|
+| `DataSync-kafka.service` | `podman compose up kafka` |
+| `DataSync.service` | rebuild image + `podman compose up datasync` (reconcile embedded) |
 
 ```bash
-sudo systemctl restart DataSync-kafka   # Kafka only
-sudo systemctl restart DataSync         # CDC + reconcile (embedded)
-
+sudo systemctl restart DataSync-kafka
+sudo systemctl restart DataSync
 systemctl status DataSync-kafka DataSync
-docker compose ps
-docker compose logs -f datasync
 ```
 
 ## SQL
 
-Bootstrap idempotente (`./install.sh`):
-
-| File | Target DB | Contenido |
-|------|-----------|-----------|
-| `sql/backup/cdc_catalog_schema_structure.sql` | `config.json` → **datasync** | Catálogo, logs, runtime_config, dedup, offsets |
-| `sql/backup/datalake_lake_schema.sql` | `config.json` → **datalake** | Schema `lake` + particiones mensuales |
-
-Sin seed data. Tras apply, insertar `cdc_catalog.connections` y `runtime_config` según necesidad.
-
-## CLI (optional)
-
-```bash
-docker compose run --rm datasync full-load --tier bronze --conn-id MARIADB_LOCAL
-docker compose run --rm datasync daemon --once
-docker compose logs -f datasync
-
-# End-to-end per connection (discover → full-load → capture → apply):
-./scripts/smoke_pipeline.sh
-SMOKE_TIER=bronze SMOKE_CONN_ID=MARIADB01 ./scripts/smoke_pipeline.sh
-```
+Bootstrap via `./install.sh` — `sql/backup/cdc_catalog_schema_structure.sql`, `datalake_lake_schema.sql`.

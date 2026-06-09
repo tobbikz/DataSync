@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install DataSync systemd units + native Kafka (no Docker for broker).
+# Install DataSync systemd: Podman Kafka + Podman DataSync daemon (User=datalake).
 # Usage: sudo deploy/systemd/install-systemd.sh [--no-enable]
 set -euo pipefail
 
@@ -17,16 +17,12 @@ while [[ $# -gt 0 ]]; do
       cat <<EOF
 Usage: sudo $0 [--no-enable]
 
-Installs native Kafka (DataSync-kafka.service) + DataSync.service (Podman daemon).
-Reconcile runs inside the daemon.
+Podman Kafka (DataSync-kafka) + Podman CDC daemon (DataSync) as user datalake.
+Run once on prod, then: git pull && ./install.sh
 
-  --no-enable  install units only (no systemctl enable --now)
+  --no-enable  install units only
 EOF
       exit 0
-      ;;
-    --native)
-      echo "Removed: --native mode." >&2
-      exit 2
       ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
@@ -40,9 +36,8 @@ fi
 DATASYNC_USER="datalake"
 DATASYNC_GROUP="datalake"
 if ! id "${DATASYNC_USER}" &>/dev/null; then
-  echo "System user ${DATASYNC_USER} not found. Create it first, e.g.:" >&2
-  echo "  sudo useradd -r -m -d /opt/datalake -s /bin/bash ${DATASYNC_USER}" >&2
-  exit 1
+  echo "Creating system user ${DATASYNC_USER}..." >&2
+  useradd -r -m -d /opt/datalake -s /bin/bash "${DATASYNC_USER}"
 fi
 DATASYNC_UID="$(id -u "${DATASYNC_USER}")"
 RUNTIME_DIR="/run/user/${DATASYNC_UID}"
@@ -52,25 +47,6 @@ disable_legacy_units() {
   for unit in datalake-cdc.service DataSync-reconcile.service DataSync-reconcile.timer datasync.service; do
     if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
       systemctl disable --now "${unit}" 2>/dev/null || true
-      rm -f "${SYSTEMD_DIR}/${unit}"
-      echo "Removed legacy unit: ${unit}"
-      removed=1
-    fi
-  done
-  while IFS= read -r unit; do
-    [[ -n "${unit}" ]] || continue
-    systemctl disable --now "${unit}" 2>/dev/null || true
-    echo "Disabled legacy instance: ${unit}"
-    removed=1
-  done < <(systemctl list-units --all --no-legend 'cdc-kafka@*' 2>/dev/null | awk '{print $1}')
-  while IFS= read -r unit; do
-    [[ -n "${unit}" ]] || continue
-    systemctl disable --now "${unit}" 2>/dev/null || true
-    echo "Disabled legacy instance: ${unit}"
-    removed=1
-  done < <(systemctl list-units --all --no-legend 'cdc-kafka-reconcile@*' 2>/dev/null | awk '{print $1}')
-  for unit in cdc-kafka@.service cdc-kafka-reconcile@.service; do
-    if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
       rm -f "${SYSTEMD_DIR}/${unit}"
       echo "Removed legacy unit: ${unit}"
       removed=1
@@ -86,16 +62,23 @@ render_unit() {
       "${src}" > "${dst}"
 }
 
-ensure_podman_user_socket() {
-  command -v podman >/dev/null 2>&1 || return 0
-  [[ -S "${RUNTIME_DIR}/podman/podman.sock" ]] && return 0
-
+prepare_datalake_host() {
+  echo "Preparing host for User=${DATASYNC_USER}..." >&2
   loginctl enable-linger "${DATASYNC_USER}" 2>/dev/null || true
+  chown -R "${DATASYNC_USER}:${DATASYNC_GROUP}" "${ROOT}"
+  chmod +x "${ROOT}/deploy/systemd/"*.sh "${ROOT}/deploy/systemd/kafka-force-clean.sh" 2>/dev/null || true
+
+  # Stop native Kafka if a previous install used /opt/kafka
+  systemctl stop DataSync-kafka.service 2>/dev/null || true
+
   if command -v runuser >/dev/null 2>&1; then
     runuser -u "${DATASYNC_USER}" -- \
       env XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
-      systemctl --user start podman.socket 2>/dev/null || true
+          DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+      systemctl --user enable --now podman.socket 2>/dev/null || true
   fi
+
+  DATASYNC_ROOT="${ROOT}" /bin/bash "${SCRIPT_DIR}/kafka-force-clean.sh"
 }
 
 sync_env_file() {
@@ -113,64 +96,54 @@ sync_env_file() {
   chmod 0644 "${ENV_FILE}"
 }
 
-chmod +x "${SCRIPT_DIR}"/datasync-*.sh
-chmod +x "${ROOT}/deploy/kafka/"*.sh
+chmod +x "${SCRIPT_DIR}"/datasync-*.sh "${SCRIPT_DIR}"/kafka-force-clean.sh 2>/dev/null || true
 
 mkdir -p "${ENV_DIR}"
 sync_env_file
-echo "Synced ${ENV_FILE} (DATASYNC_ROOT=${ROOT}, user=${DATASYNC_USER})"
+prepare_datalake_host
 
-ensure_podman_user_socket
-
-if [[ ! -r "${ROOT}/config.json" ]]; then
-  echo "WARN: ${DATASYNC_USER} cannot read ${ROOT}/config.json — chown/chmod for systemd" >&2
-fi
-
-echo "Installing native Apache Kafka (KRaft)..." >&2
-DATASYNC_ROOT="${ROOT}" /bin/bash "${ROOT}/deploy/kafka/install-kafka.sh"
-
+render_unit "${SCRIPT_DIR}/DataSync-kafka.service" "${SYSTEMD_DIR}/DataSync-kafka.service"
 render_unit "${SCRIPT_DIR}/DataSync.service" "${SYSTEMD_DIR}/DataSync.service"
 
 disable_legacy_units
-
 systemctl daemon-reload
 systemctl reset-failed DataSync-kafka.service DataSync.service 2>/dev/null || true
 
-# shellcheck source=deploy/systemd/datasync-lib.sh
-source "${SCRIPT_DIR}/datasync-lib.sh"
-stop_compose_datasync
+if [[ ! -r "${ROOT}/config.json" ]]; then
+  echo "WARN: ${DATASYNC_USER} cannot read ${ROOT}/config.json" >&2
+fi
 
 if [[ "${DO_ENABLE}" -eq 1 ]]; then
   systemctl enable DataSync-kafka.service DataSync.service
   systemctl restart DataSync-kafka.service
   sleep 5
   if ! systemctl is-active --quiet DataSync-kafka.service; then
-    echo "ERROR: DataSync-kafka.service failed — journalctl -u DataSync-kafka -n 40 --no-pager" >&2
+    echo "ERROR: DataSync-kafka failed — journalctl -u DataSync-kafka -n 40 --no-pager" >&2
     exit 1
   fi
+  # shellcheck source=deploy/systemd/datasync-lib.sh
+  source "${SCRIPT_DIR}/datasync-lib.sh"
   if ! kafka_tcp_ok; then
-    echo "ERROR: Kafka not listening on localhost:9092" >&2
+    echo "ERROR: Kafka not on localhost:9092" >&2
     exit 1
   fi
   systemctl restart DataSync.service
-  echo ""
-  echo "Enabled: DataSync-kafka (native) + DataSync.service (user=${DATASYNC_USER})"
   if ! systemctl is-active --quiet DataSync.service; then
-    echo "ERROR: DataSync.service failed — journalctl -u DataSync -n 40 --no-pager" >&2
+    echo "ERROR: DataSync failed — journalctl -u DataSync -n 40 --no-pager" >&2
     exit 1
   fi
-else
   echo ""
-  echo "Units installed (not enabled — omit --no-enable to start)."
+  echo "OK: DataSync-kafka + DataSync (user=${DATASYNC_USER}, uid=${DATASYNC_UID})"
 fi
 
 cat <<EOF
 
-Installed:
-  ${SYSTEMD_DIR}/DataSync-kafka.service  (native Apache Kafka @ localhost:9092)
-  ${SYSTEMD_DIR}/DataSync.service        (Podman datasync daemon)
+Installed (Podman, user=datalake):
+  ${SYSTEMD_DIR}/DataSync-kafka.service
+  ${SYSTEMD_DIR}/DataSync.service
   ${ENV_FILE}
-  /etc/kafka/server.properties
+
+Prod updates:  cd ${ROOT} && git pull && ./install.sh
 
 Restart:
   sudo systemctl restart DataSync-kafka
@@ -178,10 +151,10 @@ Restart:
 
 Status:
   systemctl status DataSync-kafka DataSync
-  ss -tlnp | grep 9092
+  sudo -u datalake env XDG_RUNTIME_DIR=${RUNTIME_DIR} DOCKER_HOST=unix://${RUNTIME_DIR}/podman/podman.sock podman compose -f ${ROOT}/docker-compose.yml ps
 
 Logs:
-  journalctl -u DataSync-kafka -f
-  cd ${ROOT} && podman compose logs -f datasync
+  sudo -u datalake ... podman compose logs -f kafka
+  sudo -u datalake ... podman compose logs -f datasync
 
 EOF

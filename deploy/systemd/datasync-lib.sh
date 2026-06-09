@@ -43,14 +43,25 @@ kafka_tcp_ok() {
   (echo >/dev/tcp/"$host"/"$port") 2>/dev/null
 }
 
-wait_kafka_broker() {
-  local i
+kafka_compose_state() {
+  docker_compose ps kafka --format '{{.State}}' 2>/dev/null | head -1 || true
+}
+
+wait_kafka_compose() {
+  local i state
   for i in $(seq 1 120); do
     if kafka_tcp_ok; then
       return 0
     fi
+    state="$(kafka_compose_state)"
+    if [[ "$state" == "exited" || "$state" == "dead" ]]; then
+      docker_compose logs kafka --tail 25 >&2 || true
+      return 1
+    fi
     sleep 2
   done
+  echo "Kafka timeout on ${KAFKA_BOOTSTRAP:-localhost:9092}" >&2
+  docker_compose logs kafka --tail 25 >&2 || true
   return 1
 }
 
@@ -58,19 +69,8 @@ ensure_kafka_ready() {
   if kafka_tcp_ok; then
     return 0
   fi
-
-  if systemctl is-active --quiet DataSync-kafka.service 2>/dev/null; then
-    wait_kafka_broker && return 0
-  fi
-
-  echo "Waiting for native Kafka on ${KAFKA_BOOTSTRAP:-localhost:9092}..." >&2
-  if wait_kafka_broker; then
-    return 0
-  fi
-
-  echo "Kafka not reachable — check: systemctl status DataSync-kafka" >&2
-  journalctl -u DataSync-kafka -n 20 --no-pager 2>/dev/null || true
-  return 1
+  echo "Waiting for Kafka on ${KAFKA_BOOTSTRAP:-localhost:9092}..." >&2
+  wait_kafka_compose
 }
 
 datasync_build() {
@@ -83,4 +83,10 @@ stop_compose_datasync() {
   ensure_podman_ready || return 0
   cd "${DATASYNC_ROOT}"
   docker_compose stop datasync 2>/dev/null || true
+}
+
+stop_compose_all() {
+  ensure_podman_ready || return 0
+  cd "${DATASYNC_ROOT}"
+  docker_compose stop datasync kafka 2>/dev/null || true
 }

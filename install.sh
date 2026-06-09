@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DataSync — native Kafka + Podman daemon. Idempotent schema bootstrap.
+# DataSync — Kafka + daemon in Podman. Prod: systemd user datalake.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,7 +40,7 @@ ensure_container_engine() {
     printf '✔ Container runtime (%s)\n' "$(container_runtime_label)"
     return 0
   fi
-  warn "podman or docker required — start rootless podman: systemctl --user start podman.socket"
+  warn "podman or docker required — rootless: systemctl --user start podman.socket"
   exit 1
 }
 
@@ -97,7 +97,7 @@ kafka_tcp_ok() {
   (echo >/dev/tcp/localhost/9092) 2>/dev/null
 }
 
-wait_kafka_broker() {
+wait_kafka_tcp() {
   local i
   for i in $(seq 1 90); do
     kafka_tcp_ok && return 0
@@ -106,64 +106,21 @@ wait_kafka_broker() {
   return 1
 }
 
-ensure_native_kafka() {
-  if kafka_tcp_ok; then
-    printf '✔ Kafka listening on localhost:9092\n'
-    return 0
-  fi
-
+start_kafka_dev() {
   if systemctl is-enabled --quiet DataSync-kafka.service 2>/dev/null; then
-    if [[ "${EUID}" -eq 0 ]]; then
-      systemctl start DataSync-kafka.service
-    elif command -v sudo >/dev/null 2>&1; then
-      sudo systemctl start DataSync-kafka.service
-    fi
-    wait_kafka_broker && return 0
-    warn "DataSync-kafka failed — journalctl -u DataSync-kafka -n 30"
-    return 1
-  fi
-
-  if [[ ! -x "${ROOT}/deploy/kafka/install-kafka.sh" ]]; then
-    warn "native Kafka installer missing"
-    return 1
-  fi
-
-  printf '→ Installing native Kafka (sudo)...\n'
-  if [[ "${EUID}" -eq 0 ]]; then
-    DATASYNC_ROOT="${ROOT}" "${ROOT}/deploy/kafka/install-kafka.sh"
-    systemctl enable --now DataSync-kafka.service
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo env DATASYNC_ROOT="${ROOT}" "${ROOT}/deploy/kafka/install-kafka.sh"
-    sudo systemctl enable --now DataSync-kafka.service
-  else
-    warn "sudo required — run: sudo ${ROOT}/deploy/systemd/install-systemd.sh"
-    return 1
-  fi
-  wait_kafka_broker
-}
-
-run_discover() {
-  printf '✔ Discover skipped (run manually after onboarding sources)\n'
-  return 0
-}
-
-stop_host_native_datasync() {
-  local pid cmd
-  while read -r pid; do
-    [[ -z "${pid}" ]] && continue
-    cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
-    [[ "${cmd}" == *"DataSync daemon"* ]] || continue
-    kill "${pid}" 2>/dev/null || true
-  done < <(pgrep -f 'DataSync daemon' 2>/dev/null || true)
-}
-
-start_datasync_daemon() {
-  if systemctl is-enabled --quiet DataSync.service 2>/dev/null; then
-    printf '✔ DataSync daemon managed by systemd (skip compose up)\n'
     return 0
   fi
-  stop_host_native_datasync
-  docker_compose up -d --no-recreate datasync
+  docker_compose stop zookeeper 2>/dev/null || true
+  docker_compose up -d --remove-orphans kafka
+  wait_kafka_tcp
+}
+
+start_datasync_dev() {
+  if systemctl is-enabled --quiet DataSync.service 2>/dev/null; then
+    printf '✔ DataSync managed by systemd\n'
+    return 0
+  fi
+  docker_compose up -d --force-recreate datasync
 }
 
 post_install_health() {
@@ -185,18 +142,11 @@ post_install_health() {
   return 1
 }
 
-systemd_units_installed() {
-  [[ -f /etc/systemd/system/DataSync.service && -f /etc/systemd/system/DataSync-kafka.service ]]
-}
-
-install_systemd_if_missing() {
+sync_systemd_prod() {
   [[ "${SKIP_SYSTEMD:-0}" == "1" ]] && return 1
   [[ -x "$ROOT/deploy/systemd/install-systemd.sh" ]] || return 1
-  if systemd_units_installed; then
-    return 0
-  fi
 
-  printf '→ Installing systemd units (DataSync-kafka + DataSync)...\n'
+  printf '→ Syncing prod systemd (Podman Kafka + DataSync)...\n'
   if [[ "${EUID}" -eq 0 ]]; then
     "$ROOT/deploy/systemd/install-systemd.sh"
     return 0
@@ -205,37 +155,26 @@ install_systemd_if_missing() {
     sudo "$ROOT/deploy/systemd/install-systemd.sh"
     return 0
   fi
-  warn "sudo required — run: sudo $ROOT/deploy/systemd/install-systemd.sh"
+  warn "sudo required for prod — see deploy/PROD.md"
   return 1
 }
 
-restart_systemd_stack() {
-  if ! systemctl is-enabled --quiet DataSync.service 2>/dev/null; then
-    return 1
-  fi
-  if [[ "${EUID}" -eq 0 ]]; then
-    systemctl restart DataSync-kafka.service
-    sleep 3
-    systemctl restart DataSync.service
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo systemctl restart DataSync-kafka.service
-    sleep 3
-    sudo systemctl restart DataSync.service
-  else
-    warn "sudo required to restart systemd units"
-    return 1
-  fi
+run_discover() {
+  printf '✔ Discover skipped (run manually after onboarding sources)\n'
+  return 0
 }
 
-print_systemd_hint() {
+print_dev_hint() {
   [[ "${SKIP_SYSTEMD:-0}" == "1" ]] && return 0
-  systemd_units_installed && return 0
-  [[ -x "$ROOT/deploy/systemd/install-systemd.sh" ]] || return 0
-
+  systemctl is-enabled --quiet DataSync.service 2>/dev/null && return 0
   cat <<EOF
 
-── systemd (not installed — run once with sudo) ──
-  sudo $ROOT/deploy/systemd/install-systemd.sh
+── Dev mode (no systemd) ──
+  podman compose ps
+  podman compose logs -f kafka datasync
+
+Prod once: sudo $ROOT/deploy/systemd/install-systemd.sh
+See: $ROOT/deploy/PROD.md
 
 EOF
 }
@@ -246,19 +185,16 @@ ensure_config
 build_image
 apply_catalog_schema
 
-install_systemd_if_missing || true
-
-if restart_systemd_stack; then
-  printf '✔ Systemd stack restarted (native Kafka + DataSync)\n'
+if sync_systemd_prod; then
+  printf '✔ Prod stack ready (systemd + Podman as datalake)\n'
 else
-  run_quiet "Native Kafka" ensure_native_kafka
-  run_quiet "DataSync daemon" start_datasync_daemon
+  run_quiet "Kafka (compose)" start_kafka_dev
+  run_quiet "DataSync daemon" start_datasync_dev
 fi
 
 sleep 2
 run_quiet "Post-install health" post_install_health
 run_discover
-print_systemd_hint
+print_dev_hint
 
-printf '✔ Install complete — status: %s compose ps | discover: %s compose run --rm datasync discover\n' \
-  "$(container_runtime_label)" "$(container_runtime_label)"
+printf '✔ Install complete\n'
