@@ -288,6 +288,9 @@ int run_conn_capture_slice(
     const std::string db_engine = conn_engine(cfg, conn_id);
     const std::optional<std::string> all_tiers;
 
+    RuntimeConfig runtime;
+    runtime.reload(log_pg);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_kafka_daemon",
@@ -296,7 +299,13 @@ int run_conn_capture_slice(
         .conn_id = conn_id,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"db_engine", db_engine}, {"tier", "all"}},
+        .context = {
+            {"db_engine", db_engine},
+            {"tier", "all"},
+            {"kafka_bootstrap", kafka.bootstrap},
+            {"kafka_bootstrap_source", kafka.source},
+            {"topic_prefix", topic_prefix_for_conn(conn_id)},
+        },
     });
 
     int errors = 0;

@@ -334,26 +334,46 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     }
 
     RuntimeConfig runtime;
+    runtime.reload(log_pg);
     const CaptureRuntimeConfig rcfg =
         load_mssql_capture_runtime(runtime, log_pg, conn_id, &cfg.cdc);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_kafka_mssql_capture",
+        .message = "mssql capture slice started",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"tier", service_tier.value_or("all")},
+            {"kafka_bootstrap", kafka.bootstrap},
+            {"kafka_bootstrap_source", kafka.source},
+            {"topic_prefix", rcfg.topic_prefix},
+        },
+    });
     const auto tables =
         fetch_capture_catalog_tables(log_pg, conn_id, service_tier, worker_id, worker_count, "mssql");
     clear_stale_cdc_in_progress(log_pg, conn_id, service_tier, "mssql");
     if (tables.empty()) {
-        log_write(log_pg, {
-            .level = LogLevel::Info,
-            .component = "cdc_kafka_mssql_capture",
-            .message = "mssql capture skipped: no tables",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-        });
+        log_cdc_skip_no_tables(
+            log_pg, "cdc_kafka_mssql_capture", "capture", batch_id, conn_id, service_tier, "mssql");
         return stats;
     }
 
     KafkaProducer producer(rcfg.bootstrap, rcfg.linger_ms, rcfg.producer_batch);
     if (!producer.available()) {
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_kafka_mssql_capture",
+            .message = "mssql capture kafka producer unavailable",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"kafka_bootstrap", rcfg.bootstrap}},
+        });
         throw std::runtime_error("Kafka producer unavailable for MSSQL capture");
     }
 

@@ -145,7 +145,7 @@ CatchupResult run_table_catchup(
     };
 
     runtime.reload(log_pg);
-    const std::string bootstrap = runtime.get_string("kafka_bootstrap_servers", "localhost:9092", "cdc_kafka_apply", conn_id);
+    const std::string bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
 
     const ApplyPositionRow pos = fetch_apply_position(log_pg, conn_id, schema, table);
     const std::string svc_tier = tier && !tier->empty() ? *tier : pos.service_tier;
@@ -246,7 +246,7 @@ std::vector<CatchupCandidate> find_catchup_candidates(
     const int default_stale = runtime.get_int("apply_max_table_staleness_seconds", 900, "cdc_kafka_apply", conn_id);
     const int lag_seconds_threshold = runtime.get_int("apply_catchup_lag_seconds", 300, "cdc_kafka_apply", conn_id);
     const int kafka_lag_threshold = runtime.get_int("apply_catchup_kafka_messages", 500000, "cdc_kafka_apply", conn_id);
-    const std::string bootstrap = runtime.get_string("kafka_bootstrap_servers", "localhost:9092", "cdc_kafka_apply", conn_id);
+    const std::string bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
 
     const char* vals[] = {conn_id.c_str()};
     PGresult* res = PQexecParams(

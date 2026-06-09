@@ -62,10 +62,31 @@ CaptureRuntimeConfig load_mongo_capture_runtime(
     const std::string& conn_id,
     const CdcConfig* cdc = nullptr);
 
+/** Kafka bootstrap: KAFKA_BOOTSTRAP env → runtime_config → localhost:9092 */
+struct KafkaBootstrapResolved {
+    std::string bootstrap;
+    std::string source;  // env | runtime_config | default
+};
+
+KafkaBootstrapResolved resolve_kafka_bootstrap(RuntimeConfig& runtime, const std::string& conn_id);
+
+/** Topic prefix is always conn_id (not runtime_config). */
+std::string topic_prefix_for_conn(const std::string& conn_id);
+
 std::string runtime_topic_prefix(
     RuntimeConfig& runtime,
     PGconn* pg,
     const std::string& conn_id,
+    const std::string& db_engine);
+
+/** Log why capture/apply found zero eligible tables (cdc_catalog.logs). */
+void log_cdc_skip_no_tables(
+    PGconn* pg,
+    const std::string& component,
+    const std::string& pipeline,
+    const std::string& batch_id,
+    const std::string& conn_id,
+    const std::optional<std::string>& tier,
     const std::string& db_engine);
 
 // Per-tier suffix avoids Kafka consumer group rebalance when daemon runs tiers in parallel.

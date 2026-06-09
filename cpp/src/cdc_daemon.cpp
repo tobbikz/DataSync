@@ -377,6 +377,7 @@ int run_cdc_daemon(
         });
     }
 
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, "");
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_daemon",
@@ -393,6 +394,9 @@ int run_cdc_daemon(
             {"round_idle_seconds", round_idle_seconds(cfg.cdc)},
             {"slice_max_seconds", cfg.cdc.slice_max_seconds},
             {"slice_max_events", cfg.cdc.slice_max_events},
+            {"kafka_bootstrap", kafka.bootstrap},
+            {"kafka_bootstrap_source", kafka.source},
+            {"topic_prefix_mode", "conn_id"},
         },
     });
 

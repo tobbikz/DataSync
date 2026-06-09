@@ -204,8 +204,32 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     }
 
     RuntimeConfig runtime;
+    runtime.reload(log_pg);
     const CaptureRuntimeConfig rcfg =
         load_mariadb_capture_runtime(runtime, log_pg, conn_id, &cfg.cdc);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
+
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_kafka_capture",
+        .message = "capture slice started",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"tier", service_tier.value_or("all")},
+            {"worker_id", worker_id},
+            {"worker_count", worker_count},
+            {"kafka_bootstrap", kafka.bootstrap},
+            {"kafka_bootstrap_source", kafka.source},
+            {"topic_prefix", rcfg.topic_prefix},
+            {"topic_mode", rcfg.topic_mode},
+            {"topic_buckets", rcfg.topic_buckets},
+            {"max_seconds", rcfg.max_seconds},
+            {"max_events", rcfg.max_events},
+        },
+    });
 
     // One binlog cursor per conn: serialize capture when daemon runs tiers in parallel.
     static std::mutex g_mariadb_capture_mu;
@@ -215,17 +239,21 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         fetch_capture_catalog_tables(log_pg, conn_id, service_tier, worker_id, worker_count, "mariadb");
     clear_stale_cdc_in_progress(log_pg, conn_id, service_tier, "mariadb");
     if (tables.empty()) {
-        log_write(log_pg, {
-            .level = LogLevel::Info,
-            .component = "cdc_kafka_capture",
-            .message = "capture skipped: no tables",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-        });
+        log_cdc_skip_no_tables(
+            log_pg, "cdc_kafka_capture", "capture", batch_id, conn_id, service_tier, "mariadb");
         return stats;
     }
+
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_kafka_capture",
+        .message = "capture tables selected",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {{"table_count", static_cast<int>(tables.size())}, {"tier", service_tier.value_or("all")}},
+    });
 
     std::set<std::pair<std::string, std::string>> wanted;
     std::map<std::pair<std::string, std::string>, std::string> pk_by_table;
@@ -245,6 +273,20 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     }
 
     CapturePosition start_pos = read_capture_position(log_pg, conn_id);
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_kafka_capture",
+        .message = "capture binlog resume",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"binlog_file", start_pos.binlog_file},
+            {"binlog_position", start_pos.binlog_position},
+            {"server_uuid", start_pos.server_uuid},
+        },
+    });
     const std::string live_uuid = mariadb_server_uuid(mariadb.handle);
     if (!start_pos.server_uuid.empty() && !live_uuid.empty() && start_pos.server_uuid != live_uuid) {
         upsert_capture_position(
@@ -259,12 +301,33 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         throw std::runtime_error("server_uuid changed; gap_detected — run recovery");
     }
 
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_kafka_capture",
+        .message = "capture kafka producer connecting",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {{"kafka_bootstrap", rcfg.bootstrap}, {"kafka_bootstrap_source", kafka.source}},
+    });
     KafkaProducer producer(rcfg.bootstrap, rcfg.linger_ms, rcfg.producer_batch);
     if (!producer.available()) {
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_kafka_capture",
+            .message = "capture kafka producer unavailable",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"kafka_bootstrap", rcfg.bootstrap}},
+        });
         throw std::runtime_error("Kafka producer unavailable for capture");
     }
 
     BinlogPosition binlog_start{start_pos.binlog_file, start_pos.binlog_position};
+    bool first_kafka_publish_logged = false;
     const auto publish_row = [&](
                                const std::string& schema,
                                const std::string& table,
@@ -311,6 +374,24 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         const std::string msg_key = kafka_message_key_for_row(
             schema, table, row_for_key, pk_by_table[key]);
         producer.produce(topic, msg_key, event.to_kafka_dict().dump());
+        if (!first_kafka_publish_logged) {
+            first_kafka_publish_logged = true;
+            log_write(log_pg, {
+                .level = LogLevel::Info,
+                .component = "cdc_kafka_capture",
+                .message = "capture kafka first event published",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = schema,
+                .source_table = table,
+                .context = {
+                    {"topic", topic},
+                    {"op", op_char},
+                    {"topic_prefix", rcfg.topic_prefix},
+                    {"kafka_bootstrap", rcfg.bootstrap},
+                },
+            });
+        }
     };
 
     const auto slice_deadline =
@@ -350,6 +431,20 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         }
 
         if (chunk.events == 0) {
+            log_write(log_pg, {
+                .level = LogLevel::Info,
+                .component = "cdc_kafka_capture",
+                .message = "capture binlog idle",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"binlog_file", read_stats.last_file},
+                    {"binlog_position", read_stats.last_position},
+                    {"events_total", read_stats.events},
+                },
+            });
             const auto now = std::chrono::steady_clock::now();
             if (rcfg.heartbeat_seconds > 0 &&
                 std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat).count() >=
@@ -360,6 +455,23 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             }
             break;
         }
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_kafka_capture",
+            .message = "capture binlog chunk processed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"chunk_events", chunk.events},
+                {"chunk_upserts", chunk.upserts},
+                {"chunk_deletes", chunk.deletes},
+                {"binlog_file", read_stats.last_file},
+                {"binlog_position", read_stats.last_position},
+                {"events_total", read_stats.events},
+            },
+        });
         last_heartbeat = std::chrono::steady_clock::now();
     }
 
@@ -416,6 +528,9 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             {"gtid_set", gtid_state},
             {"duration_ms", stats.duration_ms},
             {"tier", service_tier.value_or("all")},
+            {"kafka_bootstrap", rcfg.bootstrap},
+            {"topic_prefix", rcfg.topic_prefix},
+            {"tables_watched", static_cast<int>(wanted.size())},
         },
     });
 

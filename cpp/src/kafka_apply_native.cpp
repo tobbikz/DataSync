@@ -228,21 +228,6 @@ FairnessCounts finalize_slice_reporting(
     return counts;
 }
 
-std::string runtime_topic_prefix(RuntimeConfig& runtime, const std::string& conn_id, const std::string& db_engine = "mariadb") {
-    if (db_engine == "mssql") {
-        // Do not fall back to cdc_kafka_apply global prefix (MARIADB_LOCAL) — MSSQL topics are separate.
-        return runtime.get_string("capture_topic_prefix", "MSSQL_LOCAL", "cdc_kafka_mssql_capture", conn_id);
-    }
-    if (db_engine == "mongodb") {
-        return runtime.get_string("capture_topic_prefix", "MONGO_LOCAL", "cdc_kafka_mongo_capture", conn_id);
-    }
-    const std::string apply_prefix = runtime.get_string("kafka_topic_prefix", "", "cdc_kafka_apply", conn_id);
-    if (!apply_prefix.empty()) {
-        return apply_prefix;
-    }
-    return runtime.get_string("capture_topic_prefix", conn_id, "cdc_kafka_capture", conn_id);
-}
-
 std::vector<CatalogMeta> fetch_catalog_tables(
     PGconn* pg,
     const std::string& conn_id,
@@ -723,9 +708,39 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
         to_apply.push_back(std::move(e));
     }
 
+    const int dedup_skipped = static_cast<int>(eligible.size() - to_apply.size());
     if (to_apply.empty()) {
+        log_write(app_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_kafka_apply_cpp",
+            .message = "apply batch dedup only",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"batch_events", static_cast<int>(eligible.size())},
+                {"dedup_skipped", dedup_skipped},
+                {"to_apply", 0},
+            },
+        });
         return batch_offsets;
     }
+
+    log_write(app_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_kafka_apply_cpp",
+        .message = "apply batch flushing to lake",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"batch_events", static_cast<int>(eligible.size())},
+            {"dedup_skipped", dedup_skipped},
+            {"to_apply", static_cast<int>(to_apply.size())},
+        },
+    });
 
     try {
         ApplyBatchOptions options;
@@ -773,6 +788,20 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
             applied_by_table[key] = applied_by_table[key] + 1;
             batch_offsets[{e.topic, e.partition}] = e.offset;
         }
+        log_write(app_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_kafka_apply_cpp",
+            .message = "lake batch committed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"rows_applied", applied_n},
+                {"to_apply", static_cast<int>(to_apply.size())},
+                {"kafka_offsets", static_cast<int>(batch_offsets.size())},
+            },
+        });
     } catch (const std::exception& ex) {
         errors += 1;
         throw std::runtime_error(ex.what());
@@ -805,6 +834,7 @@ int run_kafka_apply_native_cli(
     const int retention_days = runtime.get_int("logs_retention_days", 7, "global");
     purge_logs(log_pg, retention_days);
 
+    const KafkaBootstrapResolved kafka_boot = resolve_kafka_bootstrap(runtime, conn_id);
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_kafka_apply_cpp",
@@ -817,6 +847,10 @@ int run_kafka_apply_native_cli(
             {"worker_id", worker_id},
             {"worker_count", worker_count},
             {"tier", service_tier.value_or("")},
+            {"db_engine", conn_engine(cfg, conn_id)},
+            {"kafka_bootstrap", kafka_boot.bootstrap},
+            {"kafka_bootstrap_source", kafka_boot.source},
+            {"topic_prefix", topic_prefix_for_conn(conn_id)},
             {"apply_batch_size", runtime.get_int("apply_batch_size", 50000, "cdc_kafka_apply", conn_id)},
         },
     });
@@ -828,10 +862,11 @@ int run_kafka_apply_native_cli(
     const std::string db_engine = conn_engine(cfg, conn_id);
     clear_stale_cdc_in_progress(app_pg.raw, conn_id, service_tier, db_engine);
 
-    const std::string bootstrap = runtime.get_string("kafka_bootstrap_servers", "localhost:9092", "cdc_kafka_apply", conn_id);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
+    const std::string bootstrap = kafka.bootstrap;
     const std::string consumer_group =
         kafka_apply_consumer_group(runtime, log_pg, conn_id, service_tier.value_or(""));
-    const std::string topic_prefix = runtime_topic_prefix(runtime, conn_id, db_engine);
+    const std::string topic_prefix = topic_prefix_for_conn(conn_id);
     const std::string topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_apply", conn_id);
     const int topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_apply", conn_id);
     const int max_seconds = cfg.cdc.slice_max_seconds > 0
@@ -887,25 +922,8 @@ int run_kafka_apply_native_cli(
     if (meta_by_key.empty()) {
         const ApplySkipReasonCounts reasons =
             fetch_apply_skip_reasons(app_pg.raw, conn_id, service_tier, db_engine);
-        log_write(log_pg, {
-            .level = LogLevel::Info,
-            .component = "cdc_kafka_apply_cpp",
-            .message = "apply slice skipped: no tables",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {
-                {"tier", service_tier.value_or("")},
-                {"db_engine", db_engine},
-                {"active_total", reasons.active_total},
-                {"needs_full_load", reasons.needs_full_load},
-                {"cdc_disabled", reasons.cdc_disabled},
-                {"no_pk", reasons.no_pk},
-                {"skipped_status", reasons.skipped_status},
-                {"apply_ready", reasons.apply_ready},
-            },
-        });
+        log_cdc_skip_no_tables(
+            log_pg, "cdc_kafka_apply_cpp", "apply", batch_id, conn_id, service_tier, db_engine);
         stats["stop_reason"] = "no_tables";
         stats["active_total"] = reasons.active_total;
         stats["needs_full_load"] = reasons.needs_full_load;
@@ -914,6 +932,27 @@ int run_kafka_apply_native_cli(
         std::cout << stats.dump() << std::endl;
         return 0;
     }
+
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_kafka_apply_cpp",
+        .message = "apply tables selected",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"tier", service_tier.value_or("")},
+            {"db_engine", db_engine},
+            {"table_count", static_cast<int>(meta_by_key.size())},
+            {"kafka_bootstrap", bootstrap},
+            {"kafka_bootstrap_source", kafka.source},
+            {"consumer_group", consumer_group},
+            {"topic_prefix", topic_prefix},
+            {"topic_mode", topic_mode},
+            {"topic_buckets", topic_buckets},
+        },
+    });
 
     std::set<TableKey> wanted;
     std::vector<std::pair<std::string, std::string>> table_pairs;
@@ -1056,6 +1095,23 @@ int run_kafka_apply_native_cli(
         return 1;
     }
 
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_kafka_apply_cpp",
+        .message = "kafka consumer subscribed",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"consumer_group", consumer_group},
+            {"topic_count", static_cast<int>(topics.size())},
+            {"kafka_bootstrap", bootstrap},
+            {"kafka_bootstrap_source", kafka.source},
+            {"poll_timeout_ms", poll_timeout_ms},
+        },
+    });
+
     std::map<TableKey, int> seen_by_table;
     std::map<TableKey, int> applied_by_table;
     std::map<TableKey, int> processed_by_table;
@@ -1071,6 +1127,8 @@ int run_kafka_apply_native_cli(
     int empty_polls = 0;
     int memory_backpressure_waits = 0;
     bool memory_backpressure_logged = false;
+    bool first_kafka_message_logged = false;
+    long long kafka_poll_progress_last = 0;
     std::vector<ApplyEvent> pending_batch;
     HostMetricsSampler host_sampler;
     host_sampler.mark_start();
@@ -1220,6 +1278,20 @@ int run_kafka_apply_native_cli(
                     if (events_seen == 0 && pending_batch.empty() && no_lag) {
                         stop_reason = "idle_no_messages";
                         loop_exited_early = true;
+                        log_write(log_pg, {
+                            .level = LogLevel::Info,
+                            .component = "cdc_kafka_apply_cpp",
+                            .message = "kafka poll idle no messages",
+                            .batch_id = batch_id,
+                            .conn_id = conn_id,
+                            .source_schema = std::nullopt,
+                            .source_table = std::nullopt,
+                            .context = {
+                                {"empty_polls", empty_polls},
+                                {"topic_count", static_cast<int>(topics.size())},
+                                {"consumer_group", consumer_group},
+                            },
+                        });
                         break;
                     }
                     const bool allow_quiet = no_lag;
@@ -1276,6 +1348,43 @@ int run_kafka_apply_native_cli(
             const std::string payload(static_cast<const char*>(msg->payload), msg->len);
             rd_kafka_message_destroy(msg);
 
+            if (!first_kafka_message_logged) {
+                first_kafka_message_logged = true;
+                log_write(log_pg, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_kafka_apply_cpp",
+                    .message = "kafka first message received",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {
+                        {"topic", topic},
+                        {"partition", partition},
+                        {"offset", offset},
+                        {"payload_bytes", static_cast<int>(payload.size())},
+                    },
+                });
+            }
+            if (events_seen - kafka_poll_progress_last >= 100) {
+                kafka_poll_progress_last = events_seen;
+                log_write(log_pg, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_kafka_apply_cpp",
+                    .message = "kafka poll progress",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {
+                        {"events_seen", events_seen},
+                        {"events_applied", events_applied},
+                        {"pending_batch", static_cast<int>(pending_batch.size())},
+                        {"empty_polls", empty_polls},
+                    },
+                });
+            }
+
             const json probe = kafka_apply_detail::parse_kafka_message_json(payload);
             if (probe.is_discarded() || !probe.is_object()) {
                 parse_skipped += 1;
@@ -1322,6 +1431,25 @@ int run_kafka_apply_native_cli(
                 continue;
             }
             event.catalog_id = meta_by_key[key].catalog_id;
+
+            if (events_applied == 0 && pending_batch.empty() && seen_by_table[key] == 0) {
+                log_write(log_pg, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_kafka_apply_cpp",
+                    .message = "kafka message parsed for table",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = schema_name,
+                    .source_table = table_name,
+                    .context = {
+                        {"op", event.op},
+                        {"topic", topic},
+                        {"partition", partition},
+                        {"offset", offset},
+                        {"event_id", event.event_id.substr(0, 64)},
+                    },
+                });
+            }
 
             seen_by_table[key] = seen_by_table[key] + 1;
             processed_by_table[key] = processed_by_table[key] + 1;

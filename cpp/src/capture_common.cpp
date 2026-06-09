@@ -1,5 +1,7 @@
 #include "capture_common.hpp"
 
+#include <cstdlib>
+
 #ifdef HAVE_FREETDS
 #include "mssql_kafka_capture.hpp"
 #endif
@@ -28,23 +30,44 @@
 #pragma GCC diagnostic pop
 #endif
 
+KafkaBootstrapResolved resolve_kafka_bootstrap(RuntimeConfig& runtime, const std::string& conn_id) {
+    KafkaBootstrapResolved out;
+    if (const char* env = std::getenv("KAFKA_BOOTSTRAP")) {
+        const std::string trimmed(env);
+        if (!trimmed.empty()) {
+            out.bootstrap = trimmed;
+            out.source = "env";
+            return out;
+        }
+    }
+    const std::string from_runtime =
+        runtime.get_string("kafka_bootstrap_servers", "", "cdc_kafka_apply", conn_id);
+    if (!from_runtime.empty()) {
+        out.bootstrap = from_runtime;
+        out.source = "runtime_config";
+        return out;
+    }
+    out.bootstrap = "localhost:9092";
+    out.source = "default";
+    return out;
+}
+
+std::string topic_prefix_for_conn(const std::string& conn_id) {
+    if (conn_id.empty()) {
+        return "UNKNOWN_CONN";
+    }
+    return conn_id;
+}
+
 std::string runtime_topic_prefix(
     RuntimeConfig& runtime,
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine) {
-    runtime.reload(pg);
-    if (db_engine == "mssql") {
-        return runtime.get_string("capture_topic_prefix", "MSSQL_LOCAL", "cdc_kafka_mssql_capture", conn_id);
-    }
-    if (db_engine == "mongodb") {
-        return runtime.get_string("capture_topic_prefix", "MONGO_LOCAL", "cdc_kafka_mongo_capture", conn_id);
-    }
-    const std::string apply_prefix = runtime.get_string("kafka_topic_prefix", "", "cdc_kafka_apply", conn_id);
-    if (!apply_prefix.empty()) {
-        return apply_prefix;
-    }
-    return runtime.get_string("capture_topic_prefix", conn_id, "cdc_kafka_capture", conn_id);
+    (void)runtime;
+    (void)pg;
+    (void)db_engine;
+    return topic_prefix_for_conn(conn_id);
 }
 
 std::string kafka_apply_consumer_group(
@@ -86,10 +109,10 @@ CaptureRuntimeConfig load_mariadb_capture_runtime(
     CaptureRuntimeConfig cfg;
     cfg.max_seconds = runtime.get_int("capture_max_seconds", 300, "cdc_kafka_capture", conn_id);
     cfg.max_events = runtime.get_int("capture_max_events", 10000000, "cdc_kafka_capture", conn_id);
-    cfg.topic_prefix = runtime.get_string("capture_topic_prefix", conn_id, "cdc_kafka_capture", conn_id);
+    cfg.topic_prefix = topic_prefix_for_conn(conn_id);
     cfg.topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
     cfg.topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_capture", conn_id);
-    cfg.bootstrap = runtime.get_string("kafka_bootstrap_servers", "localhost:9092", "cdc_kafka_apply", conn_id);
+    cfg.bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
     cfg.linger_ms = runtime.get_int("capture_producer_linger_ms", 5, "cdc_kafka_capture", conn_id);
     cfg.producer_batch = runtime.get_int("capture_producer_batch_size", 10000, "cdc_kafka_capture", conn_id);
     cfg.topic_partitions = runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_capture", conn_id);
@@ -108,10 +131,10 @@ CaptureRuntimeConfig load_mssql_capture_runtime(
     CaptureRuntimeConfig cfg;
     cfg.max_seconds = runtime.get_int("capture_max_seconds", 300, "cdc_kafka_mssql_capture", conn_id);
     cfg.max_events = runtime.get_int("capture_max_events", 10000000, "cdc_kafka_mssql_capture", conn_id);
-    cfg.topic_prefix = runtime.get_string("capture_topic_prefix", conn_id, "cdc_kafka_mssql_capture", conn_id);
+    cfg.topic_prefix = topic_prefix_for_conn(conn_id);
     cfg.topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
     cfg.topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_mssql_capture", conn_id);
-    cfg.bootstrap = runtime.get_string("kafka_bootstrap_servers", "localhost:9092", "cdc_kafka_apply", conn_id);
+    cfg.bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
     cfg.linger_ms = runtime.get_int("capture_producer_linger_ms", 5, "cdc_kafka_mssql_capture", conn_id);
     cfg.producer_batch = runtime.get_int("capture_producer_batch_size", 10000, "cdc_kafka_mssql_capture", conn_id);
     cfg.topic_partitions = runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mssql_capture", conn_id);
@@ -134,10 +157,10 @@ CaptureRuntimeConfig load_mongo_capture_runtime(
     CaptureRuntimeConfig cfg;
     cfg.max_seconds = runtime.get_int("capture_max_seconds", 60, "cdc_kafka_mongo_capture", conn_id);
     cfg.max_events = runtime.get_int("capture_max_events", 10000000, "cdc_kafka_mongo_capture", conn_id);
-    cfg.topic_prefix = runtime.get_string("capture_topic_prefix", conn_id, "cdc_kafka_mongo_capture", conn_id);
+    cfg.topic_prefix = topic_prefix_for_conn(conn_id);
     cfg.topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
     cfg.topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_mongo_capture", conn_id);
-    cfg.bootstrap = runtime.get_string("kafka_bootstrap_servers", "localhost:9092", "cdc_kafka_apply", conn_id);
+    cfg.bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
     cfg.linger_ms = runtime.get_int("capture_producer_linger_ms", 5, "cdc_kafka_mongo_capture", conn_id);
     cfg.producer_batch = runtime.get_int("capture_producer_batch_size", 10000, "cdc_kafka_mongo_capture", conn_id);
     cfg.topic_partitions = runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mongo_capture", conn_id);
@@ -711,6 +734,37 @@ ApplySkipReasonCounts fetch_apply_skip_reasons(
     return out;
 }
 
+void log_cdc_skip_no_tables(
+    PGconn* pg,
+    const std::string& component,
+    const std::string& pipeline,
+    const std::string& batch_id,
+    const std::string& conn_id,
+    const std::optional<std::string>& tier,
+    const std::string& db_engine) {
+    const ApplySkipReasonCounts reasons = fetch_apply_skip_reasons(pg, conn_id, tier, db_engine);
+    log_write(pg, {
+        .level = LogLevel::Info,
+        .component = component,
+        .message = pipeline + " skipped: no tables",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"pipeline", pipeline},
+            {"tier", tier.value_or("all")},
+            {"db_engine", db_engine},
+            {"active_total", reasons.active_total},
+            {"needs_full_load", reasons.needs_full_load},
+            {"cdc_disabled", reasons.cdc_disabled},
+            {"no_pk", reasons.no_pk},
+            {"skipped_status", reasons.skipped_status},
+            {"cdc_ready", reasons.apply_ready},
+        },
+    });
+}
+
 void ensure_apply_positions_for_tier(
     PGconn* pg,
     RuntimeConfig& runtime,
@@ -804,7 +858,8 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
 
     RuntimeConfig runtime;
     runtime.reload(pg);
-    const std::string bootstrap = runtime.get_string("kafka_bootstrap_servers", "localhost:9092", "cdc_kafka_apply", conn_id);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
+    const std::string bootstrap = kafka.bootstrap;
     const std::string consumer_group = kafka_apply_consumer_group(runtime, pg, conn_id, tier);
     ensure_apply_positions_for_tier(pg, runtime, conn_id, tier, db_engine);
 

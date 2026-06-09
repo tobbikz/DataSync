@@ -1046,8 +1046,7 @@ int run_reconcile_cli(
 
 #ifdef HAVE_RDKAFKA
     std::unique_ptr<KafkaLagProbe> kafka_probe;
-    const std::string kafka_bootstrap =
-        runtime.get_string("kafka_bootstrap_servers", "localhost:9092", "cdc_kafka_apply", conn_id);
+    const std::string kafka_bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
     try {
         kafka_probe = std::make_unique<KafkaLagProbe>(kafka_bootstrap);
     } catch (...) {

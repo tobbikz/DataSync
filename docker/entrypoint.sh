@@ -399,7 +399,7 @@ patch_kafka_bootstrap() {
 
   psql -h "${pg[0]}" -p "${pg[1]}" -U "${pg[3]}" -d "${pg[2]}" -v ON_ERROR_STOP=1 -q <<SQL
 INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
-VALUES ('kafka_bootstrap_servers', 'cdc_kafka_apply', '', '${json_val}'::jsonb, 'Kafka bootstrap (install default)')
+VALUES ('kafka_bootstrap_servers', 'cdc_kafka_apply', '', '${json_val}'::jsonb, 'Kafka bootstrap fallback when KAFKA_BOOTSTRAP env unset')
 ON CONFLICT (config_key, component, conn_id)
 DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = now();
 SQL

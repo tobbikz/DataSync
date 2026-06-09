@@ -1236,6 +1236,28 @@ json apply_events_batch(
                 false,
                 events_seen_in_slice,
                 metrics);
+            log_write(app_pg, {
+                .level = LogLevel::Info,
+                .component = "cdc_kafka_apply_cpp",
+                .message = "lake table written",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = meta.catalog_source_schema,
+                .source_table = meta.catalog_source_table,
+                .context = {
+                    {"lake_schema", meta.schema_name},
+                    {"lake_table", meta.table_name},
+                    {"inserts", op_counts.inserts},
+                    {"updates", op_counts.updates},
+                    {"deletes", op_counts.deletes},
+                    {"rows_applied", events_applied_total},
+                    {"duration_ms", table_duration_ms},
+                    {"kafka_topic", last.topic},
+                    {"kafka_partition", last.partition},
+                    {"kafka_offset", last.offset},
+                    {"fk_deferred_retries", fk_retries},
+                },
+            });
             PGresult* app_commit = PQexec(app_pg, "COMMIT");
             if (app_commit) {
                 PQclear(app_commit);
