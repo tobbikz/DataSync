@@ -80,6 +80,29 @@ std::string mariadb_server_uuid(MYSQL* mysql) {
     return {};
 }
 
+struct MasterStatusLite {
+    std::string file;
+    long long position{0};
+};
+
+MasterStatusLite fetch_master_status(MYSQL* mysql) {
+    MasterStatusLite out;
+    if (mysql_query(mysql, "SHOW MASTER STATUS") != 0) {
+        return out;
+    }
+    MYSQL_RES* res = mysql_store_result(mysql);
+    if (!res) {
+        return out;
+    }
+    MYSQL_ROW row = mysql_fetch_row(res);
+    if (row && row[0]) {
+        out.file = row[0];
+        out.position = row[1] ? std::atoll(row[1]) : 0;
+    }
+    mysql_free_result(res);
+    return out;
+}
+
 std::string mariadb_gtid_binlog_state(MYSQL* mysql) {
     for (const char* sql : {"SELECT @@gtid_binlog_state", "SELECT @@gtid_current_pos"}) {
         try {
@@ -326,6 +349,43 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         throw std::runtime_error("Kafka producer unavailable for capture");
     }
 
+    const std::string binlog_cli = find_mariadb_binlog_binary();
+    if (binlog_cli.empty()) {
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_kafka_capture",
+            .message = "capture binlog cli missing",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"hint", "install mariadb-client in runtime image or set MARIADB_BINLOG_PATH"},
+            },
+        });
+        throw std::runtime_error("mariadb-binlog not found in PATH");
+    }
+
+    const MasterStatusLite master_now = fetch_master_status(mariadb.handle);
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_kafka_capture",
+        .message = "capture binlog cli ready",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"binlog_cli", binlog_cli},
+            {"resume_file", start_pos.binlog_file},
+            {"resume_position", start_pos.binlog_position},
+            {"master_file", master_now.file},
+            {"master_position", master_now.position},
+            {"mariadb_host", source->host},
+            {"mariadb_port", source->port},
+        },
+    });
+
     BinlogPosition binlog_start{start_pos.binlog_file, start_pos.binlog_position};
     bool first_kafka_publish_logged = false;
     const auto publish_row = [&](
@@ -430,11 +490,32 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             binlog_start = BinlogPosition{chunk.last_file, chunk.last_position};
         }
 
-        if (chunk.events == 0) {
+        if (chunk.cli_missing) {
             log_write(log_pg, {
-                .level = LogLevel::Info,
+                .level = LogLevel::Error,
                 .component = "cdc_kafka_capture",
-                .message = "capture binlog idle",
+                .message = "capture binlog cli missing",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {{"stderr", chunk.stderr_tail}},
+            });
+            throw std::runtime_error("mariadb-binlog not found in PATH");
+        }
+
+        if (chunk.events == 0) {
+            const MasterStatusLite master_chunk = fetch_master_status(mariadb.handle);
+            const bool caught_up =
+                !master_chunk.file.empty() && master_chunk.file == read_stats.last_file &&
+                read_stats.last_position >= master_chunk.position;
+            const bool cli_failed = chunk.exit_code != 0 && !chunk.stderr_tail.empty();
+            log_write(log_pg, {
+                .level = cli_failed ? LogLevel::Error : LogLevel::Info,
+                .component = "cdc_kafka_capture",
+                .message = cli_failed ? "capture binlog cli failed"
+                                     : (caught_up ? "capture binlog caught up with master"
+                                                  : "capture binlog idle"),
                 .batch_id = batch_id,
                 .conn_id = conn_id,
                 .source_schema = std::nullopt,
@@ -443,8 +524,19 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                     {"binlog_file", read_stats.last_file},
                     {"binlog_position", read_stats.last_position},
                     {"events_total", read_stats.events},
+                    {"cli_exit_code", chunk.exit_code},
+                    {"master_file", master_chunk.file},
+                    {"master_position", master_chunk.position},
+                    {"caught_up", caught_up},
+                    {"stderr", chunk.stderr_tail.substr(0, 500)},
                 },
             });
+            if (cli_failed) {
+                stats.errors = 1;
+                throw std::runtime_error(
+                    "mariadb-binlog failed (exit " + std::to_string(chunk.exit_code) + "): " +
+                    chunk.stderr_tail.substr(0, 300));
+            }
             const auto now = std::chrono::steady_clock::now();
             if (rcfg.heartbeat_seconds > 0 &&
                 std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat).count() >=

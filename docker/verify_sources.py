@@ -92,6 +92,78 @@ def check_mariadb(src: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
     if gtid_mode and gtid_mode not in ("ON", "1"):
         warnings.append(f"gtid_mode={gtid_mode} (recommended ON for prod failover)")
 
+    binlog_bin = shutil.which("mariadb-binlog") or shutil.which("mysqlbinlog")
+    if not binlog_bin:
+        errors.append("mariadb-binlog not in PATH (CDC capture requires mariadb-client)")
+        return False, errors, warnings
+
+    master_cmd = [
+        mysql_bin,
+        "-h",
+        host,
+        "-P",
+        str(port),
+        "-u",
+        user,
+        f"-p{password}",
+        "-N",
+        "-B",
+        "-e",
+        "SHOW MASTER STATUS;",
+        database,
+    ]
+    try:
+        master_res = subprocess.run(master_cmd, capture_output=True, text=True, timeout=15, env=env)
+    except subprocess.TimeoutExpired:
+        errors.append("SHOW MASTER STATUS timed out")
+        return False, errors, warnings
+    if master_res.returncode != 0:
+        errors.append("SHOW MASTER STATUS failed")
+        return False, errors, warnings
+
+    master_parts = (master_res.stdout or "").strip().split("\t")
+    if len(master_parts) < 2 or not master_parts[0]:
+        errors.append("SHOW MASTER STATUS empty (binlog disabled?)")
+        return False, errors, warnings
+
+    binlog_file = master_parts[0]
+    binlog_pos = master_parts[1]
+    probe_cmd = [
+        binlog_bin,
+        "--read-from-remote-server",
+        "-h",
+        host,
+        "-P",
+        str(port),
+        "-u",
+        user,
+        f"-p{password}",
+        f"--start-position={binlog_pos}",
+        "--stop-never",
+        "-v",
+        binlog_file,
+    ]
+    try:
+        probe_res = subprocess.run(
+            probe_cmd,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        pass
+    else:
+        detail = (probe_res.stderr or probe_res.stdout or "").strip()
+        if probe_res.returncode != 0 and detail:
+            tail = detail.splitlines()[-1]
+            if "Access denied" in detail or "REPLICATION" in detail.upper():
+                errors.append(f"binlog replication denied: {tail}")
+            elif "Could not find" in detail or "binlog" in detail.lower():
+                errors.append(f"binlog read failed: {tail}")
+            else:
+                warnings.append(f"binlog probe exit {probe_res.returncode}: {tail}")
+
     return len(errors) == 0, errors, warnings
 
 

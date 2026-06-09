@@ -48,6 +48,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     freetds-common \
     libmongoc-1.0-0 \
     libmariadb3 \
+    mariadb-client \
     libpq5 \
     libsybdb5 \
     postgresql-client \

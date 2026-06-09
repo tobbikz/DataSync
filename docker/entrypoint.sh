@@ -483,6 +483,13 @@ run_health_checks() {
     fi
   fi
 
+  if command -v mariadb-binlog >/dev/null 2>&1 || command -v mysqlbinlog >/dev/null 2>&1; then
+    ok "mariadb-binlog in PATH"
+  else
+    health_fail "mariadb-binlog missing (install mariadb-client for CDC capture)"
+    failed=1
+  fi
+
   return "$failed"
 }
 

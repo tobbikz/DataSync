@@ -7,10 +7,14 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <map>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -74,7 +78,48 @@ std::string sql_literal_from_binlog_value(const std::string& raw) {
     return raw;
 }
 
+std::string read_file_tail(const std::string& path, std::size_t max_chars) {
+    std::ifstream in(path);
+    if (!in) {
+        return {};
+    }
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (content.size() <= max_chars) {
+        return content;
+    }
+    return content.substr(content.size() - max_chars);
+}
+
+bool path_executable(const std::string& path) {
+    return !path.empty() && access(path.c_str(), X_OK) == 0;
+}
+
 }  // namespace
+
+std::string find_mariadb_binlog_binary() {
+    if (const char* override_path = std::getenv("MARIADB_BINLOG_PATH")) {
+        const std::string custom(override_path);
+        if (path_executable(custom)) {
+            return custom;
+        }
+    }
+    for (const char* name : {"mariadb-binlog", "mysqlbinlog"}) {
+        FILE* which = popen(("command -v " + std::string(name) + " 2>/dev/null").c_str(), "r");
+        if (!which) {
+            continue;
+        }
+        char buf[512];
+        std::string path;
+        if (fgets(buf, sizeof(buf), which) != nullptr) {
+            path = trim(buf);
+        }
+        pclose(which);
+        if (path_executable(path)) {
+            return path;
+        }
+    }
+    return {};
+}
 
 BinlogCliStats read_remote_binlog_cli(
     const MariaDbSource& source,
@@ -87,12 +132,24 @@ BinlogCliStats read_remote_binlog_cli(
     stats.last_file = start.file;
     stats.last_position = start.position;
 
+    const std::string binlog_bin = find_mariadb_binlog_binary();
+    if (binlog_bin.empty()) {
+        stats.cli_missing = true;
+        stats.stderr_tail =
+            "mariadb-binlog not found in PATH (install mariadb-client or set MARIADB_BINLOG_PATH)";
+        return stats;
+    }
+
+    const std::string err_path =
+        std::string("/tmp/datasync_binlog_err_") + std::to_string(getpid()) + ".log";
+
     std::ostringstream cmd;
-    cmd << "timeout " << std::max(1, max_seconds) << " mariadb-binlog --read-from-remote-server"
+    cmd << "timeout " << std::max(1, max_seconds) << " " << shell_single_quote(binlog_bin)
+        << " --read-from-remote-server"
         << " -h " << shell_single_quote(source.host) << " -P " << source.port << " -u "
         << shell_single_quote(source.user) << " -p" << shell_single_quote(source.password)
         << " --start-position=" << start.position << " --base64-output=DECODE-ROWS -v "
-        << shell_single_quote(start.file) << " 2>/dev/null";
+        << shell_single_quote(start.file) << " 2>" << shell_single_quote(err_path);
 
     FILE* pipe = popen(cmd.str().c_str(), "r");
     if (!pipe) {
@@ -241,6 +298,13 @@ BinlogCliStats read_remote_binlog_cli(
     }
 
     flush_row();
-    pclose(pipe);
+    const int status = pclose(pipe);
+    if (WIFEXITED(status)) {
+        stats.exit_code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        stats.exit_code = 128 + WTERMSIG(status);
+    }
+    stats.stderr_tail = read_file_tail(err_path, 1500);
+    (void)unlink(err_path.c_str());
     return stats;
 }

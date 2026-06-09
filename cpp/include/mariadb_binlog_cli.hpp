@@ -16,7 +16,13 @@ struct BinlogCliStats {
     long long deletes{0};
     long long last_position{0};
     std::string last_file;
+    int exit_code{-1};
+    std::string stderr_tail;
+    bool cli_missing{false};
 };
+
+/** Resolve mariadb-binlog (or mysqlbinlog) on PATH; empty if not installed. */
+std::string find_mariadb_binlog_binary();
 
 using BinlogRowHandler = std::function<void(
     const std::string& schema,
