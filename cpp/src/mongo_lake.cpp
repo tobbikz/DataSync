@@ -1,5 +1,6 @@
 #include "mongo_lake.hpp"
 
+#include "lake_columns.hpp"
 #include "mssql_lake.hpp"
 
 #include <algorithm>
@@ -236,10 +237,10 @@ void ensure_mongo_lake_table_base(
         }
         col_defs.push_back(pg_ident(name) + " " + pg_type + " NULL");
     }
-    col_defs.push_back(pg_ident("_dl_load_timestamp") + " TIMESTAMPTZ DEFAULT NOW()");
-    col_defs.push_back(pg_ident("_dl_load_date") + " DATE DEFAULT CURRENT_DATE");
-    col_defs.push_back(pg_ident("_dl_source_system") + " VARCHAR(50) DEFAULT 'MongoDB'");
-    col_defs.push_back(pg_ident("_dl_snapshot_id") + " TEXT");
+    col_defs.push_back(pg_ident(lake_columns::kLoadTimestamp) + " TIMESTAMPTZ NOT NULL DEFAULT NOW()");
+    col_defs.push_back(pg_ident(lake_columns::kLoadDate) + " DATE DEFAULT CURRENT_DATE");
+    col_defs.push_back(pg_ident(lake_columns::kSourceSystem) + " VARCHAR(50) DEFAULT 'MongoDB'");
+    col_defs.push_back(pg_ident(lake_columns::kSnapshotId) + " TEXT");
 
     std::string create = "CREATE TABLE IF NOT EXISTS " + pg_ident(pg_schema) + "." + pg_ident(pg_table) + " (\n  ";
     for (std::size_t i = 0; i < col_defs.size(); ++i) {
@@ -248,8 +249,8 @@ void ensure_mongo_lake_table_base(
         }
         create += col_defs[i];
     }
-    create += ",\n  PRIMARY KEY (" + pg_ident("mongo_id") + ", " + pg_ident("_dl_load_date") + ")";
-    create += "\n) PARTITION BY RANGE (" + pg_ident("_dl_load_date") + ")";
+    create += ",\n  PRIMARY KEY (" + pg_ident("mongo_id") + ", " + pg_ident(lake_columns::kLoadTimestamp) + ")";
+    create += "\n) PARTITION BY RANGE (" + pg_ident(lake_columns::kPartitionColumn) + ")";
     pg_exec(pg, create);
 
     const std::string months = std::to_string(std::max(1, partition_months_ahead));

@@ -37,7 +37,9 @@ BEGIN
         IF to_regclass(format('%I.%I', p_schema, part_name)) IS NULL THEN
             EXECUTE format(
                 'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.%I FOR VALUES FROM (%L) TO (%L)',
-                p_schema, part_name, p_schema, p_table, start_d, end_d
+                p_schema, part_name, p_schema, p_table,
+                start_d::text || ' 00:00:00+00',
+                end_d::text || ' 00:00:00+00'
             );
             created := created + 1;
         END IF;
@@ -48,4 +50,4 @@ END;
 $$;
 
 COMMENT ON FUNCTION lake.ensure_monthly_partitions(text, text, integer) IS
-    'Create monthly RANGE partitions on _dl_load_date for a partitioned lake table.';
+    'Create monthly RANGE partitions on _dl_load_timestamp for a partitioned lake table.';

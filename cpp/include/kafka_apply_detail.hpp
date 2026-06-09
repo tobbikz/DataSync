@@ -23,6 +23,7 @@ struct ApplyEvent {
     long long offset{0};
     std::string gtid;
     long long catalog_id{0};
+    long long ts_ms{0};
     nlohmann::json row;
 };
 

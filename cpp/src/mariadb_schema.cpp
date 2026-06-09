@@ -1,5 +1,7 @@
 #include "mariadb_schema.hpp"
 
+#include "lake_columns.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
@@ -142,10 +144,10 @@ void ensure_lake_table_base(
             pk_cols.push_back(pg_ident(col.name));
         }
     }
-    col_defs.push_back(pg_ident("_dl_load_timestamp") + " TIMESTAMPTZ DEFAULT NOW()");
-    col_defs.push_back(pg_ident("_dl_load_date") + " DATE DEFAULT CURRENT_DATE");
-    col_defs.push_back(pg_ident("_dl_source_system") + " VARCHAR(50) DEFAULT 'MariaDB'");
-    col_defs.push_back(pg_ident("_dl_snapshot_id") + " TEXT");
+    col_defs.push_back(pg_ident(lake_columns::kLoadTimestamp) + " TIMESTAMPTZ NOT NULL DEFAULT NOW()");
+    col_defs.push_back(pg_ident(lake_columns::kLoadDate) + " DATE DEFAULT CURRENT_DATE");
+    col_defs.push_back(pg_ident(lake_columns::kSourceSystem) + " VARCHAR(50) DEFAULT 'MariaDB'");
+    col_defs.push_back(pg_ident(lake_columns::kSnapshotId) + " TEXT");
 
     std::string create = "CREATE TABLE IF NOT EXISTS " + pg_ident(schema) + "." + pg_ident(table) + " (\n  ";
     for (std::size_t i = 0; i < col_defs.size(); ++i) {
@@ -162,10 +164,10 @@ void ensure_lake_table_base(
             }
             create += pk_cols[i];
         }
-        create += ", " + pg_ident("_dl_load_date");
+        create += ", " + pg_ident(lake_columns::kLoadTimestamp);
         create += ")";
     }
-    create += "\n) PARTITION BY RANGE (" + pg_ident("_dl_load_date") + ")";
+    create += "\n) PARTITION BY RANGE (" + pg_ident(lake_columns::kPartitionColumn) + ")";
     pg_exec(pg, create);
 
     const std::string months = std::to_string(std::max(1, partition_months_ahead));

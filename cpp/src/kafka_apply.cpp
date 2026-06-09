@@ -2,6 +2,8 @@
 #include "kafka_apply.hpp"
 #include "capture_common.hpp"
 #include "host_metrics.hpp"
+#include "lake_columns.hpp"
+#include "mariadb_datetime.hpp"
 #include "mssql_conn.hpp"
 
 #include "mariadb_datetime.hpp"
@@ -204,6 +206,15 @@ std::string utc_now_date() {
     std::ostringstream oss;
     oss << std::put_time(&tm, "%Y-%m-%d");
     return oss.str();
+}
+
+std::string unique_load_timestamptz(long long ts_ms, int row_index) {
+    if (ts_ms > 0) {
+        return epoch_ms_to_timestamptz(ts_ms + row_index);
+    }
+    const auto now = std::chrono::system_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    return epoch_ms_to_timestamptz(ms + row_index);
 }
 
 std::string csv_escape_local(const std::string& value) {
@@ -851,8 +862,6 @@ long long apply_table_batch(
     int* fk_deferred_retries = nullptr) {
     const std::string fq = pg_ident(meta.schema_name) + "." + pg_ident(meta.table_name);
     ensure_partitions(pg, meta.schema_name, meta.table_name);
-    const std::string load_ts = utc_now_ts();
-    const std::string load_date = utc_now_date();
     const auto lake_pk_cols = meta.lake_pk.empty() ? split_pk(meta.pk_columns) : meta.lake_pk;
     auto delete_pk_cols = split_pk(meta.pk_columns);
     if (delete_pk_cols.empty()) {
@@ -892,7 +901,9 @@ long long apply_table_batch(
     }
 
     std::vector<std::string> all_cols = data_cols;
-    all_cols.insert(all_cols.end(), {"_dl_load_timestamp", "_dl_load_date", "_dl_source_system", "_dl_snapshot_id"});
+    all_cols.insert(
+        all_cols.end(),
+        {lake_columns::kLoadTimestamp, lake_columns::kLoadDate, lake_columns::kSourceSystem, lake_columns::kSnapshotId});
 
     std::ostringstream col_list;
     for (std::size_t i = 0; i < all_cols.size(); ++i) {
@@ -905,7 +916,10 @@ long long apply_table_batch(
     const bool mssql_text = source_system == "MSSQL";
     std::vector<std::string> lines;
     lines.reserve(upserts.size());
+    int row_index = 0;
     for (const auto& e : upserts) {
+        const std::string row_ts = unique_load_timestamptz(e.ts_ms, row_index++);
+        const std::string row_date = lake_columns::date_from_timestamptz(row_ts);
         std::ostringstream line;
         for (std::size_t i = 0; i < data_cols.size(); ++i) {
             if (i) {
@@ -915,7 +929,7 @@ long long apply_table_batch(
             const std::string pg_type = meta.col_types.count(data_cols[i]) ? meta.col_types.at(data_cols[i]) : "";
             line << (val ? json_cell_csv(*val, pg_type, mssql_text) : "");
         }
-        line << ',' << csv_escape_local(load_ts) << ',' << csv_escape_local(load_date) << ','
+        line << ',' << csv_escape_local(row_ts) << ',' << csv_escape_local(row_date) << ','
              << csv_escape_local(source_system) << ',' << csv_escape_local(batch_id);
         lines.push_back(line.str());
     }
@@ -1456,6 +1470,13 @@ bool parse_kafka_payload(
     out.partition = partition;
     out.offset = offset;
     out.catalog_id = data.value("catalog_id", 0LL);
+    if (data.contains("ts_ms") && !data["ts_ms"].is_null()) {
+        if (data["ts_ms"].is_number_integer()) {
+            out.ts_ms = data["ts_ms"].get<long long>();
+        } else if (data["ts_ms"].is_number_unsigned()) {
+            out.ts_ms = static_cast<long long>(data["ts_ms"].get<unsigned long long>());
+        }
+    }
 
     if (actual_engine == "mssql") {
         const std::string src_db = data.value("source_database", source.value("database", ""));

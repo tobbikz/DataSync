@@ -3,6 +3,7 @@
 #include <string>
 
 std::string epoch_to_timestamptz(long long secs);
+std::string epoch_ms_to_timestamptz(long long ms);
 std::string epoch_to_date(long long secs);
 
 bool is_invalid_sql_date(const std::string& s);
