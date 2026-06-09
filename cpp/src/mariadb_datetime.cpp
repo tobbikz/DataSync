@@ -40,7 +40,24 @@ std::string epoch_to_date(long long secs) {
 }
 
 bool is_invalid_sql_date(const std::string& s) {
-    return s.size() < 10 || s[4] != '-' || s[7] != '-' || s.substr(5, 2) == "00" || s.substr(8, 2) == "00";
+    if (s.size() < 10 || s[4] != '-' || s[7] != '-') {
+        return true;
+    }
+    if (s.substr(0, 4) == "0000") {
+        return true;
+    }
+    if (s.substr(5, 2) == "00" || s.substr(8, 2) == "00") {
+        return true;
+    }
+    return false;
+}
+
+bool is_invalid_sql_datetime(const std::string& s) {
+    if (s.empty()) {
+        return false;
+    }
+    const std::string fixed = fix_date_separators(s);
+    return is_invalid_sql_date(fixed.substr(0, std::min(fixed.size(), std::size_t{10})));
 }
 
 std::string fix_date_separators(std::string s) {
@@ -167,6 +184,9 @@ std::string normalize_text_for_pg(const std::string& s, const std::string& pg_ty
     }
     if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP") {
         std::string t = looks_like_mssql_datetime(s) ? mssql_datetime_to_iso(s) : fix_date_separators(s);
+        if (is_invalid_sql_datetime(t)) {
+            return {};
+        }
         if (pg_type == "TIMESTAMP") {
             if (const auto pos = t.rfind('+'); pos != std::string::npos) {
                 t = t.substr(0, pos);
@@ -208,7 +228,7 @@ std::string normalize_pg_sql_literal(const std::string& sql_lit, const std::stri
     }
     const std::string inner = sql_lit.substr(1, sql_lit.size() - 2);
     const std::string norm = normalize_text_for_pg(inner, pg_type);
-    if (pg_type == "DATE" && norm.empty()) {
+    if ((pg_type == "DATE" || pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP") && norm.empty()) {
         return "NULL";
     }
     return pg_escape_literal(norm);

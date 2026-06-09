@@ -113,7 +113,7 @@ std::string format_cell(const char* data, unsigned long len, const MariaDbColumn
         return mariadb_bytea_to_copy_csv(data, static_cast<std::size_t>(len));
     }
     const std::string s = normalize_text_for_pg(std::string(data, len), col.pg_type);
-    if (col.pg_type == "DATE" && s.empty()) {
+    if ((col.pg_type == "DATE" || col.pg_type == "TIMESTAMPTZ" || col.pg_type == "TIMESTAMP") && s.empty()) {
         return "";
     }
     return csv_escape(s);

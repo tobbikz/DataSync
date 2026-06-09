@@ -318,7 +318,7 @@ std::string json_cell_csv(const json& val_in, const std::string& pg_type = "", b
     std::string s = val.is_string() ? val.get<std::string>() : val.dump();
     if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || pg_type == "DATE") {
         const std::string norm = normalize_text_for_pg(s, pg_type);
-        if (pg_type == "DATE" && norm.empty()) {
+        if ((pg_type == "DATE" || pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP") && norm.empty()) {
             return "";
         }
         s = norm;
