@@ -2,7 +2,9 @@
 
 #include "mariadb_schema.hpp"
 
+#include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -192,4 +194,123 @@ void upsert_binlog_position(
         )",
         3,
         vals);
+}
+
+std::optional<long long> binlog_file_sequence_number(const std::string& filename) {
+    const auto dot = filename.rfind('.');
+    if (dot == std::string::npos || dot + 1 >= filename.size()) {
+        return std::nullopt;
+    }
+    try {
+        return std::stoll(filename.substr(dot + 1));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::vector<BinlogFileEntry> fetch_binary_logs(MYSQL* mysql) {
+    std::vector<BinlogFileEntry> out;
+    if (!mysql || mysql_query(mysql, "SHOW BINARY LOGS") != 0) {
+        return out;
+    }
+    MYSQL_RES* res = mysql_store_result(mysql);
+    if (!res) {
+        return out;
+    }
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res)) != nullptr) {
+        if (!row[0]) {
+            continue;
+        }
+        BinlogFileEntry entry;
+        entry.name = row[0];
+        entry.file_size = row[1] ? std::atoll(row[1]) : 0;
+        out.push_back(std::move(entry));
+    }
+    mysql_free_result(res);
+    return out;
+}
+
+MasterBinlogStatus fetch_master_binlog_status(MYSQL* mysql) {
+    MasterBinlogStatus out;
+    if (!mysql || mysql_query(mysql, "SHOW MASTER STATUS") != 0) {
+        return out;
+    }
+    MYSQL_RES* res = mysql_store_result(mysql);
+    if (!res) {
+        return out;
+    }
+    MYSQL_ROW row = mysql_fetch_row(res);
+    if (row && row[0]) {
+        out.file = row[0];
+        out.position = row[1] ? std::atoll(row[1]) : 0;
+    }
+    mysql_free_result(res);
+    return out;
+}
+
+bool binlog_position_caught_up(const BinlogPosition& cursor, const MasterBinlogStatus& master) {
+    if (master.file.empty()) {
+        return false;
+    }
+    if (cursor.file == master.file) {
+        return cursor.position >= master.position;
+    }
+    const auto cur_seq = binlog_file_sequence_number(cursor.file);
+    const auto master_seq = binlog_file_sequence_number(master.file);
+    if (cur_seq && master_seq) {
+        return *cur_seq > *master_seq ||
+               (*cur_seq == *master_seq && cursor.position >= master.position);
+    }
+    return false;
+}
+
+bool binlog_cursor_is_behind(const BinlogPosition& cursor, const MasterBinlogStatus& master) {
+    if (master.file.empty()) {
+        return false;
+    }
+    if (cursor.file == master.file) {
+        return cursor.position < master.position;
+    }
+    const auto cur_seq = binlog_file_sequence_number(cursor.file);
+    const auto master_seq = binlog_file_sequence_number(master.file);
+    if (cur_seq && master_seq) {
+        return *cur_seq < *master_seq;
+    }
+    return cursor.file < master.file;
+}
+
+bool advance_binlog_cursor_to_next_file(MYSQL* mysql, BinlogPosition& cursor) {
+    const auto logs = fetch_binary_logs(mysql);
+    if (logs.empty()) {
+        return false;
+    }
+
+    int current_idx = -1;
+    for (std::size_t i = 0; i < logs.size(); ++i) {
+        if (logs[i].name == cursor.file) {
+            current_idx = static_cast<int>(i);
+            break;
+        }
+    }
+    if (current_idx < 0) {
+        throw std::runtime_error(
+            "binlog file no longer on server (purged?): " + cursor.file +
+            " — run recovery or re-seed capture_position from SHOW MASTER STATUS");
+    }
+
+    const long long file_size = logs[static_cast<std::size_t>(current_idx)].file_size;
+    const bool at_or_past_eof = file_size > 0 && cursor.position >= file_size;
+
+    if (!at_or_past_eof) {
+        return false;
+    }
+
+    if (current_idx + 1 >= static_cast<int>(logs.size())) {
+        return false;
+    }
+
+    cursor.file = logs[static_cast<std::size_t>(current_idx + 1)].name;
+    cursor.position = 4;
+    return true;
 }

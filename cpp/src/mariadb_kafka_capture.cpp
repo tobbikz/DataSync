@@ -86,21 +86,8 @@ struct MasterStatusLite {
 };
 
 MasterStatusLite fetch_master_status(MYSQL* mysql) {
-    MasterStatusLite out;
-    if (mysql_query(mysql, "SHOW MASTER STATUS") != 0) {
-        return out;
-    }
-    MYSQL_RES* res = mysql_store_result(mysql);
-    if (!res) {
-        return out;
-    }
-    MYSQL_ROW row = mysql_fetch_row(res);
-    if (row && row[0]) {
-        out.file = row[0];
-        out.position = row[1] ? std::atoll(row[1]) : 0;
-    }
-    mysql_free_result(res);
-    return out;
+    const MasterBinlogStatus st = fetch_master_binlog_status(mysql);
+    return {st.file, st.position};
 }
 
 std::string mariadb_gtid_binlog_state(MYSQL* mysql) {
@@ -466,8 +453,40 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         std::chrono::steady_clock::now() + std::chrono::seconds(std::max(1, rcfg.max_seconds));
     auto last_heartbeat = std::chrono::steady_clock::now() - std::chrono::hours(24);
     BinlogCliStats read_stats;
-    read_stats.last_file = start_pos.binlog_file;
-    read_stats.last_position = start_pos.binlog_position;
+    read_stats.last_file = binlog_start.file;
+    read_stats.last_position = binlog_start.position;
+
+    {
+        const MasterBinlogStatus master_start = fetch_master_binlog_status(mariadb.handle);
+        int roll_count = 0;
+        const BinlogPosition roll_from = binlog_start;
+        while (roll_count < 512 && binlog_cursor_is_behind(binlog_start, master_start) &&
+               advance_binlog_cursor_to_next_file(mariadb.handle, binlog_start)) {
+            ++roll_count;
+        }
+        if (roll_count > 0) {
+            read_stats.last_file = binlog_start.file;
+            read_stats.last_position = binlog_start.position;
+            log_write(log_pg, {
+                .level = LogLevel::Info,
+                .component = "cdc_kafka_capture",
+                .message = "capture binlog rolled forward past EOF files",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"files_advanced", roll_count},
+                    {"from_file", roll_from.file},
+                    {"from_position", roll_from.position},
+                    {"to_file", binlog_start.file},
+                    {"to_position", binlog_start.position},
+                    {"master_file", master_start.file},
+                    {"master_position", master_start.position},
+                },
+            });
+        }
+    }
 
     while (read_stats.events < rcfg.max_events && std::chrono::steady_clock::now() < slice_deadline) {
         const auto remaining_sec = std::chrono::duration_cast<std::chrono::seconds>(
@@ -476,9 +495,13 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         if (remaining_sec <= 0) {
             break;
         }
-        const int chunk_sec = std::max(
-            1,
-            std::min(rcfg.idle_poll_seconds > 0 ? rcfg.idle_poll_seconds : 3, static_cast<int>(remaining_sec)));
+        const BinlogPosition cursor_now{binlog_start.file, binlog_start.position};
+        const MasterBinlogStatus master_now = fetch_master_binlog_status(mariadb.handle);
+        const bool lagging = binlog_cursor_is_behind(cursor_now, master_now);
+        const int idle_cap = rcfg.idle_poll_seconds > 0 ? rcfg.idle_poll_seconds : 3;
+        const int chunk_sec = lagging
+                                  ? std::max(1, std::min(static_cast<int>(remaining_sec), 30))
+                                  : std::max(1, std::min(idle_cap, static_cast<int>(remaining_sec)));
         const int events_left = rcfg.max_events - static_cast<int>(read_stats.events);
 
         const BinlogCliStats chunk = read_remote_binlog_cli(
@@ -513,17 +536,43 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         }
 
         if (chunk.events == 0) {
-            const MasterStatusLite master_chunk = fetch_master_status(mariadb.handle);
-            const bool caught_up =
-                !master_chunk.file.empty() && master_chunk.file == read_stats.last_file &&
-                read_stats.last_position >= master_chunk.position;
+            const MasterBinlogStatus master_chunk = fetch_master_binlog_status(mariadb.handle);
+            const BinlogPosition cursor_pos{read_stats.last_file, read_stats.last_position};
+            const bool caught_up = binlog_position_caught_up(cursor_pos, master_chunk);
             const bool cli_failed = chunk.exit_code != 0 && !chunk.stderr_tail.empty();
+
+            const BinlogPosition before_advance = binlog_start;
+            const bool advanced = advance_binlog_cursor_to_next_file(mariadb.handle, binlog_start);
+            if (advanced) {
+                read_stats.last_file = binlog_start.file;
+                read_stats.last_position = binlog_start.position;
+                log_write(log_pg, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_kafka_capture",
+                    .message = "capture binlog advanced to next file",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {
+                        {"from_file", before_advance.file},
+                        {"from_position", before_advance.position},
+                        {"to_file", binlog_start.file},
+                        {"to_position", binlog_start.position},
+                        {"master_file", master_chunk.file},
+                        {"master_position", master_chunk.position},
+                    },
+                });
+                continue;
+            }
+
             log_write(log_pg, {
                 .level = cli_failed ? LogLevel::Error : LogLevel::Info,
                 .component = "cdc_kafka_capture",
                 .message = cli_failed ? "capture binlog cli failed"
                                      : (caught_up ? "capture binlog caught up with master"
-                                                  : "capture binlog idle"),
+                                                  : (lagging ? "capture binlog draining lag"
+                                                             : "capture binlog idle")),
                 .batch_id = batch_id,
                 .conn_id = conn_id,
                 .source_schema = std::nullopt,
@@ -536,6 +585,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                     {"master_file", master_chunk.file},
                     {"master_position", master_chunk.position},
                     {"caught_up", caught_up},
+                    {"lagging", lagging},
                     {"stderr", chunk.stderr_tail.substr(0, 500)},
                 },
             });
@@ -544,6 +594,20 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 throw std::runtime_error(
                     "mariadb-binlog failed (exit " + std::to_string(chunk.exit_code) + "): " +
                     chunk.stderr_tail.substr(0, 300));
+            }
+            if (caught_up) {
+                const auto now = std::chrono::steady_clock::now();
+                if (rcfg.heartbeat_seconds > 0 &&
+                    std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat).count() >=
+                        rcfg.heartbeat_seconds) {
+                    bump_mariadb_capture_heartbeat(mariadb.handle);
+                    bump_capture_heartbeat_pg(log_pg, conn_id, "mariadb");
+                    last_heartbeat = now;
+                }
+                break;
+            }
+            if (lagging || binlog_cursor_is_behind(cursor_pos, master_chunk)) {
+                continue;
             }
             const auto now = std::chrono::steady_clock::now();
             if (rcfg.heartbeat_seconds > 0 &&

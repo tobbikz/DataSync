@@ -322,6 +322,19 @@ std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
     std::vector<CaptureCatalogTable> out;
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (res) {
+            log_write(pg, {
+                .level = LogLevel::Error,
+                .component = "cdc_kafka_capture",
+                .message = "fetch_capture_catalog_tables query failed",
+                .batch_id = std::nullopt,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"db_engine", db_engine},
+                    {"error", PQresultErrorMessage(res)},
+                },
+            });
             PQclear(res);
         }
         return out;
@@ -743,6 +756,55 @@ void log_cdc_skip_no_tables(
     const std::optional<std::string>& tier,
     const std::string& db_engine) {
     const ApplySkipReasonCounts reasons = fetch_apply_skip_reasons(pg, conn_id, tier, db_engine);
+
+    nlohmann::json catalog_sample = nlohmann::json::array();
+    const char* sample_vals[] = {conn_id.c_str(), db_engine.c_str()};
+    PGresult* sample_res = PQexecParams(
+        pg,
+        R"(
+        SELECT source_schema, source_table, active, cdc_enabled, needs_full_load, has_pk,
+               status::text AS status,
+               (active AND cdc_enabled AND NOT needs_full_load AND has_pk
+                AND status NOT IN ('skipped', 'disabled')) AS capture_ready
+        FROM cdc_catalog.catalog
+        WHERE conn_id = $1
+          AND db_engine = $2::cdc_catalog.db_engine
+        ORDER BY capture_ready DESC, updated_at DESC
+        LIMIT 8
+        )",
+        2,
+        nullptr,
+        sample_vals,
+        nullptr,
+        nullptr,
+        0);
+    if (sample_res && PQresultStatus(sample_res) == PGRES_TUPLES_OK) {
+        for (int i = 0; i < PQntuples(sample_res); ++i) {
+            catalog_sample.push_back({
+                {"schema", PQgetvalue(sample_res, i, 0)},
+                {"table", PQgetvalue(sample_res, i, 1)},
+                {"active", PQgetvalue(sample_res, i, 2)},
+                {"cdc_enabled", PQgetvalue(sample_res, i, 3)},
+                {"needs_full_load", PQgetvalue(sample_res, i, 4)},
+                {"has_pk", PQgetvalue(sample_res, i, 5)},
+                {"status", PQgetvalue(sample_res, i, 6)},
+                {"capture_ready", PQgetvalue(sample_res, i, 7)},
+            });
+        }
+    }
+    if (sample_res) {
+        PQclear(sample_res);
+    }
+
+    std::string hint = "capture requires active=true, cdc_enabled=true, needs_full_load=false, has_pk=true, status not skipped/disabled";
+    if (reasons.active_total == 0 && !catalog_sample.empty()) {
+        hint = "rows exist but active=false on all — run: UPDATE cdc_catalog.catalog SET active=true WHERE ...";
+    } else if (reasons.apply_ready == 0 && reasons.needs_full_load > 0) {
+        hint = "needs_full_load still true — run full-load or UPDATE needs_full_load=false after load";
+    } else if (reasons.apply_ready == 0 && reasons.cdc_disabled > 0) {
+        hint = "cdc_enabled=false — enable CDC after full-load completes";
+    }
+
     log_write(pg, {
         .level = LogLevel::Info,
         .component = component,
@@ -755,12 +817,14 @@ void log_cdc_skip_no_tables(
             {"pipeline", pipeline},
             {"tier", tier.value_or("all")},
             {"db_engine", db_engine},
+            {"hint", hint},
             {"active_total", reasons.active_total},
             {"needs_full_load", reasons.needs_full_load},
             {"cdc_disabled", reasons.cdc_disabled},
             {"no_pk", reasons.no_pk},
             {"skipped_status", reasons.skipped_status},
-            {"cdc_ready", reasons.apply_ready},
+            {"capture_ready", reasons.apply_ready},
+            {"catalog_sample", catalog_sample},
         },
     });
 }
@@ -1418,7 +1482,6 @@ void ensure_kafka_topics_exist(
 
 void ensure_capture_kafka_topics(
     PGconn*,
-    const std::string&,
     const std::string&,
     const std::string&,
     const std::string&,
