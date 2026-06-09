@@ -388,6 +388,7 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     MssqlConn mssql(*source);
     std::set<std::string> scanned_dbs;
     int published = 0;
+    int cdc_rows_read = 0;
     int skipped_no_lsn = 0;
     int skipped_no_window = 0;
     int skipped_bad_capture = 0;
@@ -460,6 +461,7 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         const std::string q = "SELECT * FROM " + fn + "(" + lsn_sql_literal(window->first) + ", " +
                               lsn_sql_literal(window->second) + ", N'all update old')";
         const auto result = mssql.query(q);
+        cdc_rows_read += static_cast<int>(result.rows.size());
         if (result.rows.empty()) {
             mark_catalog_cdc_success(log_pg, tbl.catalog_id);
             stats.tables += 1;
@@ -576,6 +578,24 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
                             std::chrono::steady_clock::now() - start)
                             .count();
 
+    if (cdc_rows_read > 0 && pstats.events_published == 0) {
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_kafka_mssql_capture",
+            .message = "capture cdc rows read but none published to kafka",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"cdc_rows_read", cdc_rows_read},
+                {"events_published", pstats.events_published},
+                {"kafka_bootstrap", rcfg.bootstrap},
+                {"catalog_tables", static_cast<int>(tables.size())},
+            },
+        });
+    }
+
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_kafka_mssql_capture",
@@ -586,6 +606,7 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         .source_table = std::nullopt,
         .context = {
             {"events_published", stats.events_published},
+            {"cdc_rows_read", cdc_rows_read},
             {"tables", stats.tables},
             {"catalog_tables", static_cast<int>(tables.size())},
             {"skipped_no_lsn", skipped_no_lsn},

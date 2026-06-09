@@ -246,6 +246,7 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
 
     MongoConn mongo(*source);
     int published = 0;
+    int changes_read = 0;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(rcfg.max_seconds);
 
     for (const auto& coll : collections) {
@@ -345,6 +346,7 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
                 }
                 continue;
             }
+            changes_read += 1;
             const bson_t* token_bson = mongoc_change_stream_get_resume_token(stream);
             if (token_bson) {
                 last_token = bson_to_json(token_bson);
@@ -449,6 +451,24 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
                             std::chrono::steady_clock::now() - start)
                             .count();
 
+    if (changes_read > 0 && pstats.events_published == 0) {
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_kafka_mongo_capture",
+            .message = "capture change stream events read but none published to kafka",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"changes_read", changes_read},
+                {"events_published", pstats.events_published},
+                {"kafka_bootstrap", rcfg.bootstrap},
+                {"catalog_collections", static_cast<int>(collections.size())},
+            },
+        });
+    }
+
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_kafka_mongo_capture",
@@ -459,6 +479,7 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
         .source_table = std::nullopt,
         .context = {
             {"events_published", stats.events_published},
+            {"changes_read", changes_read},
             {"collections", stats.collections},
             {"duration_ms", stats.duration_ms},
             {"tier", service_tier.value_or("all")},
