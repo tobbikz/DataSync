@@ -244,6 +244,53 @@ bool is_integer_pg_type(const std::string& pg_type) {
            pg_type == "BIGINT" || pg_type == "SMALLINT";
 }
 
+bool is_numeric_pg_type(const std::string& pg_type) {
+    return is_integer_pg_type(pg_type) || pg_type == "NUMERIC" || pg_type == "DECIMAL" ||
+           pg_type == "numeric" || pg_type == "decimal" || pg_type == "DOUBLE PRECISION" ||
+           pg_type == "REAL" || pg_type == "float8" || pg_type == "float4";
+}
+
+/** e.g. "-1 (4294967295)" from unsigned/signed display → "4294967295". */
+std::string sanitize_numeric_string_for_pg(const std::string& s) {
+    if (s.empty()) {
+        return s;
+    }
+    const auto open = s.find('(');
+    if (open != std::string::npos) {
+        const auto close = s.find(')', open + 1);
+        if (close != std::string::npos) {
+            const std::string inner = s.substr(open + 1, close - open - 1);
+            bool ok = !inner.empty();
+            for (char c : inner) {
+                if (c != '-' && c != '.' && !std::isdigit(static_cast<unsigned char>(c))) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                return inner;
+            }
+        }
+    }
+    std::size_t end = 0;
+    while (end < s.size() && std::isspace(static_cast<unsigned char>(s[end]))) {
+        ++end;
+    }
+    if (end < s.size() && (s[end] == '-' || s[end] == '+')) {
+        ++end;
+    }
+    const std::size_t start = end;
+    while (end < s.size() &&
+           (std::isdigit(static_cast<unsigned char>(s[end])) || s[end] == '.' || s[end] == 'e' ||
+            s[end] == 'E' || s[end] == '-' || s[end] == '+')) {
+        ++end;
+    }
+    if (end > start) {
+        return s.substr(start, end - start);
+    }
+    return s;
+}
+
 void normalize_apply_row(json& row, const std::vector<std::string>& pk_cols) {
     if (row.contains("mongo_id") && !row["mongo_id"].is_null()) {
         row["mongo_id"] = mongo_object_id_text(row["mongo_id"]);
@@ -276,13 +323,18 @@ void normalize_apply_row(json& row, const std::vector<std::string>& pk_cols) {
 
 std::string json_cell_csv(const json& val_in, const std::string& pg_type = "", bool mssql_text = false) {
     json val = val_in;
-    if (val.is_string() && is_integer_pg_type(pg_type)) {
-        const std::string s = val.get<std::string>();
-        if (!s.empty()) {
+    if (val.is_string() && is_numeric_pg_type(pg_type)) {
+        const std::string s = sanitize_numeric_string_for_pg(val.get<std::string>());
+        if (s.empty()) {
+            val = nullptr;
+        } else if (is_integer_pg_type(pg_type)) {
             try {
                 val = std::stoll(s);
             } catch (...) {
+                val = s;
             }
+        } else {
+            val = s;
         }
     }
     if (val.is_null()) {
@@ -333,13 +385,18 @@ std::string json_cell_csv(const json& val_in, const std::string& pg_type = "", b
 
 std::string json_cell_sql(const json& val_in, const std::string& pg_type = "") {
     json val = val_in;
-    if (val.is_string() && is_integer_pg_type(pg_type)) {
-        const std::string s = val.get<std::string>();
-        if (!s.empty()) {
+    if (val.is_string() && is_numeric_pg_type(pg_type)) {
+        const std::string s = sanitize_numeric_string_for_pg(val.get<std::string>());
+        if (s.empty()) {
+            val = nullptr;
+        } else if (is_integer_pg_type(pg_type)) {
             try {
                 val = std::stoll(s);
             } catch (...) {
+                val = s;
             }
+        } else {
+            val = s;
         }
     }
     if (val.is_null()) {

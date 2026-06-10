@@ -31,7 +31,7 @@ std::vector<std::uint8_t> bytea_repeated_x_escapes(const std::string& value) {
         out.push_back(static_cast<std::uint8_t>(std::strtoul(hex_pair, nullptr, 16)));
         i += 4;
     }
-    if (i == value.size()) {
+    if (!out.empty()) {
         return out;
     }
     return {};
