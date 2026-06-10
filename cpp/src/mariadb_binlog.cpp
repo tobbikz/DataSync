@@ -1,6 +1,7 @@
 #include "mariadb_binlog.hpp"
 
 #include "mariadb_schema.hpp"
+#include "obs_log.hpp"
 
 #include <optional>
 #include <stdexcept>
@@ -141,6 +142,31 @@ bool is_mariadb_binlog_purged_error(const std::string& message) {
     return message.find("Could not find first log file") != std::string::npos ||
            message.find("Could not find target log file") != std::string::npos ||
            message.find("binlog file no longer on server") != std::string::npos;
+}
+
+bool is_mariadb_gtid_out_of_order_error(const std::string& message) {
+    return message.find("out of order GTID") != std::string::npos ||
+           message.find("Out of order GTID") != std::string::npos;
+}
+
+MariaDbGtidResyncResult resync_capture_after_mariadb_gtid_error(
+    PGconn* pg,
+    MYSQL* mysql,
+    const std::string& conn_id,
+    const std::string& batch_id) {
+    MariaDbGtidResyncResult out;
+    capture_binlog_position_t0(pg, mysql, conn_id);
+    out.ran = true;
+    log_write(pg, {
+        .level = LogLevel::Warning,
+        .component = "cdc_kafka_capture",
+        .message = "gtid out of order: capture re-anchored to master status",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+    });
+    return out;
 }
 
 std::optional<BinlogPosition> fetch_binlog_position(PGconn* pg, const std::string& conn_id) {

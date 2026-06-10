@@ -37,15 +37,69 @@ std::vector<std::uint8_t> bytea_repeated_x_escapes(const std::string& value) {
     return {};
 }
 
+std::vector<std::uint8_t> bytea_scan_embedded_x_escapes(const std::string& value) {
+    std::vector<std::uint8_t> out;
+    for (std::size_t i = 0; i + 3 < value.size(); ++i) {
+        if (value[i] == '\\' && (value[i + 1] == 'x' || value[i + 1] == 'X') &&
+            is_hex_digit_char(value[i + 2]) && is_hex_digit_char(value[i + 3])) {
+            char hex_pair[3] = {value[i + 2], value[i + 3], '\0'};
+            out.push_back(static_cast<std::uint8_t>(std::strtoul(hex_pair, nullptr, 16)));
+            i += 3;
+        }
+    }
+    return out;
+}
+
+std::string strip_binary_literal_prefix(std::string s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+        s.erase(s.begin());
+    }
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+        s.pop_back();
+    }
+    const std::string lower = to_lower(s);
+    if (lower.rfind("_binary", 0) == 0) {
+        s = s.substr(7);
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+            s.erase(s.begin());
+        }
+    }
+    if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'') {
+        std::string inner = s.substr(1, s.size() - 2);
+        std::string unescaped;
+        unescaped.reserve(inner.size());
+        for (std::size_t i = 0; i < inner.size(); ++i) {
+            if (inner[i] == '\'' && i + 1 < inner.size() && inner[i + 1] == '\'') {
+                unescaped += '\'';
+                ++i;
+            } else {
+                unescaped += inner[i];
+            }
+        }
+        return unescaped;
+    }
+    if (s.size() >= 3 && (s[0] == 'X' || s[0] == 'x') && s[1] == '\'') {
+        const auto close = s.rfind('\'');
+        if (close != std::string::npos && close > 2) {
+            return s.substr(2, close - 2);
+        }
+    }
+    return s;
+}
+
 std::vector<std::uint8_t> bytea_payload_to_bytes(const std::string& value) {
     if (value.empty()) {
         return {};
     }
-    if (auto esc = bytea_repeated_x_escapes(value); !esc.empty()) {
+    const std::string normalized = strip_binary_literal_prefix(value);
+    if (auto esc = bytea_repeated_x_escapes(normalized); !esc.empty()) {
         return esc;
     }
-    if (value.size() >= 2 && value[0] == '\\' && (value[1] == 'x' || value[1] == 'X')) {
-        const std::string tail = value.substr(2);
+    if (auto embedded = bytea_scan_embedded_x_escapes(normalized); !embedded.empty()) {
+        return embedded;
+    }
+    if (normalized.size() >= 2 && normalized[0] == '\\' && (normalized[1] == 'x' || normalized[1] == 'X')) {
+        const std::string tail = normalized.substr(2);
         if (!tail.empty() && tail.size() % 2 == 0) {
             bool all_hex = true;
             for (char c : tail) {
@@ -65,9 +119,9 @@ std::vector<std::uint8_t> bytea_payload_to_bytes(const std::string& value) {
             }
         }
     }
-    if (value.size() >= 2 && value.size() % 2 == 0) {
+    if (normalized.size() >= 2 && normalized.size() % 2 == 0) {
         bool all_hex = true;
-        for (char c : value) {
+        for (char c : normalized) {
             if (!is_hex_digit_char(c)) {
                 all_hex = false;
                 break;
@@ -75,15 +129,15 @@ std::vector<std::uint8_t> bytea_payload_to_bytes(const std::string& value) {
         }
         if (all_hex) {
             std::vector<std::uint8_t> out;
-            out.reserve(value.size() / 2);
-            for (std::size_t i = 0; i + 1 < value.size(); i += 2) {
-                char hex_pair[3] = {value[i], value[i + 1], '\0'};
+            out.reserve(normalized.size() / 2);
+            for (std::size_t i = 0; i + 1 < normalized.size(); i += 2) {
+                char hex_pair[3] = {normalized[i], normalized[i + 1], '\0'};
                 out.push_back(static_cast<std::uint8_t>(std::strtoul(hex_pair, nullptr, 16)));
             }
             return out;
         }
     }
-    return std::vector<std::uint8_t>(value.begin(), value.end());
+    return std::vector<std::uint8_t>(normalized.begin(), normalized.end());
 }
 
 }  // namespace

@@ -1123,6 +1123,8 @@ int run_reconcile_cli(
             checks["reconcile_mode"] = reconcile_mode;
             checks["capture_lag_seconds"] = capture_lag_seconds;
             checks["capture_lag_status"] = capture_status;
+            checks["row_count_status"] = row_status;
+            checks["apply_lag_status"] = lag_status;
 
 #ifdef HAVE_RDKAFKA
             long long kafka_lag = -1;
@@ -1133,7 +1135,11 @@ int run_reconcile_cli(
                     apply_meta.kafka_partition,
                     apply_meta.kafka_offset);
             }
-            const std::string kafka_status = eval_kafka_lag_status(kafka_lag, rcfg);
+            const std::string kafka_status_raw = eval_kafka_lag_status(kafka_lag, rcfg);
+            std::string kafka_status = kafka_status_raw;
+            if (!full_mode && kafka_status == "fail") {
+                kafka_status = "warn";
+            }
             checks["kafka_consumer_lag"] = kafka_lag;
             checks["kafka_lag_status"] = kafka_status;
             checks["kafka_topic"] = apply_meta.kafka_topic;
@@ -1199,9 +1205,14 @@ int run_reconcile_cli(
                     {"source_row_count", source_rows},
                     {"lake_row_count", lake_rows},
                     {"row_count_delta", source_rows >= 0 && lake_rows >= 0 ? source_rows - lake_rows : 0},
+                    {"row_count_status", row_status},
                     {"apply_lag_seconds", apply_meta.apply_lag_seconds},
+                    {"apply_lag_status", lag_status},
                     {"capture_lag_seconds", capture_lag_seconds},
+                    {"capture_lag_status", capture_status},
                     {"reconcile_mode", reconcile_mode},
+                    {"kafka_consumer_lag", checks.value("kafka_consumer_lag", nlohmann::json())},
+                    {"kafka_lag_status", checks.value("kafka_lag_status", nlohmann::json("skip"))},
                 },
             });
         } catch (const std::exception& ex) {

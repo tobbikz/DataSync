@@ -623,6 +623,13 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                     stats.errors = reboot.ran ? 0 : 1;
                     return stats;
                 }
+                if (is_mariadb_gtid_out_of_order_error(cli_err)) {
+                    const auto resync =
+                        resync_capture_after_mariadb_gtid_error(log_pg, mariadb.handle, conn_id, batch_id);
+                    rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+                    stats.errors = resync.ran ? 0 : 1;
+                    return stats;
+                }
                 stats.errors = 1;
                 throw std::runtime_error(
                     "mariadb-binlog failed (exit " + std::to_string(chunk.exit_code) + "): " +
@@ -757,6 +764,14 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 reboot_conn_after_mariadb_binlog_gap(log_pg, recovery_conn.handle, conn_id, batch_id);
             rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
             stats.errors = reboot.ran ? 0 : 1;
+            return stats;
+        }
+        if (is_mariadb_gtid_out_of_order_error(ex.what())) {
+            MariaDbConn recovery_conn(*source);
+            const auto resync =
+                resync_capture_after_mariadb_gtid_error(log_pg, recovery_conn.handle, conn_id, batch_id);
+            rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+            stats.errors = resync.ran ? 0 : 1;
             return stats;
         }
         rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
