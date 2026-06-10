@@ -3,9 +3,12 @@
 #include "lake_columns.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -214,6 +217,43 @@ std::string sanitize_mariadb_text_for_pg(const std::string& in) {
         }
     }
     return out;
+}
+
+std::string mariadb_not_null_copy_default(const MariaDbColumn& col) {
+    const std::string& t = col.pg_type;
+    if (t == "DATE") {
+        return "1970-01-01";
+    }
+    if (t == "TIMESTAMPTZ") {
+        return "1970-01-01 00:00:00+00";
+    }
+    if (t == "TIMESTAMP") {
+        return "1970-01-01 00:00:00";
+    }
+    if (t == "TIME") {
+        return "00:00:00";
+    }
+    if (t == "BOOLEAN") {
+        return "f";
+    }
+    if (t == "JSONB") {
+        return "{}";
+    }
+    if (t == "BIGINT" || t == "INTEGER" || t == "SMALLINT") {
+        return "0";
+    }
+    if (t == "NUMERIC" || t == "DECIMAL" || t == "DOUBLE PRECISION" || t == "REAL") {
+        return "0";
+    }
+    static std::atomic<std::uint64_t> seq{1};
+    const std::uint64_t n = seq.fetch_add(1, std::memory_order_relaxed);
+    if (col.is_pk) {
+        std::ostringstream oss;
+        oss << "00000000-0000-4000-8000-" << std::hex << std::setw(12) << std::setfill('0')
+            << (n & 0xffffffffffffULL);
+        return oss.str();
+    }
+    return "__missing__" + std::to_string(n);
 }
 
 std::string mariadb_bytea_to_copy_csv(const char* data, std::size_t len) {

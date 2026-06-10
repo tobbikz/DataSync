@@ -23,6 +23,9 @@ std::string mariadb_lake_pg_type(const std::string& column_name, const std::stri
 /** Strip NUL bytes and other bytes PostgreSQL TEXT rejects (mirrors MSSQL sanitizer). */
 std::string sanitize_mariadb_text_for_pg(const std::string& value);
 
+/** Raw cell value when MariaDB sends NULL but the lake column is NOT NULL (schema drift). */
+std::string mariadb_not_null_copy_default(const MariaDbColumn& col);
+
 /** COPY CSV cell for BYTEA (hex \\x… form). */
 std::string mariadb_bytea_to_copy_csv(const char* data, std::size_t len);
 std::string mariadb_bytea_to_copy_csv(const std::string& value);
