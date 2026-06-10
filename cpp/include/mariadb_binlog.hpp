@@ -51,20 +51,6 @@ void capture_binlog_position_t0(PGconn* pg, MYSQL* mysql, const std::string& con
 /** True when mariadb-binlog or server reports a purged/missing binlog file. */
 bool is_mariadb_binlog_purged_error(const std::string& message);
 
-/** True when mariadb-binlog reports GTID ordering mismatch in the binlog stream. */
-bool is_mariadb_gtid_out_of_order_error(const std::string& message);
-
-struct MariaDbGtidResyncResult {
-    bool ran{false};
-};
-
-/** Re-anchor capture to SHOW MASTER STATUS (no full-load reboot). */
-MariaDbGtidResyncResult resync_capture_after_mariadb_gtid_error(
-    PGconn* pg,
-    MYSQL* mysql,
-    const std::string& conn_id,
-    const std::string& batch_id);
-
 std::optional<BinlogPosition> fetch_binlog_position(PGconn* pg, const std::string& conn_id);
 
 // Updates binlog file:pos in capture_position (legacy mariadb_cdc path)

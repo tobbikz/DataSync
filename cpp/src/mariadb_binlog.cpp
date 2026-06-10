@@ -1,8 +1,6 @@
 #include "mariadb_binlog.hpp"
 
 #include "mariadb_schema.hpp"
-#include "obs_log.hpp"
-
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -29,7 +27,6 @@ std::string mariadb_scalar_safe(MYSQL* mysql, const char* sql) {
 struct MasterStatus {
     std::string binlog_file;
     long long binlog_position{0};
-    std::string gtid;
 };
 
 MasterStatus read_master_status(MYSQL* mysql) {
@@ -51,14 +48,7 @@ MasterStatus read_master_status(MYSQL* mysql) {
     MasterStatus out;
     out.binlog_file = row[0];
     out.binlog_position = row[1] ? std::atoll(row[1]) : 0;
-    if (row[2]) {
-        out.gtid = row[2];
-    }
     mysql_free_result(res);
-
-    if (out.gtid.empty()) {
-        out.gtid = mariadb_scalar_safe(mysql, "SELECT @@gtid_binlog_state");
-    }
     return out;
 }
 
@@ -134,39 +124,13 @@ void capture_binlog_position_t0(PGconn* pg, MYSQL* mysql, const std::string& con
     if (uuid.empty()) {
         uuid = mariadb_scalar_safe(mysql, "SELECT @@server_uid");
     }
-    upsert_capture_position_full(
-        pg, conn_id, master.gtid, master.binlog_file, master.binlog_position, uuid);
+    upsert_capture_position_full(pg, conn_id, "", master.binlog_file, master.binlog_position, uuid);
 }
 
 bool is_mariadb_binlog_purged_error(const std::string& message) {
     return message.find("Could not find first log file") != std::string::npos ||
            message.find("Could not find target log file") != std::string::npos ||
            message.find("binlog file no longer on server") != std::string::npos;
-}
-
-bool is_mariadb_gtid_out_of_order_error(const std::string& message) {
-    return message.find("out of order GTID") != std::string::npos ||
-           message.find("Out of order GTID") != std::string::npos;
-}
-
-MariaDbGtidResyncResult resync_capture_after_mariadb_gtid_error(
-    PGconn* pg,
-    MYSQL* mysql,
-    const std::string& conn_id,
-    const std::string& batch_id) {
-    MariaDbGtidResyncResult out;
-    capture_binlog_position_t0(pg, mysql, conn_id);
-    out.ran = true;
-    log_write(pg, {
-        .level = LogLevel::Warning,
-        .component = "cdc_kafka_capture",
-        .message = "gtid out of order: capture re-anchored to master status",
-        .batch_id = batch_id,
-        .conn_id = conn_id,
-        .source_schema = std::nullopt,
-        .source_table = std::nullopt,
-    });
-    return out;
 }
 
 std::optional<BinlogPosition> fetch_binlog_position(PGconn* pg, const std::string& conn_id) {

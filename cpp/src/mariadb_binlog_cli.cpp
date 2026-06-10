@@ -145,7 +145,7 @@ BinlogCliStats read_remote_binlog_cli(
 
     std::ostringstream cmd;
     cmd << "timeout " << std::max(1, max_seconds) << " " << shell_single_quote(binlog_bin)
-        << " --read-from-remote-server"
+        << " --read-from-remote-server --skip-gtid-strict-mode"
         << " -h " << shell_single_quote(source.host) << " -P " << source.port << " -u "
         << shell_single_quote(source.user) << " -p" << shell_single_quote(source.password)
         << " --start-position=" << start.position << " --base64-output=DECODE-ROWS -v "

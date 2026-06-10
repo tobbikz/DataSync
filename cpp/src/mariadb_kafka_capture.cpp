@@ -91,32 +91,6 @@ MasterStatusLite fetch_master_status(MYSQL* mysql) {
     return {st.file, st.position};
 }
 
-std::string mariadb_gtid_binlog_state(MYSQL* mysql) {
-    for (const char* sql : {"SELECT @@gtid_binlog_state", "SELECT @@gtid_current_pos"}) {
-        try {
-            const std::string val = mariadb_scalar(mysql, sql);
-            if (!val.empty()) {
-                return val;
-            }
-        } catch (...) {
-        }
-    }
-    if (mysql_query(mysql, "SHOW MASTER STATUS") != 0) {
-        return {};
-    }
-    MYSQL_RES* res = mysql_store_result(mysql);
-    if (!res) {
-        return {};
-    }
-    MYSQL_ROW row = mysql_fetch_row(res);
-    std::string gtid;
-    if (row && row[2]) {
-        gtid = row[2];
-    }
-    mysql_free_result(res);
-    return gtid;
-}
-
 CapturePosition read_capture_position(PGconn* pg, const std::string& conn_id) {
     const char* vals[] = {conn_id.c_str()};
     PGresult* res = PQexecParams(
@@ -154,7 +128,6 @@ CapturePosition read_capture_position(PGconn* pg, const std::string& conn_id) {
 void upsert_capture_position(
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& gtid_set,
     const std::string& binlog_file,
     long long binlog_pos,
     const std::string& server_uuid_val,
@@ -163,7 +136,6 @@ void upsert_capture_position(
     const std::string pos_str = std::to_string(binlog_pos);
     const char* vals1[] = {
         conn_id.c_str(),
-        gtid_set.c_str(),
         binlog_file.c_str(),
         pos_str.c_str(),
         server_uuid_val.c_str(),
@@ -174,9 +146,8 @@ void upsert_capture_position(
         R"(
         INSERT INTO cdc_catalog.capture_position
             (conn_id, gtid_set, binlog_file, binlog_position, server_uuid, status, last_error, last_event_ts, updated_at)
-        VALUES ($1, $2, $3, $4::bigint, $5, $6::cdc_catalog.cdc_health_status, $7, now(), now())
+        VALUES ($1, '', $2, $3::bigint, $4, $5::cdc_catalog.cdc_health_status, $6, now(), now())
         ON CONFLICT (conn_id) DO UPDATE SET
-            gtid_set = EXCLUDED.gtid_set,
             binlog_file = EXCLUDED.binlog_file,
             binlog_position = EXCLUDED.binlog_position,
             server_uuid = EXCLUDED.server_uuid,
@@ -185,7 +156,7 @@ void upsert_capture_position(
             last_event_ts = now(),
             updated_at = now()
         )",
-        7,
+        6,
         vals1);
 }
 
@@ -312,7 +283,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         upsert_capture_position(
             log_pg,
             conn_id,
-            mariadb_gtid_binlog_state(mariadb.handle),
             start_pos.binlog_file,
             start_pos.binlog_position,
             live_uuid,
@@ -561,7 +531,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 upsert_capture_position(
                     log_pg,
                     conn_id,
-                    mariadb_gtid_binlog_state(mariadb.handle),
                     read_stats.last_file,
                     read_stats.last_position,
                     live_uuid);
@@ -623,13 +592,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                     stats.errors = reboot.ran ? 0 : 1;
                     return stats;
                 }
-                if (is_mariadb_gtid_out_of_order_error(cli_err)) {
-                    const auto resync =
-                        resync_capture_after_mariadb_gtid_error(log_pg, mariadb.handle, conn_id, batch_id);
-                    rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
-                    stats.errors = resync.ran ? 0 : 1;
-                    return stats;
-                }
                 stats.errors = 1;
                 throw std::runtime_error(
                     "mariadb-binlog failed (exit " + std::to_string(chunk.exit_code) + "): " +
@@ -687,7 +649,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         upsert_capture_position(
             log_pg,
             conn_id,
-            mariadb_gtid_binlog_state(mariadb.handle),
             start_pos.binlog_file,
             start_pos.binlog_position,
             live_uuid,
@@ -696,14 +657,12 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         throw std::runtime_error("kafka publish failed: " + err_detail);
     }
 
-    const std::string gtid_state = mariadb_gtid_binlog_state(mariadb.handle);
     for (long long catalog_id : cdc_active_catalog_ids) {
         mark_catalog_cdc_success(log_pg, catalog_id);
     }
     upsert_capture_position(
         log_pg,
         conn_id,
-        gtid_state,
         read_stats.last_file,
         read_stats.last_position,
         live_uuid);
@@ -747,7 +706,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             {"ddl_recorded", stats.ddl_recorded},
             {"binlog_file", stats.binlog_file},
             {"binlog_position", stats.binlog_position},
-            {"gtid_set", gtid_state},
             {"duration_ms", stats.duration_ms},
             {"tier", service_tier.value_or("all")},
             {"kafka_bootstrap", rcfg.bootstrap},
@@ -764,14 +722,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 reboot_conn_after_mariadb_binlog_gap(log_pg, recovery_conn.handle, conn_id, batch_id);
             rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
             stats.errors = reboot.ran ? 0 : 1;
-            return stats;
-        }
-        if (is_mariadb_gtid_out_of_order_error(ex.what())) {
-            MariaDbConn recovery_conn(*source);
-            const auto resync =
-                resync_capture_after_mariadb_gtid_error(log_pg, recovery_conn.handle, conn_id, batch_id);
-            rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
-            stats.errors = resync.ran ? 0 : 1;
             return stats;
         }
         rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);

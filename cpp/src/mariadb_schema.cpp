@@ -156,72 +156,6 @@ bool mariadb_is_text_like_mysql_type(const std::string& t) {
            t.find("enum") != std::string::npos || t.find("set") != std::string::npos;
 }
 
-bool ends_with_ci(const std::string& haystack, const std::string& suffix) {
-    if (haystack.size() < suffix.size()) {
-        return false;
-    }
-    const std::string tail = to_lower(haystack.substr(haystack.size() - suffix.size()));
-    return tail == to_lower(suffix);
-}
-
-bool starts_with_ci(const std::string& haystack, const std::string& prefix) {
-    if (haystack.size() < prefix.size()) {
-        return false;
-    }
-    const std::string head = to_lower(haystack.substr(0, prefix.size()));
-    return head == to_lower(prefix);
-}
-
-bool mariadb_column_prefers_bytea(const std::string& column_name, const std::string& mysql_type_raw) {
-    const std::string t = to_lower(mysql_type_raw);
-    if (t.find("blob") != std::string::npos || t.find("binary") != std::string::npos) {
-        return false;
-    }
-    if (!mariadb_is_text_like_mysql_type(t)) {
-        return false;
-    }
-    const std::string n = to_lower(column_name);
-    static const char* const kExact[] = {
-        "pin",
-        "password",
-        "passwd",
-        "pwd",
-        "hash",
-        "salt",
-        "token",
-        "secret",
-        "checksum",
-        "digest",
-        "ciphertext",
-        "nonce",
-        "iv",
-        "signature",
-        "api_key",
-        "private_key",
-    };
-    for (const char* exact : kExact) {
-        if (n == exact) {
-            return true;
-        }
-    }
-    static const char* const kSuffix[] = {
-        "_hash",
-        "_pin",
-        "_token",
-        "_salt",
-        "_secret",
-        "_checksum",
-        "_digest",
-        "_signature",
-    };
-    for (const char* suffix : kSuffix) {
-        if (ends_with_ci(n, suffix)) {
-            return true;
-        }
-    }
-    return starts_with_ci(n, "bin_") || starts_with_ci(n, "binary_");
-}
-
 std::string mariadb_to_pg_type(const std::string& mysql_type_raw) {
     const std::string t = to_lower(mysql_type_raw);
     if (t.find("bigint") != std::string::npos) {
@@ -264,9 +198,7 @@ std::string mariadb_to_pg_type(const std::string& mysql_type_raw) {
 }
 
 std::string mariadb_lake_pg_type(const std::string& column_name, const std::string& mysql_type_raw) {
-    if (mariadb_column_prefers_bytea(column_name, mysql_type_raw)) {
-        return "BYTEA";
-    }
+    (void)column_name;
     return mariadb_to_pg_type(mysql_type_raw);
 }
 

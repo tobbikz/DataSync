@@ -17,11 +17,8 @@ struct MariaDbColumn {
 std::string pg_ident(const std::string& name);
 std::string mariadb_to_pg_type(const std::string& mysql_type_raw);
 
-/** Lake PG type: BLOB/BINARY → BYTEA; text-like columns named pin/hash/… → BYTEA. */
+/** Lake PG type: BLOB/BINARY → BYTEA; everything else from mariadb_to_pg_type. */
 std::string mariadb_lake_pg_type(const std::string& column_name, const std::string& mysql_type_raw);
-
-/** True when a VARCHAR/TEXT column should be stored as BYTEA (pin, hash, token, …). */
-bool mariadb_column_prefers_bytea(const std::string& column_name, const std::string& mysql_type_raw);
 
 /** Strip NUL bytes and other bytes PostgreSQL TEXT rejects (mirrors MSSQL sanitizer). */
 std::string sanitize_mariadb_text_for_pg(const std::string& value);

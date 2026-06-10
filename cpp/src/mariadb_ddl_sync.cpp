@@ -127,6 +127,10 @@ bool pg_type_is_text_like(const std::string& data_type) {
     return data_type == "text" || data_type == "character varying" || data_type == "character";
 }
 
+bool catalog_pg_type_is_text_like(const std::string& pg_type) {
+    return pg_type == "TEXT" || pg_type == "JSONB";
+}
+
 int sync_binary_column_types(
     PGconn* pg,
     const std::string& schema,
@@ -134,26 +138,36 @@ int sync_binary_column_types(
     const std::vector<MariaDbColumn>& cols) {
     int changed = 0;
     for (const auto& col : cols) {
-        if (col.pg_type != "BYTEA") {
-            continue;
-        }
         if (!pg_column_exists(pg, schema, table, col.name)) {
             continue;
         }
         const std::string current = pg_column_data_type(pg, schema, table, col.name);
-        if (current == "bytea") {
-            continue;
-        }
-        if (!pg_type_is_text_like(current)) {
-            continue;
-        }
         const std::string fq = pg_ident(schema) + "." + pg_ident(table);
         const std::string ident = pg_ident(col.name);
+        if (col.pg_type == "BYTEA") {
+            if (current == "bytea") {
+                continue;
+            }
+            if (!pg_type_is_text_like(current)) {
+                continue;
+            }
+            pg_exec(
+                pg,
+                "ALTER TABLE " + fq + " ALTER COLUMN " + ident + " TYPE bytea USING (CASE WHEN " + ident +
+                " IS NULL THEN NULL::bytea ELSE decode(encode(convert_to(" + ident +
+                ", 'SQL_ASCII'), 'hex'), 'hex') END)");
+            changed += 1;
+            continue;
+        }
+        if (current != "bytea") {
+            continue;
+        }
+        if (!catalog_pg_type_is_text_like(col.pg_type)) {
+            continue;
+        }
         pg_exec(
             pg,
-            "ALTER TABLE " + fq + " ALTER COLUMN " + ident + " TYPE bytea USING (CASE WHEN " + ident +
-            " IS NULL THEN NULL::bytea ELSE decode(encode(convert_to(" + ident +
-            ", 'SQL_ASCII'), 'hex'), 'hex') END)");
+            "ALTER TABLE " + fq + " ALTER COLUMN " + ident + " TYPE text USING encode(" + ident + ", 'escape')");
         changed += 1;
     }
     return changed;

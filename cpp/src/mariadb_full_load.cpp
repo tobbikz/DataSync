@@ -109,7 +109,7 @@ std::string format_cell(const char* data, unsigned long len, const MariaDbColumn
     const bool missing = !data || len == 0;
     if (col.pg_type == "BYTEA" || is_binary_type(col.mysql_type)) {
         if (missing) {
-            return col.is_nullable ? "" : "\\N";
+            return "\\N";
         }
         return mariadb_bytea_to_copy_csv(data, static_cast<std::size_t>(len));
     }
