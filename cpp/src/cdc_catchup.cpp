@@ -2,6 +2,7 @@
 
 #include "capture_common.hpp"
 #include "config.hpp"
+#include "daemon_full_load.hpp"
 #include "mariadb_conn.hpp"
 #include "mariadb_full_load.hpp"
 #include "mariadb_schema.hpp"
@@ -326,6 +327,19 @@ std::vector<CatchupResult> run_catchup_if_needed(
     RuntimeConfig runtime;
     runtime.reload(log_pg);
     if (!runtime.get_bool("apply_catchup_enabled", true, "cdc_kafka_apply", conn_id)) {
+        return {};
+    }
+    if (tier && !tier->empty() && full_load_tier_busy(conn_id, *tier)) {
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_kafka_apply",
+            .message = "catchup skipped: tier full-load lock held",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"tier", *tier}},
+        });
         return {};
     }
     const int max_tables = runtime.get_int("apply_catchup_max_tables", 1, "cdc_kafka_apply", conn_id);

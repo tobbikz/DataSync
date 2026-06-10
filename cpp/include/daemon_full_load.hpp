@@ -15,8 +15,19 @@ struct DaemonFullLoadOutcome {
 };
 
 // Isolated full-load phase for daemon: fork+exec `DataSync full-load --tier --conn-id`.
-// Caller should continue capture/apply in the same cycle (apply skips needs_full_load tables).
+// Daemon runs this in a background thread while pre-apply/apply run concurrently.
 DaemonFullLoadOutcome run_daemon_full_load_isolated(
+    const AppConfig& cfg,
+    PGconn* log_pg,
+    const std::string& conn_id,
+    const std::string& tier,
+    const std::string& batch_id);
+
+/** True when another thread holds the per-(conn_id,tier) full-load lock (subprocess + onboard). */
+bool full_load_tier_busy(const std::string& conn_id, const std::string& tier);
+
+/** Acquire tier lock; returns nullopt if another full-load/onboard is already running. */
+std::optional<DaemonFullLoadOutcome> try_run_daemon_full_load_isolated(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,

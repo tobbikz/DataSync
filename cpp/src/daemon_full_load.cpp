@@ -11,7 +11,48 @@
 #include <unistd.h>
 #include <algorithm>
 #include <cstdlib>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <utility>
 #include <vector>
+
+namespace {
+
+std::mutex g_tier_lock_registry_mu;
+std::map<std::pair<std::string, std::string>, std::shared_ptr<std::mutex>> g_tier_locks;
+
+std::shared_ptr<std::mutex> tier_full_load_mutex(const std::string& conn_id, const std::string& tier) {
+    const auto key = std::make_pair(conn_id, tier);
+    std::lock_guard<std::mutex> guard(g_tier_lock_registry_mu);
+    auto& slot = g_tier_locks[key];
+    if (!slot) {
+        slot = std::make_shared<std::mutex>();
+    }
+    return slot;
+}
+
+}  // namespace
+
+bool full_load_tier_busy(const std::string& conn_id, const std::string& tier) {
+    const auto mu = tier_full_load_mutex(conn_id, tier);
+    std::unique_lock<std::mutex> lock(*mu, std::try_to_lock);
+    return !lock.owns_lock();
+}
+
+std::optional<DaemonFullLoadOutcome> try_run_daemon_full_load_isolated(
+    const AppConfig& cfg,
+    PGconn* log_pg,
+    const std::string& conn_id,
+    const std::string& tier,
+    const std::string& batch_id) {
+    const auto mu = tier_full_load_mutex(conn_id, tier);
+    std::unique_lock<std::mutex> lock(*mu, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return std::nullopt;
+    }
+    return run_daemon_full_load_isolated(cfg, log_pg, conn_id, tier, batch_id);
+}
 
 namespace {
 

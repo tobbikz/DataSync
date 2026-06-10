@@ -709,13 +709,6 @@ bool load_one_table(
 
     mark_catalog_full_load_in_progress(app_pg.raw, target.catalog_id);
 
-    {
-        RuntimeConfig bookmark_runtime;
-        bookmark_runtime.reload(app_pg.raw);
-        seed_stream_capture_bookmark_if_needed(
-            app_pg.raw, bookmark_runtime, target.conn_id, target.catalog_id, "mariadb", batch_id);
-    }
-
     if (!target.has_pk || target.pk_columns.empty()) {
         mark_catalog_skipped(app_pg.raw, target.catalog_id, "no primary key");
         log_fl(
@@ -729,6 +722,26 @@ bool load_one_table(
             target.source_schema,
             target.source_table);
         return false;
+    }
+
+    {
+        RuntimeConfig bookmark_runtime;
+        bookmark_runtime.reload(app_pg.raw);
+        try {
+            seed_stream_capture_bookmark_if_needed(
+                app_pg.raw, bookmark_runtime, target.conn_id, target.catalog_id, "mariadb", batch_id);
+        } catch (const std::exception& ex) {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Warning,
+                batch_id,
+                "stream capture bookmark skipped; continuing full load",
+                {{"error", ex.what()}},
+                target.conn_id,
+                target.source_schema,
+                target.source_table);
+        }
     }
 
     const auto cols = fetch_mariadb_columns(mariadb.handle, target.source_schema, target.source_table);

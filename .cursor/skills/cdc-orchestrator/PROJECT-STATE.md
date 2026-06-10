@@ -27,6 +27,8 @@ Config: **`config.json`** en raíz del repo (PG DataSync + DataLake). Fuentes OL
 - [x] Native C++ capture + apply (~340k+ events/min)
 - [x] MSSQL + MongoDB parity (capture, full-load, catchup)
 - [x] Daemon auto full-load aislado (`needs_full_load` → subprocess, sin mezclar capture/apply)
+- [x] Daemon cycle: full-load en background thread; pre-apply + apply concurrentes (no bloqueo por bulk pending)
+- [x] Stream bookmark Kafka: retry watermark (Not leader for partition) + skip sin tumbar tabla
 - [x] Mongo onboard fixes: `seed_mongo_cdc_resume` T0, capture idle poll, `apply_position` seed, discover `mongo_id` PK
 - [x] Mongo `apply_batch_stats` parity: `capture_lag` desde `cdc_mongo_resume`, `source_schema=cdc_test`
 - [x] Mongo discover/prune parity: `fetch_mongo_objects` sets `source_schema=source_database`; SQL `046` for legacy rows

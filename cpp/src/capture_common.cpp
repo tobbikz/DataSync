@@ -29,6 +29,48 @@
 #pragma GCC diagnostic ignored "-Wignored-qualifiers"
 #include <librdkafka/rdkafka.h>
 #pragma GCC diagnostic pop
+
+namespace {
+
+bool kafka_watermark_err_is_transient(rd_kafka_resp_err_t err) {
+    switch (err) {
+    case RD_KAFKA_RESP_ERR_NOT_LEADER_FOR_PARTITION:
+    case RD_KAFKA_RESP_ERR_LEADER_NOT_AVAILABLE:
+    case RD_KAFKA_RESP_ERR__TRANSPORT:
+    case RD_KAFKA_RESP_ERR_REQUEST_TIMED_OUT:
+    case RD_KAFKA_RESP_ERR__TIMED_OUT:
+    case RD_KAFKA_RESP_ERR_NETWORK_EXCEPTION:
+    case RD_KAFKA_RESP_ERR_BROKER_NOT_AVAILABLE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+rd_kafka_resp_err_t query_kafka_watermark_offsets_retry(
+    rd_kafka_t* rk,
+    const char* topic,
+    int partition,
+    int64_t* low,
+    int64_t* high,
+    int timeout_ms,
+    int max_attempts) {
+    rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR__FAIL;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        err = rd_kafka_query_watermark_offsets(rk, topic, partition, low, high, timeout_ms);
+        if (err == RD_KAFKA_RESP_ERR_NO_ERROR || err == RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION) {
+            return err;
+        }
+        if (!kafka_watermark_err_is_transient(err) || attempt + 1 >= max_attempts) {
+            return err;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250 * (attempt + 1)));
+    }
+    return err;
+}
+
+}  // namespace
+
 #endif
 
 KafkaBootstrapResolved resolve_kafka_bootstrap(RuntimeConfig& runtime, const std::string& conn_id) {
@@ -491,14 +533,28 @@ bool seed_stream_capture_bookmark_if_needed(
     for (int partition = 0; partition < topic_partitions; ++partition) {
         int64_t low = 0;
         int64_t high = 0;
-        const rd_kafka_resp_err_t err =
-            rd_kafka_query_watermark_offsets(rk, topic.c_str(), partition, &low, &high, 15000);
+        const rd_kafka_resp_err_t err = query_kafka_watermark_offsets_retry(
+            rk, topic.c_str(), partition, &low, &high, 15000, 6);
         if (err == RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION) {
             continue;
         }
         if (err != RD_KAFKA_RESP_ERR_NO_ERROR) {
             rd_kafka_destroy(rk);
-            throw std::runtime_error(std::string("stream bookmark watermark failed: ") + rd_kafka_err2str(err));
+            log_write(pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_catalog_onboard",
+                .message = "stream capture bookmark skipped: watermark query failed",
+                .batch_id = batch_id.empty() ? std::nullopt : std::make_optional(batch_id),
+                .conn_id = conn_id,
+                .source_schema = source_schema,
+                .source_table = source_table,
+                .context = {
+                    {"topic", topic},
+                    {"partition", partition},
+                    {"error", rd_kafka_err2str(err)},
+                },
+            });
+            return false;
         }
         topic_offsets[std::to_string(partition)] = high;
     }
@@ -577,28 +633,8 @@ void flag_table_for_full_load(
     const std::string& table,
     const std::string& db_engine,
     const std::string& batch_id) {
-    const char* vals1[] = {conn_id.c_str(), db_engine.c_str(), schema.c_str(), table.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        UPDATE cdc_catalog.catalog
-        SET needs_full_load = false, updated_at = now()
-        WHERE conn_id = $1
-          AND db_engine = $2::cdc_catalog.db_engine
-          AND NOT (source_schema = $3 AND source_table = $4)
-        )",
-        4,
-        nullptr,
-        vals1,
-        nullptr,
-        nullptr,
-        0);
-    if (res) {
-        PQclear(res);
-    }
-
     const char* vals2[] = {conn_id.c_str(), db_engine.c_str(), schema.c_str(), table.c_str()};
-    res = PQexecParams(
+    PGresult* res = PQexecParams(
         pg,
         R"(
         UPDATE cdc_catalog.catalog
@@ -641,7 +677,20 @@ void flag_table_for_full_load(
         const long long catalog_id = std::atoll(PQgetvalue(res, 0, 0));
         RuntimeConfig runtime;
         runtime.reload(pg);
-        seed_stream_capture_bookmark_if_needed(pg, runtime, conn_id, catalog_id, db_engine, batch_id);
+        try {
+            seed_stream_capture_bookmark_if_needed(pg, runtime, conn_id, catalog_id, db_engine, batch_id);
+        } catch (const std::exception& ex) {
+            log_write(pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_catalog_onboard",
+                .message = "stream capture bookmark skipped during flag_table_for_full_load",
+                .batch_id = batch_id.empty() ? std::nullopt : std::make_optional(batch_id),
+                .conn_id = conn_id,
+                .source_schema = schema,
+                .source_table = table,
+                .context = {{"error", ex.what()}},
+            });
+        }
     }
     if (res) {
         PQclear(res);
@@ -1570,8 +1619,8 @@ long long kafka_backlog_messages(
 
     int64_t low = 0;
     int64_t high = 0;
-    rd_kafka_resp_err_t err =
-        rd_kafka_query_watermark_offsets(consumer, topic.c_str(), partition, &low, &high, 15000);
+    rd_kafka_resp_err_t err = query_kafka_watermark_offsets_retry(
+        consumer, topic.c_str(), partition, &low, &high, 15000, 6);
     if (err != RD_KAFKA_RESP_ERR_NO_ERROR) {
         rd_kafka_topic_partition_list_destroy(parts);
         rd_kafka_destroy(consumer);
@@ -1608,7 +1657,8 @@ long long reset_apply_offset_to_end(
 
     int64_t low = 0;
     int64_t high = 0;
-    rd_kafka_resp_err_t err = rd_kafka_query_watermark_offsets(rk, topic.c_str(), partition, &low, &high, 15000);
+    rd_kafka_resp_err_t err =
+        query_kafka_watermark_offsets_retry(rk, topic.c_str(), partition, &low, &high, 15000, 6);
     if (err == RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION) {
         rd_kafka_destroy(rk);
         return -1;

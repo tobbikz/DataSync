@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <optional>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -107,17 +108,94 @@ int run_one_cycle(
         .context = {{"tier", tier.tier_code}, {"db_engine", db_engine}},
     });
 
-    const DaemonFullLoadOutcome full_load = run_daemon_full_load_isolated(cfg, log_pg, conn_id, tier.tier_code, batch_id);
-    int cycle_errors = 0;
-    if (full_load.ran) {
+    std::optional<DaemonFullLoadOutcome> full_load_outcome;
+    std::thread full_load_thread;
+    const int pending_before =
+        count_full_load_pending(log_pg, conn_id, tier.tier_code, db_engine);
+    if (pending_before > 0) {
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_daemon",
+            .message = "daemon full-load started in background; CDC slice running concurrently",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"tier", tier.tier_code},
+                {"db_engine", db_engine},
+                {"pending_tables", pending_before},
+                {"phase", "full_load_background"},
+            },
+        });
+        full_load_thread = std::thread(
+            [&cfg, &full_load_outcome, conn_id, tier_code = tier.tier_code, batch_id, pending_before]() {
+                try {
+                    PgConn pg(cfg.datasync.conn_string());
+                    if (!pg.raw) {
+                        DaemonFullLoadOutcome failed;
+                        failed.ran = true;
+                        failed.exit_code = 1;
+                        failed.pending_tables = pending_before;
+                        full_load_outcome = failed;
+                        return;
+                    }
+                    const auto outcome =
+                        try_run_daemon_full_load_isolated(cfg, pg.raw, conn_id, tier_code, batch_id);
+                    if (outcome) {
+                        full_load_outcome = *outcome;
+                    } else {
+                        DaemonFullLoadOutcome skipped;
+                        skipped.pending_tables = pending_before;
+                        full_load_outcome = skipped;
+                    }
+                } catch (const std::exception&) {
+                    DaemonFullLoadOutcome failed;
+                    failed.ran = true;
+                    failed.exit_code = 1;
+                    failed.pending_tables = pending_before;
+                    full_load_outcome = failed;
+                }
+            });
+    }
+
+    const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, tier.tier_code, batch_id);
+    const int pre_rc = pre.errors > 0 ? 1 : 0;
+    const int apply_rc = run_apply_workers(cfg, conn_id, tier.tier_code, tier.apply_worker_count);
+    int cycle_errors = (pre_rc != 0 ? 1 : 0) + (apply_rc != 0 ? 1 : 0);
+
+    if (full_load_thread.joinable()) {
+        full_load_thread.join();
+    }
+
+    if (full_load_outcome && !full_load_outcome->ran && pending_before > 0) {
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_daemon",
+            .message = "daemon full-load skipped: tier lock held by another full-load",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"tier", tier.tier_code},
+                {"db_engine", db_engine},
+                {"pending_tables", pending_before},
+                {"phase", "full_load_background"},
+            },
+        });
+    }
+
+    if (full_load_outcome && full_load_outcome->ran) {
+        const DaemonFullLoadOutcome& full_load = *full_load_outcome;
         const bool partial_ok = full_load.tables_loaded > 0 && full_load.exit_code != 0;
         log_write(log_pg, {
             .level = full_load.exit_code == 0 ? LogLevel::Info : LogLevel::Warning,
             .component = "cdc_daemon",
             .message = full_load.exit_code == 0
-                           ? "daemon full-load finished; continuing apply for cdc-ready tables"
-                           : (partial_ok ? "daemon full-load partial; continuing apply for cdc-ready tables"
-                                         : "daemon full-load failed; continuing apply for cdc-ready tables"),
+                           ? "daemon full-load background finished"
+                           : (partial_ok ? "daemon full-load background partial"
+                                         : "daemon full-load background failed"),
             .batch_id = batch_id,
             .conn_id = conn_id,
             .source_schema = std::nullopt,
@@ -129,17 +207,13 @@ int run_one_cycle(
                 {"pending_tables", full_load.pending_tables},
                 {"pending_after", full_load.pending_after},
                 {"tables_loaded", full_load.tables_loaded},
+                {"phase", "full_load_background"},
             },
         });
         if (full_load.exit_code != 0) {
             cycle_errors += 1;
         }
     }
-
-    const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, tier.tier_code, batch_id);
-    const int pre_rc = pre.errors > 0 ? 1 : 0;
-    const int apply_rc = run_apply_workers(cfg, conn_id, tier.tier_code, tier.apply_worker_count);
-    cycle_errors += (pre_rc != 0 ? 1 : 0) + (apply_rc != 0 ? 1 : 0);
 
     log_write(log_pg, {
         .level = cycle_errors ? LogLevel::Warning : LogLevel::Info,
@@ -154,6 +228,7 @@ int run_one_cycle(
             {"db_engine", db_engine},
             {"pre_apply_exit", pre_rc},
             {"apply_exit", apply_rc},
+            {"full_load_concurrent", pending_before > 0},
             {"errors", cycle_errors},
         },
     });
@@ -285,9 +360,9 @@ void run_startup_full_load_sweep(
                 break;
             }
             try {
-                const DaemonFullLoadOutcome sweep = run_daemon_full_load_isolated(
+                const auto sweep = try_run_daemon_full_load_isolated(
                     cfg, log_pg, conn_id, tier.tier_code, make_batch_id());
-                if (sweep.ran && sweep.exit_code != 0) {
+                if (sweep && sweep->ran && sweep->exit_code != 0) {
                     exit_code = 1;
                 }
             } catch (const std::exception& ex) {
@@ -414,7 +489,17 @@ int run_cdc_daemon(
     int exit_code = 0;
     std::size_t last_conn_count = conn_ids_initial.size();
 
-    run_startup_full_load_sweep(cfg, log_pg, conn_ids_initial, tiers, exit_code);
+    std::thread startup_full_load_thread([cfg, conn_ids_initial, tiers]() {
+        try {
+            PgConn pg(cfg.datasync.conn_string());
+            if (!pg.raw) {
+                return;
+            }
+            int sweep_exit = 0;
+            run_startup_full_load_sweep(cfg, pg.raw, conn_ids_initial, tiers, sweep_exit);
+        } catch (const std::exception&) {
+        }
+    });
 
     std::thread reconcile_thread([&cfg]() {
         try {
@@ -476,6 +561,9 @@ int run_cdc_daemon(
         }
     }
 
+    if (startup_full_load_thread.joinable()) {
+        startup_full_load_thread.join();
+    }
     if (reconcile_thread.joinable()) {
         reconcile_thread.join();
     }
