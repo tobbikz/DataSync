@@ -14,7 +14,9 @@ public:
     KafkaProducer(
         const std::string& bootstrap,
         int linger_ms = 5,
-        int batch_size = 10000);
+        int batch_size = 10000,
+        int queue_max_messages = 0,
+        int queue_max_kbytes = 0);
     ~KafkaProducer();
 
     KafkaProducer(const KafkaProducer&) = delete;

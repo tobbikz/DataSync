@@ -48,6 +48,9 @@ bool capture_binlog_position_t0_if_absent(PGconn* pg, MYSQL* mysql, const std::s
 // Legacy name — always upserts (capture checkpoint advance only).
 void capture_binlog_position_t0(PGconn* pg, MYSQL* mysql, const std::string& conn_id);
 
+/** True when mariadb-binlog or server reports a purged/missing binlog file. */
+bool is_mariadb_binlog_purged_error(const std::string& message);
+
 std::optional<BinlogPosition> fetch_binlog_position(PGconn* pg, const std::string& conn_id);
 
 // Updates binlog file:pos in capture_position (legacy mariadb_cdc path)

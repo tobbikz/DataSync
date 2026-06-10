@@ -331,7 +331,12 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         .source_table = std::nullopt,
         .context = {{"kafka_bootstrap", rcfg.bootstrap}, {"kafka_bootstrap_source", kafka.source}},
     });
-    KafkaProducer producer(rcfg.bootstrap, rcfg.linger_ms, rcfg.producer_batch);
+    KafkaProducer producer(
+        rcfg.bootstrap,
+        rcfg.linger_ms,
+        rcfg.producer_batch,
+        rcfg.producer_queue_max_messages,
+        rcfg.producer_queue_max_kbytes);
     if (!producer.available()) {
         log_write(log_pg, {
             .level = LogLevel::Error,
@@ -613,10 +618,17 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 },
             });
             if (cli_failed) {
+                const std::string cli_err = chunk.stderr_tail.substr(0, 2000);
+                if (is_mariadb_binlog_purged_error(cli_err)) {
+                    const auto reboot = reboot_conn_after_mariadb_binlog_gap(log_pg, mariadb.handle, conn_id, batch_id);
+                    rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+                    stats.errors = reboot.ran ? 0 : 1;
+                    return stats;
+                }
                 stats.errors = 1;
                 throw std::runtime_error(
                     "mariadb-binlog failed (exit " + std::to_string(chunk.exit_code) + "): " +
-                    chunk.stderr_tail.substr(0, 300));
+                    cli_err.substr(0, 300));
             }
             if (caught_up) {
                 const auto now = std::chrono::steady_clock::now();
@@ -741,6 +753,14 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
 
     return stats;
     } catch (const std::exception& ex) {
+        if (is_mariadb_binlog_purged_error(ex.what())) {
+            MariaDbConn recovery_conn(*source);
+            const auto reboot =
+                reboot_conn_after_mariadb_binlog_gap(log_pg, recovery_conn.handle, conn_id, batch_id);
+            rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+            stats.errors = reboot.ran ? 0 : 1;
+            return stats;
+        }
         rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
         log_write(log_pg, {
             .level = LogLevel::Warning,

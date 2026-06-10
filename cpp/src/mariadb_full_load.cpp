@@ -106,14 +106,30 @@ std::string csv_escape(const std::string& value) {
 }
 
 std::string format_cell(const char* data, unsigned long len, const MariaDbColumn& col) {
-    if (!data) {
-        return "";
-    }
+    const bool missing = !data || len == 0;
     if (col.pg_type == "BYTEA" || is_binary_type(col.mysql_type)) {
+        if (missing) {
+            return col.is_nullable ? "" : "\\N";
+        }
         return mariadb_bytea_to_copy_csv(data, static_cast<std::size_t>(len));
+    }
+    if (missing) {
+        if (!col.is_nullable && col.pg_type == "DATE") {
+            return csv_escape("1970-01-01");
+        }
+        if (!col.is_nullable && (col.pg_type == "TIMESTAMPTZ" || col.pg_type == "TIMESTAMP")) {
+            return csv_escape(col.pg_type == "TIMESTAMPTZ" ? "1970-01-01 00:00:00+00" : "1970-01-01 00:00:00");
+        }
+        return "";
     }
     const std::string s = normalize_text_for_pg(std::string(data, len), col.pg_type);
     if ((col.pg_type == "DATE" || col.pg_type == "TIMESTAMPTZ" || col.pg_type == "TIMESTAMP") && s.empty()) {
+        if (!col.is_nullable && col.pg_type == "DATE") {
+            return csv_escape("1970-01-01");
+        }
+        if (!col.is_nullable) {
+            return csv_escape(col.pg_type == "TIMESTAMPTZ" ? "1970-01-01 00:00:00+00" : "1970-01-01 00:00:00");
+        }
         return "";
     }
     return csv_escape(s);

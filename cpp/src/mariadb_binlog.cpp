@@ -137,6 +137,12 @@ void capture_binlog_position_t0(PGconn* pg, MYSQL* mysql, const std::string& con
         pg, conn_id, master.gtid, master.binlog_file, master.binlog_position, uuid);
 }
 
+bool is_mariadb_binlog_purged_error(const std::string& message) {
+    return message.find("Could not find first log file") != std::string::npos ||
+           message.find("Could not find target log file") != std::string::npos ||
+           message.find("binlog file no longer on server") != std::string::npos;
+}
+
 std::optional<BinlogPosition> fetch_binlog_position(PGconn* pg, const std::string& conn_id) {
     const char* vals[] = {conn_id.c_str()};
     PGresult* res = PQexecParams(

@@ -11,6 +11,8 @@ VALUES
     ('apply_batch_size', 'cdc_kafka_apply', '', '50000'::jsonb, 'Apply batch before flush'),
     ('apply_max_seconds', 'cdc_kafka_apply', '', '300'::jsonb, 'Apply slice max seconds'),
     ('capture_max_seconds', 'cdc_kafka_capture', '', '300'::jsonb, 'MariaDB capture slice max'),
+    ('capture_producer_queue_max_messages', 'cdc_kafka_capture', '', '500000'::jsonb, 'Kafka producer queue depth'),
+    ('capture_producer_queue_max_kbytes', 'cdc_kafka_capture', '', '1048576'::jsonb, 'Kafka producer queue memory KB'),
     ('kafka_topic_mode', 'global', '', '"bucketed"'::jsonb, 'Kafka topic layout'),
     ('kafka_topic_buckets', 'global', '', '64'::jsonb, 'Bucket count when bucketed mode'),
     ('catalog_sync_interval_rounds', 'catalog', '', '12'::jsonb, 'Daemon: run discover every N rounds (1=every round)')

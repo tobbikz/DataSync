@@ -221,7 +221,7 @@ void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const
 
 std::vector<MariaDbColumn> fetch_mariadb_columns(MYSQL* mysql, const std::string& schema, const std::string& table) {
     const std::string sql =
-        "SELECT column_name, column_type, column_key FROM information_schema.columns "
+        "SELECT column_name, column_type, column_key, is_nullable FROM information_schema.columns "
         "WHERE table_schema='" +
         schema + "' AND table_name='" + table + "' ORDER BY ordinal_position";
 
@@ -244,6 +244,7 @@ std::vector<MariaDbColumn> fetch_mariadb_columns(MYSQL* mysql, const std::string
         col.name = row[0];
         col.mysql_type = row[1];
         col.is_pk = row[2] && std::string(row[2]) == "PRI";
+        col.is_nullable = !(row[3] && std::string(row[3]) == "NO");
         col.pg_type = mariadb_lake_pg_type(col.name, col.mysql_type);
         cols.push_back(std::move(col));
     }

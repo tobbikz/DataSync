@@ -1,9 +1,11 @@
 #include "kafka_producer.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #ifdef HAVE_RDKAFKA
 #pragma GCC diagnostic push
@@ -50,7 +52,12 @@ struct KafkaProducer::Impl {
     KafkaProducerImpl body;
 };
 
-KafkaProducer::KafkaProducer(const std::string& bootstrap, int linger_ms, int batch_size)
+KafkaProducer::KafkaProducer(
+    const std::string& bootstrap,
+    int linger_ms,
+    int batch_size,
+    int queue_max_messages,
+    int queue_max_kbytes)
     : impl_(new Impl()) {
 #ifdef HAVE_RDKAFKA
     char errstr[512];
@@ -59,6 +66,14 @@ KafkaProducer::KafkaProducer(const std::string& bootstrap, int linger_ms, int ba
     rd_kafka_conf_set(conf, "acks", "all", errstr, sizeof(errstr));
     rd_kafka_conf_set(conf, "linger.ms", std::to_string(linger_ms).c_str(), errstr, sizeof(errstr));
     rd_kafka_conf_set(conf, "batch.num.messages", std::to_string(batch_size).c_str(), errstr, sizeof(errstr));
+    if (queue_max_messages > 0) {
+        rd_kafka_conf_set(
+            conf, "queue.buffering.max.messages", std::to_string(queue_max_messages).c_str(), errstr, sizeof(errstr));
+    }
+    if (queue_max_kbytes > 0) {
+        rd_kafka_conf_set(
+            conf, "queue.buffering.max.kbytes", std::to_string(queue_max_kbytes).c_str(), errstr, sizeof(errstr));
+    }
     rd_kafka_conf_set_dr_msg_cb(conf, delivery_report);
     rd_kafka_conf_set_opaque(conf, &impl_->body);
 
@@ -87,6 +102,8 @@ KafkaProducer::KafkaProducer(const std::string& bootstrap, int linger_ms, int ba
     (void)bootstrap;
     (void)linger_ms;
     (void)batch_size;
+    (void)queue_max_messages;
+    (void)queue_max_kbytes;
     impl_->body.first_error = "librdkafka not available";
     impl_->body.available = false;
 #endif
@@ -114,20 +131,30 @@ void KafkaProducer::produce(const std::string& topic, const std::string& key, co
         throw std::runtime_error("Kafka producer unavailable: " + (impl_ ? impl_->body.first_error : "null"));
     }
 #ifdef HAVE_RDKAFKA
-    impl_->body.pending.fetch_add(1);
-    rd_kafka_resp_err_t err = rd_kafka_producev(
-        impl_->body.producer,
-        RD_KAFKA_V_TOPIC(topic.c_str()),
-        RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
-        RD_KAFKA_V_KEY(const_cast<char*>(key.data()), key.size()),
-        RD_KAFKA_V_VALUE(const_cast<char*>(value.data()), value.size()),
-        RD_KAFKA_V_END);
-    if (err) {
+    rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR__FAIL;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        impl_->body.pending.fetch_add(1);
+        err = rd_kafka_producev(
+            impl_->body.producer,
+            RD_KAFKA_V_TOPIC(topic.c_str()),
+            RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+            RD_KAFKA_V_KEY(const_cast<char*>(key.data()), key.size()),
+            RD_KAFKA_V_VALUE(const_cast<char*>(value.data()), value.size()),
+            RD_KAFKA_V_END);
+        if (err == RD_KAFKA_RESP_ERR_NO_ERROR) {
+            rd_kafka_poll(impl_->body.producer, 0);
+            return;
+        }
         impl_->body.pending.fetch_sub(1);
-        impl_->body.errors.fetch_add(1);
-        throw std::runtime_error(std::string("kafka produce failed: ") + rd_kafka_err2str(err));
+        if (err != RD_KAFKA_RESP_ERR__QUEUE_FULL) {
+            impl_->body.errors.fetch_add(1);
+            throw std::runtime_error(std::string("kafka produce failed: ") + rd_kafka_err2str(err));
+        }
+        rd_kafka_poll(impl_->body.producer, 10);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5 + attempt / 4));
     }
-    rd_kafka_poll(impl_->body.producer, 0);
+    impl_->body.errors.fetch_add(1);
+    throw std::runtime_error(std::string("kafka produce failed: ") + rd_kafka_err2str(err));
 #endif
 }
 

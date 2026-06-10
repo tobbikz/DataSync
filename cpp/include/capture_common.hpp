@@ -37,6 +37,8 @@ struct CaptureRuntimeConfig {
     std::string bootstrap{"localhost:9092"};
     int linger_ms{5};
     int producer_batch{10000};
+    int producer_queue_max_messages{500000};
+    int producer_queue_max_kbytes{1048576};
     int topic_partitions{6};
     bool mssql_replay_on_idle{false};
 };
@@ -157,6 +159,19 @@ void flag_table_for_full_load(
     const std::string& table,
     const std::string& db_engine,
     const std::string& batch_id = "");
+
+struct BinlogGapRebootResult {
+    bool ran{false};
+    bool t0_reset{false};
+    int tables_flagged{0};
+};
+
+/** After MariaDB purged binlog files: reseed capture T0 and batch-flag conn tables for full-load reboot. */
+BinlogGapRebootResult reboot_conn_after_mariadb_binlog_gap(
+    PGconn* pg,
+    MYSQL* mysql,
+    const std::string& conn_id,
+    const std::string& batch_id);
 
 /** Bookmark Kafka offsets in catalog.engine_meta when capture_during_full_load is set. */
 bool seed_stream_capture_bookmark_if_needed(

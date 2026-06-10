@@ -10,6 +10,7 @@
 #endif
 #include "kafka_topics.hpp"
 #include "cdc_envelope.hpp"
+#include "mariadb_binlog.hpp"
 #include "mariadb_conn.hpp"
 #include "mariadb_schema.hpp"
 #include "mssql_lake.hpp"
@@ -158,6 +159,10 @@ CaptureRuntimeConfig load_mariadb_capture_runtime(
     cfg.bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
     cfg.linger_ms = runtime.get_int("capture_producer_linger_ms", 5, "cdc_kafka_capture", conn_id);
     cfg.producer_batch = runtime.get_int("capture_producer_batch_size", 10000, "cdc_kafka_capture", conn_id);
+    cfg.producer_queue_max_messages =
+        runtime.get_int("capture_producer_queue_max_messages", 500000, "cdc_kafka_capture", conn_id);
+    cfg.producer_queue_max_kbytes =
+        runtime.get_int("capture_producer_queue_max_kbytes", 1048576, "cdc_kafka_capture", conn_id);
     cfg.topic_partitions = runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_capture", conn_id);
     cfg.idle_poll_seconds = runtime.get_int("capture_idle_poll_seconds", 3, "cdc_kafka_capture", conn_id);
     cfg.heartbeat_seconds = runtime.get_int("capture_heartbeat_seconds", 60, "cdc_kafka_capture", conn_id);
@@ -534,7 +539,7 @@ bool seed_stream_capture_bookmark_if_needed(
         int64_t low = 0;
         int64_t high = 0;
         const rd_kafka_resp_err_t err = query_kafka_watermark_offsets_retry(
-            rk, topic.c_str(), partition, &low, &high, 15000, 6);
+            rk, topic.c_str(), partition, &low, &high, 15000, 12);
         if (err == RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION) {
             continue;
         }
@@ -624,6 +629,115 @@ bool seed_stream_capture_bookmark_if_needed(
         },
     });
     return true;
+}
+
+namespace {
+
+bool conn_had_capture_baseline(PGconn* pg, const std::string& conn_id) {
+    const char* vals[] = {conn_id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT
+            EXISTS (
+                SELECT 1 FROM cdc_catalog.capture_position
+                WHERE conn_id = $1
+                  AND binlog_file IS NOT NULL
+                  AND length(trim(binlog_file)) > 0
+            ) AS has_capture,
+            EXISTS (
+                SELECT 1 FROM cdc_catalog.catalog
+                WHERE conn_id = $1
+                  AND last_full_load_at IS NOT NULL
+            ) AS has_full_load
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+        if (res) {
+            PQclear(res);
+        }
+        return false;
+    }
+    const bool ok = std::string(PQgetvalue(res, 0, 0)) == "t" || std::string(PQgetvalue(res, 0, 1)) == "t";
+    PQclear(res);
+    return ok;
+}
+
+}  // namespace
+
+BinlogGapRebootResult reboot_conn_after_mariadb_binlog_gap(
+    PGconn* pg,
+    MYSQL* mysql,
+    const std::string& conn_id,
+    const std::string& batch_id) {
+    BinlogGapRebootResult out;
+    if (!conn_had_capture_baseline(pg, conn_id)) {
+        capture_binlog_position_t0(pg, mysql, conn_id);
+        out.ran = true;
+        out.t0_reset = true;
+        log_write(pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_kafka_capture",
+            .message = "binlog gap: capture T0 seeded (conn not yet baselined)",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+        });
+        return out;
+    }
+
+    capture_binlog_position_t0(pg, mysql, conn_id);
+    out.t0_reset = true;
+
+    const char* vals[] = {conn_id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET needs_full_load = true,
+            capture_during_full_load = true,
+            cdc_enabled = true,
+            status = 'pending',
+            last_error = 'binlog purged: auto full-load reboot',
+            engine_meta = engine_meta - 'stream_kafka_offsets' - 'stream_bookmarked_at',
+            updated_at = now()
+        WHERE conn_id = $1
+          AND db_engine = 'mariadb'
+          AND active = true
+          AND has_pk = true
+          AND status NOT IN ('skipped', 'disabled')
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res && PQresultStatus(res) == PGRES_COMMAND_OK) {
+        out.tables_flagged = std::atoi(PQcmdTuples(res));
+    }
+    if (res) {
+        PQclear(res);
+    }
+
+    out.ran = true;
+    log_write(pg, {
+        .level = LogLevel::Warning,
+        .component = "cdc_kafka_capture",
+        .message = "binlog gap: capture T0 reset and tables flagged for full-load reboot",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {{"tables_flagged", out.tables_flagged}},
+    });
+    return out;
 }
 
 void flag_table_for_full_load(
@@ -1647,7 +1761,7 @@ long long kafka_backlog_messages(
     int64_t low = 0;
     int64_t high = 0;
     rd_kafka_resp_err_t err = query_kafka_watermark_offsets_retry(
-        consumer, topic.c_str(), partition, &low, &high, 15000, 6);
+        consumer, topic.c_str(), partition, &low, &high, 15000, 12);
     if (err != RD_KAFKA_RESP_ERR_NO_ERROR) {
         rd_kafka_topic_partition_list_destroy(parts);
         rd_kafka_destroy(consumer);
@@ -1685,7 +1799,7 @@ long long reset_apply_offset_to_end(
     int64_t low = 0;
     int64_t high = 0;
     rd_kafka_resp_err_t err =
-        query_kafka_watermark_offsets_retry(rk, topic.c_str(), partition, &low, &high, 15000, 6);
+        query_kafka_watermark_offsets_retry(rk, topic.c_str(), partition, &low, &high, 15000, 12);
     if (err == RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION) {
         rd_kafka_destroy(rk);
         return -1;

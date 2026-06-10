@@ -10,6 +10,7 @@ struct MariaDbColumn {
     std::string name;
     std::string mysql_type;
     bool is_pk{false};
+    bool is_nullable{true};
     std::string pg_type;
 };
 
