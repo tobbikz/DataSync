@@ -23,6 +23,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -1006,6 +1007,8 @@ json apply_events_batch(
     }
 
     long long applied = 0;
+    int table_errors = 0;
+    int* table_errors_acc = options.table_errors_out ? options.table_errors_out : &table_errors;
     json offsets = json::object();
     int staging_id = 0;
 
@@ -1184,9 +1187,34 @@ json apply_events_batch(
             if (lake_commit) {
                 PQclear(lake_commit);
             }
-        } catch (...) {
+        } catch (const std::exception& ex) {
             PQexec(lake_pg, "ROLLBACK");
-            throw;
+            (*table_errors_acc) += 1;
+            if (options.failed_events_out) {
+                for (auto& e : deletes) {
+                    options.failed_events_out->push_back(std::move(e));
+                }
+                for (auto& e : upserts) {
+                    options.failed_events_out->push_back(std::move(e));
+                }
+            }
+            log_write(app_pg, {
+                .level = LogLevel::Error,
+                .component = "cdc_kafka_apply_cpp",
+                .message = "lake table apply failed",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = meta.catalog_source_schema,
+                .source_table = meta.catalog_source_table,
+                .context = {
+                    {"lake_schema", meta.schema_name},
+                    {"lake_table", meta.table_name},
+                    {"error", ex.what()},
+                    {"upserts", static_cast<int>(upserts.size())},
+                    {"deletes", static_cast<int>(deletes.size())},
+                },
+            });
+            continue;
         }
 
         std::vector<ApplyEvent> audit;
@@ -1288,13 +1316,28 @@ json apply_events_batch(
             if (app_commit) {
                 PQclear(app_commit);
             }
-        } catch (...) {
+        } catch (const std::exception& ex) {
             PQexec(app_pg, "ROLLBACK");
+            (*table_errors_acc) += 1;
+            log_write(app_pg, {
+                .level = LogLevel::Error,
+                .component = "cdc_kafka_apply_cpp",
+                .message = "apply audit/position failed",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = meta.catalog_source_schema,
+                .source_table = meta.catalog_source_table,
+                .context = {
+                    {"lake_schema", meta.schema_name},
+                    {"lake_table", meta.table_name},
+                    {"error", ex.what()},
+                },
+            });
             throw;
         }
     }
 
-    return json{{"applied", applied}, {"offsets", offsets}};
+    return json{{"applied", applied}, {"offsets", offsets}, {"errors", *table_errors_acc}};
 }
 
 ApplyEvent parse_apply_event(const json& obj) {

@@ -742,6 +742,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
         },
     });
 
+    int batch_table_errors = 0;
     try {
         ApplyBatchOptions options;
         options.append_only = append_only;
@@ -751,6 +752,9 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
         options.apply_staleness_seconds = apply_staleness_seconds;
         options.apply_inactive_seconds = apply_inactive_seconds;
         options.host_sampler = host_sampler;
+        std::vector<ApplyEvent> failed_events;
+        options.table_errors_out = &batch_table_errors;
+        options.failed_events_out = &failed_events;
         if (catchup_tables) {
             options.catchup_tables = *catchup_tables;
         }
@@ -783,11 +787,54 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
         json result = apply_events_batch(app_pg, lake_pg, conn_id, batch_id, to_apply, options);
         const long long applied_n = result.value("applied", 0LL);
         events_applied += applied_n;
+        errors += batch_table_errors;
+
+        std::set<std::pair<std::string, int>> dirty_partitions;
+        for (const auto& e : failed_events) {
+            dirty_partitions.insert({e.topic, e.partition});
+        }
         for (const auto& e : to_apply) {
+            if (dirty_partitions.count({e.topic, e.partition}) > 0) {
+                continue;
+            }
             const TableKey key{e.schema_name, e.table_name};
             applied_by_table[key] = applied_by_table[key] + 1;
-            batch_offsets[{e.topic, e.partition}] = e.offset;
+            auto it = batch_offsets.find({e.topic, e.partition});
+            if (it == batch_offsets.end() || e.offset > it->second) {
+                batch_offsets[{e.topic, e.partition}] = e.offset;
+            }
         }
+        if (!failed_events.empty()) {
+            pending.insert(
+                pending.end(),
+                std::make_move_iterator(failed_events.begin()),
+                std::make_move_iterator(failed_events.end()));
+        }
+
+        if (batch_table_errors > 0) {
+            log_write(app_pg, {
+                .level = applied_n > 0 ? LogLevel::Warning : LogLevel::Error,
+                .component = "cdc_kafka_apply_cpp",
+                .message = applied_n > 0 ? "apply batch partial flush"
+                                         : "apply batch flush failed",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"table_errors", batch_table_errors},
+                    {"rows_applied", applied_n},
+                    {"failed_events", static_cast<int>(failed_events.size())},
+                    {"dirty_partitions", static_cast<int>(dirty_partitions.size())},
+                    {"kafka_offsets", static_cast<int>(batch_offsets.size())},
+                },
+            });
+        }
+
+        if (applied_n == 0 && batch_table_errors > 0) {
+            throw std::runtime_error("apply batch flush failed: no rows applied");
+        }
+
         log_write(app_pg, {
             .level = LogLevel::Info,
             .component = "cdc_kafka_apply_cpp",
@@ -799,11 +846,20 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
             .context = {
                 {"rows_applied", applied_n},
                 {"to_apply", static_cast<int>(to_apply.size())},
+                {"table_errors", batch_table_errors},
                 {"kafka_offsets", static_cast<int>(batch_offsets.size())},
             },
         });
     } catch (const std::exception& ex) {
-        errors += 1;
+        if (batch_table_errors == 0) {
+            errors += 1;
+        }
+        if (pending.empty()) {
+            pending.insert(
+                pending.end(),
+                std::make_move_iterator(eligible.begin()),
+                std::make_move_iterator(eligible.end()));
+        }
         throw std::runtime_error(ex.what());
     }
 
@@ -1180,7 +1236,11 @@ int run_kafka_apply_native_cli(
                     .conn_id = conn_id,
                     .source_schema = std::nullopt,
                     .source_table = std::nullopt,
-                    .context = {{"error", ex.what()}, {"cdc_in_progress_cleared", cleared}},
+                    .context = {
+                        {"error", ex.what()},
+                        {"errors", errors},
+                        {"cdc_in_progress_cleared", cleared},
+                    },
                 });
             } catch (const std::exception& clear_ex) {
                 log_write(log_pg, {
@@ -1191,7 +1251,11 @@ int run_kafka_apply_native_cli(
                     .conn_id = conn_id,
                     .source_schema = std::nullopt,
                     .source_table = std::nullopt,
-                    .context = {{"error", ex.what()}, {"clear_error", clear_ex.what()}},
+                    .context = {
+                        {"error", ex.what()},
+                        {"errors", errors},
+                        {"clear_error", clear_ex.what()},
+                    },
                 });
             }
         }

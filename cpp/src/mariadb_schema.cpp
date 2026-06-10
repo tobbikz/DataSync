@@ -4,15 +4,86 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
 std::string to_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
     return s;
+}
+
+bool is_hex_digit_char(char c) {
+    return std::isxdigit(static_cast<unsigned char>(c)) != 0;
+}
+
+std::vector<std::uint8_t> bytea_repeated_x_escapes(const std::string& value) {
+    std::vector<std::uint8_t> out;
+    std::size_t i = 0;
+    while (i + 3 < value.size() && value[i] == '\\' && (value[i + 1] == 'x' || value[i + 1] == 'X') &&
+           is_hex_digit_char(value[i + 2]) && is_hex_digit_char(value[i + 3])) {
+        char hex_pair[3] = {value[i + 2], value[i + 3], '\0'};
+        out.push_back(static_cast<std::uint8_t>(std::strtoul(hex_pair, nullptr, 16)));
+        i += 4;
+    }
+    if (i == value.size()) {
+        return out;
+    }
+    return {};
+}
+
+std::vector<std::uint8_t> bytea_payload_to_bytes(const std::string& value) {
+    if (value.empty()) {
+        return {};
+    }
+    if (auto esc = bytea_repeated_x_escapes(value); !esc.empty()) {
+        return esc;
+    }
+    if (value.size() >= 2 && value[0] == '\\' && (value[1] == 'x' || value[1] == 'X')) {
+        const std::string tail = value.substr(2);
+        if (!tail.empty() && tail.size() % 2 == 0) {
+            bool all_hex = true;
+            for (char c : tail) {
+                if (!is_hex_digit_char(c)) {
+                    all_hex = false;
+                    break;
+                }
+            }
+            if (all_hex) {
+                std::vector<std::uint8_t> out;
+                out.reserve(tail.size() / 2);
+                for (std::size_t i = 0; i + 1 < tail.size(); i += 2) {
+                    char hex_pair[3] = {tail[i], tail[i + 1], '\0'};
+                    out.push_back(static_cast<std::uint8_t>(std::strtoul(hex_pair, nullptr, 16)));
+                }
+                return out;
+            }
+        }
+    }
+    if (value.size() >= 2 && value.size() % 2 == 0) {
+        bool all_hex = true;
+        for (char c : value) {
+            if (!is_hex_digit_char(c)) {
+                all_hex = false;
+                break;
+            }
+        }
+        if (all_hex) {
+            std::vector<std::uint8_t> out;
+            out.reserve(value.size() / 2);
+            for (std::size_t i = 0; i + 1 < value.size(); i += 2) {
+                char hex_pair[3] = {value[i], value[i + 1], '\0'};
+                out.push_back(static_cast<std::uint8_t>(std::strtoul(hex_pair, nullptr, 16)));
+            }
+            return out;
+        }
+    }
+    return std::vector<std::uint8_t>(value.begin(), value.end());
 }
 
 }  // namespace
@@ -179,13 +250,15 @@ std::string mariadb_bytea_to_copy_csv(const char* data, std::size_t len) {
 }
 
 std::string mariadb_bytea_to_copy_csv(const std::string& value) {
-    return mariadb_bytea_to_copy_csv(value.data(), value.size());
+    const auto bytes = bytea_payload_to_bytes(value);
+    return mariadb_bytea_to_copy_csv(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
 std::string mariadb_bytea_to_sql_literal(const std::string& value) {
+    const auto bytes = bytea_payload_to_bytes(value);
     static const char hex[] = "0123456789abcdef";
     std::string out = "'\\x";
-    for (unsigned char b : value) {
+    for (std::uint8_t b : bytes) {
         out.push_back(hex[b >> 4]);
         out.push_back(hex[b & 0x0f]);
     }

@@ -45,6 +45,10 @@ struct ApplyBatchOptions {
     std::unordered_map<std::string, TableSliceState> slice_table_state;
     std::unordered_set<std::string> catchup_tables;
     const HostMetricsSampler* host_sampler{nullptr};
+    /** Optional: failed table events re-queued by flush layer (not committed). */
+    std::vector<ApplyEvent>* failed_events_out{nullptr};
+    /** Optional: per-table apply failures in this batch. */
+    int* table_errors_out{nullptr};
 };
 
 struct QuietTableRef {
