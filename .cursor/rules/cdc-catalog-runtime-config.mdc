@@ -54,5 +54,5 @@ const int parallel_tables = runtime.get_int("full_load_parallel_tables", 1, "mar
 
 ## Parallelism (implemented)
 
-- **`full_load_parallel_tables`**: tables at the same FK dependency level load concurrently (each with own PG + MariaDB connection). Levels run sequentially (parents before children).
+- **`full_load_parallel_tables`**: tables within the same schema load concurrently in batches (each with own PG + MariaDB connection).
 - **`full_load_workers`**: splits numeric single-column PK into ranges; each worker runs keyset COPY on its segment. Composite or non-numeric PK → sequential fallback with log checkpoint.

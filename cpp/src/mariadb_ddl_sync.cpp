@@ -2,12 +2,8 @@
 
 #include "mariadb_schema.hpp"
 
-#include <climits>
 #include <map>
-#include <queue>
-#include <set>
 #include <sstream>
-#include <unordered_map>
 
 namespace {
 
@@ -284,32 +280,6 @@ std::vector<ForeignKeyDef> fetch_mariadb_foreign_keys_once(MYSQL* mysql, const s
     return out;
 }
 
-std::vector<ForeignKeyDef> fetch_mariadb_foreign_keys(
-    MariaDbConn& conn,
-    const std::string& schema,
-    const std::string& table,
-    const MariaDbRetryOptions& retry) {
-    const int attempts = retry.max_attempts <= 0 ? INT_MAX : std::max(1, retry.max_attempts);
-    for (int attempt = 0; attempt < attempts; ++attempt) {
-        try {
-            return fetch_mariadb_foreign_keys_once(conn.handle, schema, table);
-        } catch (const std::exception& ex) {
-            const std::string msg = ex.what();
-            const bool transient = mariadb_error_is_transient(msg);
-            if (!transient || attempt + 1 >= attempts) {
-                if (transient) {
-                    throw std::runtime_error(
-                        std::string("fk scan failed after ") + std::to_string(attempts) + " attempts: " + msg);
-                }
-                throw;
-            }
-            conn.reconnect();
-            mariadb_sleep_retry_backoff(attempt, retry);
-        }
-    }
-    return {};
-}
-
 int sync_foreign_keys(
     PGconn* pg,
     const std::string& schema,
@@ -383,128 +353,4 @@ DdlSyncResult sync_mariadb_columns_to_lake(
         return {};
     }
     return sync_mariadb_ddl_after_truncate(pg, mysql, schema, table, cols, cfg, conn_id);
-}
-
-std::vector<std::string> sort_tables_by_fk_order(
-    MariaDbConn& conn,
-    const std::string& schema,
-    const std::vector<std::string>& tables,
-    const MariaDbRetryOptions& retry) {
-    std::set<std::string> table_set(tables.begin(), tables.end());
-    if (table_set.size() <= 1) {
-        return tables;
-    }
-
-    std::unordered_map<std::string, int> in_degree;
-    std::unordered_map<std::string, std::vector<std::string>> dependents;
-    for (const auto& t : tables) {
-        in_degree[t] = 0;
-    }
-
-    for (const auto& child : tables) {
-        for (const auto& fk : fetch_mariadb_foreign_keys(conn, schema, child, retry)) {
-            if (fk.ref_schema != schema) {
-                continue;
-            }
-            if (table_set.find(fk.ref_table) == table_set.end()) {
-                continue;
-            }
-            if (fk.ref_table == child) {
-                continue;
-            }
-            in_degree[child] += 1;
-            dependents[fk.ref_table].push_back(child);
-        }
-    }
-
-    std::queue<std::string> ready;
-    for (const auto& t : tables) {
-        if (in_degree[t] == 0) {
-            ready.push(t);
-        }
-    }
-
-    std::vector<std::string> ordered;
-    while (!ready.empty()) {
-        const std::string current = ready.front();
-        ready.pop();
-        ordered.push_back(current);
-        for (const auto& child : dependents[current]) {
-            in_degree[child] -= 1;
-            if (in_degree[child] == 0) {
-                ready.push(child);
-            }
-        }
-    }
-
-    if (ordered.size() != tables.size()) {
-        return tables;
-    }
-    return ordered;
-}
-
-std::vector<std::vector<std::string>> group_tables_by_fk_level(
-    MariaDbConn& conn,
-    const std::string& schema,
-    const std::vector<std::string>& tables,
-    const MariaDbRetryOptions& retry) {
-    std::set<std::string> table_set(tables.begin(), tables.end());
-    if (table_set.size() <= 1) {
-        return {tables};
-    }
-
-    std::unordered_map<std::string, int> in_degree;
-    std::unordered_map<std::string, std::vector<std::string>> dependents;
-    for (const auto& t : tables) {
-        in_degree[t] = 0;
-    }
-
-    for (const auto& child : tables) {
-        for (const auto& fk : fetch_mariadb_foreign_keys(conn, schema, child, retry)) {
-            if (fk.ref_schema != schema) {
-                continue;
-            }
-            if (table_set.find(fk.ref_table) == table_set.end()) {
-                continue;
-            }
-            if (fk.ref_table == child) {
-                continue;
-            }
-            in_degree[child] += 1;
-            dependents[fk.ref_table].push_back(child);
-        }
-    }
-
-    std::queue<std::string> ready;
-    for (const auto& t : tables) {
-        if (in_degree[t] == 0) {
-            ready.push(t);
-        }
-    }
-
-    std::vector<std::vector<std::string>> levels;
-    std::size_t placed = 0;
-    while (!ready.empty()) {
-        const std::size_t wave = ready.size();
-        std::vector<std::string> level;
-        level.reserve(wave);
-        for (std::size_t i = 0; i < wave; ++i) {
-            const std::string current = ready.front();
-            ready.pop();
-            level.push_back(current);
-            placed += 1;
-            for (const auto& child : dependents[current]) {
-                in_degree[child] -= 1;
-                if (in_degree[child] == 0) {
-                    ready.push(child);
-                }
-            }
-        }
-        levels.push_back(std::move(level));
-    }
-
-    if (placed != tables.size()) {
-        return {tables};
-    }
-    return levels;
 }

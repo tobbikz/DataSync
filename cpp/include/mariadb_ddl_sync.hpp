@@ -62,17 +62,3 @@ int run_mariadb_ddl_sync_cli(
     const std::optional<std::string>& service_tier,
     const std::optional<std::string>& source_schema = std::nullopt,
     const std::optional<std::string>& source_table = std::nullopt);
-
-// Topological order: parents before children (FK-safe full load).
-std::vector<std::string> sort_tables_by_fk_order(
-    MariaDbConn& conn,
-    const std::string& schema,
-    const std::vector<std::string>& tables,
-    const MariaDbRetryOptions& retry = {});
-
-// FK dependency levels: level 0 = no in-batch parents; same level may load in parallel.
-std::vector<std::vector<std::string>> group_tables_by_fk_level(
-    MariaDbConn& conn,
-    const std::string& schema,
-    const std::vector<std::string>& tables,
-    const MariaDbRetryOptions& retry = {});

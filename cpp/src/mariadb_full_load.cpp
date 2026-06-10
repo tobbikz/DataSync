@@ -934,7 +934,6 @@ FullLoadRunStats run_mariadb_full_load(
         }
 
         const int parallel_tables = std::max(1, runtime.get_int("full_load_parallel_tables", 1, "mariadb_load", conn_id));
-        const MariaDbRetryOptions retry = mariadb_retry_options(runtime, conn_id);
 
         try {
             if (capture_binlog_position_t0_if_absent(app_pg.raw, order_db.handle, conn_id)) {
@@ -972,7 +971,6 @@ FullLoadRunStats run_mariadb_full_load(
             by_schema[t.source_schema].push_back(t);
         }
 
-        int fk_levels = 0;
         for (auto& [schema, rows] : by_schema) {
             std::vector<std::string> names;
             std::map<std::string, CatalogTableRow> row_by_table;
@@ -982,79 +980,61 @@ FullLoadRunStats run_mariadb_full_load(
                 row_by_table[row.source_table] = row;
             }
 
-            std::vector<std::vector<std::string>> levels;
-            try {
-                levels = group_tables_by_fk_level(order_db, schema, names, retry);
-            } catch (const std::exception& ex) {
-                log_fl(
-                    log_pg,
-                    nullptr,
-                    LogLevel::Warning,
-                    batch_id,
-                    "fk load level failed; loading tables without fk ordering",
-                    {{"schema", schema}, {"error", ex.what()}, {"table_count", names.size()}},
-                    conn_id);
-                levels = {names};
-            }
-            fk_levels += static_cast<int>(levels.size());
-
             log_fl(
                 log_pg,
                 nullptr,
                 LogLevel::Info,
                 batch_id,
-                "fk load level resolved",
-                {{"schema", schema}, {"levels", levels.size()}, {"parallel_tables", parallel_tables}},
+                "full load schema batch",
+                {{"schema", schema}, {"table_count", names.size()}, {"parallel_tables", parallel_tables}},
                 conn_id);
 
-            for (const auto& level : levels) {
-                for (std::size_t batch_start = 0; batch_start < level.size();
-                     batch_start += static_cast<std::size_t>(parallel_tables)) {
-                    const std::size_t batch_end =
-                        std::min(batch_start + static_cast<std::size_t>(parallel_tables), level.size());
-                    std::vector<std::thread> pool;
-                    pool.reserve(batch_end - batch_start);
+            for (std::size_t batch_start = 0; batch_start < names.size();
+                 batch_start += static_cast<std::size_t>(parallel_tables)) {
+                const std::size_t batch_end =
+                    std::min(batch_start + static_cast<std::size_t>(parallel_tables), names.size());
+                std::vector<std::thread> pool;
+                pool.reserve(batch_end - batch_start);
 
-                    for (std::size_t i = batch_start; i < batch_end; ++i) {
-                        const CatalogTableRow target = row_by_table[level[i]];
-                        pool.emplace_back([&, target]() {
-                            long long rows = 0;
-                            try {
-                                const bool ok = load_one_table(cfg, log_pg, &log_mtx, *src, target, batch_id, rows);
-                                std::lock_guard<std::mutex> lock(stats_mtx);
-                                stats.tables_processed += 1;
-                                if (ok) {
-                                    stats.tables_success += 1;
-                                    stats.total_rows += rows;
-                                } else {
-                                    stats.tables_failed += 1;
-                                }
-                            } catch (const std::exception& ex) {
-                                try {
-                                    PgConn fail_pg(cfg.datasync.conn_string());
-                                    mark_catalog_failed(fail_pg.raw, target.catalog_id, ex.what());
-                                } catch (...) {
-                                }
-                                log_fl(
-                                    log_pg,
-                                    &log_mtx,
-                                    LogLevel::Error,
-                                    batch_id,
-                                    "table full load failed",
-                                    {{"error", ex.what()}},
-                                    target.conn_id,
-                                    target.source_schema,
-                                    target.source_table);
-                                std::lock_guard<std::mutex> lock(stats_mtx);
-                                stats.tables_processed += 1;
+                for (std::size_t i = batch_start; i < batch_end; ++i) {
+                    const CatalogTableRow target = row_by_table[names[i]];
+                    pool.emplace_back([&, target]() {
+                        long long rows = 0;
+                        try {
+                            const bool ok = load_one_table(cfg, log_pg, &log_mtx, *src, target, batch_id, rows);
+                            std::lock_guard<std::mutex> lock(stats_mtx);
+                            stats.tables_processed += 1;
+                            if (ok) {
+                                stats.tables_success += 1;
+                                stats.total_rows += rows;
+                            } else {
                                 stats.tables_failed += 1;
                             }
-                        });
-                    }
+                        } catch (const std::exception& ex) {
+                            try {
+                                PgConn fail_pg(cfg.datasync.conn_string());
+                                mark_catalog_failed(fail_pg.raw, target.catalog_id, ex.what());
+                            } catch (...) {
+                            }
+                            log_fl(
+                                log_pg,
+                                &log_mtx,
+                                LogLevel::Error,
+                                batch_id,
+                                "table full load failed",
+                                {{"error", ex.what()}},
+                                target.conn_id,
+                                target.source_schema,
+                                target.source_table);
+                            std::lock_guard<std::mutex> lock(stats_mtx);
+                            stats.tables_processed += 1;
+                            stats.tables_failed += 1;
+                        }
+                    });
+                }
 
-                    for (auto& thread : pool) {
-                        thread.join();
-                    }
+                for (auto& thread : pool) {
+                    thread.join();
                 }
             }
         }
