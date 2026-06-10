@@ -130,16 +130,22 @@ std::string kafka_apply_consumer_group(
 
 namespace {
 
-void apply_cdc_slice_limits(CaptureRuntimeConfig& cfg, const CdcConfig* cdc) {
-    if (!cdc) {
-        return;
-    }
-    if (cdc->slice_max_seconds > 0) {
-        cfg.max_seconds = cdc->slice_max_seconds;
-    }
-    if (cdc->slice_max_events > 0) {
-        cfg.max_events = cdc->slice_max_events;
-    }
+int capture_slice_max_seconds(
+    const RuntimeConfig& runtime,
+    const CdcConfig* cdc,
+    const std::string& conn_id,
+    const std::string& component) {
+    const int fallback = (cdc && cdc->slice_max_seconds > 0) ? cdc->slice_max_seconds : 300;
+    return runtime.get_int("capture_max_seconds", fallback, component, conn_id);
+}
+
+int capture_slice_max_events(
+    const RuntimeConfig& runtime,
+    const CdcConfig* cdc,
+    const std::string& conn_id,
+    const std::string& component) {
+    const int fallback = (cdc && cdc->slice_max_events > 0) ? static_cast<int>(cdc->slice_max_events) : 10000000;
+    return runtime.get_int("capture_max_events", fallback, component, conn_id);
 }
 
 }  // namespace
@@ -151,8 +157,8 @@ CaptureRuntimeConfig load_mariadb_capture_runtime(
     const CdcConfig* cdc) {
     runtime.reload(pg);
     CaptureRuntimeConfig cfg;
-    cfg.max_seconds = runtime.get_int("capture_max_seconds", 300, "cdc_kafka_capture", conn_id);
-    cfg.max_events = runtime.get_int("capture_max_events", 10000000, "cdc_kafka_capture", conn_id);
+    cfg.max_seconds = capture_slice_max_seconds(runtime, cdc, conn_id, "cdc_kafka_capture");
+    cfg.max_events = capture_slice_max_events(runtime, cdc, conn_id, "cdc_kafka_capture");
     cfg.topic_prefix = topic_prefix_for_conn(conn_id);
     cfg.topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
     cfg.topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_capture", conn_id);
@@ -166,7 +172,6 @@ CaptureRuntimeConfig load_mariadb_capture_runtime(
     cfg.topic_partitions = runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_capture", conn_id);
     cfg.idle_poll_seconds = runtime.get_int("capture_idle_poll_seconds", 3, "cdc_kafka_capture", conn_id);
     cfg.heartbeat_seconds = runtime.get_int("capture_heartbeat_seconds", 60, "cdc_kafka_capture", conn_id);
-    apply_cdc_slice_limits(cfg, cdc);
     return cfg;
 }
 
@@ -177,8 +182,8 @@ CaptureRuntimeConfig load_mssql_capture_runtime(
     const CdcConfig* cdc) {
     runtime.reload(pg);
     CaptureRuntimeConfig cfg;
-    cfg.max_seconds = runtime.get_int("capture_max_seconds", 300, "cdc_kafka_mssql_capture", conn_id);
-    cfg.max_events = runtime.get_int("capture_max_events", 10000000, "cdc_kafka_mssql_capture", conn_id);
+    cfg.max_seconds = capture_slice_max_seconds(runtime, cdc, conn_id, "cdc_kafka_mssql_capture");
+    cfg.max_events = capture_slice_max_events(runtime, cdc, conn_id, "cdc_kafka_mssql_capture");
     cfg.topic_prefix = topic_prefix_for_conn(conn_id);
     cfg.topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
     cfg.topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_mssql_capture", conn_id);
@@ -192,7 +197,6 @@ CaptureRuntimeConfig load_mssql_capture_runtime(
         runtime.get_int("capture_heartbeat_seconds", 60, "cdc_kafka_mssql_capture", conn_id);
     cfg.mssql_replay_on_idle =
         runtime.get_bool("mssql_capture_replay_on_idle", false, "cdc_kafka_mssql_capture", conn_id);
-    apply_cdc_slice_limits(cfg, cdc);
     return cfg;
 }
 
@@ -203,8 +207,8 @@ CaptureRuntimeConfig load_mongo_capture_runtime(
     const CdcConfig* cdc) {
     runtime.reload(pg);
     CaptureRuntimeConfig cfg;
-    cfg.max_seconds = runtime.get_int("capture_max_seconds", 60, "cdc_kafka_mongo_capture", conn_id);
-    cfg.max_events = runtime.get_int("capture_max_events", 10000000, "cdc_kafka_mongo_capture", conn_id);
+    cfg.max_seconds = capture_slice_max_seconds(runtime, cdc, conn_id, "cdc_kafka_mongo_capture");
+    cfg.max_events = capture_slice_max_events(runtime, cdc, conn_id, "cdc_kafka_mongo_capture");
     cfg.topic_prefix = topic_prefix_for_conn(conn_id);
     cfg.topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
     cfg.topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_mongo_capture", conn_id);
@@ -216,7 +220,6 @@ CaptureRuntimeConfig load_mongo_capture_runtime(
         runtime.get_int("capture_idle_poll_seconds", 3, "cdc_kafka_mongo_capture", conn_id);
     cfg.heartbeat_seconds =
         runtime.get_int("capture_heartbeat_seconds", 60, "cdc_kafka_mongo_capture", conn_id);
-    apply_cdc_slice_limits(cfg, cdc);
     return cfg;
 }
 

@@ -925,12 +925,15 @@ int run_kafka_apply_native_cli(
     const std::string topic_prefix = topic_prefix_for_conn(conn_id);
     const std::string topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_apply", conn_id);
     const int topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_apply", conn_id);
-    const int max_seconds = cfg.cdc.slice_max_seconds > 0
-        ? cfg.cdc.slice_max_seconds
-        : runtime.get_int("apply_max_seconds", 300, "cdc_kafka_apply", conn_id);
-    const int max_events = cfg.cdc.slice_max_events > 0
-        ? cfg.cdc.slice_max_events
-        : runtime.get_int("apply_max_events", 10000000, "cdc_kafka_apply", conn_id);
+    const int slice_seconds_fallback =
+        cfg.cdc.slice_max_seconds > 0 ? cfg.cdc.slice_max_seconds : 300;
+    const int slice_events_fallback = cfg.cdc.slice_max_events > 0
+        ? static_cast<int>(cfg.cdc.slice_max_events)
+        : 10000000;
+    const int max_seconds =
+        runtime.get_int("apply_max_seconds", slice_seconds_fallback, "cdc_kafka_apply", conn_id);
+    const int max_events =
+        runtime.get_int("apply_max_events", slice_events_fallback, "cdc_kafka_apply", conn_id);
     const int target = runtime.get_int("apply_target_events_per_table", 0, "cdc_kafka_apply", conn_id);
     const int poll_timeout_ms = runtime.get_int("apply_poll_timeout_ms", 100, "cdc_kafka_apply", conn_id);
     const int fetch_max_bytes = runtime.get_int("apply_fetch_max_bytes", 52428800, "cdc_kafka_apply", conn_id);

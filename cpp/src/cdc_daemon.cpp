@@ -161,7 +161,11 @@ int run_one_cycle(
 
     const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, tier.tier_code, batch_id);
     const int pre_rc = pre.errors > 0 ? 1 : 0;
-    const int apply_rc = run_apply_workers(cfg, conn_id, tier.tier_code, tier.apply_worker_count);
+    RuntimeConfig apply_runtime;
+    apply_runtime.reload(log_pg);
+    const int apply_workers = apply_runtime.get_int(
+        "apply_worker_count", tier.apply_worker_count, "cdc_kafka_apply", conn_id);
+    const int apply_rc = run_apply_workers(cfg, conn_id, tier.tier_code, apply_workers);
     int cycle_errors = (pre_rc != 0 ? 1 : 0) + (apply_rc != 0 ? 1 : 0);
 
     if (full_load_thread.joinable()) {

@@ -367,8 +367,19 @@ void merge_lake_column_nullability(
     const char* vals[] = {schema.c_str(), table.c_str()};
     PGresult* res = PQexecParams(
         pg,
-        "SELECT column_name, is_nullable FROM information_schema.columns "
-        "WHERE table_schema = $1 AND table_name = $2",
+        R"(
+        SELECT a.attname,
+               NOT bool_or(a.attnotnull) AS is_nullable
+        FROM pg_namespace n
+        JOIN pg_class c ON c.relnamespace = n.oid
+        JOIN pg_attribute a ON a.attrelid = c.oid
+        WHERE n.nspname = $1
+          AND (c.relname = $2 OR c.relname LIKE $2 || '[_]%')
+          AND c.relkind IN ('r', 'p')
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        GROUP BY a.attname
+        )",
         2,
         nullptr,
         vals,
@@ -384,7 +395,7 @@ void merge_lake_column_nullability(
     std::unordered_map<std::string, bool> lake_nullable;
     for (int i = 0; i < PQntuples(res); ++i) {
         const std::string name = PQgetvalue(res, i, 0);
-        const bool nullable = PQgetvalue(res, i, 1) && std::string(PQgetvalue(res, i, 1)) == "YES";
+        const bool nullable = PQgetvalue(res, i, 1) && std::string(PQgetvalue(res, i, 1)) == "t";
         lake_nullable[name] = nullable;
     }
     PQclear(res);
@@ -392,6 +403,9 @@ void merge_lake_column_nullability(
         const auto it = lake_nullable.find(col.name);
         if (it != lake_nullable.end()) {
             col.is_nullable = col.is_nullable && it->second;
+        }
+        if (col.is_pk) {
+            col.is_nullable = false;
         }
     }
 }

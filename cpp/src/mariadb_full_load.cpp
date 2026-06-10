@@ -117,13 +117,13 @@ std::string format_cell(const char* data, unsigned long len, const MariaDbColumn
         return mariadb_bytea_to_copy_csv(data, static_cast<std::size_t>(len));
     }
     if (missing) {
-        if (!col.is_nullable) {
+        if (!col.is_nullable || col.is_pk) {
             return csv_escape(mariadb_not_null_copy_default(col));
         }
         return "";
     }
     const std::string s = normalize_text_for_pg(std::string(data, len), col.pg_type);
-    if (s.empty() && !col.is_nullable) {
+    if (s.empty() && (!col.is_nullable || col.is_pk)) {
         return csv_escape(mariadb_not_null_copy_default(col));
     }
     return csv_escape(s);
@@ -668,6 +668,7 @@ void mark_catalog_success(PGconn* pg, long long catalog_id) {
             last_full_load_at = now(),
             last_error_at = NULL,
             last_error = NULL,
+            engine_meta = COALESCE(engine_meta, '{}'::jsonb) - 'full_load_fail_count',
             updated_at = now()
         WHERE catalog_id = $1::bigint
         )",
@@ -675,22 +676,67 @@ void mark_catalog_success(PGconn* pg, long long catalog_id) {
         vals);
 }
 
-void mark_catalog_failed(PGconn* pg, long long catalog_id, const std::string& error) {
-    const std::string trunc = error.substr(0, 1000);
-    const std::string id = std::to_string(catalog_id);
-    const char* vals[] = {id.c_str(), trunc.c_str()};
+void reactivate_full_load_after_cooldown(PGconn* pg, RuntimeConfig& runtime, const std::string& conn_id) {
+    const int max_retries = runtime.get_int("full_load_max_fail_retries", 5, "mariadb_load", conn_id);
+    const int cooldown_min = runtime.get_int("full_load_failed_cooldown_minutes", 240, "mariadb_load", conn_id);
+    const std::string max_str = std::to_string(max_retries);
+    const std::string cooldown_str = std::to_string(cooldown_min);
+    const char* vals[] = {conn_id.c_str(), max_str.c_str(), cooldown_str.c_str()};
     pg_exec_params_simple(
         pg,
         R"(
         UPDATE cdc_catalog.catalog
-        SET status = 'failed',
-            needs_full_load = true,
+        SET needs_full_load = true,
+            engine_meta = COALESCE(engine_meta, '{}'::jsonb) - 'full_load_fail_count',
+            updated_at = now()
+        WHERE conn_id = $1
+          AND db_engine = 'mariadb'
+          AND active = true
+          AND status = 'failed'
+          AND needs_full_load = false
+          AND COALESCE((engine_meta->>'full_load_fail_count')::int, 0) >= $2::int
+          AND last_error_at < now() - ($3::int * interval '1 minute')
+        )",
+        3,
+        vals);
+}
+
+void mark_catalog_failed(
+    PGconn* pg,
+    long long catalog_id,
+    const std::string& conn_id,
+    const std::string& error) {
+    RuntimeConfig runtime;
+    runtime.reload(pg);
+    const int max_retries = runtime.get_int("full_load_max_fail_retries", 5, "mariadb_load", conn_id);
+    const std::string trunc = error.substr(0, 950);
+    const std::string id = std::to_string(catalog_id);
+    const std::string max_str = std::to_string(max_retries);
+    const char* vals[] = {id.c_str(), trunc.c_str(), max_str.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET engine_meta = jsonb_set(
+                COALESCE(engine_meta, '{}'::jsonb),
+                '{full_load_fail_count}',
+                to_jsonb(COALESCE((engine_meta->>'full_load_fail_count')::int, 0) + 1),
+                true),
+            status = 'failed',
+            needs_full_load = CASE
+                WHEN COALESCE((engine_meta->>'full_load_fail_count')::int, 0) + 1 >= $3::int THEN false
+                ELSE true
+            END,
             last_error_at = now(),
-            last_error = $2,
+            last_error = CASE
+                WHEN COALESCE((engine_meta->>'full_load_fail_count')::int, 0) + 1 >= $3::int
+                THEN $2 || ' [full-load paused: max retries reached]'
+                ELSE $2
+            END,
             updated_at = now()
         WHERE catalog_id = $1::bigint
         )",
-        2,
+        3,
         vals);
 }
 
@@ -914,6 +960,9 @@ FullLoadRunStats run_mariadb_full_load(
         }
 
         MariaDbConn order_db(*src);
+        runtime.reload(app_pg.raw);
+        reactivate_full_load_after_cooldown(app_pg.raw, runtime, conn_id);
+
         const MariaDbPreflightResult preflight = check_mariadb_cdc_ready(order_db.handle);
         for (const auto& w : preflight.warnings) {
             log_fl(
@@ -1025,7 +1074,7 @@ FullLoadRunStats run_mariadb_full_load(
                         } catch (const std::exception& ex) {
                             try {
                                 PgConn fail_pg(cfg.datasync.conn_string());
-                                mark_catalog_failed(fail_pg.raw, target.catalog_id, ex.what());
+                                mark_catalog_failed(fail_pg.raw, target.catalog_id, target.conn_id, ex.what());
                             } catch (...) {
                             }
                             log_fl(
