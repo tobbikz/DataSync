@@ -168,6 +168,33 @@ int run_one_cycle(
         full_load_thread.join();
     }
 
+    try {
+        const int cleared = clear_stale_cdc_in_progress(log_pg, conn_id, tier.tier_code, db_engine);
+        if (cleared > 0) {
+            log_write(log_pg, {
+                .level = LogLevel::Info,
+                .component = "cdc_daemon",
+                .message = "stale cdc_in_progress cleared after daemon cycle",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {{"cleared", cleared}, {"tier", tier.tier_code}, {"db_engine", db_engine}},
+            });
+        }
+    } catch (const std::exception& ex) {
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_daemon",
+            .message = "clear stale cdc_in_progress failed after cycle",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"error", ex.what()}, {"tier", tier.tier_code}},
+        });
+    }
+
     if (full_load_outcome && !full_load_outcome->ran && pending_before > 0) {
         log_write(log_pg, {
             .level = LogLevel::Info,
@@ -269,6 +296,20 @@ int run_parallel_daemon_round(
             continue;
         }
         try {
+            const std::string db_engine = conn_engine(cfg, conn_id);
+            const int cleared = clear_stale_cdc_in_progress(capture_pg.raw, conn_id, std::nullopt, db_engine);
+            if (cleared > 0) {
+                log_write(capture_pg.raw, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_daemon",
+                    .message = "stale cdc_in_progress cleared before capture",
+                    .batch_id = round_batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {{"cleared", cleared}, {"db_engine", db_engine}},
+                });
+            }
             if (run_conn_capture_slice(cfg, capture_pg.raw, conn_id, round_batch_id) != 0) {
                 failures.fetch_add(1);
             }

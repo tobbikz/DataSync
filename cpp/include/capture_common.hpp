@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -181,12 +182,15 @@ void mark_catalog_cdc_success(PGconn* pg, long long catalog_id);
 /** Reset stale full_load_in_progress rows (crash/reload) back to pending. */
 void clear_stale_full_load_in_progress(PGconn* pg, const std::string& conn_id, const std::string& db_engine);
 
-/** Reset stale cdc_in_progress rows (crash/reload) back to success. */
-void clear_stale_cdc_in_progress(
+/** Reset stale cdc_in_progress rows (crash/reload) back to success. Returns rows updated. */
+int clear_stale_cdc_in_progress(
     PGconn* pg,
     const std::string& conn_id,
     const std::optional<std::string>& service_tier,
     const std::string& db_engine);
+
+/** Release cdc_in_progress flags after a failed capture/apply slice. */
+void rollback_cdc_in_progress_ids(PGconn* pg, const std::set<long long>& catalog_ids);
 
 int count_full_load_pending(
     PGconn* pg,

@@ -277,6 +277,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     }
     std::set<long long> cdc_active_catalog_ids;
 
+    try {
     MariaDbConn mariadb(*source);
     std::map<std::pair<std::string, std::string>, std::vector<std::string>> col_cache;
     for (const auto& key : wanted) {
@@ -739,4 +740,21 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     });
 
     return stats;
+    } catch (const std::exception& ex) {
+        rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_kafka_capture",
+            .message = "capture slice failed; cdc_in_progress rolled back",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"error", ex.what()},
+                {"tables_touched", static_cast<int>(cdc_active_catalog_ids.size())},
+            },
+        });
+        throw;
+    }
 }

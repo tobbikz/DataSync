@@ -848,7 +848,15 @@ void clear_stale_full_load_in_progress(PGconn* pg, const std::string& conn_id, c
         vals);
 }
 
-void clear_stale_cdc_in_progress(
+void rollback_cdc_in_progress_ids(PGconn* pg, const std::set<long long>& catalog_ids) {
+    for (long long catalog_id : catalog_ids) {
+        if (catalog_id > 0) {
+            mark_catalog_cdc_success(pg, catalog_id);
+        }
+    }
+}
+
+int clear_stale_cdc_in_progress(
     PGconn* pg,
     const std::string& conn_id,
     const std::optional<std::string>& service_tier,
@@ -860,7 +868,6 @@ void clear_stale_cdc_in_progress(
         WHERE conn_id = $1
           AND db_engine = $2::cdc_catalog.db_engine
           AND status = 'cdc_in_progress'
-          AND cdc_enabled = true
     )";
     std::vector<const char*> vals = {conn_id.c_str(), db_engine.c_str()};
     std::string tier_val;
@@ -869,7 +876,27 @@ void clear_stale_cdc_in_progress(
         tier_val = *service_tier;
         vals.push_back(tier_val.c_str());
     }
-    pg_exec_params_simple(pg, sql.c_str(), static_cast<int>(vals.size()), vals.data());
+    PGresult* res = PQexecParams(
+        pg,
+        sql.c_str(),
+        static_cast<int>(vals.size()),
+        nullptr,
+        vals.data(),
+        nullptr,
+        nullptr,
+        0);
+    if (!res) {
+        throw std::runtime_error(std::string("clear stale cdc_in_progress failed: ") + PQerrorMessage(pg));
+    }
+    const auto st = PQresultStatus(res);
+    if (st != PGRES_COMMAND_OK) {
+        const std::string err = PQerrorMessage(pg);
+        PQclear(res);
+        throw std::runtime_error(std::string("clear stale cdc_in_progress failed: ") + err);
+    }
+    const int cleared = std::atoi(PQcmdTuples(res));
+    PQclear(res);
+    return cleared;
 }
 
 int count_full_load_pending(

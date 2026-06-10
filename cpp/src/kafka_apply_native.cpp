@@ -1169,16 +1169,31 @@ int run_kafka_apply_native_cli(
                 last_offsets[tp] = std::max(last_offsets[tp], offset);
             }
         } catch (const std::exception& ex) {
-            log_write(log_pg, {
-                .level = LogLevel::Error,
-                .component = "cdc_kafka_apply_cpp",
-                .message = "apply batch flush failed",
-                .batch_id = batch_id,
-                .conn_id = conn_id,
-                .source_schema = std::nullopt,
-                .source_table = std::nullopt,
-                .context = {{"error", ex.what()}},
-            });
+            try {
+                const int cleared =
+                    clear_stale_cdc_in_progress(app_pg.raw, conn_id, service_tier, db_engine);
+                log_write(log_pg, {
+                    .level = LogLevel::Error,
+                    .component = "cdc_kafka_apply_cpp",
+                    .message = "apply batch flush failed",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {{"error", ex.what()}, {"cdc_in_progress_cleared", cleared}},
+                });
+            } catch (const std::exception& clear_ex) {
+                log_write(log_pg, {
+                    .level = LogLevel::Error,
+                    .component = "cdc_kafka_apply_cpp",
+                    .message = "apply batch flush failed",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {{"error", ex.what()}, {"clear_error", clear_ex.what()}},
+                });
+            }
         }
     };
 
@@ -1625,9 +1640,30 @@ int run_kafka_apply_native_cli(
                                    std::chrono::steady_clock::now() - start)
                                    .count();
         std::cout << stats.dump() << std::endl;
+        try {
+            clear_stale_cdc_in_progress(app_pg.raw, conn_id, service_tier, db_engine);
+        } catch (...) {
+        }
         rd_kafka_consumer_close(rk);
         rd_kafka_destroy(rk);
         return 1;
+    }
+
+    try {
+        const int cleared = clear_stale_cdc_in_progress(app_pg.raw, conn_id, service_tier, db_engine);
+        if (cleared > 0) {
+            log_write(log_pg, {
+                .level = LogLevel::Info,
+                .component = "cdc_kafka_apply_cpp",
+                .message = "stale cdc_in_progress cleared after apply slice",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {{"cleared", cleared}},
+            });
+        }
+    } catch (...) {
     }
 
     rd_kafka_consumer_close(rk);
