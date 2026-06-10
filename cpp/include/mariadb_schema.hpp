@@ -38,6 +38,13 @@ void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const
 
 std::vector<MariaDbColumn> fetch_mariadb_columns(MYSQL* mysql, const std::string& schema, const std::string& table);
 
+/** Tighten is_nullable when the lake column is NOT NULL (schema drift vs MariaDB). */
+void merge_lake_column_nullability(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    std::vector<MariaDbColumn>& cols);
+
 void ensure_lake_table_base(
     PGconn* pg,
     const std::string& schema,

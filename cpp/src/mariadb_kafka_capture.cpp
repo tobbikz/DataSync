@@ -400,9 +400,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             return;
         }
         if (auto cid_it = catalog_id_by_table.find(key); cid_it != catalog_id_by_table.end()) {
-            if (cdc_active_catalog_ids.insert(cid_it->second).second) {
-                mark_catalog_cdc_in_progress(log_pg, cid_it->second);
-            }
+            cdc_active_catalog_ids.insert(cid_it->second);
         }
         const auto cols_it = col_cache.find(key);
         if (cols_it == col_cache.end()) {

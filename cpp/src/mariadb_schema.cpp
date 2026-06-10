@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 
 namespace {
 
@@ -253,6 +255,46 @@ std::vector<MariaDbColumn> fetch_mariadb_columns(MYSQL* mysql, const std::string
         throw std::runtime_error("no columns found in source table");
     }
     return cols;
+}
+
+void merge_lake_column_nullability(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    std::vector<MariaDbColumn>& cols) {
+    if (!pg_lake_table_exists(pg, schema, table)) {
+        return;
+    }
+    const char* vals[] = {schema.c_str(), table.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        "SELECT column_name, is_nullable FROM information_schema.columns "
+        "WHERE table_schema = $1 AND table_name = $2",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        return;
+    }
+    std::unordered_map<std::string, bool> lake_nullable;
+    for (int i = 0; i < PQntuples(res); ++i) {
+        const std::string name = PQgetvalue(res, i, 0);
+        const bool nullable = PQgetvalue(res, i, 1) && std::string(PQgetvalue(res, i, 1)) == "YES";
+        lake_nullable[name] = nullable;
+    }
+    PQclear(res);
+    for (auto& col : cols) {
+        const auto it = lake_nullable.find(col.name);
+        if (it != lake_nullable.end()) {
+            col.is_nullable = col.is_nullable && it->second;
+        }
+    }
 }
 
 void ensure_lake_table_base(

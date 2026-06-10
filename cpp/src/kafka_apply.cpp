@@ -1164,10 +1164,6 @@ json apply_events_batch(
 
         const auto table_start = std::chrono::steady_clock::now();
 
-        if (meta.catalog_id > 0) {
-            mark_catalog_cdc_in_progress(app_pg, meta.catalog_id);
-        }
-
         PGresult* lake_begin = PQexec(lake_pg, "BEGIN");
         if (lake_begin) {
             PQclear(lake_begin);
@@ -1202,94 +1198,96 @@ json apply_events_batch(
             PQclear(app_begin);
         }
         try {
-            if (options.audit_enabled) {
+            if (options.audit_enabled && !audit.empty()) {
                 record_applied_events(app_pg, conn_id, audit);
             }
-            const ApplyEvent& last = audit.back();
             const auto table_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                                std::chrono::steady_clock::now() - table_start)
                                                .count();
-            const ApplyOpCounts op_counts = count_apply_ops(audit);
-            const std::string state_key =
-                table_state_key(meta.catalog_source_schema, meta.catalog_source_table);
-            bool is_starving = false;
-            int events_seen_in_slice = 0;
-            BatchStatsMetrics metrics;
-            if (const auto it = options.slice_table_state.find(state_key);
-                it != options.slice_table_state.end()) {
-                is_starving = it->second.is_starving;
-                events_seen_in_slice = it->second.events_seen_in_slice;
-                metrics.kafka_consumer_lag = it->second.kafka_consumer_lag;
-                metrics.catchup_triggered = it->second.catchup_triggered;
-                metrics.dedup_skipped = it->second.dedup_skipped;
+            if (!audit.empty()) {
+                const ApplyEvent& last = audit.back();
+                const ApplyOpCounts op_counts = count_apply_ops(audit);
+                const std::string state_key =
+                    table_state_key(meta.catalog_source_schema, meta.catalog_source_table);
+                bool is_starving = false;
+                int events_seen_in_slice = 0;
+                BatchStatsMetrics metrics;
+                if (const auto it = options.slice_table_state.find(state_key);
+                    it != options.slice_table_state.end()) {
+                    is_starving = it->second.is_starving;
+                    events_seen_in_slice = it->second.events_seen_in_slice;
+                    metrics.kafka_consumer_lag = it->second.kafka_consumer_lag;
+                    metrics.catchup_triggered = it->second.catchup_triggered;
+                    metrics.dedup_skipped = it->second.dedup_skipped;
+                }
+                const long long events_applied_total =
+                    op_counts.inserts + op_counts.updates + op_counts.deletes;
+                if (events_applied_total > 0) {
+                    is_starving = false;
+                }
+                metrics.fk_deferred_retries = fk_retries;
+                metrics.host_sampler = options.host_sampler;
+                update_apply_position(
+                    app_pg,
+                    meta.catalog_id,
+                    last.topic,
+                    last.partition,
+                    last.offset,
+                    last.gtid);
+                const TableHealthSnapshot health = fetch_table_health_by_catalog_id(
+                    app_pg,
+                    meta.catalog_id,
+                    options.apply_staleness_seconds,
+                    options.apply_inactive_seconds);
+                insert_apply_batch_stats(
+                    app_pg,
+                    batch_id,
+                    conn_id,
+                    meta.catalog_id,
+                    meta.catalog_source_schema,
+                    meta.catalog_source_table,
+                    options.service_tier,
+                    op_counts,
+                    table_duration_ms,
+                    last.topic,
+                    last.partition,
+                    last.offset,
+                    health,
+                    is_starving,
+                    false,
+                    events_seen_in_slice,
+                    metrics);
+                log_write(app_pg, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_kafka_apply_cpp",
+                    .message = "lake table written",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = meta.catalog_source_schema,
+                    .source_table = meta.catalog_source_table,
+                    .context = {
+                        {"lake_schema", meta.schema_name},
+                        {"lake_table", meta.table_name},
+                        {"inserts", op_counts.inserts},
+                        {"updates", op_counts.updates},
+                        {"deletes", op_counts.deletes},
+                        {"rows_applied", events_applied_total},
+                        {"duration_ms", table_duration_ms},
+                        {"kafka_topic", last.topic},
+                        {"kafka_partition", last.partition},
+                        {"kafka_offset", last.offset},
+                        {"fk_deferred_retries", fk_retries},
+                    },
+                });
+                offsets[last.topic + ":" + std::to_string(last.partition)] = last.offset;
             }
-            const long long events_applied_total =
-                op_counts.inserts + op_counts.updates + op_counts.deletes;
-            if (events_applied_total > 0) {
-                is_starving = false;
-            }
-            metrics.fk_deferred_retries = fk_retries;
-            metrics.host_sampler = options.host_sampler;
-            update_apply_position(
-                app_pg,
-                meta.catalog_id,
-                last.topic,
-                last.partition,
-                last.offset,
-                last.gtid);
             if (meta.catalog_id > 0) {
                 mark_catalog_cdc_success(app_pg, meta.catalog_id);
             }
-            const TableHealthSnapshot health = fetch_table_health_by_catalog_id(
-                app_pg,
-                meta.catalog_id,
-                options.apply_staleness_seconds,
-                options.apply_inactive_seconds);
-            insert_apply_batch_stats(
-                app_pg,
-                batch_id,
-                conn_id,
-                meta.catalog_id,
-                meta.catalog_source_schema,
-                meta.catalog_source_table,
-                options.service_tier,
-                op_counts,
-                table_duration_ms,
-                last.topic,
-                last.partition,
-                last.offset,
-                health,
-                is_starving,
-                false,
-                events_seen_in_slice,
-                metrics);
-            log_write(app_pg, {
-                .level = LogLevel::Info,
-                .component = "cdc_kafka_apply_cpp",
-                .message = "lake table written",
-                .batch_id = batch_id,
-                .conn_id = conn_id,
-                .source_schema = meta.catalog_source_schema,
-                .source_table = meta.catalog_source_table,
-                .context = {
-                    {"lake_schema", meta.schema_name},
-                    {"lake_table", meta.table_name},
-                    {"inserts", op_counts.inserts},
-                    {"updates", op_counts.updates},
-                    {"deletes", op_counts.deletes},
-                    {"rows_applied", events_applied_total},
-                    {"duration_ms", table_duration_ms},
-                    {"kafka_topic", last.topic},
-                    {"kafka_partition", last.partition},
-                    {"kafka_offset", last.offset},
-                    {"fk_deferred_retries", fk_retries},
-                },
-            });
             PGresult* app_commit = PQexec(app_pg, "COMMIT");
             if (app_commit) {
                 PQclear(app_commit);
             }
-            offsets[last.topic + ":" + std::to_string(last.partition)] = last.offset;
         } catch (...) {
             PQexec(app_pg, "ROLLBACK");
             throw;

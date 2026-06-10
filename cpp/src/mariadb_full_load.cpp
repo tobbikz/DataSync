@@ -770,7 +770,7 @@ bool load_one_table(
         }
     }
 
-    const auto cols = fetch_mariadb_columns(mariadb.handle, target.source_schema, target.source_table);
+    auto cols = fetch_mariadb_columns(mariadb.handle, target.source_schema, target.source_table);
     const auto pk_cols = split_pk_columns(target.pk_columns);
 
     const int partition_months =
@@ -792,6 +792,8 @@ bool load_one_table(
 
     const DdlSyncResult ddl = sync_mariadb_ddl_after_truncate(
         lake_pg.raw, mariadb.handle, target.source_schema, target.source_table, cols, runtime, target.conn_id);
+
+    merge_lake_column_nullability(lake_pg.raw, target.source_schema, target.source_table, cols);
 
     log_fl(
         log_pg,
