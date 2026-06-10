@@ -181,16 +181,25 @@ bool is_integer_pk_type(const MariaDbColumn& col) {
            lower.find("double") != std::string::npos;
 }
 
-std::optional<PkRange> fetch_integer_pk_range(MYSQL* mysql, const CatalogTableRow& target, const std::string& pk_col) {
+MariaDbRetryOptions mariadb_retry_options(RuntimeConfig& runtime, const std::string& conn_id) {
+    MariaDbRetryOptions opts;
+    opts.max_attempts = runtime.get_int("mariadb_reconnect_max_attempts", 0, "mariadb_load", conn_id);
+    opts.base_ms = std::max(100, runtime.get_int("mariadb_reconnect_base_ms", 500, "mariadb_load", conn_id));
+    opts.max_ms = std::max(opts.base_ms, runtime.get_int("mariadb_reconnect_max_ms", 60000, "mariadb_load", conn_id));
+    return opts;
+}
+
+std::optional<PkRange> fetch_integer_pk_range(
+    MariaDbConn& conn,
+    const CatalogTableRow& target,
+    const std::string& pk_col,
+    const MariaDbRetryOptions& retry) {
     std::ostringstream sql;
     sql << "SELECT MIN(`" << pk_col << "`), MAX(`" << pk_col << "`) FROM `" << target.source_schema << "`.`"
         << target.source_table << "`";
-    if (mysql_query(mysql, sql.str().c_str()) != 0) {
-        throw std::runtime_error(std::string("MariaDB MIN/MAX failed: ") + mysql_error(mysql));
-    }
-    MYSQL_RES* res = mysql_store_result(mysql);
+    MYSQL_RES* res = mariadb_mysql_query_store_retry(conn, sql.str(), retry);
     if (!res) {
-        throw std::runtime_error(std::string("MariaDB MIN/MAX store_result failed: ") + mysql_error(mysql));
+        return std::nullopt;
     }
     MYSQL_ROW row = mysql_fetch_row(res);
     if (!row || !row[0] || !row[1]) {
@@ -241,7 +250,7 @@ std::string pk_range_clause(
 }
 
 long long copy_rows_keyset(
-    MYSQL* mysql,
+    MariaDbConn& conn,
     PGconn* pg,
     const CatalogTableRow& target,
     const std::vector<MariaDbColumn>& cols,
@@ -249,6 +258,7 @@ long long copy_rows_keyset(
     std::size_t batch_size,
     int source_sleep_ms,
     const std::string& snapshot_id,
+    const MariaDbRetryOptions& retry,
     const PkRange& pk_range = {}) {
     const std::string load_ts = utc_now_ts();
     const std::string load_date = utc_now_date();
@@ -317,13 +327,9 @@ long long copy_rows_keyset(
         }
         query << " LIMIT " << batch_size;
 
-        if (mysql_query(mysql, query.str().c_str()) != 0) {
-            throw std::runtime_error(std::string("MariaDB SELECT failed: ") + mysql_error(mysql));
-        }
-
-        MYSQL_RES* res = mysql_store_result(mysql);
+        MYSQL_RES* res = mariadb_mysql_query_store_retry(conn, query.str(), retry);
         if (!res) {
-            throw std::runtime_error(std::string("MariaDB store_result failed: ") + mysql_error(mysql));
+            break;
         }
 
         std::vector<std::string> batch_lines;
@@ -398,7 +404,7 @@ long long copy_rows_parallel(
     const MariaDbSource& source,
     PGconn* log_pg,
     std::mutex* log_mtx,
-    MYSQL* mysql,
+    MariaDbConn& conn,
     PGconn* pg,
     const CatalogTableRow& target,
     const std::vector<MariaDbColumn>& cols,
@@ -406,10 +412,11 @@ long long copy_rows_parallel(
     std::size_t batch_size,
     int source_sleep_ms,
     int workers,
-    const std::string& snapshot_id) {
+    const std::string& snapshot_id,
+    const MariaDbRetryOptions& retry) {
     if (workers <= 1) {
         return copy_rows_keyset(
-            mysql, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, {});
+            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {});
     }
 
     if (pk_cols.size() != 1) {
@@ -424,7 +431,7 @@ long long copy_rows_parallel(
             target.source_schema,
             target.source_table);
         return copy_rows_keyset(
-            mysql, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, {});
+            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {});
     }
 
     const MariaDbColumn* pk_col_def = nullptr;
@@ -446,10 +453,10 @@ long long copy_rows_parallel(
             target.source_schema,
             target.source_table);
         return copy_rows_keyset(
-            mysql, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, {});
+            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {});
     }
 
-    const auto bounds = fetch_integer_pk_range(mysql, target, pk_cols[0]);
+    const auto bounds = fetch_integer_pk_range(conn, target, pk_cols[0], retry);
     if (!bounds) {
         return 0;
     }
@@ -471,7 +478,7 @@ long long copy_rows_parallel(
             target.source_schema,
             target.source_table);
         return copy_rows_keyset(
-            mysql,
+            conn,
             pg,
             target,
             cols,
@@ -479,12 +486,13 @@ long long copy_rows_parallel(
             batch_size,
             source_sleep_ms,
             snapshot_id,
+            retry,
             pk_range_for_keyset(*bounds));
     }
 
     if (min_v >= max_v) {
         return copy_rows_keyset(
-            mysql,
+            conn,
             pg,
             target,
             cols,
@@ -492,6 +500,7 @@ long long copy_rows_parallel(
             batch_size,
             source_sleep_ms,
             snapshot_id,
+            retry,
             pk_range_for_keyset(*bounds));
     }
 
@@ -529,7 +538,7 @@ long long copy_rows_parallel(
                 MariaDbConn worker_db(source);
                 PgConn worker_pg(cfg.datalake.conn_string());
                 row_counts[static_cast<std::size_t>(w)] = copy_rows_keyset(
-                    worker_db.handle,
+                    worker_db,
                     worker_pg.raw,
                     target,
                     cols,
@@ -537,6 +546,7 @@ long long copy_rows_parallel(
                     batch_size,
                     source_sleep_ms,
                     snapshot_id,
+                    retry,
                     slice);
             } catch (...) {
                 errors[static_cast<std::size_t>(w)] = std::current_exception();
@@ -781,12 +791,13 @@ bool load_one_table(
         target.source_schema,
         target.source_table);
 
+    const MariaDbRetryOptions retry = mariadb_retry_options(runtime, target.conn_id);
     rows_out = copy_rows_parallel(
         cfg,
         source,
         log_pg,
         log_mtx,
-        mariadb.handle,
+        mariadb,
         lake_pg.raw,
         target,
         cols,
@@ -794,7 +805,8 @@ bool load_one_table(
         batch_size,
         source_sleep_ms,
         workers,
-        batch_id);
+        batch_id,
+        retry);
 
     mark_catalog_success(app_pg.raw, target.catalog_id);
 
@@ -922,6 +934,7 @@ FullLoadRunStats run_mariadb_full_load(
         }
 
         const int parallel_tables = std::max(1, runtime.get_int("full_load_parallel_tables", 1, "mariadb_load", conn_id));
+        const MariaDbRetryOptions retry = mariadb_retry_options(runtime, conn_id);
 
         try {
             if (capture_binlog_position_t0_if_absent(app_pg.raw, order_db.handle, conn_id)) {
@@ -969,7 +982,20 @@ FullLoadRunStats run_mariadb_full_load(
                 row_by_table[row.source_table] = row;
             }
 
-            const auto levels = group_tables_by_fk_level(order_db.handle, schema, names);
+            std::vector<std::vector<std::string>> levels;
+            try {
+                levels = group_tables_by_fk_level(order_db, schema, names, retry);
+            } catch (const std::exception& ex) {
+                log_fl(
+                    log_pg,
+                    nullptr,
+                    LogLevel::Warning,
+                    batch_id,
+                    "fk load level failed; loading tables without fk ordering",
+                    {{"schema", schema}, {"error", ex.what()}, {"table_count", names.size()}},
+                    conn_id);
+                levels = {names};
+            }
             fk_levels += static_cast<int>(levels.size());
 
             log_fl(

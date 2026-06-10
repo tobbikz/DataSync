@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "mariadb_conn.hpp"
 #include "runtime_config.hpp"
 
 #include <libpq-fe.h>
@@ -64,12 +65,14 @@ int run_mariadb_ddl_sync_cli(
 
 // Topological order: parents before children (FK-safe full load).
 std::vector<std::string> sort_tables_by_fk_order(
-    MYSQL* mysql,
+    MariaDbConn& conn,
     const std::string& schema,
-    const std::vector<std::string>& tables);
+    const std::vector<std::string>& tables,
+    const MariaDbRetryOptions& retry = {});
 
 // FK dependency levels: level 0 = no in-batch parents; same level may load in parallel.
 std::vector<std::vector<std::string>> group_tables_by_fk_level(
-    MYSQL* mysql,
+    MariaDbConn& conn,
     const std::string& schema,
-    const std::vector<std::string>& tables);
+    const std::vector<std::string>& tables,
+    const MariaDbRetryOptions& retry = {});

@@ -2,6 +2,7 @@
 
 #include "mariadb_schema.hpp"
 
+#include <climits>
 #include <map>
 #include <queue>
 #include <set>
@@ -243,7 +244,7 @@ struct ForeignKeyDef {
     std::vector<std::string> ref_columns;
 };
 
-std::vector<ForeignKeyDef> fetch_mariadb_foreign_keys(MYSQL* mysql, const std::string& schema, const std::string& table) {
+std::vector<ForeignKeyDef> fetch_mariadb_foreign_keys_once(MYSQL* mysql, const std::string& schema, const std::string& table) {
     const std::string sql =
         "SELECT constraint_name, column_name, referenced_table_schema, referenced_table_name, "
         "referenced_column_name, ordinal_position "
@@ -281,6 +282,32 @@ std::vector<ForeignKeyDef> fetch_mariadb_foreign_keys(MYSQL* mysql, const std::s
         out.push_back(std::move(fk));
     }
     return out;
+}
+
+std::vector<ForeignKeyDef> fetch_mariadb_foreign_keys(
+    MariaDbConn& conn,
+    const std::string& schema,
+    const std::string& table,
+    const MariaDbRetryOptions& retry) {
+    const int attempts = retry.max_attempts <= 0 ? INT_MAX : std::max(1, retry.max_attempts);
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        try {
+            return fetch_mariadb_foreign_keys_once(conn.handle, schema, table);
+        } catch (const std::exception& ex) {
+            const std::string msg = ex.what();
+            const bool transient = mariadb_error_is_transient(msg);
+            if (!transient || attempt + 1 >= attempts) {
+                if (transient) {
+                    throw std::runtime_error(
+                        std::string("fk scan failed after ") + std::to_string(attempts) + " attempts: " + msg);
+                }
+                throw;
+            }
+            conn.reconnect();
+            mariadb_sleep_retry_backoff(attempt, retry);
+        }
+    }
+    return {};
 }
 
 int sync_foreign_keys(
@@ -338,7 +365,7 @@ DdlSyncResult sync_mariadb_ddl_after_truncate(
     }
     if (cfg.get_bool("ddl_sync_foreign_keys", true, "mariadb_load", conn_id)) {
         result.foreign_keys_created =
-            sync_foreign_keys(pg, schema, table, fetch_mariadb_foreign_keys(mysql, schema, table));
+            sync_foreign_keys(pg, schema, table, fetch_mariadb_foreign_keys_once(mysql, schema, table));
     }
     return result;
 }
@@ -359,9 +386,10 @@ DdlSyncResult sync_mariadb_columns_to_lake(
 }
 
 std::vector<std::string> sort_tables_by_fk_order(
-    MYSQL* mysql,
+    MariaDbConn& conn,
     const std::string& schema,
-    const std::vector<std::string>& tables) {
+    const std::vector<std::string>& tables,
+    const MariaDbRetryOptions& retry) {
     std::set<std::string> table_set(tables.begin(), tables.end());
     if (table_set.size() <= 1) {
         return tables;
@@ -374,7 +402,7 @@ std::vector<std::string> sort_tables_by_fk_order(
     }
 
     for (const auto& child : tables) {
-        for (const auto& fk : fetch_mariadb_foreign_keys(mysql, schema, child)) {
+        for (const auto& fk : fetch_mariadb_foreign_keys(conn, schema, child, retry)) {
             if (fk.ref_schema != schema) {
                 continue;
             }
@@ -416,9 +444,10 @@ std::vector<std::string> sort_tables_by_fk_order(
 }
 
 std::vector<std::vector<std::string>> group_tables_by_fk_level(
-    MYSQL* mysql,
+    MariaDbConn& conn,
     const std::string& schema,
-    const std::vector<std::string>& tables) {
+    const std::vector<std::string>& tables,
+    const MariaDbRetryOptions& retry) {
     std::set<std::string> table_set(tables.begin(), tables.end());
     if (table_set.size() <= 1) {
         return {tables};
@@ -431,7 +460,7 @@ std::vector<std::vector<std::string>> group_tables_by_fk_level(
     }
 
     for (const auto& child : tables) {
-        for (const auto& fk : fetch_mariadb_foreign_keys(mysql, schema, child)) {
+        for (const auto& fk : fetch_mariadb_foreign_keys(conn, schema, child, retry)) {
             if (fk.ref_schema != schema) {
                 continue;
             }
