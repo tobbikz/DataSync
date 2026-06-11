@@ -50,6 +50,12 @@ void bump_mariadb_capture_heartbeat(MYSQL* mysql);
 /** MSSQL/MariaDB: refresh capture idle markers on DataSync when source heartbeat is N/A. */
 void bump_capture_heartbeat_pg(PGconn* pg, const std::string& conn_id, const std::string& db_engine);
 
+/** MariaDB: touch capture_position.updated_at at slice start (monitoring liveness). */
+void touch_capture_position_slice(PGconn* pg, const std::string& conn_id);
+
+/** MariaDB: record failed capture slice — status + last_error + updated_at. */
+void mark_capture_position_failed(PGconn* pg, const std::string& conn_id, const std::string& error);
+
 CaptureRuntimeConfig load_mariadb_capture_runtime(
     RuntimeConfig& runtime,
     PGconn* pg,

@@ -143,10 +143,16 @@ BinlogCliStats read_remote_binlog_cli(
     const std::string err_path =
         std::string("/tmp/datasync_binlog_err_") + std::to_string(getpid()) + ".log";
 
+    const bool binlog_ssl =
+        std::getenv("MARIADB_BINLOG_SSL") != nullptr && std::getenv("MARIADB_BINLOG_SSL")[0] == '1';
+
     std::ostringstream cmd;
     cmd << "timeout " << std::max(1, max_seconds) << " " << shell_single_quote(binlog_bin)
-        << " --read-from-remote-server --skip-gtid-strict-mode"
-        << " -h " << shell_single_quote(source.host) << " -P " << source.port << " -u "
+        << " --read-from-remote-server --skip-gtid-strict-mode";
+    if (!binlog_ssl) {
+        cmd << " --skip-ssl";
+    }
+    cmd << " -h " << shell_single_quote(source.host) << " -P " << source.port << " -u "
         << shell_single_quote(source.user) << " -p" << shell_single_quote(source.password)
         << " --start-position=" << start.position << " --base64-output=DECODE-ROWS -v "
         << shell_single_quote(start.file) << " 2>" << shell_single_quote(err_path);

@@ -173,31 +173,36 @@ void upsert_capture_position(
     long long binlog_pos,
     const std::string& server_uuid_val,
     const std::string& status = "healthy",
-    const std::string& last_error = "") {
+    const std::string& last_error = "",
+    int capture_lag_seconds = 0) {
     const std::string pos_str = std::to_string(binlog_pos);
+    const std::string lag_str = std::to_string(capture_lag_seconds);
     const char* vals1[] = {
         conn_id.c_str(),
         binlog_file.c_str(),
         pos_str.c_str(),
         server_uuid_val.c_str(),
         status.c_str(),
-        last_error.empty() ? nullptr : last_error.c_str()};
+        last_error.empty() ? nullptr : last_error.c_str(),
+        lag_str.c_str()};
     pg_exec_params_simple(
         pg,
         R"(
         INSERT INTO cdc_catalog.capture_position
-            (conn_id, gtid_set, binlog_file, binlog_position, server_uuid, status, last_error, last_event_ts, updated_at)
-        VALUES ($1, '', $2, $3::bigint, $4, $5::cdc_catalog.cdc_health_status, $6, now(), now())
+            (conn_id, gtid_set, binlog_file, binlog_position, server_uuid, status, last_error,
+             capture_lag_seconds, last_event_ts, updated_at)
+        VALUES ($1, '', $2, $3::bigint, $4, $5::cdc_catalog.cdc_health_status, $6, $7::integer, now(), now())
         ON CONFLICT (conn_id) DO UPDATE SET
             binlog_file = EXCLUDED.binlog_file,
             binlog_position = EXCLUDED.binlog_position,
             server_uuid = EXCLUDED.server_uuid,
             status = EXCLUDED.status,
             last_error = EXCLUDED.last_error,
+            capture_lag_seconds = EXCLUDED.capture_lag_seconds,
             last_event_ts = now(),
             updated_at = now()
         )",
-        6,
+        7,
         vals1);
 }
 
@@ -291,6 +296,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
 
     try {
     MariaDbConn mariadb(*source);
+    touch_capture_position_slice(log_pg, conn_id);
     std::map<std::pair<std::string, std::string>, std::vector<std::string>> col_cache;
     for (const auto& key : wanted) {
         col_cache[key] = fetch_table_columns(mariadb.handle, key.first, key.second);
@@ -825,12 +831,19 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     for (long long catalog_id : cdc_active_catalog_ids) {
         mark_catalog_cdc_success(log_pg, catalog_id);
     }
+    const MasterBinlogStatus master_end = fetch_master_binlog_status(mariadb.handle);
+    const BinlogPosition cursor_end{read_stats.last_file, read_stats.last_position};
+    const int capture_lag_sec =
+        binlog_position_caught_up(cursor_end, master_end) ? 0 : 1;
     upsert_capture_position(
         log_pg,
         conn_id,
         read_stats.last_file,
         read_stats.last_position,
-        live_uuid);
+        live_uuid,
+        "healthy",
+        "",
+        capture_lag_sec);
 
     stats.events_published = pstats.events_published;
     stats.errors = pstats.errors;
@@ -906,6 +919,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             return stats;
         }
         rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+        mark_capture_position_failed(log_pg, conn_id, ex.what());
         log_write(log_pg, {
             .level = LogLevel::Warning,
             .component = "cdc_kafka_capture",

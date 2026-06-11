@@ -1,8 +1,10 @@
 #include "mariadb_ddl_sync.hpp"
 
+#include "lake_columns.hpp"
 #include "mariadb_schema.hpp"
 
 #include <map>
+#include <optional>
 #include <sstream>
 
 namespace {
@@ -89,6 +91,101 @@ bool pg_constraint_exists(PGconn* pg, const std::string& schema, const std::stri
         PQclear(res);
     }
     return ok;
+}
+
+std::optional<std::string> pg_try_exec(PGconn* pg, const std::string& sql) {
+    PGresult* res = PQexec(pg, sql.c_str());
+    if (!res) {
+        return std::string("PQexec returned null");
+    }
+    const auto st = PQresultStatus(res);
+    if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK) {
+        std::string err = PQerrorMessage(pg);
+        if (const char* msg = PQresultErrorMessage(res)) {
+            if (msg[0]) {
+                err += " | ";
+                err += msg;
+            }
+        }
+        PQclear(res);
+        return err;
+    }
+    PQclear(res);
+    return std::nullopt;
+}
+
+std::string mirror_unique_index_name(
+    const std::string& schema,
+    const std::string& table,
+    const std::vector<std::string>& columns) {
+    std::string name = "dl_uq_" + schema + "_" + table;
+    for (const auto& col : columns) {
+        name += "_" + col;
+    }
+    if (name.size() > 63) {
+        name.resize(63);
+    }
+    return name;
+}
+
+bool dedupe_lake_rows_on_columns(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    const std::vector<std::string>& key_columns) {
+    if (key_columns.empty()) {
+        return false;
+    }
+    const std::string fq = pg_ident(schema) + "." + pg_ident(table);
+    std::ostringstream partition_by;
+    for (std::size_t i = 0; i < key_columns.size(); ++i) {
+        if (i) {
+            partition_by << ", ";
+        }
+        partition_by << pg_ident(key_columns[i]);
+    }
+    const std::string sql =
+        "DELETE FROM " + fq + " t USING ("
+        "SELECT ctid FROM ("
+        "SELECT ctid, ROW_NUMBER() OVER (PARTITION BY " + partition_by.str() + " ORDER BY " +
+        pg_ident(lake_columns::kLoadTimestamp) + " DESC NULLS LAST) AS rn "
+        "FROM " +
+        fq + ") x WHERE x.rn > 1) d WHERE t.ctid = d.ctid";
+    return !pg_try_exec(pg, sql).has_value();
+}
+
+// Lake PK is (source_pk, _dl_load_timestamp); FKs reference source PK columns only — ensure UNIQUE first.
+bool ensure_referenced_unique_index(
+    PGconn* pg,
+    const std::string& ref_schema,
+    const std::string& ref_table,
+    const std::vector<std::string>& ref_columns) {
+    for (const auto& col : ref_columns) {
+        if (!pg_column_exists(pg, ref_schema, ref_table, col)) {
+            return false;
+        }
+    }
+    const std::string idx_name = mirror_unique_index_name(ref_schema, ref_table, ref_columns);
+    if (pg_index_exists(pg, ref_schema, idx_name)) {
+        return true;
+    }
+    std::ostringstream col_list;
+    for (std::size_t i = 0; i < ref_columns.size(); ++i) {
+        if (i) {
+            col_list << ", ";
+        }
+        col_list << pg_ident(ref_columns[i]);
+    }
+    const std::string fq = pg_ident(ref_schema) + "." + pg_ident(ref_table);
+    const std::string create_sql = "CREATE UNIQUE INDEX IF NOT EXISTS " + pg_ident(idx_name) + " ON " + fq +
+                                   " (" + col_list.str() + ")";
+    if (!pg_try_exec(pg, create_sql).has_value()) {
+        return true;
+    }
+    if (!dedupe_lake_rows_on_columns(pg, ref_schema, ref_table, ref_columns)) {
+        return false;
+    }
+    return !pg_try_exec(pg, create_sql).has_value();
 }
 
 int sync_missing_columns(
@@ -319,6 +416,9 @@ int sync_foreign_keys(
         if (!pg_table_exists(pg, fk.ref_schema, fk.ref_table)) {
             continue;
         }
+        if (!ensure_referenced_unique_index(pg, fk.ref_schema, fk.ref_table, fk.ref_columns)) {
+            continue;
+        }
 
         std::ostringstream local_cols;
         std::ostringstream ref_cols;
@@ -331,11 +431,13 @@ int sync_foreign_keys(
             ref_cols << pg_ident(fk.ref_columns[i]);
         }
 
-        pg_exec(
-            pg,
+        const std::string alter_sql =
             "ALTER TABLE " + pg_ident(schema) + "." + pg_ident(table) + " ADD CONSTRAINT " + pg_ident(pg_fk_name) +
             " FOREIGN KEY (" + local_cols.str() + ") REFERENCES " + pg_ident(fk.ref_schema) + "." +
-            pg_ident(fk.ref_table) + " (" + ref_cols.str() + ")");
+            pg_ident(fk.ref_table) + " (" + ref_cols.str() + ")";
+        if (pg_try_exec(pg, alter_sql).has_value()) {
+            continue;
+        }
         created += 1;
     }
     return created;

@@ -258,6 +258,49 @@ void bump_capture_heartbeat_pg(PGconn* pg, const std::string& conn_id, const std
     }
 }
 
+void touch_capture_position_slice(PGconn* pg, const std::string& conn_id) {
+    const char* vals[] = {conn_id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.capture_position
+        SET updated_at = now()
+        WHERE conn_id = $1
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res) {
+        PQclear(res);
+    }
+}
+
+void mark_capture_position_failed(PGconn* pg, const std::string& conn_id, const std::string& error) {
+    const std::string err = error.size() > 2000 ? error.substr(0, 2000) : error;
+    const char* vals[] = {conn_id.c_str(), err.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.capture_position
+        SET status = 'failed'::cdc_catalog.cdc_health_status,
+            last_error = $2,
+            updated_at = now()
+        WHERE conn_id = $1
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res) {
+        PQclear(res);
+    }
+}
+
 std::vector<std::string> split_pk_columns(const std::string& pk_columns) {
     std::vector<std::string> out;
     std::string part;
