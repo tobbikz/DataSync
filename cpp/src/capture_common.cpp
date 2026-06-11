@@ -1327,11 +1327,10 @@ void ensure_apply_positions_for_tier(
             INSERT INTO cdc_catalog.apply_position
                 (catalog_id, conn_id, source_schema, source_table, kafka_topic, status)
             VALUES ($1::bigint, $2, $3, $4, $5, 'healthy')
-            ON CONFLICT (catalog_id) DO UPDATE SET
-                conn_id = EXCLUDED.conn_id,
-                source_schema = EXCLUDED.source_schema,
-                source_table = EXCLUDED.source_table,
+            ON CONFLICT (conn_id, source_schema, source_table) DO UPDATE SET
+                catalog_id = EXCLUDED.catalog_id,
                 kafka_topic = EXCLUDED.kafka_topic,
+                status = 'healthy'::cdc_catalog.cdc_health_status,
                 updated_at = now()
             )",
             5,

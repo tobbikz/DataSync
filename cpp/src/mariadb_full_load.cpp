@@ -107,12 +107,14 @@ std::string csv_escape(const std::string& value) {
 
 std::string format_cell(const char* data, unsigned long len, const MariaDbColumn& col) {
     const bool missing = !data || len == 0;
+    // COPY ... FORMAT csv: NULL is an unquoted empty field (not text-format \N).
+    auto csv_null = []() { return std::string{}; };
     if (col.pg_type == "BYTEA" || is_binary_type(col.mysql_type)) {
         if (missing) {
             if (!col.is_nullable) {
                 return mariadb_bytea_to_copy_csv(static_cast<const char*>(nullptr), 0);
             }
-            return "\\N";
+            return csv_null();
         }
         return mariadb_bytea_to_copy_csv(data, static_cast<std::size_t>(len));
     }
@@ -122,9 +124,9 @@ std::string format_cell(const char* data, unsigned long len, const MariaDbColumn
         }
         if (col.pg_type == "TIMESTAMPTZ" || col.pg_type == "TIMESTAMP" || col.pg_type == "DATE" ||
             col.pg_type == "TIME") {
-            return "\\N";
+            return csv_null();
         }
-        return "";
+        return csv_null();
     }
     const std::string s = normalize_text_for_pg(std::string(data, len), col.pg_type);
     if (s.empty()) {
@@ -133,9 +135,9 @@ std::string format_cell(const char* data, unsigned long len, const MariaDbColumn
         }
         if (col.pg_type == "TIMESTAMPTZ" || col.pg_type == "TIMESTAMP" || col.pg_type == "DATE" ||
             col.pg_type == "TIME") {
-            return "\\N";
+            return csv_null();
         }
-        return csv_escape(s);
+        return csv_null();
     }
     return csv_escape(s);
 }
