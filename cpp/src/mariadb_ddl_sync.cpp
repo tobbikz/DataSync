@@ -74,6 +74,32 @@ bool pg_table_exists(PGconn* pg, const std::string& schema, const std::string& t
     return ok;
 }
 
+bool pg_table_is_partitioned(PGconn* pg, const std::string& schema, const std::string& table) {
+    const char* vals[] = {schema.c_str(), table.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT c.relkind = 'p'
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2
+        LIMIT 1
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    const bool ok =
+        res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 &&
+        PQgetvalue(res, 0, 0)[0] == 't';
+    if (res) {
+        PQclear(res);
+    }
+    return ok;
+}
+
 bool pg_constraint_exists(PGconn* pg, const std::string& schema, const std::string& constraint_name) {
     const char* vals[] = {schema.c_str(), constraint_name.c_str()};
     PGresult* res = PQexecParams(
@@ -160,6 +186,10 @@ bool ensure_referenced_unique_index(
     const std::string& ref_schema,
     const std::string& ref_table,
     const std::vector<std::string>& ref_columns) {
+    // Partitioned lake tables (BY _dl_load_timestamp) cannot host UNIQUE on business keys alone.
+    if (pg_table_is_partitioned(pg, ref_schema, ref_table)) {
+        return false;
+    }
     for (const auto& col : ref_columns) {
         if (!pg_column_exists(pg, ref_schema, ref_table, col)) {
             return false;
@@ -330,6 +360,7 @@ int sync_indexes(
     const std::string& schema,
     const std::string& table,
     const std::vector<IndexDef>& indexes) {
+    const bool partitioned = pg_table_is_partitioned(pg, schema, table);
     int created = 0;
     for (const auto& idx : indexes) {
         const std::string pg_index_name = ("dl_" + schema + "_" + table + "_" + idx.name).substr(0, 63);
@@ -343,11 +374,15 @@ int sync_indexes(
             }
             cols << pg_ident(idx.columns[i]);
         }
-        const std::string unique = idx.unique ? "UNIQUE " : "";
-        pg_exec(
-            pg,
-            "CREATE " + unique + "INDEX IF NOT EXISTS " + pg_ident(pg_index_name) + " ON " + pg_ident(schema) + "." +
-            pg_ident(table) + " (" + cols.str() + ")");
+        // PG partitioned tables require UNIQUE indexes to include the partition key;
+        // lake is PARTITION BY RANGE (_dl_load_timestamp) — mirror on business keys uses non-unique indexes.
+        const bool use_unique = idx.unique && !partitioned;
+        const std::string unique = use_unique ? "UNIQUE " : "";
+        const std::string sql = "CREATE " + unique + "INDEX IF NOT EXISTS " + pg_ident(pg_index_name) + " ON " +
+                                pg_ident(schema) + "." + pg_ident(table) + " (" + cols.str() + ")";
+        if (pg_try_exec(pg, sql).has_value()) {
+            continue;
+        }
         created += 1;
     }
     return created;
