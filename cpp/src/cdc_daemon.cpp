@@ -9,6 +9,7 @@
 #include "kafka_apply.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
+#include "pipeline_health.hpp"
 #include "runtime_config.hpp"
 #include "service_tiers.hpp"
 
@@ -263,6 +264,21 @@ int run_one_cycle(
             {"errors", cycle_errors},
         },
     });
+
+    try {
+        refresh_pipeline_health_totals(log_pg, tier.tier_code, db_engine);
+    } catch (const std::exception& ex) {
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_daemon",
+            .message = "pipeline_health totals refresh failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"error", ex.what()}, {"tier", tier.tier_code}, {"db_engine", db_engine}},
+        });
+    }
 
     return cycle_errors == 0 ? 0 : 1;
 }

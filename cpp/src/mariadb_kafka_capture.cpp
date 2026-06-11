@@ -9,6 +9,7 @@
 #include "mariadb_conn.hpp"
 #include "mariadb_schema.hpp"
 #include "obs_log.hpp"
+#include "pipeline_health.hpp"
 #include "runtime_config.hpp"
 
 #include <chrono>
@@ -713,6 +714,21 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             {"tables_watched", static_cast<int>(wanted.size())},
         },
     });
+
+    try {
+        update_pipeline_health_capture(log_pg, conn_id, "mariadb");
+    } catch (const std::exception& ex) {
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_kafka_capture",
+            .message = "pipeline_health capture refresh failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"error", ex.what()}},
+        });
+    }
 
     return stats;
     } catch (const std::exception& ex) {

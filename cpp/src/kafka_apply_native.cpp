@@ -12,6 +12,7 @@
 #include "mssql_lake.hpp"
 #include "mongo_lake.hpp"
 #include "obs_log.hpp"
+#include "pipeline_health.hpp"
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
 
@@ -1690,6 +1691,43 @@ int run_kafka_apply_native_cli(
                 {"errors", errors},
             },
         });
+
+        if (service_tier && !service_tier->empty()) {
+            try {
+                const PipelineCatalogCounts catalog_counts =
+                    fetch_pipeline_catalog_counts(app_pg.raw, conn_id, *service_tier, db_engine);
+                PipelineKafkaLagSummary kafka_lag;
+#ifdef HAVE_RDKAFKA
+                kafka_lag = compute_pipeline_kafka_lag(app_pg.raw, rk, conn_id, *service_tier, db_engine);
+#endif
+                update_pipeline_health_apply(
+                    app_pg.raw,
+                    conn_id,
+                    *service_tier,
+                    db_engine,
+                    catalog_counts,
+                    kafka_lag,
+                    PipelineApplySliceStats{
+                        .events_seen = events_seen,
+                        .events_applied = events_applied,
+                        .errors = errors,
+                        .stop_reason = stop_reason,
+                        .duration_ms = duration_ms,
+                    });
+                refresh_pipeline_health_totals(app_pg.raw, *service_tier, db_engine);
+            } catch (const std::exception& ex) {
+                log_write(log_pg, {
+                    .level = LogLevel::Warning,
+                    .component = "cdc_kafka_apply_cpp",
+                    .message = "pipeline_health refresh failed",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {{"error", ex.what()}},
+                });
+            }
+        }
     } catch (const std::exception& ex) {
         log_write(log_pg, {
             .level = LogLevel::Error,

@@ -48,6 +48,7 @@ set(DATASYNC_SOURCES
     src/mongo_full_load.cpp
     src/runtime_config.cpp
     src/obs_log.cpp
+    src/pipeline_health.cpp
 )
 
 find_path(FREETDS_INCLUDE_DIR NAMES sybdb.h)
