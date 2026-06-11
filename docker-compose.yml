@@ -1,5 +1,5 @@
 # DataSync — Kafka (KRaft) + CDC daemon in one compose stack.
-# Host: ./install.sh  |  Systemd: DataSync.service → install.sh (DATASYNC_FOREGROUND=1)
+# Host: ./install.sh start  |  Systemd: DataSync.service → install.sh start/stop
 # host network: daemon reaches OLTP on host (MariaDB :3306, PG :5432, etc.)
 # No MariaDB/MSSQL/Mongo server containers — only Kafka + DataSync daemon.
 # on rootful Docker and rootless Podman (no rootlessport bridge gap).

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Host:      ./install.sh              → build + Kafka + daemon + discover
-# Systemd:   ExecStart=$ROOT/install.sh  with  Environment=DATASYNC_FOREGROUND=1
-# Container: install.sh container …    (Docker ENTRYPOINT only)
+# Host:      ./install.sh | ./install.sh start  → build + Kafka + daemon + discover
+# Systemd:   ExecStart=$ROOT/install.sh start  ExecStop=$ROOT/install.sh stop
+#            sudo ./install.sh systemd-install  (once — installs DataSync.service)
+# Container: install.sh container …            (Docker ENTRYPOINT only)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -101,28 +102,6 @@ docker_compose() {
     *)
       warn "unknown container engine: $DATASYNC_CONTAINER_ENGINE"
       return 1
-      ;;
-  esac
-}
-
-# exec(1) cannot run shell functions — resolve real compose binary for foreground/systemd.
-compose_exec_up() {
-  ensure_container_runtime || exit 1
-  case "$DATASYNC_CONTAINER_ENGINE" in
-    docker) exec docker compose up --remove-orphans "$@" ;;
-    docker_sudo) exec sudo docker compose up --remove-orphans "$@" ;;
-    podman)
-      if podman compose version >/dev/null 2>&1; then
-        exec podman compose up --remove-orphans "$@"
-      elif command -v docker-compose >/dev/null 2>&1; then
-        exec docker-compose up --remove-orphans "$@"
-      fi
-      warn "podman compose plugin required"
-      exit 1
-      ;;
-    *)
-      warn "unknown container engine: $DATASYNC_CONTAINER_ENGINE"
-      exit 1
       ;;
   esac
 }
@@ -653,42 +632,44 @@ run_host_discover() {
     datasync discover || return 1
 }
 
-host_maybe_build() {
-  if [[ "${DATASYNC_FORCE_BUILD:-0}" == "1" ]]; then
-    docker_compose build datasync
-    return
-  fi
-  # systemd restart: skip rebuild when image already exists (avoid rebuild loop on failure)
-  if [[ -n "${INVOCATION_ID:-}" ]]; then
-    case "$DATASYNC_CONTAINER_ENGINE" in
-      docker) docker image inspect datasync:local >/dev/null 2>&1 && return 0 ;;
-      docker_sudo) sudo docker image inspect datasync:local >/dev/null 2>&1 && return 0 ;;
-      podman) podman image inspect datasync:local >/dev/null 2>&1 && return 0 ;;
-    esac
-  fi
+host_build_datasync() {
+  ensure_container_runtime || exit 1
+  cd "$ROOT"
   docker_compose build datasync
 }
 
-host_install_and_run() {
+host_stack_start() {
   ensure_container_runtime || exit 1
   cd "$ROOT"
-  host_maybe_build
-
-  if [[ "${DATASYNC_FOREGROUND:-0}" == "1" ]]; then
-    docker_compose up -d kafka
-    wait_kafka_compose || exit 1
-    if [[ "${DATASYNC_AUTO_DISCOVER:-1}" == "1" ]]; then
-      run_host_discover || true
-    fi
-    compose_exec_up
-  fi
-
-  docker_compose up -d --remove-orphans
+  host_build_datasync
+  docker_compose up -d kafka
   wait_kafka_compose || exit 1
+  docker_compose up -d --force-recreate --remove-orphans datasync
   if [[ "${DATASYNC_AUTO_DISCOVER:-1}" == "1" ]]; then
     run_host_discover || true
   fi
   docker_compose ps
+}
+
+host_stack_stop() {
+  ensure_container_runtime || exit 0
+  cd "$ROOT"
+  docker_compose stop datasync kafka 2>/dev/null || true
+}
+
+install_systemd_unit() {
+  local unit_src="$ROOT/DataSync.service"
+  local unit_dst="/etc/systemd/system/DataSync.service"
+  [[ -f "$unit_src" ]] || fail "missing DataSync.service in $ROOT"
+  if [[ "${EUID}" -ne 0 ]]; then
+    fail "systemd-install requires root — run: sudo $ROOT/install.sh systemd-install"
+  fi
+  sed "s|@DATASYNC_ROOT@|$ROOT|g" "$unit_src" >"${unit_dst}.tmp"
+  install -m 644 "${unit_dst}.tmp" "$unit_dst"
+  rm -f "${unit_dst}.tmp"
+  systemctl daemon-reload
+  printf '✔ installed %s (ExecStart=%s/install.sh start)\n' "$unit_dst" "$ROOT"
+  printf '  enable: systemctl enable --now DataSync\n'
 }
 
 case "${1:-}" in
@@ -696,11 +677,17 @@ case "${1:-}" in
     shift
     container_dispatch "$@"
     ;;
-  "")
-    host_install_and_run
+  start|"")
+    host_stack_start
+    ;;
+  stop)
+    host_stack_stop
+    ;;
+  systemd-install)
+    install_systemd_unit
     ;;
   *)
-    warn "usage: ./install.sh  |  install.sh container <cmd>"
+    warn "usage: ./install.sh [start|stop|systemd-install]  |  install.sh container <cmd>"
     exit 2
     ;;
 esac

@@ -1,9 +1,9 @@
-# systemd unit — install once:
-#   sudo cp DataSync.service /etc/systemd/system/
-#   sudo sed -i "s|@DATASYNC_ROOT@|$(pwd)|g" /etc/systemd/system/DataSync.service
-#   sudo systemctl daemon-reload && sudo systemctl enable --now DataSync
+# systemd unit — install once (or after git pull if unit changed):
+#   sudo ./install.sh systemd-install
+#   sudo systemctl enable --now DataSync
 #
-# Logs: journalctl -u DataSync -f
+# Restart (rebuild + recreate daemon): sudo systemctl restart DataSync
+# Logs: journalctl -u DataSync -n 50  &&  docker compose logs -f datasync
 
 [Unit]
 Description=DataSync (Kafka + CDC daemon)
@@ -11,16 +11,15 @@ After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=oneshot
+RemainAfterExit=yes
 WorkingDirectory=@DATASYNC_ROOT@
-Environment=DATASYNC_FOREGROUND=1
 Environment=DATASYNC_AUTO_DISCOVER=1
 Environment=KAFKA_BOOTSTRAP=127.0.0.1:9092
 EnvironmentFile=-/etc/datasync/datasync.env
-ExecStart=@DATASYNC_ROOT@/install.sh
+ExecStart=@DATASYNC_ROOT@/install.sh start
+ExecStop=@DATASYNC_ROOT@/install.sh stop
 TimeoutStartSec=900
-Restart=on-failure
-RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
