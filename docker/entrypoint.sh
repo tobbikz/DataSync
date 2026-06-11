@@ -505,7 +505,9 @@ if [[ "${1:-}" == "verify-sources" ]]; then
   fi
   export PGPASSWORD="${pg[4]}"
   apply_pg_sslmode "${pg[5]:-}"
-  sync_connections_from_config || true
+  if [[ "${DATASYNC_SKIP_CONNECTIONS_SYNC:-0}" != "1" ]]; then
+    sync_connections_from_config || true
+  fi
   python3 "$VERIFY_SOURCES_PY"
   exit $?
 fi
@@ -552,7 +554,9 @@ fi
 apply_catalog_schema
 apply_lake_schema
 post_schema_bootstrap
-sync_connections_from_config
+if [[ "${DATASYNC_SKIP_CONNECTIONS_SYNC:-0}" != "1" ]]; then
+  sync_connections_from_config
+fi
 
 if [[ "${1:-}" == "schema-only" ]]; then
   exit 0

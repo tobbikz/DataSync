@@ -22,8 +22,18 @@ std::string extras_string(PGresult* res, int row) {
     return v ? v : "{}";
 }
 
-// MariaDB/MySQL client uses a unix socket when host is "localhost"; force TCP.
 std::string normalize_tcp_host(std::string host) {
+    if (host == "localhost") {
+        return "127.0.0.1";
+    }
+    return host.empty() ? "127.0.0.1" : host;
+}
+
+// Force TCP for remote tooling; keep "localhost" when password empty (unix socket / peer auth).
+std::string normalize_mariadb_host(std::string host, bool force_tcp) {
+    if (!force_tcp) {
+        return host.empty() ? "localhost" : host;
+    }
     if (host == "localhost") {
         return "127.0.0.1";
     }
@@ -33,11 +43,12 @@ std::string normalize_tcp_host(std::string host) {
 MariaDbSource row_to_mariadb(PGresult* res, int row) {
     MariaDbSource src;
     src.conn_id = PQgetvalue(res, row, 0);
-    src.host = normalize_tcp_host(PQgetvalue(res, row, 2) ? PQgetvalue(res, row, 2) : "localhost");
+    const std::string raw_host = PQgetvalue(res, row, 2) ? PQgetvalue(res, row, 2) : "localhost";
+    src.password = PQgetvalue(res, row, 6) ? PQgetvalue(res, row, 6) : "";
+    src.host = normalize_mariadb_host(raw_host, !src.password.empty());
     src.port = parse_port(PQgetvalue(res, row, 3), 3306);
     src.db_name = PQgetvalue(res, row, 4) ? PQgetvalue(res, row, 4) : "";
     src.user = PQgetvalue(res, row, 5) ? PQgetvalue(res, row, 5) : "";
-    src.password = PQgetvalue(res, row, 6) ? PQgetvalue(res, row, 6) : "";
     return src;
 }
 

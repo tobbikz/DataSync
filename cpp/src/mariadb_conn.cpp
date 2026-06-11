@@ -6,6 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <thread>
+#include <unistd.h>
 
 namespace {
 
@@ -63,14 +64,30 @@ MYSQL* MariaDbConn::open_handle(const MariaDbSource& src) {
     }
     unsigned int timeout = 30;
     mysql_options(raw, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+    const bool local_host = src.host == "localhost" || src.host == "127.0.0.1" || src.host == "::1";
+    const char* socket_path = nullptr;
+    if (local_host && src.password.empty()) {
+        static const char* kSockets[] = {
+            "/run/mysqld/mysqld.sock",
+            "/var/run/mysqld/mysqld.sock",
+            "/run/mariadb/mariadb.sock",
+            nullptr,
+        };
+        for (const char* const* p = kSockets; *p; ++p) {
+            if (access(*p, F_OK) == 0) {
+                socket_path = *p;
+                break;
+            }
+        }
+    }
     if (!mysql_real_connect(
             raw,
-            src.host.c_str(),
+            socket_path ? "localhost" : src.host.c_str(),
             src.user.c_str(),
             src.password.c_str(),
             nullptr,
-            src.port,
-            nullptr,
+            socket_path ? 0 : src.port,
+            socket_path,
             0)) {
         const std::string err = mysql_error(raw);
         mysql_close(raw);

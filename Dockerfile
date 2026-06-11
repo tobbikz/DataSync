@@ -36,7 +36,7 @@ COPY cpp/ cpp/
 # CMakeLists expects librdkafka under cpp/deps/rdkafka (built in this stage, not from host)
 RUN mkdir -p cpp/deps && cp -a /opt/rdkafka cpp/deps/rdkafka
 
-RUN cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release \
+RUN cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
     && cmake --build build --target DataSync -j"$(nproc)"
 
 # -----------------------------------------------------------------------------

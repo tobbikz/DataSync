@@ -132,6 +132,7 @@ endif()
 
 target_compile_options(DataSync PRIVATE -Wall -Wextra)
 
+option(BUILD_TESTING "Build Catch2 unit tests" OFF)
 include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(tests)

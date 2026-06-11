@@ -13,15 +13,10 @@ import argparse
 import json
 import os
 import random
+import subprocess
 import sys
 import time
 from pathlib import Path
-
-try:
-    import pymysql
-except ImportError:
-    print("Install pymysql: pip install pymysql", file=sys.stderr)
-    sys.exit(1)
 
 
 def load_pg_dsn() -> dict:
@@ -63,72 +58,84 @@ def load_mariadb_conn(conn_id: str) -> dict:
     return {
         "host": host,
         "port": int(port),
-        "user": user,
-        "password": password,
+        "user": user or os.environ.get("MARIADB_USER", "root"),
+        "password": password or os.environ.get("MARIADB_PASSWORD", ""),
         "database": db_name or "test",
     }
 
 
+def mariadb_cli(mysql_cfg: dict, sql: str) -> str:
+    cmd = ["mariadb", "--batch", "--skip-column-names"]
+    local = mysql_cfg["host"] in ("127.0.0.1", "localhost", "::1")
+    use_socket = local and os.environ.get("MARIADB_USE_TCP", "0") != "1"
+    if os.environ.get("MARIADB_USE_TCP") == "1":
+        use_socket = False
+    # Local dev: unix_socket auth (omit -h/-u/-p). Prod/docker: set MARIADB_USE_TCP=1.
+    if not use_socket:
+        cmd.extend(["-h", mysql_cfg["host"], "-P", str(mysql_cfg["port"])])
+        if mysql_cfg["user"]:
+            cmd.extend(["-u", mysql_cfg["user"]])
+        if mysql_cfg["password"]:
+            cmd.append(f"-p{mysql_cfg['password']}")
+    cmd.extend(["-e", sql])
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "mariadb failed")
+    return proc.stdout.strip()
+
+
 def ensure_schema(mysql_cfg: dict, schema: str, table: str) -> None:
-    conn = pymysql.connect(**mysql_cfg, autocommit=True)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"CREATE DATABASE IF NOT EXISTS `{schema}`")
-            cur.execute(f"USE `{schema}`")
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS `{table}` (
-                    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(128) NOT NULL DEFAULT '',
-                    amount INT NOT NULL DEFAULT 0,
-                    deleted_at DATETIME NULL,
-                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-                        ON UPDATE CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB
-                """
-            )
-            cur.execute(f"SELECT COUNT(*) FROM `{table}`")
-            if cur.fetchone()[0] == 0:
-                cur.executemany(
-                    f"INSERT INTO `{table}` (name, amount) VALUES (%s, %s)",
-                    [(f"seed_{i}", i) for i in range(1, 101)],
-                )
-    finally:
-        conn.close()
+    mariadb_cli(
+        mysql_cfg,
+        f"""
+        CREATE DATABASE IF NOT EXISTS `{schema}`;
+        CREATE TABLE IF NOT EXISTS `{schema}`.`{table}` (
+            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(128) NOT NULL DEFAULT '',
+            amount INT NOT NULL DEFAULT 0,
+            deleted_at DATETIME NULL,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB;
+        INSERT INTO `{schema}`.`{table}` (name, amount)
+        SELECT * FROM (
+            SELECT 'seed_1', 1 UNION ALL SELECT 'seed_2', 2
+        ) s
+        WHERE (SELECT COUNT(*) FROM `{schema}`.`{table}`) = 0;
+        """,
+    )
 
 
 def run_txn(mysql_cfg: dict, schema: str, table: str) -> str:
-    conn = pymysql.connect(**mysql_cfg, autocommit=True)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"USE `{schema}`")
-            op = random.choice(["insert", "update", "update", "delete"])
-            if op == "insert":
-                n = random.randint(1, 999_999)
-                cur.execute(
-                    f"INSERT INTO `{table}` (name, amount) VALUES (%s, %s)",
-                    (f"sim_{int(time.time())}_{n}", n % 1000),
-                )
-                return f"INSERT id={cur.lastrowid}"
-            cur.execute(f"SELECT id FROM `{table}` ORDER BY RAND() LIMIT 1")
-            row = cur.fetchone()
-            if not row:
-                cur.execute(
-                    f"INSERT INTO `{table}` (name, amount) VALUES (%s, %s)",
-                    ("bootstrap", 1),
-                )
-                return f"INSERT bootstrap id={cur.lastrowid}"
-            pk = row[0]
-            if op == "delete":
-                cur.execute(f"DELETE FROM `{table}` WHERE id = %s", (pk,))
-                return f"DELETE id={pk}"
-            cur.execute(
-                f"UPDATE `{table}` SET amount = amount + 1, name = %s WHERE id = %s",
-                (f"upd_{int(time.time())}", pk),
-            )
-            return f"UPDATE id={pk}"
-    finally:
-        conn.close()
+    op = random.choice(["insert", "update", "update", "delete"])
+    if op == "insert":
+        n = random.randint(1, 999_999)
+        mariadb_cli(
+            mysql_cfg,
+            f"INSERT INTO `{schema}`.`{table}` (name, amount) "
+            f"VALUES ('sim_{int(time.time())}_{n}', {n % 1000});",
+        )
+        return f"INSERT sim_{n}"
+    pk = mariadb_cli(
+        mysql_cfg,
+        f"SELECT id FROM `{schema}`.`{table}` ORDER BY RAND() LIMIT 1;",
+    )
+    if not pk:
+        mariadb_cli(
+            mysql_cfg,
+            f"INSERT INTO `{schema}`.`{table}` (name, amount) VALUES ('bootstrap', 1);",
+        )
+        return "INSERT bootstrap"
+    pk_id = pk.splitlines()[0].strip()
+    if op == "delete":
+        mariadb_cli(mysql_cfg, f"DELETE FROM `{schema}`.`{table}` WHERE id = {pk_id};")
+        return f"DELETE id={pk_id}"
+    mariadb_cli(
+        mysql_cfg,
+        f"UPDATE `{schema}`.`{table}` SET amount = amount + 1, "
+        f"name = 'upd_{int(time.time())}' WHERE id = {pk_id};",
+    )
+    return f"UPDATE id={pk_id}"
 
 
 def main() -> int:
