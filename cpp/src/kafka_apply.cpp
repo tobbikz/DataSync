@@ -11,6 +11,7 @@
 #include "mssql_lake.hpp"
 #include "mongo_lake.hpp"
 #include "obs_log.hpp"
+#include "pipeline_health.hpp"
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
 
@@ -845,6 +846,36 @@ void insert_apply_batch_stats(
         )",
         37,
         vals);
+
+    if (!service_tier.empty()) {
+        try {
+            std::string db_engine = "mariadb";
+            if (catalog_id > 0) {
+                const std::string cid = std::to_string(catalog_id);
+                const char* cvals[] = {cid.c_str()};
+                PGresult* eres = PQexecParams(
+                    pg,
+                    "SELECT db_engine::text FROM cdc_catalog.catalog WHERE catalog_id = $1::bigint",
+                    1,
+                    nullptr,
+                    cvals,
+                    nullptr,
+                    nullptr,
+                    0);
+                if (eres && PQresultStatus(eres) == PGRES_TUPLES_OK && PQntuples(eres) > 0) {
+                    const char* eng = PQgetvalue(eres, 0, 0);
+                    if (eng && eng[0]) {
+                        db_engine = eng;
+                    }
+                }
+                if (eres) {
+                    PQclear(eres);
+                }
+            }
+            refresh_pipeline_health_live(pg, conn_id, service_tier, db_engine, 15, false);
+        } catch (...) {
+        }
+    }
 }
 
 void merge_from_staging(

@@ -54,7 +54,7 @@ bool is_invalid_sql_date(const std::string& s) {
 
 bool is_invalid_sql_datetime(const std::string& s) {
     if (s.empty()) {
-        return false;
+        return true;
     }
     const std::string fixed = fix_date_separators(s);
     return is_invalid_sql_date(fixed.substr(0, std::min(fixed.size(), std::size_t{10})));

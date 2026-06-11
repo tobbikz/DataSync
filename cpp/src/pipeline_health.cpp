@@ -4,14 +4,16 @@
 
 #include <libpq-fe.h>
 
+#include <chrono>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
-namespace {
-
 constexpr const char* kTotalConnId = "__TOTAL__";
+
+namespace {
 
 void exec_params_or_throw(PGconn* pg, const char* sql, int n, const char* const* vals) {
     PGresult* res = PQexecParams(pg, sql, n, nullptr, vals, nullptr, nullptr, 0);
@@ -47,7 +49,69 @@ const char* opt_or_null(const std::string& value) {
     return value.empty() ? nullptr : value.c_str();
 }
 
+std::mutex g_pipeline_health_mu;
+std::map<std::string, std::chrono::steady_clock::time_point> g_pipeline_health_last;
+
+bool pipeline_health_should_throttle(
+    const std::string& conn_id,
+    const std::string& service_tier,
+    int throttle_seconds,
+    bool force) {
+    if (force || throttle_seconds <= 0) {
+        return false;
+    }
+    const std::string key = conn_id + "|" + service_tier;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_pipeline_health_mu);
+    const auto it = g_pipeline_health_last.find(key);
+    if (it != g_pipeline_health_last.end()) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count();
+        if (elapsed < throttle_seconds) {
+            return true;
+        }
+    }
+    g_pipeline_health_last[key] = now;
+    return false;
+}
+
+void exec_refresh_sql(PGconn* pg, const char* sql, int n, const char* const* vals) {
+    PGresult* res = PQexecParams(pg, sql, n, nullptr, vals, nullptr, nullptr, 0);
+    if (!res) {
+        throw std::runtime_error("pipeline_health refresh failed (no result)");
+    }
+    if (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK) {
+        const std::string err = PQerrorMessage(pg);
+        PQclear(res);
+        throw std::runtime_error("pipeline_health refresh: " + err);
+    }
+    PQclear(res);
+}
+
 }  // namespace
+
+void refresh_pipeline_health_live(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& service_tier,
+    const std::string& db_engine,
+    int throttle_seconds,
+    bool force) {
+    if (!pg || PQstatus(pg) != CONNECTION_OK || conn_id.empty() || service_tier.empty() ||
+        conn_id == kTotalConnId) {
+        return;
+    }
+    if (pipeline_health_should_throttle(conn_id, service_tier, throttle_seconds, force)) {
+        return;
+    }
+
+    const char* vals[] = {conn_id.c_str(), service_tier.c_str(), db_engine.c_str()};
+    exec_refresh_sql(
+        pg,
+        "SELECT cdc_catalog.refresh_pipeline_health_live($1, $2::cdc_catalog.service_tier, $3::cdc_catalog.db_engine)",
+        3,
+        vals);
+    refresh_pipeline_health_totals(pg, service_tier, db_engine);
+}
 
 void ensure_pipeline_health_rows(PGconn* pg, const std::string& conn_id, const std::string& db_engine) {
     if (!pg || PQstatus(pg) != CONNECTION_OK) {
@@ -223,25 +287,38 @@ void update_pipeline_health_capture(PGconn* pg, const std::string& conn_id, cons
     ensure_pipeline_health_rows(pg, conn_id, db_engine);
 
     const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
-    exec_params_or_throw(
+    PGresult* res = PQexecParams(
         pg,
         R"(
-        UPDATE cdc_catalog.pipeline_health ph
-        SET
-            capture_lag_seconds = cp.capture_lag_seconds,
-            capture_status = cp.status,
-            binlog_file = cp.binlog_file,
-            binlog_position = cp.binlog_position,
-            last_capture_at = cp.last_event_ts,
-            updated_at = now(),
-            updated_by = 'capture'
-        FROM cdc_catalog.capture_position cp
-        WHERE ph.conn_id = $1
-          AND ph.db_engine = $2::cdc_catalog.db_engine
-          AND cp.conn_id = $1
+        SELECT DISTINCT c.service_tier::text
+        FROM cdc_catalog.catalog c
+        WHERE c.conn_id = $1
+          AND c.db_engine = $2::cdc_catalog.db_engine
+          AND c.active = true
         )",
         2,
-        vals);
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        return;
+    }
+    for (int i = 0; i < PQntuples(res); ++i) {
+        const char* tier = PQgetvalue(res, i, 0);
+        if (!tier || !tier[0]) {
+            continue;
+        }
+        try {
+            refresh_pipeline_health_live(pg, conn_id, tier, db_engine, 0, true);
+        } catch (...) {
+        }
+    }
+    PQclear(res);
 }
 
 void update_pipeline_health_apply(
@@ -252,23 +329,16 @@ void update_pipeline_health_apply(
     const PipelineCatalogCounts& counts,
     const PipelineKafkaLagSummary& kafka_lag,
     const PipelineApplySliceStats& slice) {
+    (void)counts;
+    (void)kafka_lag;
     if (!pg || PQstatus(pg) != CONNECTION_OK || service_tier.empty()) {
         return;
     }
-    ensure_pipeline_health_rows(pg, conn_id, db_engine);
+    try {
+        refresh_pipeline_health_live(pg, conn_id, service_tier, db_engine, 0, true);
+    } catch (...) {
+    }
 
-    const std::string total_tables = std::to_string(counts.total_tables);
-    const std::string cdc_ready = std::to_string(counts.cdc_ready);
-    const std::string pending_full_load = std::to_string(counts.pending_full_load);
-    const std::string failed_tables = std::to_string(counts.failed_tables);
-    const std::string success_tables = std::to_string(counts.success_tables);
-    const std::string apply_healthy = std::to_string(counts.apply_healthy);
-    const std::string apply_lagging = std::to_string(counts.apply_lagging);
-    const std::string apply_quarantined = std::to_string(counts.apply_quarantined);
-    const std::string max_apply_lag = std::to_string(counts.max_apply_lag_seconds);
-    const std::string kafka_total = std::to_string(kafka_lag.total);
-    const std::string kafka_parts = std::to_string(kafka_lag.partitions_with_lag);
-    const std::string max_kafka = std::to_string(kafka_lag.max_lag);
     const std::string events_seen = std::to_string(slice.events_seen);
     const std::string events_applied = std::to_string(slice.events_applied);
     const std::string slice_errors = std::to_string(slice.errors);
@@ -278,20 +348,6 @@ void update_pipeline_health_apply(
         conn_id.c_str(),
         service_tier.c_str(),
         db_engine.c_str(),
-        total_tables.c_str(),
-        cdc_ready.c_str(),
-        pending_full_load.c_str(),
-        failed_tables.c_str(),
-        success_tables.c_str(),
-        apply_healthy.c_str(),
-        apply_lagging.c_str(),
-        apply_quarantined.c_str(),
-        max_apply_lag.c_str(),
-        kafka_total.c_str(),
-        kafka_parts.c_str(),
-        max_kafka.c_str(),
-        opt_or_null(kafka_lag.max_schema),
-        opt_or_null(kafka_lag.max_table),
         events_seen.c_str(),
         events_applied.c_str(),
         slice_errors.c_str(),
@@ -302,50 +358,20 @@ void update_pipeline_health_apply(
     exec_params_or_throw(
         pg,
         R"(
-        INSERT INTO cdc_catalog.pipeline_health (
-            conn_id, service_tier, db_engine,
-            total_tables, cdc_ready, pending_full_load, failed_tables, success_tables,
-            apply_healthy, apply_lagging, apply_quarantined, max_apply_lag_seconds,
-            kafka_lag_total, kafka_partitions_with_lag, max_kafka_lag,
-            max_kafka_lag_schema, max_kafka_lag_table,
-            last_apply_at, last_slice_events_seen, last_slice_events_applied,
-            last_slice_errors, last_slice_stop_reason, last_slice_duration_ms,
-            updated_at, updated_by
-        ) VALUES (
-            $1, $2::cdc_catalog.service_tier, $3::cdc_catalog.db_engine,
-            $4::integer, $5::integer, $6::integer, $7::integer, $8::integer,
-            $9::integer, $10::integer, $11::integer, $12::integer,
-            $13::bigint, $14::integer, $15::bigint,
-            $16, $17,
-            now(), $18::bigint, $19::bigint,
-            $20::integer, $21, $22::bigint,
-            now(), 'apply'
-        )
-        ON CONFLICT (conn_id, service_tier, db_engine) DO UPDATE SET
-            total_tables = EXCLUDED.total_tables,
-            cdc_ready = EXCLUDED.cdc_ready,
-            pending_full_load = EXCLUDED.pending_full_load,
-            failed_tables = EXCLUDED.failed_tables,
-            success_tables = EXCLUDED.success_tables,
-            apply_healthy = EXCLUDED.apply_healthy,
-            apply_lagging = EXCLUDED.apply_lagging,
-            apply_quarantined = EXCLUDED.apply_quarantined,
-            max_apply_lag_seconds = EXCLUDED.max_apply_lag_seconds,
-            kafka_lag_total = EXCLUDED.kafka_lag_total,
-            kafka_partitions_with_lag = EXCLUDED.kafka_partitions_with_lag,
-            max_kafka_lag = EXCLUDED.max_kafka_lag,
-            max_kafka_lag_schema = EXCLUDED.max_kafka_lag_schema,
-            max_kafka_lag_table = EXCLUDED.max_kafka_lag_table,
-            last_apply_at = EXCLUDED.last_apply_at,
-            last_slice_events_seen = EXCLUDED.last_slice_events_seen,
-            last_slice_events_applied = EXCLUDED.last_slice_events_applied,
-            last_slice_errors = EXCLUDED.last_slice_errors,
-            last_slice_stop_reason = EXCLUDED.last_slice_stop_reason,
-            last_slice_duration_ms = EXCLUDED.last_slice_duration_ms,
-            updated_at = EXCLUDED.updated_at,
-            updated_by = EXCLUDED.updated_by
+        UPDATE cdc_catalog.pipeline_health
+        SET
+            last_slice_events_seen = $4::bigint,
+            last_slice_events_applied = $5::bigint,
+            last_slice_errors = $6::integer,
+            last_slice_stop_reason = $7,
+            last_slice_duration_ms = $8::bigint,
+            updated_at = now(),
+            updated_by = 'apply'
+        WHERE conn_id = $1
+          AND service_tier = $2::cdc_catalog.service_tier
+          AND db_engine = $3::cdc_catalog.db_engine
         )",
-        22,
+        8,
         vals);
 }
 
@@ -357,102 +383,10 @@ void refresh_pipeline_health_totals(
         return;
     }
 
-    const char* vals[] = {service_tier.c_str(), db_engine.c_str(), kTotalConnId};
-    exec_params_or_throw(
+    const char* vals[] = {service_tier.c_str(), db_engine.c_str()};
+    exec_refresh_sql(
         pg,
-        R"(
-        INSERT INTO cdc_catalog.pipeline_health (
-            conn_id, service_tier, db_engine,
-            capture_lag_seconds, capture_status,
-            kafka_lag_total, kafka_partitions_with_lag, max_kafka_lag,
-            max_kafka_lag_schema, max_kafka_lag_table,
-            total_tables, cdc_ready, pending_full_load, failed_tables, success_tables,
-            apply_healthy, apply_lagging, apply_quarantined, max_apply_lag_seconds,
-            last_capture_at, last_apply_at,
-            last_slice_events_seen, last_slice_events_applied,
-            last_slice_errors, last_slice_stop_reason, last_slice_duration_ms,
-            updated_at, updated_by
-        )
-        SELECT
-            $3,
-            $1::cdc_catalog.service_tier,
-            $2::cdc_catalog.db_engine,
-            coalesce(max(ph.capture_lag_seconds), 0),
-            CASE
-                WHEN count(*) FILTER (WHERE ph.capture_status <> 'healthy'::cdc_catalog.cdc_health_status) > 0
-                    THEN 'lagging'::cdc_catalog.cdc_health_status
-                ELSE 'healthy'::cdc_catalog.cdc_health_status
-            END,
-            coalesce(sum(ph.kafka_lag_total), 0),
-            coalesce(sum(ph.kafka_partitions_with_lag), 0),
-            coalesce(max(ph.max_kafka_lag), 0),
-            (
-                SELECT ph2.max_kafka_lag_schema
-                FROM cdc_catalog.pipeline_health ph2
-                WHERE ph2.service_tier = $1::cdc_catalog.service_tier
-                  AND ph2.db_engine = $2::cdc_catalog.db_engine
-                  AND ph2.conn_id <> $3
-                ORDER BY ph2.max_kafka_lag DESC NULLS LAST, ph2.conn_id
-                LIMIT 1
-            ),
-            (
-                SELECT ph2.max_kafka_lag_table
-                FROM cdc_catalog.pipeline_health ph2
-                WHERE ph2.service_tier = $1::cdc_catalog.service_tier
-                  AND ph2.db_engine = $2::cdc_catalog.db_engine
-                  AND ph2.conn_id <> $3
-                ORDER BY ph2.max_kafka_lag DESC NULLS LAST, ph2.conn_id
-                LIMIT 1
-            ),
-            coalesce(sum(ph.total_tables), 0),
-            coalesce(sum(ph.cdc_ready), 0),
-            coalesce(sum(ph.pending_full_load), 0),
-            coalesce(sum(ph.failed_tables), 0),
-            coalesce(sum(ph.success_tables), 0),
-            coalesce(sum(ph.apply_healthy), 0),
-            coalesce(sum(ph.apply_lagging), 0),
-            coalesce(sum(ph.apply_quarantined), 0),
-            coalesce(max(ph.max_apply_lag_seconds), 0),
-            max(ph.last_capture_at),
-            max(ph.last_apply_at),
-            coalesce(sum(ph.last_slice_events_seen), 0),
-            coalesce(sum(ph.last_slice_events_applied), 0),
-            coalesce(sum(ph.last_slice_errors), 0),
-            'aggregate',
-            coalesce(sum(ph.last_slice_duration_ms), 0),
-            now(),
-            'daemon'
-        FROM cdc_catalog.pipeline_health ph
-        WHERE ph.service_tier = $1::cdc_catalog.service_tier
-          AND ph.db_engine = $2::cdc_catalog.db_engine
-          AND ph.conn_id <> $3
-        ON CONFLICT (conn_id, service_tier, db_engine) DO UPDATE SET
-            capture_lag_seconds = EXCLUDED.capture_lag_seconds,
-            capture_status = EXCLUDED.capture_status,
-            kafka_lag_total = EXCLUDED.kafka_lag_total,
-            kafka_partitions_with_lag = EXCLUDED.kafka_partitions_with_lag,
-            max_kafka_lag = EXCLUDED.max_kafka_lag,
-            max_kafka_lag_schema = EXCLUDED.max_kafka_lag_schema,
-            max_kafka_lag_table = EXCLUDED.max_kafka_lag_table,
-            total_tables = EXCLUDED.total_tables,
-            cdc_ready = EXCLUDED.cdc_ready,
-            pending_full_load = EXCLUDED.pending_full_load,
-            failed_tables = EXCLUDED.failed_tables,
-            success_tables = EXCLUDED.success_tables,
-            apply_healthy = EXCLUDED.apply_healthy,
-            apply_lagging = EXCLUDED.apply_lagging,
-            apply_quarantined = EXCLUDED.apply_quarantined,
-            max_apply_lag_seconds = EXCLUDED.max_apply_lag_seconds,
-            last_capture_at = EXCLUDED.last_capture_at,
-            last_apply_at = EXCLUDED.last_apply_at,
-            last_slice_events_seen = EXCLUDED.last_slice_events_seen,
-            last_slice_events_applied = EXCLUDED.last_slice_events_applied,
-            last_slice_errors = EXCLUDED.last_slice_errors,
-            last_slice_stop_reason = EXCLUDED.last_slice_stop_reason,
-            last_slice_duration_ms = EXCLUDED.last_slice_duration_ms,
-            updated_at = EXCLUDED.updated_at,
-            updated_by = EXCLUDED.updated_by
-        )",
-        3,
+        "SELECT cdc_catalog.refresh_pipeline_health_totals($1::cdc_catalog.service_tier, $2::cdc_catalog.db_engine)",
+        2,
         vals);
 }

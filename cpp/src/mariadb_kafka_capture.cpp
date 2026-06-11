@@ -404,7 +404,21 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         const nlohmann::json* row_for_key = (op_char == "d") ? &before : &after;
         const std::string msg_key = kafka_message_key_for_row(
             schema, table, row_for_key, pk_by_table[key]);
-        producer.produce(topic, msg_key, event.to_kafka_dict().dump());
+        try {
+            producer.produce(topic, msg_key, event.to_kafka_dict().dump());
+        } catch (const std::exception& ex) {
+            log_write(log_pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_kafka_capture",
+                .message = "capture row skipped: kafka publish failed",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = schema,
+                .source_table = table,
+                .context = {{"error", ex.what()}, {"topic", topic}},
+            });
+            return;
+        }
         if (!first_kafka_publish_logged) {
             first_kafka_publish_logged = true;
             log_write(log_pg, {

@@ -207,7 +207,7 @@ std::string mariadb_lake_pg_type(const std::string& column_name, const std::stri
 
 std::string sanitize_mariadb_text_for_pg(const std::string& in) {
     if (in.find('\0') == std::string::npos) {
-        return in;
+        return sanitize_utf8_for_json(in);
     }
     std::string out;
     out.reserve(in.size());
@@ -215,6 +215,52 @@ std::string sanitize_mariadb_text_for_pg(const std::string& in) {
         if (c != '\0') {
             out.push_back(c);
         }
+    }
+    return sanitize_utf8_for_json(out);
+}
+
+std::string sanitize_utf8_for_json(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (std::size_t i = 0; i < in.size();) {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        if (c < 0x80) {
+            out.push_back(static_cast<char>(c));
+            ++i;
+            continue;
+        }
+        std::size_t len = 0;
+        if ((c & 0xE0) == 0xC0) {
+            len = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            len = 4;
+        } else {
+            out.push_back('?');
+            ++i;
+            continue;
+        }
+        if (i + len > in.size()) {
+            out.push_back('?');
+            ++i;
+            continue;
+        }
+        bool valid = true;
+        for (std::size_t j = 1; j < len; ++j) {
+            const unsigned char cc = static_cast<unsigned char>(in[i + j]);
+            if ((cc & 0xC0) != 0x80) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            out.push_back('?');
+            ++i;
+            continue;
+        }
+        out.append(in, i, len);
+        i += len;
     }
     return out;
 }

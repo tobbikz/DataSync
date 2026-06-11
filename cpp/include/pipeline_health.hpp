@@ -59,7 +59,15 @@ void update_pipeline_health_capture(
     const std::string& conn_id,
     const std::string& db_engine);
 
-/** Refresh apply/kafka/catalog columns for conn+tier (after apply slice). */
+void refresh_pipeline_health_live(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& service_tier,
+    const std::string& db_engine,
+    int throttle_seconds = 15,
+    bool force = false);
+
+/** Refresh apply/kafka/catalog columns for conn+tier (end-of-slice summary). */
 void update_pipeline_health_apply(
     PGconn* pg,
     const std::string& conn_id,

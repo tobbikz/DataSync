@@ -1694,18 +1694,15 @@ int run_kafka_apply_native_cli(
 
         if (service_tier && !service_tier->empty()) {
             try {
-                const PipelineCatalogCounts catalog_counts =
+                const PipelineCatalogCounts counts =
                     fetch_pipeline_catalog_counts(app_pg.raw, conn_id, *service_tier, db_engine);
                 PipelineKafkaLagSummary kafka_lag;
-#ifdef HAVE_RDKAFKA
-                kafka_lag = compute_pipeline_kafka_lag(app_pg.raw, rk, conn_id, *service_tier, db_engine);
-#endif
                 update_pipeline_health_apply(
                     app_pg.raw,
                     conn_id,
                     *service_tier,
                     db_engine,
-                    catalog_counts,
+                    counts,
                     kafka_lag,
                     PipelineApplySliceStats{
                         .events_seen = events_seen,
@@ -1714,7 +1711,6 @@ int run_kafka_apply_native_cli(
                         .stop_reason = stop_reason,
                         .duration_ms = duration_ms,
                     });
-                refresh_pipeline_health_totals(app_pg.raw, *service_tier, db_engine);
             } catch (const std::exception& ex) {
                 log_write(log_pg, {
                     .level = LogLevel::Warning,

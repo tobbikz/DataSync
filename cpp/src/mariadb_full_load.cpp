@@ -120,11 +120,22 @@ std::string format_cell(const char* data, unsigned long len, const MariaDbColumn
         if (!col.is_nullable || col.is_pk) {
             return csv_escape(mariadb_not_null_copy_default(col));
         }
+        if (col.pg_type == "TIMESTAMPTZ" || col.pg_type == "TIMESTAMP" || col.pg_type == "DATE" ||
+            col.pg_type == "TIME") {
+            return "\\N";
+        }
         return "";
     }
     const std::string s = normalize_text_for_pg(std::string(data, len), col.pg_type);
-    if (s.empty() && (!col.is_nullable || col.is_pk)) {
-        return csv_escape(mariadb_not_null_copy_default(col));
+    if (s.empty()) {
+        if (!col.is_nullable || col.is_pk) {
+            return csv_escape(mariadb_not_null_copy_default(col));
+        }
+        if (col.pg_type == "TIMESTAMPTZ" || col.pg_type == "TIMESTAMP" || col.pg_type == "DATE" ||
+            col.pg_type == "TIME") {
+            return "\\N";
+        }
+        return csv_escape(s);
     }
     return csv_escape(s);
 }

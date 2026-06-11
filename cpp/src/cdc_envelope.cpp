@@ -1,5 +1,7 @@
 #include "cdc_envelope.hpp"
 
+#include "mariadb_schema.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
@@ -96,7 +98,7 @@ nlohmann::json parse_sql_literal(const std::string& raw) {
         if (unescaped.size() == 10 && unescaped[4] == '-' && unescaped[7] == '-') {
             return unescaped;
         }
-        return unescaped;
+        return sanitize_utf8_for_json(unescaped);
     }
     static const std::regex int_re(R"(-?\d+)");
     static const std::regex float_re(R"(-?\d+\.\d+)");
@@ -104,17 +106,17 @@ nlohmann::json parse_sql_literal(const std::string& raw) {
         try {
             return std::stoll(raw);
         } catch (...) {
-            return raw;
+            return sanitize_utf8_for_json(raw);
         }
     }
     if (std::regex_match(raw, float_re)) {
         try {
             return std::stod(raw);
         } catch (...) {
-            return raw;
+            return sanitize_utf8_for_json(raw);
         }
     }
-    return raw;
+    return sanitize_utf8_for_json(raw);
 }
 
 nlohmann::json row_dict_from_columns(
