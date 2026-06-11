@@ -29,6 +29,21 @@
 
 namespace {
 
+struct InvalidPkSkipStats {
+    long long count{0};
+    nlohmann::json samples{nlohmann::json::array()};
+
+    void merge(const InvalidPkSkipStats& other) {
+        count += other.count;
+        for (const auto& sample : other.samples) {
+            if (samples.size() >= 5) {
+                break;
+            }
+            samples.push_back(sample);
+        }
+    }
+};
+
 struct CatalogTableRow {
     long long catalog_id{0};
     std::string conn_id;
@@ -78,6 +93,33 @@ long long elapsed_ms(const std::chrono::steady_clock::time_point& start) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - start)
         .count();
+}
+
+std::string format_pk_row_sample(
+    MYSQL_ROW row,
+    const std::vector<std::string>& pk_cols,
+    const std::vector<std::size_t>& pk_indices) {
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+        if (i) {
+            oss << ", ";
+        }
+        const std::size_t idx = pk_indices[i];
+        oss << pk_cols[i] << '=';
+        if (!row[idx]) {
+            oss << "NULL";
+        } else {
+            oss << row[idx];
+        }
+    }
+    return oss.str();
+}
+
+void advance_keyset_pk_values(MYSQL_ROW row, const std::vector<std::size_t>& pk_indices, std::vector<std::string>& out) {
+    out.clear();
+    for (const std::size_t idx : pk_indices) {
+        out.push_back(row[idx] ? row[idx] : "");
+    }
 }
 
 std::string csv_escape(const std::string& value) {
@@ -241,7 +283,8 @@ long long copy_rows_keyset(
     int source_sleep_ms,
     const std::string& snapshot_id,
     const MariaDbRetryOptions& retry,
-    const PkRange& pk_range = {}) {
+    const PkRange& pk_range = {},
+    InvalidPkSkipStats* skip_stats = nullptr) {
     const std::string load_ts = utc_now_ts();
     const std::string load_date = utc_now_date();
 
@@ -319,24 +362,32 @@ long long copy_rows_keyset(
         while ((row = mysql_fetch_row(res)) != nullptr) {
             unsigned long* lens = mysql_fetch_lengths(res);
             std::ostringstream line;
+            bool row_ok = true;
             for (std::size_t i = 0; i < cols.size(); ++i) {
                 if (i) {
                     line << ',';
                 }
                 std::string cell;
                 if (!mariadb_format_copy_cell(row[i], lens ? lens[i] : 0, cols[i], cell)) {
-                    mysql_free_result(res);
-                    throw std::runtime_error("NULL primary key in source row");
+                    row_ok = false;
+                    break;
                 }
                 line << cell;
+            }
+            if (!row_ok) {
+                if (skip_stats) {
+                    skip_stats->count += 1;
+                    if (skip_stats->samples.size() < 5) {
+                        skip_stats->samples.push_back(format_pk_row_sample(row, pk_cols, pk_indices));
+                    }
+                }
+                advance_keyset_pk_values(row, pk_indices, last_pk_values);
+                continue;
             }
             line << ',' << csv_escape(load_ts) << ',' << csv_escape(load_date) << ",MariaDB,"
                  << csv_escape(snapshot_id);
             batch_lines.push_back(line.str());
-            last_pk_values.clear();
-            for (std::size_t idx : pk_indices) {
-                last_pk_values.push_back(row[idx] ? row[idx] : "");
-            }
+            advance_keyset_pk_values(row, pk_indices, last_pk_values);
         }
         mysql_free_result(res);
 
@@ -383,6 +434,12 @@ long long copy_rows_keyset(
         }
     }
 
+    if (total_rows == 0 && skip_stats && skip_stats->count > 0) {
+        throw std::runtime_error(
+            "full load: all scanned rows skipped due to invalid primary key (count=" +
+            std::to_string(skip_stats->count) + ")");
+    }
+
     return total_rows;
 }
 
@@ -400,10 +457,11 @@ long long copy_rows_parallel(
     int source_sleep_ms,
     int workers,
     const std::string& snapshot_id,
-    const MariaDbRetryOptions& retry) {
+    const MariaDbRetryOptions& retry,
+    InvalidPkSkipStats* skip_stats = nullptr) {
     if (workers <= 1) {
         return copy_rows_keyset(
-            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {});
+            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {}, skip_stats);
     }
 
     if (pk_cols.size() != 1) {
@@ -418,7 +476,7 @@ long long copy_rows_parallel(
             target.source_schema,
             target.source_table);
         return copy_rows_keyset(
-            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {});
+            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {}, skip_stats);
     }
 
     const MariaDbColumn* pk_col_def = nullptr;
@@ -440,7 +498,7 @@ long long copy_rows_parallel(
             target.source_schema,
             target.source_table);
         return copy_rows_keyset(
-            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {});
+            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {}, skip_stats);
     }
 
     const auto bounds = fetch_integer_pk_range(conn, target, pk_cols[0], retry);
@@ -474,7 +532,8 @@ long long copy_rows_parallel(
             source_sleep_ms,
             snapshot_id,
             retry,
-            pk_range_for_keyset(*bounds));
+            pk_range_for_keyset(*bounds),
+            skip_stats);
     }
 
     if (min_v >= max_v) {
@@ -488,7 +547,8 @@ long long copy_rows_parallel(
             source_sleep_ms,
             snapshot_id,
             retry,
-            pk_range_for_keyset(*bounds));
+            pk_range_for_keyset(*bounds),
+            skip_stats);
     }
 
     const long long total = max_v - min_v + 1;
@@ -506,6 +566,7 @@ long long copy_rows_parallel(
         target.source_table);
 
     std::vector<long long> row_counts(static_cast<std::size_t>(workers), 0);
+    std::vector<InvalidPkSkipStats> worker_skips(static_cast<std::size_t>(workers));
     std::vector<std::exception_ptr> errors(static_cast<std::size_t>(workers));
     std::vector<std::thread> threads;
     threads.reserve(static_cast<std::size_t>(workers));
@@ -534,7 +595,8 @@ long long copy_rows_parallel(
                     source_sleep_ms,
                     snapshot_id,
                     retry,
-                    slice);
+                    slice,
+                    &worker_skips[static_cast<std::size_t>(w)]);
             } catch (...) {
                 errors[static_cast<std::size_t>(w)] = std::current_exception();
             }
@@ -554,6 +616,11 @@ long long copy_rows_parallel(
     long long total_rows = 0;
     for (long long n : row_counts) {
         total_rows += n;
+    }
+    if (skip_stats) {
+        for (const auto& worker_skip : worker_skips) {
+            skip_stats->merge(worker_skip);
+        }
     }
     return total_rows;
 }
@@ -829,6 +896,7 @@ TableLoadOutcome load_one_table(
         target.source_table);
 
     const MariaDbRetryOptions retry = mariadb_retry_options(runtime, target.conn_id);
+    InvalidPkSkipStats skip_stats;
     rows_out = copy_rows_parallel(
         cfg,
         source,
@@ -843,7 +911,21 @@ TableLoadOutcome load_one_table(
         source_sleep_ms,
         workers,
         batch_id,
-        retry);
+        retry,
+        &skip_stats);
+
+    if (skip_stats.count > 0) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Warning,
+            batch_id,
+            "full load skipped rows with invalid primary key",
+            {{"rows_skipped", skip_stats.count}, {"pk_samples", skip_stats.samples}},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
+    }
 
     mark_catalog_success(app_pg.raw, target.catalog_id);
 
