@@ -721,6 +721,61 @@ long long events_per_minute(long long events_total, long long duration_ms) {
     return (events_total * 60'000LL) / ms;
 }
 
+json trim_sample_json_value(const json& value, std::size_t max_len) {
+    if (value.is_string()) {
+        std::string text = sanitize_utf8_for_json(value.get<std::string>());
+        if (text.size() > max_len) {
+            text.resize(max_len);
+            text += "…";
+        }
+        return text;
+    }
+    if (value.is_number_integer()) {
+        return value.get<long long>();
+    }
+    if (value.is_number_unsigned()) {
+        return value.get<unsigned long long>();
+    }
+    if (value.is_number_float()) {
+        return value.get<double>();
+    }
+    if (value.is_boolean()) {
+        return value.get<bool>();
+    }
+    if (value.is_null()) {
+        return nullptr;
+    }
+    return json("…");
+}
+
+json build_apply_row_sample(
+    const std::vector<ApplyEvent>& events,
+    int max_rows = 2,
+    int max_keys = 4,
+    std::size_t max_val_len = 48) {
+    json sample = json::array();
+    if (events.empty() || max_rows <= 0) {
+        return sample;
+    }
+    const int start = std::max(0, static_cast<int>(events.size()) - max_rows);
+    for (int i = start; i < static_cast<int>(events.size()); ++i) {
+        const ApplyEvent& event = events[static_cast<std::size_t>(i)];
+        json row_snippet = json::object();
+        if (event.row.is_object()) {
+            int keys = 0;
+            for (auto it = event.row.begin(); it != event.row.end() && keys < max_keys; ++it, ++keys) {
+                row_snippet[it.key()] = trim_sample_json_value(*it, max_val_len);
+            }
+            if (event.row.size() > static_cast<std::size_t>(max_keys)) {
+                row_snippet["_more_keys"] =
+                    static_cast<int>(event.row.size()) - max_keys;
+            }
+        }
+        sample.push_back({{"op", event.op}, {"row", row_snippet}});
+    }
+    return sample;
+}
+
 void insert_apply_batch_stats(
     PGconn* pg,
     const std::string& batch_id,
@@ -738,7 +793,8 @@ void insert_apply_batch_stats(
     bool is_starving,
     bool is_inactive,
     int events_seen_in_slice,
-    const BatchStatsMetrics& metrics) {
+    const BatchStatsMetrics& metrics,
+    const json& context = json::object()) {
     const long long total = counts.inserts + counts.updates + counts.deletes;
     const long long epm = events_per_minute(total, duration_ms);
     const std::string cid = catalog_id > 0 ? std::to_string(catalog_id) : "";
@@ -780,6 +836,7 @@ void insert_apply_batch_stats(
         host.host_net_tx_mb >= 0 ? std::to_string(host.host_net_tx_mb) : "";
     const std::string rss_mb =
         host.process_rss_mb >= 0 ? std::to_string(host.process_rss_mb) : "";
+    const std::string ctx_json = context.is_null() ? "{}" : context.dump();
     const char* vals[] = {
         batch_id.c_str(),
         conn_id.c_str(),
@@ -817,7 +874,8 @@ void insert_apply_batch_stats(
         mem_pct.empty() ? nullptr : mem_pct.c_str(),
         net_rx.empty() ? nullptr : net_rx.c_str(),
         net_tx.empty() ? nullptr : net_tx.c_str(),
-        rss_mb.empty() ? nullptr : rss_mb.c_str()};
+        rss_mb.empty() ? nullptr : rss_mb.c_str(),
+        ctx_json.c_str()};
     pg_exec_params_simple(
         pg,
         R"(
@@ -831,7 +889,8 @@ void insert_apply_batch_stats(
             capture_lag_seconds, kafka_consumer_lag, reconcile_row_delta,
             catchup_triggered, fk_deferred_retries, dedup_skipped,
             host_cpu_percent, host_mem_used_mb, host_mem_percent,
-            host_net_rx_mb, host_net_tx_mb, process_rss_mb
+            host_net_rx_mb, host_net_tx_mb, process_rss_mb,
+            context
         ) VALUES (
             $1, $2, NULLIF($3, '')::bigint, $4, $5, $6,
             $7::bigint, $8::bigint, $9::bigint, $10::bigint,
@@ -841,10 +900,11 @@ void insert_apply_batch_stats(
             $26::integer, $27::bigint, $28::bigint,
             $29::boolean, $30::integer, $31::integer,
             NULLIF($32, '')::double precision, NULLIF($33, '')::bigint, NULLIF($34, '')::integer,
-            NULLIF($35, '')::bigint, NULLIF($36, '')::bigint, NULLIF($37, '')::bigint
+            NULLIF($35, '')::bigint, NULLIF($36, '')::bigint, NULLIF($37, '')::bigint,
+            $38::jsonb
         )
         )",
-        37,
+        38,
         vals);
 
     if (!service_tier.empty()) {
@@ -1355,6 +1415,11 @@ json apply_events_batch(
                     meta.catalog_id,
                     options.apply_staleness_seconds,
                     options.apply_inactive_seconds);
+                const json batch_context = {
+                    {"sample", build_apply_row_sample(audit)},
+                    {"lake_target",
+                     {{"schema", meta.schema_name}, {"table", meta.table_name}}},
+                };
                 insert_apply_batch_stats(
                     app_pg,
                     batch_id,
@@ -1372,7 +1437,8 @@ json apply_events_batch(
                     is_starving,
                     false,
                     events_seen_in_slice,
-                    metrics);
+                    metrics,
+                    batch_context);
                 log_write(app_pg, {
                     .level = LogLevel::Info,
                     .component = "cdc_kafka_apply_cpp",
