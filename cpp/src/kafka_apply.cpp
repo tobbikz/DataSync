@@ -250,6 +250,15 @@ bool is_numeric_pg_type(const std::string& pg_type) {
            pg_type == "REAL" || pg_type == "float8" || pg_type == "float4";
 }
 
+bool is_bytea_pg_type(const std::string& pg_type) {
+    if (pg_type.empty()) {
+        return false;
+    }
+    std::string upper = pg_type;
+    std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return std::toupper(c); });
+    return upper == "BYTEA";
+}
+
 /** e.g. "-1 (4294967295)" from unsigned/signed display → "4294967295". */
 std::string sanitize_numeric_string_for_pg(const std::string& s) {
     if (s.empty()) {
@@ -334,7 +343,7 @@ std::string json_cell_csv(const json& val_in, const std::string& pg_type = "", b
     if (val.is_number_float()) {
         return std::to_string(val.get<double>());
     }
-    if (pg_type == "BYTEA") {
+    if (is_bytea_pg_type(pg_type)) {
         if (val.is_string()) {
             return mariadb_bytea_to_copy_csv(val.get<std::string>());
         }
@@ -390,7 +399,7 @@ std::string json_cell_sql(const json& val_in, const std::string& pg_type = "") {
     if (val.is_number_float()) {
         return std::to_string(val.get<double>());
     }
-    if (pg_type == "BYTEA") {
+    if (is_bytea_pg_type(pg_type)) {
         if (val.is_string()) {
             return mariadb_bytea_to_sql_literal(val.get<std::string>());
         }
@@ -520,6 +529,8 @@ std::map<std::string, std::string> fetch_lake_col_types(
             pg_type = "TIMESTAMP";
         } else if (udt && std::string(udt) == "date") {
             pg_type = "DATE";
+        } else if (udt && std::string(udt) == "bytea") {
+            pg_type = "BYTEA";
         } else {
             pg_type = udt ? udt : "";
         }
@@ -1419,6 +1430,9 @@ json apply_events_batch(
                     {"deletes", static_cast<int>(deletes.size())},
                 },
             });
+            if (meta.catalog_id > 0) {
+                mark_catalog_cdc_failed(app_pg, meta.catalog_id, ex.what());
+            }
             continue;
         }
 
@@ -1542,9 +1556,6 @@ json apply_events_batch(
                 });
                 kafka_offset_out = {last.topic + ":" + std::to_string(last.partition), last.offset};
             }
-            if (meta.catalog_id > 0) {
-                mark_catalog_cdc_success(app_pg, meta.catalog_id);
-            }
             pg_exec(lake_pg, "RELEASE SAVEPOINT sp_lake_apply");
             PGresult* lake_commit = PQexec(lake_pg, "COMMIT");
             const bool lake_commit_ok =
@@ -1578,6 +1589,9 @@ json apply_events_batch(
                         {"audit_events", static_cast<int>(audit.size())},
                     },
                 });
+                if (meta.catalog_id > 0) {
+                    mark_catalog_cdc_failed(app_pg, meta.catalog_id, lake_err);
+                }
                 continue;
             }
             PQclear(lake_commit);
@@ -1611,9 +1625,15 @@ json apply_events_batch(
                         {"audit_events", static_cast<int>(audit.size())},
                     },
                 });
+                if (meta.catalog_id > 0) {
+                    mark_catalog_cdc_failed(app_pg, meta.catalog_id, app_err);
+                }
                 continue;
             }
             PQclear(app_commit);
+            if (meta.catalog_id > 0) {
+                mark_catalog_cdc_success(app_pg, meta.catalog_id);
+            }
             applied += table_applied;
             if (kafka_offset_out) {
                 offsets[kafka_offset_out->first] = kafka_offset_out->second;
@@ -1644,6 +1664,9 @@ json apply_events_batch(
                     {"audit_events", static_cast<int>(audit.size())},
                 },
             });
+            if (meta.catalog_id > 0) {
+                mark_catalog_cdc_failed(app_pg, meta.catalog_id, ex.what());
+            }
             continue;
         }
     }

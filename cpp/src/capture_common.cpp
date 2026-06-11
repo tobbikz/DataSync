@@ -982,6 +982,24 @@ void mark_catalog_cdc_success(PGconn* pg, long long catalog_id) {
         vals);
 }
 
+void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string& error) {
+    const std::string id = std::to_string(catalog_id);
+    const std::string trunc = error.substr(0, 1000);
+    const char* vals[] = {id.c_str(), trunc.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET status = 'failed',
+            last_error = $2,
+            last_error_at = now(),
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+        )",
+        2,
+        vals);
+}
+
 void clear_stale_full_load_in_progress(PGconn* pg, const std::string& conn_id, const std::string& db_engine) {
     const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
     pg_exec_params_simple(
