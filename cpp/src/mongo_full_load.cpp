@@ -264,25 +264,37 @@ long long copy_collection_batches(
     PGconn* pg,
     const std::string& pg_schema,
     const std::string& pg_table,
-    const std::vector<std::string>& all_cols,
+    std::vector<std::string>& all_cols,
+    std::map<std::string, std::string>& pg_cols,
     std::size_t batch_size,
     int source_sleep_ms,
     const std::string& snapshot_id) {
     const std::string load_ts = utc_now_ts();
     const std::string load_date = utc_now_date();
 
-    std::ostringstream copy_cols;
-    for (const auto& c : all_cols) {
-        copy_cols << pg_ident(c) << ", ";
-    }
-    copy_cols << pg_ident("_dl_load_timestamp") << ", " << pg_ident("_dl_load_date") << ", "
-              << pg_ident("_dl_source_system") << ", " << pg_ident("_dl_snapshot_id");
+    auto rebuild_copy_sql = [&]() {
+        std::ostringstream copy_cols;
+        for (const auto& c : all_cols) {
+            copy_cols << pg_ident(c) << ", ";
+        }
+        copy_cols << pg_ident("_dl_load_timestamp") << ", " << pg_ident("_dl_load_date") << ", "
+                  << pg_ident("_dl_source_system") << ", " << pg_ident("_dl_snapshot_id");
+        const std::string fq = pg_ident(pg_schema) + "." + pg_ident(pg_table);
+        return std::string("COPY ") + fq + " (" + copy_cols.str() + ") FROM STDIN WITH (FORMAT csv)";
+    };
 
-    const std::string fq = pg_ident(pg_schema) + "." + pg_ident(pg_table);
-    const std::string copy_sql = "COPY " + fq + " (" + copy_cols.str() + ") FROM STDIN WITH (FORMAT csv)";
+    std::string copy_sql = rebuild_copy_sql();
 
     long long total_rows = 0;
     bson_value_t* last_id_value = nullptr;
+
+    auto cleanup_last_id = [&]() {
+        if (last_id_value) {
+            bson_value_destroy(last_id_value);
+            delete last_id_value;
+            last_id_value = nullptr;
+        }
+    };
 
     while (true) {
         bson_t query = BSON_INITIALIZER;
@@ -305,6 +317,7 @@ long long copy_collection_batches(
         bson_destroy(&opts);
 
         std::vector<std::string> batch_lines;
+        std::vector<std::map<std::string, nlohmann::json>> batch_flats;
         const bson_t* doc = nullptr;
         while (mongoc_cursor_next(cursor, &doc)) {
             bson_iter_t iter;
@@ -318,7 +331,48 @@ long long copy_collection_batches(
             }
 
             const auto j = bson_to_json(doc);
-            const auto flat = flatten_mongo_document(j);
+            batch_flats.push_back(flatten_mongo_document(j));
+        }
+        mongoc_cursor_destroy(cursor);
+
+        if (batch_flats.empty()) {
+            break;
+        }
+
+        const auto batch_schema = infer_schema_from_flat_rows(batch_flats, batch_flats.size());
+        bool schema_changed = false;
+        for (const auto& [name, pg_type] : batch_schema) {
+            if (name == "mongo_id") {
+                continue;
+            }
+            const auto it = pg_cols.find(name);
+            if (it == pg_cols.end()) {
+                pg_cols[name] = pg_type;
+                schema_changed = true;
+            } else {
+                std::set<std::string> type_set;
+                type_set.insert(it->second);
+                type_set.insert(pg_type);
+                const std::string merged = resolve_pg_type_from_type_set(type_set);
+                if (merged != it->second) {
+                    it->second = merged;
+                    schema_changed = true;
+                }
+            }
+        }
+        if (schema_changed) {
+            sync_missing_mongo_columns(pg, pg_schema, pg_table, pg_cols);
+            sync_mongo_column_types(pg, pg_schema, pg_table, pg_cols);
+            all_cols = {"mongo_id"};
+            for (const auto& [name, _] : pg_cols) {
+                if (name != "mongo_id") {
+                    all_cols.push_back(name);
+                }
+            }
+            copy_sql = rebuild_copy_sql();
+        }
+
+        for (const auto& flat : batch_flats) {
             std::ostringstream line;
             for (std::size_t i = 0; i < all_cols.size(); ++i) {
                 if (i) {
@@ -332,11 +386,6 @@ long long copy_collection_batches(
             line << ',' << csv_escape(load_ts) << ',' << csv_escape(load_date) << ",MongoDB," << csv_escape(snapshot_id);
             batch_lines.push_back(line.str());
         }
-        mongoc_cursor_destroy(cursor);
-
-        if (batch_lines.empty()) {
-            break;
-        }
 
         PGresult* copy_res = PQexec(pg, copy_sql.c_str());
         if (!copy_res || PQresultStatus(copy_res) != PGRES_COPY_IN) {
@@ -344,51 +393,36 @@ long long copy_collection_batches(
             if (copy_res) {
                 PQclear(copy_res);
             }
-            if (last_id_value) {
-                bson_value_destroy(last_id_value);
-                delete last_id_value;
-                last_id_value = nullptr;
-            }
+            cleanup_last_id();
             throw std::runtime_error("COPY start failed: " + err);
         }
         PQclear(copy_res);
 
         for (const auto& line : batch_lines) {
             if (PQputCopyData(pg, line.c_str(), static_cast<int>(line.size())) != 1) {
-                if (last_id_value) {
-                    bson_value_destroy(last_id_value);
-                    delete last_id_value;
-                    last_id_value = nullptr;
-                }
+                cleanup_last_id();
                 throw std::runtime_error(std::string("COPY data failed: ") + PQerrorMessage(pg));
             }
             if (PQputCopyData(pg, "\n", 1) != 1) {
-                if (last_id_value) {
-                    bson_value_destroy(last_id_value);
-                    delete last_id_value;
-                    last_id_value = nullptr;
-                }
+                cleanup_last_id();
                 throw std::runtime_error(std::string("COPY newline failed: ") + PQerrorMessage(pg));
             }
         }
         if (PQputCopyEnd(pg, nullptr) != 1) {
-            if (last_id_value) {
-                bson_value_destroy(last_id_value);
-            }
+            cleanup_last_id();
             throw std::runtime_error(std::string("COPY end failed: ") + PQerrorMessage(pg));
         }
         PGresult* end_res = PQgetResult(pg);
-        if (!end_res || PQresultStatus(end_res) != PGRES_COMMAND_OK) {
-            const std::string err = PQerrorMessage(pg);
-            if (end_res) {
+        while (end_res) {
+            if (PQresultStatus(end_res) != PGRES_COMMAND_OK) {
+                const std::string err = PQerrorMessage(pg);
                 PQclear(end_res);
+                cleanup_last_id();
+                throw std::runtime_error("COPY commit failed: " + err);
             }
-            if (last_id_value) {
-                bson_value_destroy(last_id_value);
-            }
-            throw std::runtime_error("COPY commit failed: " + err);
+            PQclear(end_res);
+            end_res = PQgetResult(pg);
         }
-        PQclear(end_res);
 
         total_rows += static_cast<long long>(batch_lines.size());
         if (batch_lines.size() < batch_size) {
@@ -399,10 +433,7 @@ long long copy_collection_batches(
         }
     }
 
-    if (last_id_value) {
-        bson_value_destroy(last_id_value);
-        delete last_id_value;
-    }
+    cleanup_last_id();
     return total_rows;
 }
 
@@ -482,7 +513,7 @@ bool load_one_collection(
 
     mongoc_collection_t* coll = mongo.collection(target.source_database, target.source_table);
     const auto sample = sample_flattened_mongo_docs(coll, 1000);
-    const auto pg_cols = infer_schema_from_flat_rows(sample);
+    auto pg_cols = infer_schema_from_flat_rows(sample);
 
     const std::string pg_schema = mongo_pg_schema_name(target.source_database);
     const std::string pg_table = mongo_pg_table_name(target.source_table);
@@ -532,6 +563,7 @@ bool load_one_collection(
         pg_schema,
         pg_table,
         all_cols,
+        pg_cols,
         batch_size,
         source_sleep_ms,
         batch_id);
@@ -660,10 +692,8 @@ FullLoadRunStats run_mongo_full_load(
             for (const auto& e : preflight.errors) {
                 err_ctx.push_back(e);
             }
-            for (const auto& t : conn_targets) {
-                stats.tables_processed += 1;
-                stats.tables_failed += 1;
-            }
+            stats.tables_processed += static_cast<int>(conn_targets.size());
+            stats.tables_failed += static_cast<int>(conn_targets.size());
             log_fl(
                 log_pg,
                 nullptr,

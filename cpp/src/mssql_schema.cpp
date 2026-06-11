@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <stdexcept>
 
 namespace {
 
@@ -64,8 +65,8 @@ std::string mssql_to_pg_type(const std::string& data_type, int max_length, int p
     if (base == "real") {
         return "REAL";
     }
-    if (base == "datetime" || base == "datetime2") {
-        return "TIMESTAMP";
+    if (base == "datetime" || base == "datetime2" || base == "smalldatetime") {
+        return "TIMESTAMPTZ";
     }
     if (base == "date") {
         return "DATE";
@@ -130,12 +131,7 @@ std::vector<MssqlColumn> fetch_mssql_columns(
            "WHERE s.name = " << sql_escape_literal(schema) << " AND tb.name = " << sql_escape_literal(table)
         << " ORDER BY c.column_id";
 
-    if (dbfcmd(db, "%s", sql.str().c_str()) == FAIL) {
-        throw std::runtime_error("MSSQL column query dbcmd failed: " + format_dberror(db));
-    }
-    if (dbsqlexec(db) == FAIL) {
-        throw std::runtime_error("MSSQL column query exec failed: " + format_dberror(db));
-    }
+    run_dbsql(db, sql.str());
 
     std::vector<MssqlColumn> cols;
     if (dbresults(db) == FAIL) {
@@ -254,9 +250,9 @@ void ensure_mssql_lake_table_base(
 
     const auto expected_pk = expected_mssql_lake_pk(source_pk_cols);
     if (pg_lake_table_exists(pg, pg_schema, pg_table) && !lake_pk_matches(pg, pg_schema, pg_table, expected_pk)) {
-        pg_exec(
-            pg,
-            "DROP TABLE IF EXISTS " + pg_ident(pg_schema) + "." + pg_ident(pg_table) + " CASCADE");
+        throw std::runtime_error(
+            "lake primary key mismatch for " + pg_schema + "." + pg_table +
+            " — manual intervention required (DROP not allowed)");
     }
 
     std::vector<std::string> pk_set(source_pk_cols.begin(), source_pk_cols.end());

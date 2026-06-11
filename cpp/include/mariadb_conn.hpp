@@ -23,10 +23,10 @@ struct MariaDbConn {
     MariaDbConn& operator=(const MariaDbConn&) = delete;
 
     void reconnect();
-    const MariaDbSource& source() const { return *source_; }
+    const MariaDbSource& source() const { return source_; }
 
 private:
-    const MariaDbSource* source_{nullptr};
+    MariaDbSource source_;
 
     static MYSQL* open_handle(const MariaDbSource& src);
 };

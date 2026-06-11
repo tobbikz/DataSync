@@ -184,6 +184,10 @@ std::string normalize_text_for_pg(const std::string& s, const std::string& pg_ty
     }
     if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP") {
         std::string t = looks_like_mssql_datetime(s) ? mssql_datetime_to_iso(s) : fix_date_separators(s);
+        // SQL Server CONVERT(..., 127): yyyy-mm-ddThh:mi:ss[.frac]
+        if (t.size() >= 11 && t[4] == '-' && t[7] == '-' && t[10] == 'T') {
+            t[10] = ' ';
+        }
         if (is_invalid_sql_datetime(t)) {
             return {};
         }

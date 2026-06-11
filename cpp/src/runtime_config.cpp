@@ -2,6 +2,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <limits>
+#include <mutex>
+
 namespace {
 
 std::string json_scalar_to_string(const std::string& raw) {
@@ -31,8 +34,10 @@ std::string RuntimeConfig::make_lookup_key(
 }
 
 void RuntimeConfig::reload(PGconn* pg) {
-    values_.clear();
+    std::unordered_map<std::string, std::string> next;
     if (!pg || PQstatus(pg) != CONNECTION_OK) {
+        std::unique_lock lock(mutex_);
+        values_.clear();
         return;
     }
 
@@ -47,18 +52,22 @@ void RuntimeConfig::reload(PGconn* pg) {
     }
 
     for (int i = 0; i < PQntuples(res); ++i) {
-        values_[make_lookup_key(
+        next[make_lookup_key(
             PQgetvalue(res, i, 0),
             PQgetvalue(res, i, 1),
             PQgetvalue(res, i, 2))] = json_scalar_to_string(PQgetvalue(res, i, 3));
     }
     PQclear(res);
+
+    std::unique_lock lock(mutex_);
+    values_ = std::move(next);
 }
 
 const std::string* RuntimeConfig::find_raw(
     const std::string& key,
     const std::string& component,
     const std::string& conn_id) const {
+    std::shared_lock lock(mutex_);
     if (auto it = values_.find(make_lookup_key(key, component, conn_id)); it != values_.end()) {
         return &it->second;
     }
@@ -96,8 +105,19 @@ std::size_t RuntimeConfig::get_size_t(
     std::size_t default_value,
     const std::string& component,
     const std::string& conn_id) const {
-    const int v = get_int(key, static_cast<int>(default_value), component, conn_id);
-    return v < 0 ? default_value : static_cast<std::size_t>(v);
+    const std::string* raw = find_raw(key, component, conn_id);
+    if (!raw) {
+        return default_value;
+    }
+    try {
+        const unsigned long long parsed = std::stoull(*raw);
+        if (parsed > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max())) {
+            return default_value;
+        }
+        return static_cast<std::size_t>(parsed);
+    } catch (...) {
+        return default_value;
+    }
 }
 
 bool RuntimeConfig::get_bool(

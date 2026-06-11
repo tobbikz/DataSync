@@ -9,13 +9,17 @@
 struct FullLoadRunStats {
     int tables_processed{0};
     int tables_success{0};
+    int tables_skipped{0};
     int tables_failed{0};
     long long total_rows{0};
 };
 
-/** Exit 0 when at least one table loaded or nothing to do; 1 only when every table failed. */
+/** Exit 0 when nothing failed, or at least one table succeeded; 1 only when every processed table failed. */
 inline int full_load_process_exit_code(const FullLoadRunStats& stats) {
     if (stats.tables_processed == 0) {
+        return 0;
+    }
+    if (stats.tables_failed == 0) {
         return 0;
     }
     return stats.tables_success > 0 ? 0 : 1;

@@ -41,6 +41,9 @@ struct MssqlConn {
     MssqlQueryResult query(const std::string& sql);
 };
 
+/** Execute literal SQL via dbcmd + dbsqlexec (safe when SQL contains '%'). */
+bool run_dbsql(DBPROCESS* db, const std::string& sql);
+
 /** Make FreeTDS/MSSQL text safe for PostgreSQL UTF-8 COPY (Latin-1 uplift + valid UTF-8 pass-through). */
 std::string sanitize_mssql_text_for_pg(const std::string& value);
 

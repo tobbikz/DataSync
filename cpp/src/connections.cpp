@@ -1,10 +1,16 @@
 #include "connections.hpp"
+#include "obs_log.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <cstdlib>
 
 namespace {
+
+std::mutex& connections_mutex_instance() {
+    static std::mutex mutex;
+    return mutex;
+}
 
 std::uint16_t parse_port(const char* text, std::uint16_t fallback) {
     if (!text || !*text) {
@@ -83,9 +89,13 @@ MongoSource row_to_mongo(PGresult* res, int row) {
 
 }  // namespace
 
-int reload_connections(PGconn* pg, AppConfig& cfg) {
+std::mutex& app_config_mutex() {
+    return connections_mutex_instance();
+}
+
+int reload_connections_nolock(PGconn* pg, AppConfig& cfg) {
     if (!pg || PQstatus(pg) != CONNECTION_OK) {
-        return 0;
+        return -1;
     }
 
     static const char* kSql = R"(
@@ -97,16 +107,33 @@ int reload_connections(PGconn* pg, AppConfig& cfg) {
 
     PGresult* res = PQexec(pg, kSql);
     if (!res) {
-        return 0;
+        log_write(pg, {
+            .level = LogLevel::Warning,
+            .component = "catalog",
+            .message = "reload_connections query failed",
+            .context = {{"error", "PQexec returned null"}},
+        });
+        return -1;
     }
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        const char* err = PQresultErrorMessage(res);
+        log_write(pg, {
+            .level = LogLevel::Warning,
+            .component = "catalog",
+            .message = "reload_connections query failed",
+            .context = {{"sqlstate", PQresultErrorField(res, PG_DIAG_SQLSTATE) ? PQresultErrorField(res, PG_DIAG_SQLSTATE) : ""},
+                        {"error", err ? err : ""}},
+        });
         PQclear(res);
-        return 0;
+        return -1;
     }
 
     const int rows = PQntuples(res);
     if (rows == 0) {
         PQclear(res);
+        cfg.mariadb_sources.clear();
+        cfg.mssql_sources.clear();
+        cfg.mongo_sources.clear();
         return 0;
     }
 
@@ -136,5 +163,10 @@ int reload_connections(PGconn* pg, AppConfig& cfg) {
     cfg.mariadb_sources = std::move(mariadb);
     cfg.mssql_sources = std::move(mssql);
     cfg.mongo_sources = std::move(mongo);
-    return rows;
+    return static_cast<int>(cfg.mariadb_sources.size() + cfg.mssql_sources.size() + cfg.mongo_sources.size());
+}
+
+int reload_connections(PGconn* pg, AppConfig& cfg) {
+    std::lock_guard<std::mutex> lock(app_config_mutex());
+    return reload_connections_nolock(pg, cfg);
 }

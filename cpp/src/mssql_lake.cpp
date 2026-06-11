@@ -1,6 +1,8 @@
 #include "mssql_lake.hpp"
 
 #include <cctype>
+#include <functional>
+#include <set>
 
 namespace {
 
@@ -12,9 +14,30 @@ bool is_ident_char(char c) {
     return is_ident_start(c) || std::isdigit(static_cast<unsigned char>(c));
 }
 
+std::string disambiguate_seen(std::string base, const std::string& raw_name, std::set<std::string>& seen, std::size_t max_len) {
+    if (!seen.count(base)) {
+        seen.insert(base);
+        return base;
+    }
+    const auto hash_suffix = [&](const std::string& seed) {
+        const auto h = std::hash<std::string>{}(seed);
+        return std::string("_") + std::to_string(h % 1000000ULL);
+    };
+    std::string suffix = hash_suffix(raw_name);
+    std::size_t keep = max_len > suffix.size() ? max_len - suffix.size() : 0;
+    std::string candidate = base.substr(0, std::min(base.size(), keep)) + suffix;
+    while (seen.count(candidate)) {
+        suffix = hash_suffix(raw_name + suffix);
+        keep = max_len > suffix.size() ? max_len - suffix.size() : 0;
+        candidate = base.substr(0, std::min(base.size(), keep)) + suffix;
+    }
+    seen.insert(candidate);
+    return candidate;
+}
+
 }  // namespace
 
-std::string sanitize_pg_identifier_part(const std::string& name, std::size_t max_len) {
+std::string sanitize_pg_identifier_part(const std::string& name, std::size_t max_len, std::set<std::string>* seen) {
     std::string out;
     out.reserve(name.size());
     for (char c : name) {
@@ -35,6 +58,9 @@ std::string sanitize_pg_identifier_part(const std::string& name, std::size_t max
     }
     if (out.size() > max_len) {
         out.resize(max_len);
+    }
+    if (seen) {
+        return disambiguate_seen(std::move(out), name, *seen, max_len);
     }
     return out;
 }

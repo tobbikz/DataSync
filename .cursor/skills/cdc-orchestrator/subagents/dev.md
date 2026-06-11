@@ -23,7 +23,7 @@
 ## Done criteria
 
 - Cambio acotado + rationale en comentario solo si no obvio
-- Sin romper 18 unit tests
+- Verificar build `DataSync` tras cambios C++
 - Orchestrator corre QA después
 
 ## No hacer

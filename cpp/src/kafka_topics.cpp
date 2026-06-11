@@ -7,6 +7,9 @@
 #include <sstream>
 
 int topic_bucket(const std::string& schema, const std::string& table, int num_buckets) {
+    if (num_buckets <= 0) {
+        num_buckets = 1;
+    }
     const std::string key = schema + "." + table;
     unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const unsigned char*>(key.data()), key.size(), digest);

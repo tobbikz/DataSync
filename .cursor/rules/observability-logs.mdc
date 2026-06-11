@@ -19,7 +19,7 @@ Do **not** add parallel log sinks (files, `metadata.process_log`, ad-hoc tables)
 | `context` | JSON object: counts, durations, error codes — **never passwords** |
 | `batch_id`, `conn_id`, `source_schema`, `source_table` | Correlation when applicable |
 
-Schema DDL: `sql/002_observability_logs.sql` (table in `cdc_catalog`)
+Schema DDL: `prod_ops.sql` → `@section:datasync_baseline` (table in `cdc_catalog`)
 
 ## Rules
 

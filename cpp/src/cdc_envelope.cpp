@@ -149,7 +149,7 @@ std::string op_char_from_mysql(const std::string& mysql_op) {
     if (mysql_op == "DELETE") {
         return "d";
     }
-    return "u";
+    return "";
 }
 
 nlohmann::json CdcEvent::to_kafka_dict() const {

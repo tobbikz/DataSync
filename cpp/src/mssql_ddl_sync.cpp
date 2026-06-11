@@ -537,8 +537,12 @@ DdlSyncResult sync_mssql_columns_to_lake(
             cfg.get_int("lake_partition_months_ahead", 3, "mssql_load", conn_id));
         return {};
     }
-    return sync_mssql_ddl_after_truncate(
-        pg, mssql, source_database, source_schema, source_table, cols, cfg, conn_id);
+    DdlSyncResult result;
+    if (cfg.get_bool("ddl_sync_columns", true, "mssql_load", conn_id)) {
+        result.columns_added = sync_missing_columns(pg, pg_schema, pg_table, cols);
+        result.columns_widened = sync_mssql_column_types(pg, pg_schema, pg_table, cols);
+    }
+    return result;
 }
 
 DdlSyncRunStats run_mssql_ddl_sync(

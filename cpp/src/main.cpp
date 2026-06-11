@@ -19,6 +19,10 @@
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
 
+#ifdef HAVE_MONGOC
+#include "mongo_conn.hpp"
+#endif
+
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -324,6 +328,11 @@ int main(int argc, char** argv) {
     }
 
     try {
+#ifdef HAVE_MONGOC
+        struct MongoLibraryShutdown {
+            ~MongoLibraryShutdown() { mongo_library_cleanup(); }
+        } mongo_shutdown;
+#endif
         AppConfig cfg = config_path.empty() ? load_config_auto(argv[0]) : load_config(config_path);
         const std::string batch_id = make_batch_id();
         PgConn log_pg(cfg.datasync.conn_string());

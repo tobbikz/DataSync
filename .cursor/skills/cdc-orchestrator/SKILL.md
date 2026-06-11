@@ -50,7 +50,7 @@ Prompt de delegación debe incluir: paths, credenciales dev (`:3307`, `config.cd
 ```
 1. Orchestrator: lee estado → propone 1 sprint (DEV + QA tasks)
 2. Task DEV → implementa fix top bug
-3. Task QA → run_full_manual_test.sh o pasos manuales
+3. Task QA → `run_cdc_populate.sh` o pasos manuales
 4. Orchestrator: actualiza PROJECT-STATE → reporta pass/fail al usuario
 5. Si 0 failed en E2E+stress → proponer prod pilot (escalar)
 ```

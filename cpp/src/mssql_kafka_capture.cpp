@@ -43,6 +43,15 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     return {};
 }
 
+int seed_mssql_cdc_lsn_for_conn(
+    const AppConfig&,
+    PGconn*,
+    const std::string&,
+    const std::optional<std::string>&,
+    const std::string&) {
+    return 0;
+}
+
 #else
 
 namespace {
@@ -388,6 +397,16 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     MssqlConn mssql(*source);
     std::set<std::string> scanned_dbs;
     int published = 0;
+    struct MssqlPendingCommit {
+        long long catalog_id{0};
+        std::string source_database;
+        std::string source_schema;
+        std::string source_table;
+        std::vector<uint8_t> next_lsn;
+        std::vector<uint8_t> last_sq;
+        bool has_lsn{false};
+    };
+    std::vector<MssqlPendingCommit> pending_commits;
     int cdc_rows_read = 0;
     int skipped_no_lsn = 0;
     int skipped_no_window = 0;
@@ -463,8 +482,8 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         const auto result = mssql.query(q);
         cdc_rows_read += static_cast<int>(result.rows.size());
         if (result.rows.empty()) {
-            mark_catalog_cdc_success(log_pg, tbl.catalog_id);
-            stats.tables += 1;
+            pending_commits.push_back(
+                {tbl.catalog_id, tbl.source_database, tbl.source_schema, tbl.source_table, {}, {}, false});
             if (rcfg.idle_poll_seconds > 0 && std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::sleep_for(std::chrono::seconds(rcfg.idle_poll_seconds));
             }
@@ -541,19 +560,25 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             last_heartbeat = std::chrono::steady_clock::now();
         }
 
+        MssqlPendingCommit pending;
+        pending.catalog_id = tbl.catalog_id;
+        pending.source_database = tbl.source_database;
+        pending.source_schema = tbl.source_schema;
+        pending.source_table = tbl.source_table;
         if (!last_sl.empty()) {
-            const auto inc_rows = mssql.query("SELECT sys.fn_cdc_increment_lsn(" + lsn_sql_literal(last_sl) + ")");
-            std::vector<uint8_t> next_lsn = last_sl;
+            const auto inc_rows =
+                mssql.query("SELECT sys.fn_cdc_increment_lsn(" + lsn_sql_literal(last_sl) + ")");
+            pending.next_lsn = last_sl;
             if (!inc_rows.rows.empty() && !inc_rows.rows[0].empty()) {
                 const auto inc = lsn_as_bytes(inc_rows.rows[0][0]);
                 if (!inc.empty()) {
-                    next_lsn = inc;
+                    pending.next_lsn = inc;
                 }
             }
-            upsert_lsn(log_pg, conn_id, tbl.source_database, tbl.source_schema, tbl.source_table, next_lsn, last_sq);
+            pending.last_sq = last_sq;
+            pending.has_lsn = true;
         }
-        mark_catalog_cdc_success(log_pg, tbl.catalog_id);
-        stats.tables += 1;
+        pending_commits.push_back(std::move(pending));
     }
 
     if (published == 0 && rcfg.heartbeat_seconds > 0) {
@@ -567,10 +592,32 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     const int queued = producer.flush(30);
     const KafkaProducerStats pstats = producer.stats();
     if (pstats.errors > 0 || queued > 0) {
+        std::set<long long> rollback_ids;
+        for (const auto& p : pending_commits) {
+            rollback_ids.insert(p.catalog_id);
+        }
+        if (!rollback_ids.empty()) {
+            rollback_cdc_in_progress_ids(log_pg, rollback_ids);
+        }
         const std::string err_detail =
             !pstats.first_error.empty() ? pstats.first_error : std::to_string(queued) + " messages still queued";
         throw std::runtime_error("kafka publish failed: " + err_detail);
     }
+
+    for (const auto& p : pending_commits) {
+        if (p.has_lsn) {
+            upsert_lsn(
+                log_pg,
+                conn_id,
+                p.source_database,
+                p.source_schema,
+                p.source_table,
+                p.next_lsn,
+                p.last_sq);
+        }
+        mark_catalog_cdc_success(log_pg, p.catalog_id);
+    }
+    stats.tables = static_cast<int>(pending_commits.size());
 
     stats.events_published = pstats.events_published;
     stats.errors = pstats.errors;

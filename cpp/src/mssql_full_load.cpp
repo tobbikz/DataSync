@@ -1,6 +1,7 @@
 #include "mssql_full_load.hpp"
 
 #include "capture_common.hpp"
+#include "mariadb_datetime.hpp"
 #include "mssql_conn.hpp"
 #include "mssql_kafka_capture.hpp"
 #include "mssql_lake.hpp"
@@ -145,7 +146,16 @@ std::string utc_now_date() {
 }
 
 std::string brack(const std::string& name) {
-    return "[" + name + "]";
+    std::string escaped;
+    escaped.reserve(name.size() + 2);
+    for (char c : name) {
+        if (c == ']') {
+            escaped += "]]";
+        } else {
+            escaped += c;
+        }
+    }
+    return "[" + escaped + "]";
 }
 
 std::string to_lower(std::string s) {
@@ -168,7 +178,7 @@ std::string mssql_select_expr(const MssqlColumn& col) {
     return b;
 }
 
-std::string cell_as_csv(DBPROCESS* db, int col) {
+std::string cell_as_csv(DBPROCESS* db, int col, const std::string& pg_type) {
     if (!dbdata(db, col)) {
         return "";
     }
@@ -194,7 +204,11 @@ std::string cell_as_csv(DBPROCESS* db, int col) {
     char buf[4096];
     mssql_cell_to_char(db, col, buf, static_cast<DBINT>(sizeof(buf) - 1));
     buf[sizeof(buf) - 1] = '\0';
-    return csv_escape(sanitize_mssql_text_for_pg(trim_mssql_text(buf)));
+    std::string text = sanitize_mssql_text_for_pg(trim_mssql_text(buf));
+    if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || pg_type == "DATE") {
+        text = normalize_text_for_pg(text, pg_type);
+    }
+    return csv_escape(text);
 }
 
 std::string format_dberror(DBPROCESS* db) {
@@ -228,10 +242,12 @@ std::optional<MssqlPkRange> fetch_mssql_numeric_pk_bounds(
     std::ostringstream sql;
     sql << "SELECT MIN(" << brack(pk_col) << "), MAX(" << brack(pk_col) << ") FROM " << brack(schema) << "."
         << brack(table);
-    if (dbfcmd(db, "%s", sql.str().c_str()) == FAIL) {
+    try {
+        run_dbsql(db, sql.str());
+    } catch (...) {
         return std::nullopt;
     }
-    if (dbsqlexec(db) == FAIL || dbresults(db) == FAIL) {
+    if (dbresults(db) == FAIL) {
         return std::nullopt;
     }
     const int rc = dbnextrow(db);
@@ -390,12 +406,7 @@ long long copy_rows_offset(
         query << " ORDER BY " << order_by.str() << " OFFSET " << offset << " ROWS FETCH NEXT " << batch_size
               << " ROWS ONLY";
 
-        if (dbfcmd(db, "%s", query.str().c_str()) == FAIL) {
-            throw std::runtime_error("MSSQL SELECT dbcmd failed: " + format_dberror(db));
-        }
-        if (dbsqlexec(db) == FAIL) {
-            throw std::runtime_error("MSSQL SELECT exec failed: " + format_dberror(db));
-        }
+        run_dbsql(db, query.str());
         if (dbresults(db) == FAIL) {
             throw std::runtime_error("MSSQL SELECT dbresults failed: " + format_dberror(db));
         }
@@ -414,7 +425,7 @@ long long copy_rows_offset(
                 if (col > 1) {
                     line << ',';
                 }
-                line << cell_as_csv(db, col);
+                line << cell_as_csv(db, col, cols[static_cast<std::size_t>(col - 1)].pg_type);
             }
             line << ',' << csv_escape(load_ts) << ',' << csv_escape(load_date) << ",MSSQL," << csv_escape(snapshot_id);
             batch_lines.push_back(line.str());
@@ -449,14 +460,15 @@ long long copy_rows_offset(
             throw std::runtime_error(std::string("COPY end failed: ") + PQerrorMessage(pg));
         }
         PGresult* end_res = PQgetResult(pg);
-        if (!end_res || PQresultStatus(end_res) != PGRES_COMMAND_OK) {
-            const std::string err = PQerrorMessage(pg);
-            if (end_res) {
+        while (end_res) {
+            if (PQresultStatus(end_res) != PGRES_COMMAND_OK) {
+                const std::string err = PQerrorMessage(pg);
                 PQclear(end_res);
+                throw std::runtime_error("COPY commit failed: " + err);
             }
-            throw std::runtime_error("COPY commit failed: " + err);
+            PQclear(end_res);
+            end_res = PQgetResult(pg);
         }
-        PQclear(end_res);
 
         total_rows += static_cast<long long>(batch_lines.size());
         offset += static_cast<long long>(batch_lines.size());
@@ -562,7 +574,9 @@ void mark_catalog_failed(PGconn* pg, long long catalog_id, const std::string& er
         vals);
 }
 
-bool load_one_table(
+enum class TableLoadOutcome { Success, Skipped, Failed };
+
+TableLoadOutcome load_one_table(
     const AppConfig& cfg,
     PGconn* log_pg,
     std::mutex* log_mtx,
@@ -653,7 +667,7 @@ bool load_one_table(
             target.conn_id,
             target.source_schema,
             target.source_table);
-        return false;
+        return TableLoadOutcome::Skipped;
     }
 
     const auto cols = fetch_mssql_columns(mssql.handle, target.source_schema, target.source_table);
@@ -794,7 +808,7 @@ bool load_one_table(
         target.conn_id,
         target.source_schema,
         target.source_table);
-    return true;
+    return TableLoadOutcome::Success;
 }
 
 }  // namespace
@@ -931,13 +945,15 @@ FullLoadRunStats run_mssql_full_load(
                         threads.emplace_back([&, target]() {
                             long long rows_loaded = 0;
                             try {
-                                const bool ok =
+                                const auto outcome =
                                     load_one_table(cfg, log_pg, &log_mtx, *src, target, batch_id, rows_loaded);
                                 std::lock_guard<std::mutex> lock(stats_mtx);
                                 stats.tables_processed += 1;
-                                if (ok) {
+                                if (outcome == TableLoadOutcome::Success) {
                                     stats.tables_success += 1;
                                     stats.total_rows += rows_loaded;
+                                } else if (outcome == TableLoadOutcome::Skipped) {
+                                    stats.tables_skipped += 1;
                                 } else {
                                     stats.tables_failed += 1;
                                 }
@@ -977,6 +993,7 @@ FullLoadRunStats run_mssql_full_load(
         stats.tables_failed == 0 ? "full load completed" : "full load completed with errors",
         {{"tables_processed", stats.tables_processed},
          {"tables_success", stats.tables_success},
+         {"tables_skipped", stats.tables_skipped},
          {"tables_failed", stats.tables_failed},
          {"total_rows", stats.total_rows},
          {"duration_ms", elapsed_ms(run_start)}});

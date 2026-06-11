@@ -1,13 +1,12 @@
 #pragma once
 
 #include "config.hpp"
-#include "mariadb_cdc.hpp"
+#include "mariadb_binlog.hpp"
 
 #include <functional>
 #include <libpq-fe.h>
 #include <string>
-
-struct BinlogPosition;
+#include <vector>
 
 // Reads remote binlog via mariadb-binlog -v (mariadb_rpl workaround for MariaDB 12.x).
 struct BinlogCliStats {

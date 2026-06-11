@@ -164,11 +164,28 @@ std::string mariadb_to_pg_type(const std::string& mysql_type_raw) {
     if (t.find("bigint") != std::string::npos) {
         return "BIGINT";
     }
+    if (t.rfind("bit", 0) == 0) {
+        const auto open = t.find('(');
+        const auto close = t.find(')', open);
+        if (open != std::string::npos && close != std::string::npos && close > open + 1) {
+            const int bits = std::atoi(t.substr(open + 1, close - open - 1).c_str());
+            if (bits == 1) {
+                return "BOOLEAN";
+            }
+            if (bits > 1) {
+                return "BIT(" + std::to_string(bits) + ")";
+            }
+        }
+        return "BOOLEAN";
+    }
     if (t.find("int") != std::string::npos) {
         if (t.find("tinyint") != std::string::npos || t.find("smallint") != std::string::npos) {
             return "SMALLINT";
         }
         if (t.find("mediumint") != std::string::npos) {
+            return "INTEGER";
+        }
+        if (t == "int" || t.rfind("int(", 0) == 0 || t.find("integer") != std::string::npos) {
             return "INTEGER";
         }
         return "NUMERIC";
@@ -312,7 +329,6 @@ std::string mariadb_bytea_to_copy_csv(const char* data, std::size_t len) {
         hex_payload.push_back(hex[b >> 4]);
         hex_payload.push_back(hex[b & 0x0f]);
     }
-    bool quote = true;
     std::string out = "\"";
     for (char c : hex_payload) {
         out += (c == '"') ? "\"\"" : std::string(1, c);
@@ -366,11 +382,21 @@ void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const
     PQclear(res);
 }
 
+std::string mysql_escape_literal(const std::string& value) {
+    std::string out = "'";
+    for (char c : value) {
+        out += (c == '\'') ? "''" : std::string(1, c);
+    }
+    out += "'";
+    return out;
+}
+
 std::vector<MariaDbColumn> fetch_mariadb_columns(MYSQL* mysql, const std::string& schema, const std::string& table) {
     const std::string sql =
         "SELECT column_name, column_type, column_key, is_nullable FROM information_schema.columns "
-        "WHERE table_schema='" +
-        schema + "' AND table_name='" + table + "' ORDER BY ordinal_position";
+        "WHERE table_schema=" +
+        mysql_escape_literal(schema) + " AND table_name=" + mysql_escape_literal(table) +
+        " ORDER BY ordinal_position";
 
     if (mysql_query(mysql, sql.c_str()) != 0) {
         throw std::runtime_error(std::string("schema read failed: ") + mysql_error(mysql));

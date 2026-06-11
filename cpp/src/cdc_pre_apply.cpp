@@ -63,31 +63,44 @@ int sync_mssql_columns_for_tier(
         return 0;
     }
 
-    MssqlConn mssql(*source);
-    PgConn lake_pg(cfg.datalake.conn_string());
     int synced = 0;
-    for (int i = 0; i < PQntuples(res); ++i) {
-        const std::string db = PQgetvalue(res, i, 0);
-        const std::string schema = PQgetvalue(res, i, 1);
-        const std::string table = PQgetvalue(res, i, 2);
-        if (!runtime.get_bool("ddl_sync_columns", true, "mssql_load", conn_id)) {
-            continue;
+    try {
+        MssqlConn mssql(*source);
+        PgConn lake_pg(cfg.datalake.conn_string());
+        for (int i = 0; i < PQntuples(res); ++i) {
+            const std::string db = PQgetvalue(res, i, 0);
+            const std::string schema = PQgetvalue(res, i, 1);
+            const std::string table = PQgetvalue(res, i, 2);
+            if (!runtime.get_bool("ddl_sync_columns", true, "mssql_load", conn_id)) {
+                continue;
+            }
+            const auto ddl = sync_mssql_columns_to_lake(
+                lake_pg.raw, mssql, db, schema, table, runtime, conn_id);
+            if (ddl.columns_added > 0 || ddl.columns_widened > 0) {
+                synced += 1;
+                log_write(log_pg, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_kafka_mssql_ddl",
+                    .message = "mssql ddl sync columns updated",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = schema,
+                    .source_table = table,
+                    .context = {{"columns_added", ddl.columns_added}, {"columns_widened", ddl.columns_widened}},
+                });
+            }
         }
-        const auto ddl = sync_mssql_columns_to_lake(
-            lake_pg.raw, mssql, db, schema, table, runtime, conn_id);
-        if (ddl.columns_added > 0 || ddl.columns_widened > 0) {
-            synced += 1;
-            log_write(log_pg, {
-                .level = LogLevel::Info,
-                .component = "cdc_kafka_mssql_ddl",
-                .message = "mssql ddl sync columns updated",
-                .batch_id = batch_id,
-                .conn_id = conn_id,
-                .source_schema = schema,
-                .source_table = table,
-                .context = {{"columns_added", ddl.columns_added}, {"columns_widened", ddl.columns_widened}},
-            });
-        }
+    } catch (const std::exception& ex) {
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_kafka_mssql_ddl",
+            .message = "mssql connect failed during pre-apply ddl sync",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"tier", tier}, {"error", ex.what()}},
+        });
     }
     PQclear(res);
     return synced;
@@ -310,8 +323,22 @@ int run_conn_capture_slice(
 
     int errors = 0;
     if (db_engine == "mssql") {
-        const auto stats = run_mssql_kafka_capture_slice(cfg, log_pg, conn_id, all_tiers, batch_id);
-        errors = stats.errors;
+        try {
+            const auto stats = run_mssql_kafka_capture_slice(cfg, log_pg, conn_id, all_tiers, batch_id);
+            errors = stats.errors;
+        } catch (const std::exception& ex) {
+            errors = 1;
+            log_write(log_pg, {
+                .level = LogLevel::Error,
+                .component = "cdc_kafka_mssql_capture",
+                .message = "mssql capture slice failed",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {{"error", ex.what()}},
+            });
+        }
     } else if (db_engine == "mongodb") {
         const auto stats = run_mongo_kafka_capture_slice(cfg, log_pg, conn_id, all_tiers, batch_id);
         errors = stats.errors;

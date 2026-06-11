@@ -30,6 +30,7 @@ struct CaptureRuntimeConfig {
     int max_seconds{300};
     int max_events{50000};
     int idle_poll_seconds{3};
+    int quiet_exit_lagging_chunks{3};
     int heartbeat_seconds{60};
     std::string topic_prefix;
     std::string topic_mode{"bucketed"};
@@ -160,7 +161,8 @@ void enable_cdc_after_full_load(
     const std::string& conn_id,
     const std::optional<std::string>& service_tier,
     const std::string& db_engine,
-    const std::string& batch_id);
+    const std::string& batch_id,
+    bool expect_updates = false);
 
 void flag_table_for_full_load(
     PGconn* pg,
@@ -214,7 +216,7 @@ int clear_stale_cdc_in_progress(
     const std::optional<std::string>& service_tier,
     const std::string& db_engine);
 
-/** Release cdc_in_progress flags after a failed capture/apply slice. */
+/** Revert cdc_in_progress to success without updating last_cdc_at (failed capture/apply slice). */
 void rollback_cdc_in_progress_ids(PGconn* pg, const std::set<long long>& catalog_ids);
 
 int count_full_load_pending(

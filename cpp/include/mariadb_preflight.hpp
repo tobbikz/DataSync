@@ -12,3 +12,4 @@ struct MariaDbPreflightResult {
 };
 
 MariaDbPreflightResult check_mariadb_cdc_ready(MYSQL* mysql);
+MariaDbPreflightResult check_mariadb_load_ready(MYSQL* mysql);

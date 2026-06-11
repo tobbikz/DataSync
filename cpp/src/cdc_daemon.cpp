@@ -9,7 +9,6 @@
 #include "kafka_apply.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
-#include "pipeline_health.hpp"
 #include "runtime_config.hpp"
 #include "service_tiers.hpp"
 
@@ -22,6 +21,15 @@
 #include <algorithm>
 
 namespace {
+
+struct JoinOnExit {
+    std::thread& thread;
+    ~JoinOnExit() {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+};
 
 std::atomic<bool> g_shutdown{false};
 std::atomic<int> g_catalog_sync_round{0};
@@ -160,6 +168,8 @@ int run_one_cycle(
             });
     }
 
+    JoinOnExit join_full_load{full_load_thread};
+
     const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, tier.tier_code, batch_id);
     const int pre_rc = pre.errors > 0 ? 1 : 0;
     RuntimeConfig apply_runtime;
@@ -168,10 +178,6 @@ int run_one_cycle(
         "apply_worker_count", tier.apply_worker_count, "cdc_kafka_apply", conn_id);
     const int apply_rc = run_apply_workers(cfg, conn_id, tier.tier_code, apply_workers);
     int cycle_errors = (pre_rc != 0 ? 1 : 0) + (apply_rc != 0 ? 1 : 0);
-
-    if (full_load_thread.joinable()) {
-        full_load_thread.join();
-    }
 
     try {
         const int cleared = clear_stale_cdc_in_progress(log_pg, conn_id, tier.tier_code, db_engine);
@@ -265,21 +271,6 @@ int run_one_cycle(
         },
     });
 
-    try {
-        refresh_pipeline_health_totals(log_pg, tier.tier_code, db_engine);
-    } catch (const std::exception& ex) {
-        log_write(log_pg, {
-            .level = LogLevel::Warning,
-            .component = "cdc_daemon",
-            .message = "pipeline_health totals refresh failed",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {{"error", ex.what()}, {"tier", tier.tier_code}, {"db_engine", db_engine}},
-        });
-    }
-
     return cycle_errors == 0 ? 0 : 1;
 }
 
@@ -309,43 +300,48 @@ int run_parallel_daemon_round(
         }
     }
 
+    std::vector<std::thread> capture_threads;
+    capture_threads.reserve(conn_ids.size());
     for (const auto& conn_id : conn_ids) {
-        PgConn capture_pg(cfg.datasync.conn_string());
-        if (!capture_pg.raw) {
-            failures.fetch_add(1);
-            continue;
-        }
-        try {
-            const std::string db_engine = conn_engine(cfg, conn_id);
-            const int cleared = clear_stale_cdc_in_progress(capture_pg.raw, conn_id, std::nullopt, db_engine);
-            if (cleared > 0) {
+        capture_threads.emplace_back([&, conn_id]() {
+            PgConn capture_pg(cfg.datasync.conn_string());
+            if (!capture_pg.raw) {
+                failures.fetch_add(1);
+                return;
+            }
+            try {
+                const std::string db_engine = conn_engine(cfg, conn_id);
+                const int cleared =
+                    clear_stale_cdc_in_progress(capture_pg.raw, conn_id, std::nullopt, db_engine);
+                if (cleared > 0) {
+                    log_write(capture_pg.raw, {
+                        .level = LogLevel::Info,
+                        .component = "cdc_daemon",
+                        .message = "stale cdc_in_progress cleared before capture",
+                        .batch_id = round_batch_id,
+                        .conn_id = conn_id,
+                        .source_schema = std::nullopt,
+                        .source_table = std::nullopt,
+                        .context = {{"cleared", cleared}, {"db_engine", db_engine}},
+                    });
+                }
+                if (run_conn_capture_slice(cfg, capture_pg.raw, conn_id, round_batch_id) != 0) {
+                    failures.fetch_add(1);
+                }
+            } catch (const std::exception& ex) {
+                failures.fetch_add(1);
                 log_write(capture_pg.raw, {
-                    .level = LogLevel::Info,
+                    .level = LogLevel::Error,
                     .component = "cdc_daemon",
-                    .message = "stale cdc_in_progress cleared before capture",
+                    .message = "conn capture failed",
                     .batch_id = round_batch_id,
                     .conn_id = conn_id,
                     .source_schema = std::nullopt,
                     .source_table = std::nullopt,
-                    .context = {{"cleared", cleared}, {"db_engine", db_engine}},
+                    .context = {{"error", ex.what()}},
                 });
             }
-            if (run_conn_capture_slice(cfg, capture_pg.raw, conn_id, round_batch_id) != 0) {
-                failures.fetch_add(1);
-            }
-        } catch (const std::exception& ex) {
-            failures.fetch_add(1);
-            log_write(capture_pg.raw, {
-                .level = LogLevel::Error,
-                .component = "cdc_daemon",
-                .message = "conn capture failed",
-                .batch_id = round_batch_id,
-                .conn_id = conn_id,
-                .source_schema = std::nullopt,
-                .source_table = std::nullopt,
-                .context = {{"error", ex.what()}},
-            });
-        }
+        });
     }
 
     std::vector<std::thread> threads;
@@ -380,6 +376,11 @@ int run_parallel_daemon_round(
         }
     }
 
+    for (auto& thread : capture_threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
     for (auto& thread : threads) {
         if (thread.joinable()) {
             thread.join();
@@ -393,8 +394,14 @@ int round_idle_seconds(const CdcConfig& cdc) {
 }
 
 std::vector<std::string> reload_daemon_conn_ids(PGconn* log_pg, AppConfig& cfg) {
-    reload_connections(log_pg, cfg);
+    std::lock_guard<std::mutex> lock(app_config_mutex());
+    reload_connections_nolock(log_pg, cfg);
     return all_conn_ids(cfg);
+}
+
+AppConfig snapshot_app_config(const AppConfig& cfg) {
+    std::lock_guard<std::mutex> lock(app_config_mutex());
+    return cfg;
 }
 
 void run_startup_full_load_sweep(
@@ -550,25 +557,27 @@ int run_cdc_daemon(
     int exit_code = 0;
     std::size_t last_conn_count = conn_ids_initial.size();
 
-    std::thread startup_full_load_thread([cfg, conn_ids_initial, tiers]() {
+    const AppConfig startup_cfg = snapshot_app_config(cfg);
+    std::thread startup_full_load_thread([startup_cfg, conn_ids_initial, tiers]() {
         try {
-            PgConn pg(cfg.datasync.conn_string());
+            PgConn pg(startup_cfg.datasync.conn_string());
             if (!pg.raw) {
                 return;
             }
             int sweep_exit = 0;
-            run_startup_full_load_sweep(cfg, pg.raw, conn_ids_initial, tiers, sweep_exit);
+            run_startup_full_load_sweep(startup_cfg, pg.raw, conn_ids_initial, tiers, sweep_exit);
         } catch (const std::exception&) {
         }
     });
 
-    std::thread reconcile_thread([&cfg]() {
+    const AppConfig reconcile_cfg = snapshot_app_config(cfg);
+    std::thread reconcile_thread([reconcile_cfg]() {
         try {
-            PgConn pg(cfg.datasync.conn_string());
+            PgConn pg(reconcile_cfg.datasync.conn_string());
             if (!pg.raw) {
                 return;
             }
-            (void)run_reconcile_loop(cfg, pg.raw, std::nullopt, false, &g_shutdown);
+            (void)run_reconcile_loop(reconcile_cfg, pg.raw, std::nullopt, false, &g_shutdown);
         } catch (const std::exception&) {
             // reconcile errors are logged inside run_reconcile_loop
         }
@@ -601,10 +610,12 @@ int run_cdc_daemon(
                         {"previous_conn_ids", static_cast<int>(last_conn_count)},
                     },
                 });
-                run_startup_full_load_sweep(cfg, log_pg, conn_ids, tiers, exit_code);
+                const AppConfig sweep_cfg = snapshot_app_config(cfg);
+                run_startup_full_load_sweep(sweep_cfg, log_pg, conn_ids, tiers, exit_code);
                 last_conn_count = conn_ids.size();
             }
-            if (run_parallel_daemon_round(cfg, conn_ids, tiers) != 0) {
+            const AppConfig round_cfg = snapshot_app_config(cfg);
+            if (run_parallel_daemon_round(round_cfg, conn_ids, tiers) != 0) {
                 exit_code = 1;
             }
         }
@@ -640,7 +651,8 @@ int run_cdc_daemon(
         .context = {{"cycles", cycles}, {"once", once}, {"had_errors", exit_code != 0}},
     });
 
-    // Keep process exit 0 so systemd restart/stop is not marked failed after transient apply errors.
-    (void)exit_code;
+    if (once && exit_code != 0) {
+        return exit_code;
+    }
     return 0;
 }

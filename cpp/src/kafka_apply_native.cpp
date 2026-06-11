@@ -12,7 +12,6 @@
 #include "mssql_lake.hpp"
 #include "mongo_lake.hpp"
 #include "obs_log.hpp"
-#include "pipeline_health.hpp"
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
 
@@ -45,6 +44,8 @@ using kafka_apply_detail::ApplyEvent;
 using kafka_apply_detail::ApplyBatchOptions;
 using kafka_apply_detail::QuietTableRef;
 using kafka_apply_detail::apply_events_batch;
+using kafka_apply_detail::fill_table_key_from_event_id;
+using kafka_apply_detail::resolve_event_lake_key_from_catalog;
 using kafka_apply_detail::filter_new_event_ids;
 using kafka_apply_detail::parse_kafka_payload;
 using kafka_apply_detail::record_quiet_table_batch_stats;
@@ -444,7 +445,22 @@ void insert_fairness_metrics(
         vals);
 }
 
-std::set<TableKey> fetch_quarantined(PGconn* pg, const std::string& conn_id) {
+TableKey lake_key_for_source(
+    const std::map<TableKey, CatalogMeta>& meta_by_key,
+    const std::string& source_schema,
+    const std::string& source_table) {
+    for (const auto& [lake_key, meta] : meta_by_key) {
+        if (meta.source_schema == source_schema && meta.source_table == source_table) {
+            return lake_key;
+        }
+    }
+    return {source_schema, source_table};
+}
+
+std::set<TableKey> fetch_quarantined(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::map<TableKey, CatalogMeta>& meta_by_key) {
     std::set<TableKey> out;
     const char* vals[] = {conn_id.c_str()};
     PGresult* res = PQexecParams(
@@ -459,7 +475,9 @@ std::set<TableKey> fetch_quarantined(PGconn* pg, const std::string& conn_id) {
         0);
     if (res && PQresultStatus(res) == PGRES_TUPLES_OK) {
         for (int i = 0; i < PQntuples(res); ++i) {
-            out.insert({PQgetvalue(res, i, 0), PQgetvalue(res, i, 1)});
+            const std::string src_schema = PQgetvalue(res, i, 0);
+            const std::string src_table = PQgetvalue(res, i, 1);
+            out.insert(lake_key_for_source(meta_by_key, src_schema, src_table));
         }
     }
     if (res) {
@@ -468,7 +486,12 @@ std::set<TableKey> fetch_quarantined(PGconn* pg, const std::string& conn_id) {
     return out;
 }
 
-std::set<TableKey> fetch_stale_keys(PGconn* pg, const std::string& conn_id, int staleness, const std::set<TableKey>& wanted) {
+std::set<TableKey> fetch_stale_keys(
+    PGconn* pg,
+    const std::string& conn_id,
+    int staleness,
+    const std::set<TableKey>& wanted,
+    const std::map<TableKey, CatalogMeta>& meta_by_key) {
     std::set<TableKey> out;
     const std::string staleness_str = std::to_string(staleness);
     const char* vals[] = {conn_id.c_str(), staleness_str.c_str()};
@@ -486,9 +509,11 @@ std::set<TableKey> fetch_stale_keys(PGconn* pg, const std::string& conn_id, int 
         0);
     if (res && PQresultStatus(res) == PGRES_TUPLES_OK) {
         for (int i = 0; i < PQntuples(res); ++i) {
-            TableKey key{PQgetvalue(res, i, 0), PQgetvalue(res, i, 1)};
-            if (wanted.count(key)) {
-                out.insert(key);
+            const std::string src_schema = PQgetvalue(res, i, 0);
+            const std::string src_table = PQgetvalue(res, i, 1);
+            const TableKey lake_key = lake_key_for_source(meta_by_key, src_schema, src_table);
+            if (wanted.count(lake_key)) {
+                out.insert(lake_key);
             }
         }
     }
@@ -498,13 +523,34 @@ std::set<TableKey> fetch_stale_keys(PGconn* pg, const std::string& conn_id, int 
     return out;
 }
 
+bool offsets_map_have_lag(
+    rd_kafka_t* rk,
+    const std::map<std::pair<std::string, int>, long long>& last_offsets) {
+    for (const auto& [tp, consumed] : last_offsets) {
+        int64_t low = 0;
+        int64_t high = 0;
+        if (rd_kafka_query_watermark_offsets(rk, tp.first.c_str(), tp.second, &low, &high, 10000) !=
+            RD_KAFKA_RESP_ERR_NO_ERROR) {
+            continue;
+        }
+        if (high <= low) {
+            continue;
+        }
+        if (consumed + 1 < high) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool topics_have_lag(
     rd_kafka_t* rk,
     const std::vector<std::string>& topics,
     const std::map<std::pair<std::string, int>, long long>& last_offsets,
     int partition_count) {
-    (void)topics;
-    (void)partition_count;
+    if (!last_offsets.empty()) {
+        return offsets_map_have_lag(rk, last_offsets);
+    }
 
     rd_kafka_topic_partition_list_t* assigned = nullptr;
     rd_kafka_assignment(rk, &assigned);
@@ -662,6 +708,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
     const std::map<TableKey, int>& seen_by_table,
     const std::map<TableKey, CatalogMeta>& meta_by_key,
     const std::string& source_system = "MariaDB",
+    const std::string& db_engine = "mariadb",
     const std::string& service_tier = "",
     int apply_staleness_seconds = 900,
     int apply_inactive_seconds = 3600,
@@ -743,6 +790,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
     });
 
     int batch_table_errors = 0;
+    std::vector<ApplyEvent> failed_events;
     try {
         ApplyBatchOptions options;
         options.append_only = append_only;
@@ -752,7 +800,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
         options.apply_staleness_seconds = apply_staleness_seconds;
         options.apply_inactive_seconds = apply_inactive_seconds;
         options.host_sampler = host_sampler;
-        std::vector<ApplyEvent> failed_events;
+        failed_events.clear();
         options.table_errors_out = &batch_table_errors;
         options.failed_events_out = &failed_events;
         if (catchup_tables) {
@@ -805,10 +853,36 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
             }
         }
         if (!failed_events.empty()) {
-            pending.insert(
-                pending.end(),
-                std::make_move_iterator(failed_events.begin()),
-                std::make_move_iterator(failed_events.end()));
+            int dropped_unrecoverable = 0;
+            for (auto& e : failed_events) {
+                if (e.catalog_id > 0) {
+                    resolve_event_lake_key_from_catalog(app_pg, conn_id, e);
+                }
+                if (e.schema_name.empty() || e.table_name.empty()) {
+                    fill_table_key_from_event_id(e, db_engine);
+                }
+                if (e.schema_name.empty() || e.table_name.empty()) {
+                    dropped_unrecoverable += 1;
+                    auto it = batch_offsets.find({e.topic, e.partition});
+                    if (it == batch_offsets.end() || e.offset > it->second) {
+                        batch_offsets[{e.topic, e.partition}] = e.offset;
+                    }
+                    continue;
+                }
+                pending.push_back(std::move(e));
+            }
+            if (dropped_unrecoverable > 0) {
+                log_write(app_pg, {
+                    .level = LogLevel::Warning,
+                    .component = "cdc_kafka_apply_cpp",
+                    .message = "apply dropped unrecoverable failed events",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {{"events", dropped_unrecoverable}},
+                });
+            }
         }
 
         if (batch_table_errors > 0) {
@@ -855,10 +929,29 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
             errors += 1;
         }
         if (pending.empty()) {
-            pending.insert(
-                pending.end(),
-                std::make_move_iterator(eligible.begin()),
-                std::make_move_iterator(eligible.end()));
+            // eligible may contain moved-from shells after to_apply was built; re-queue real events only.
+            for (auto& e : to_apply) {
+                if (e.catalog_id > 0) {
+                    resolve_event_lake_key_from_catalog(app_pg, conn_id, e);
+                }
+                if (e.schema_name.empty() || e.table_name.empty()) {
+                    fill_table_key_from_event_id(e, db_engine);
+                }
+                if (!e.schema_name.empty() && !e.table_name.empty()) {
+                    pending.push_back(std::move(e));
+                }
+            }
+            for (auto& e : failed_events) {
+                if (e.catalog_id > 0) {
+                    resolve_event_lake_key_from_catalog(app_pg, conn_id, e);
+                }
+                if (e.schema_name.empty() || e.table_name.empty()) {
+                    fill_table_key_from_event_id(e, db_engine);
+                }
+                if (!e.schema_name.empty() && !e.table_name.empty()) {
+                    pending.push_back(std::move(e));
+                }
+            }
         }
         throw std::runtime_error(ex.what());
     }
@@ -931,21 +1024,23 @@ int run_kafka_apply_native_cli(
         ? static_cast<int>(cfg.cdc.slice_max_events)
         : 10000000;
     const int max_seconds =
-        runtime.get_int("apply_max_seconds", slice_seconds_fallback, "cdc_kafka_apply", conn_id);
+        runtime.get_int("apply_max_seconds", 2, "cdc_kafka_apply", conn_id);
     const int max_events =
         runtime.get_int("apply_max_events", slice_events_fallback, "cdc_kafka_apply", conn_id);
     const int target = runtime.get_int("apply_target_events_per_table", 0, "cdc_kafka_apply", conn_id);
     const int poll_timeout_ms = runtime.get_int("apply_poll_timeout_ms", 100, "cdc_kafka_apply", conn_id);
     const int fetch_max_bytes = runtime.get_int("apply_fetch_max_bytes", 52428800, "cdc_kafka_apply", conn_id);
     const int max_partition_fetch_bytes = runtime.get_int("apply_max_partition_fetch_bytes", 10485760, "cdc_kafka_apply", conn_id);
-    const int empty_poll_quiet = runtime.get_int("apply_empty_poll_quiet_threshold", 10, "cdc_kafka_apply", conn_id);
+    const int empty_poll_quiet = runtime.get_int("apply_empty_poll_quiet_threshold", 3, "cdc_kafka_apply", conn_id);
     const int batch_size = runtime.get_int("apply_batch_size", 50000, "cdc_kafka_apply", conn_id);
     const int staleness = runtime.get_int("apply_max_table_staleness_seconds", 900, "cdc_kafka_apply", conn_id);
     const int inactive_seconds = runtime.get_int("apply_inactive_seconds", 3600, "cdc_kafka_apply", conn_id);
     const int applied_retention = runtime.get_int("applied_events_retention_days", 7, "cdc_kafka_apply", conn_id);
     const int stats_retention = runtime.get_int("apply_batch_stats_retention_days", 30, "cdc_kafka_apply", conn_id);
     const bool dedup_enabled = runtime.get_bool("apply_dedup_enabled", true, "cdc_kafka_apply", conn_id);
-    const bool append_only = runtime.get_bool("apply_append_only", true, "cdc_kafka_apply", conn_id);
+    const bool append_only = runtime.get_bool("apply_append_only", false, "cdc_kafka_apply", conn_id);
+    const bool exit_on_targets_met =
+        runtime.get_bool("apply_exit_on_targets_met", true, "cdc_kafka_apply", conn_id);
     const bool audit_enabled = runtime.get_bool("apply_audit_enabled", true, "cdc_kafka_apply", conn_id);
     const int queued_min_messages = runtime.get_int("apply_queued_min_messages", 100000, "cdc_kafka_apply", conn_id);
     const int fetch_wait_max_ms = runtime.get_int("apply_fetch_wait_max_ms", 500, "cdc_kafka_apply", conn_id);
@@ -1055,8 +1150,8 @@ int run_kafka_apply_native_cli(
 
     ensure_apply_positions(app_pg.raw, meta_by_key, conn_id, topic_prefix, topic_mode, topic_buckets);
 
-    std::set<TableKey> quarantined = fetch_quarantined(app_pg.raw, conn_id);
-    std::set<TableKey> stale_keys = fetch_stale_keys(app_pg.raw, conn_id, staleness, wanted);
+    std::set<TableKey> quarantined = fetch_quarantined(app_pg.raw, conn_id, meta_by_key);
+    std::set<TableKey> stale_keys = fetch_stale_keys(app_pg.raw, conn_id, staleness, wanted, meta_by_key);
 
     const auto topics = topics_for_tables(topic_prefix, table_pairs, topic_mode, topic_buckets);
 
@@ -1188,6 +1283,7 @@ int run_kafka_apply_native_cli(
     bool memory_backpressure_logged = false;
     bool first_kafka_message_logged = false;
     long long kafka_poll_progress_last = 0;
+    std::map<std::pair<std::string, int>, long long> skipped_parse_offsets;
     std::vector<ApplyEvent> pending_batch;
     HostMetricsSampler host_sampler;
     host_sampler.mark_start();
@@ -1217,6 +1313,7 @@ int run_kafka_apply_native_cli(
                 seen_by_table,
                 meta_by_key,
                 source_system,
+                db_engine,
                 service_tier.value_or(""),
                 staleness,
                 inactive_seconds,
@@ -1322,7 +1419,8 @@ int run_kafka_apply_native_cli(
         }
         if (reason == "all_targets_met" || reason == "idle_complete" || reason == "slice_complete") {
             flush_batch();
-            if (topics_have_lag(rk, topics, last_offsets, topic_partitions)) {
+            if (!exit_on_targets_met &&
+                topics_have_lag(rk, topics, last_offsets, topic_partitions)) {
                 return false;
             }
         }
@@ -1356,8 +1454,7 @@ int run_kafka_apply_native_cli(
                 empty_polls += 1;
                 if (empty_polls >= empty_poll_quiet) {
                     flush_batch();
-                    const bool no_lag = !topics_have_lag(rk, topics, last_offsets, topic_partitions);
-                    if (events_seen == 0 && pending_batch.empty() && no_lag) {
+                    if (events_seen == 0 && pending_batch.empty()) {
                         stop_reason = "idle_no_messages";
                         loop_exited_early = true;
                         log_write(log_pg, {
@@ -1376,8 +1473,8 @@ int run_kafka_apply_native_cli(
                         });
                         break;
                     }
-                    const bool allow_quiet = no_lag;
-                    if (stop_slice_if_ready(allow_quiet)) {
+                    const bool no_lag = !topics_have_lag(rk, topics, last_offsets, topic_partitions);
+                    if (stop_slice_if_ready(no_lag)) {
                         break;
                     }
                 }
@@ -1390,14 +1487,13 @@ int run_kafka_apply_native_cli(
                     empty_polls += 1;
                     if (empty_polls >= empty_poll_quiet) {
                         flush_batch();
-                        const bool no_lag = !topics_have_lag(rk, topics, last_offsets, topic_partitions);
-                        if (events_seen == 0 && pending_batch.empty() && no_lag) {
+                        if (events_seen == 0 && pending_batch.empty()) {
                             stop_reason = "idle_no_messages";
                             loop_exited_early = true;
                             break;
                         }
-                        const bool allow_quiet = no_lag;
-                        if (stop_slice_if_ready(allow_quiet)) {
+                        const bool no_lag = !topics_have_lag(rk, topics, last_offsets, topic_partitions);
+                        if (stop_slice_if_ready(no_lag)) {
                             break;
                         }
                     }
@@ -1470,6 +1566,11 @@ int run_kafka_apply_native_cli(
             const json probe = kafka_apply_detail::parse_kafka_message_json(payload);
             if (probe.is_discarded() || !probe.is_object()) {
                 parse_skipped += 1;
+                auto tp = std::make_pair(topic, partition);
+                auto sit = skipped_parse_offsets.find(tp);
+                if (sit == skipped_parse_offsets.end() || offset > sit->second) {
+                    skipped_parse_offsets[tp] = offset;
+                }
                 continue;
             }
             std::string schema_name;
@@ -1556,12 +1657,20 @@ int run_kafka_apply_native_cli(
                 flush_batch();
             }
 
-            if (stop_slice_if_ready(false)) {
+            flush_batch();
+            if (stop_slice_if_ready(true)) {
                 break;
             }
         }
 
         flush_batch();
+
+        if (!skipped_parse_offsets.empty()) {
+            commit_kafka_offsets(rk, skipped_parse_offsets);
+            for (const auto& [tp, offset] : skipped_parse_offsets) {
+                last_offsets[tp] = std::max(last_offsets[tp], offset);
+            }
+        }
 
         if (!loop_exited_early) {
             if (events_seen >= max_events) {
@@ -1691,38 +1800,6 @@ int run_kafka_apply_native_cli(
             },
         });
 
-        if (service_tier && !service_tier->empty()) {
-            try {
-                const PipelineCatalogCounts counts =
-                    fetch_pipeline_catalog_counts(app_pg.raw, conn_id, *service_tier, db_engine);
-                PipelineKafkaLagSummary kafka_lag;
-                update_pipeline_health_apply(
-                    app_pg.raw,
-                    conn_id,
-                    *service_tier,
-                    db_engine,
-                    counts,
-                    kafka_lag,
-                    PipelineApplySliceStats{
-                        .events_seen = events_seen,
-                        .events_applied = events_applied,
-                        .errors = errors,
-                        .stop_reason = stop_reason,
-                        .duration_ms = duration_ms,
-                    });
-            } catch (const std::exception& ex) {
-                log_write(log_pg, {
-                    .level = LogLevel::Warning,
-                    .component = "cdc_kafka_apply_cpp",
-                    .message = "pipeline_health refresh failed",
-                    .batch_id = batch_id,
-                    .conn_id = conn_id,
-                    .source_schema = std::nullopt,
-                    .source_table = std::nullopt,
-                    .context = {{"error", ex.what()}},
-                });
-            }
-        }
     } catch (const std::exception& ex) {
         log_write(log_pg, {
             .level = LogLevel::Error,

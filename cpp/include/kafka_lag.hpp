@@ -21,7 +21,7 @@ struct KafkaLagProbe {
     KafkaLagProbe& operator=(const KafkaLagProbe&) = delete;
 };
 
-/** high_watermark - (consumed_offset + 1); 0 when caught up or unavailable. */
+/** high_watermark - (consumed_offset + 1); 0 when caught up; -1 when watermark query fails. */
 long long compute_kafka_consumer_lag(
     rd_kafka_t* rk,
     const std::string& topic,

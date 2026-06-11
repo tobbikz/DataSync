@@ -40,6 +40,17 @@ bool full_load_tier_busy(const std::string& conn_id, const std::string& tier) {
     return !lock.owns_lock();
 }
 
+std::optional<TierFullLoadLock> TierFullLoadLock::try_acquire(
+    const std::string& conn_id,
+    const std::string& tier) {
+    const auto mu = tier_full_load_mutex(conn_id, tier);
+    std::unique_lock<std::mutex> guard(*mu, std::try_to_lock);
+    if (!guard.owns_lock()) {
+        return std::nullopt;
+    }
+    return TierFullLoadLock(mu, std::move(guard));
+}
+
 std::optional<DaemonFullLoadOutcome> try_run_daemon_full_load_isolated(
     const AppConfig& cfg,
     PGconn* log_pg,

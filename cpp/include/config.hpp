@@ -52,7 +52,7 @@ struct CdcTierConfig {
 };
 
 struct CdcConfig {
-    int round_idle_seconds{1};
+    int round_idle_seconds{5};
     int slice_max_seconds{60};
     int slice_max_events{10'000'000};
     std::vector<CdcTierConfig> tiers;

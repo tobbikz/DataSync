@@ -45,8 +45,8 @@ std::string mongo_catalog_source_schema(
 
 namespace {
 
-std::string sanitize_col_name(const std::string& name) {
-    return sanitize_pg_identifier_part(name);
+std::string sanitize_col_name(const std::string& name, std::set<std::string>* seen_names) {
+    return sanitize_pg_identifier_part(name, 63, seen_names);
 }
 
 }  // namespace
@@ -54,7 +54,12 @@ std::string sanitize_col_name(const std::string& name) {
 std::map<std::string, nlohmann::json> flatten_mongo_document(
     const nlohmann::json& doc,
     const std::string& parent_key,
-    char sep) {
+    char sep,
+    std::set<std::string>* seen_names) {
+    std::set<std::string> local_seen;
+    if (!seen_names) {
+        seen_names = &local_seen;
+    }
     std::map<std::string, nlohmann::json> out;
     if (!doc.is_object()) {
         return out;
@@ -72,12 +77,13 @@ std::map<std::string, nlohmann::json> flatten_mongo_document(
             } else {
                 out[new_key] = v.dump();
             }
+            seen_names->insert(new_key);
             continue;
         }
         new_key = parent_key.empty() ? key : parent_key + sep + key;
-        new_key = sanitize_col_name(new_key);
+        new_key = sanitize_col_name(new_key, seen_names);
         if (v.is_object()) {
-            auto nested = flatten_mongo_document(v, new_key, sep);
+            auto nested = flatten_mongo_document(v, new_key, sep, seen_names);
             out.insert(nested.begin(), nested.end());
         } else if (v.is_array()) {
             out[new_key] = v;

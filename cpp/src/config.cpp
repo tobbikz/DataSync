@@ -84,7 +84,7 @@ std::filesystem::path find_default_config_path(const char* argv0) {
 CdcConfig default_cdc_config() {
     CdcConfig cdc;
     cdc.round_idle_seconds = 5;
-    cdc.slice_max_seconds = 60;
+    cdc.slice_max_seconds = 15;
     cdc.slice_max_events = 10'000'000;
     cdc.tiers = {
         {"platinum", 4, true, 1},
@@ -143,14 +143,31 @@ void parse_cdc_config(const nlohmann::json& root, CdcConfig& cdc) {
     }
 }
 
+std::string pg_quote_conn_value(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('\'');
+    for (const char c : value) {
+        if (c == '\'') {
+            out += "''";
+        } else if (c == '\\') {
+            out += "\\\\";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('\'');
+    return out;
+}
+
 }  // namespace
 
 std::string PgConfig::conn_string() const {
     std::string s = "host=" + host +
                     " port=" + std::to_string(port) +
                     " dbname=" + database +
-                    " user=" + user +
-                    " password=" + password;
+                    " user=" + pg_quote_conn_value(user) +
+                    " password=" + pg_quote_conn_value(password);
     if (!sslmode.empty()) {
         s += " sslmode=" + sslmode;
     }

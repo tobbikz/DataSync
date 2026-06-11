@@ -29,7 +29,8 @@ struct MongoLakeColumn {
 std::map<std::string, nlohmann::json> flatten_mongo_document(
     const nlohmann::json& doc,
     const std::string& parent_key = "",
-    char sep = '_');
+    char sep = '_',
+    std::set<std::string>* seen_names = nullptr);
 
 std::string infer_pg_type_from_json(const nlohmann::json& value);
 

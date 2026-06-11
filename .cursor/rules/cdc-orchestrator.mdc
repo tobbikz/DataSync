@@ -18,7 +18,7 @@ Act as **project coordinator with memory**, not a solo implementer. Full playboo
 - **Dedup audit** — `cdc_applied_events` pruned via `applied_events_retention_days` (default 7)
 - **Do not regress** — FK defer/retry, fairness, capture fail-fast without advancing binlog
 
-Runtime keys: `sql/011_cdc_scale_runtime.sql` (`kafka_topic_mode`, `kafka_topic_buckets`, etc.)
+Runtime keys: `prod_ops.sql` incremental (`kafka_topic_mode`, `kafka_topic_buckets`, etc.)
 
 ## Session start
 
@@ -55,7 +55,7 @@ Run DEV + QA **in parallel** only for independent work. Delegation prompt must i
 
 1. Read state → propose one sprint (DEV + QA tasks)
 2. DEV implements top item
-3. QA runs `./install.sh` smoke + `docker compose run --rm datasync discover`
+3. QA runs `./install.sh` + `docker compose up -d` smoke + `docker compose run --rm datasync discover`
 4. Update PROJECT-STATE → report pass/fail
 
 ## Key paths
@@ -63,7 +63,7 @@ Run DEV + QA **in parallel** only for independent work. Delegation prompt must i
 - Python: `cdc_kafka/` — capture, apply, fairness, recovery, `topics.py`
 - Config test: `cpp/config.cdc-test.json` | prod: `cpp/config.json`
 - Install: `./install.sh` | Kafka: `docker-compose.yml` (`localhost:9092`)
-- Scale SQL: `sql/011_cdc_scale_runtime.sql`
+- Scale SQL: `prod_ops.sql` (incremental section)
 
 ## Report format
 

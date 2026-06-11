@@ -1,6 +1,5 @@
 # DataSync — multi-stage image (C++ CDC daemon + CLI)
-# Build: docker build -t datasync:local .
-# Install: ./install.sh
+# Host: ./install.sh  |  Image build is part of install.sh
 
 FROM debian:bookworm-slim AS builder
 
@@ -33,18 +32,26 @@ RUN git clone --depth 1 --branch "${RDKAFKA_VERSION}" \
 WORKDIR /src
 COPY cpp/ cpp/
 
-# CMakeLists expects librdkafka under cpp/deps/rdkafka (built in this stage, not from host)
-RUN mkdir -p cpp/deps && cp -a /opt/rdkafka cpp/deps/rdkafka
+# Vendored librdkafka lives under cpp/build/deps (single out-of-tree build dir)
+RUN mkdir -p cpp/build/deps && cp -a /opt/rdkafka cpp/build/deps/rdkafka
 
-RUN cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-    && cmake --build build --target DataSync -j"$(nproc)"
+RUN cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+    && cmake --build cpp/build --target DataSync -j"$(nproc)"
 
 # -----------------------------------------------------------------------------
 
 FROM debian:bookworm-slim AS runtime
 
+# mariadb-client = CLI only (mariadb-binlog reads binlog from host :3306). No MariaDB server in this image.
+# bookworm default client 3.5 cannot parse binlog protocol from MariaDB 12.x — use MariaDB repo 12.3.
+ARG MARIADB_REPO_VERSION=12.3
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
+    gnupg \
+    && curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup \
+      | bash -s -- --mariadb-server-version="${MARIADB_REPO_VERSION}" --os-type=debian --os-version=bookworm \
+    && apt-get install -y --no-install-recommends \
     freetds-common \
     libmongoc-1.0-0 \
     libmariadb3 \
@@ -53,16 +60,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsybdb5 \
     postgresql-client \
     python3 \
+    && apt-get purge -y curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/rdkafka/lib /opt/rdkafka/lib
-COPY --from=builder /src/build/DataSync /usr/local/bin/DataSync
-COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY docker/catalog_bootstrap.py /app/docker/catalog_bootstrap.py
-COPY docker/verify_sources.py /app/docker/verify_sources.py
-COPY sql/ /app/sql/
+COPY --from=builder /src/cpp/build/DataSync /usr/local/bin/DataSync
+COPY install.sh prod_ops.sql /app/
 
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN chmod +x /app/install.sh
 
 ENV LD_LIBRARY_PATH=/opt/rdkafka/lib
 ENV DATASYNC_ROOT=/app
@@ -72,5 +77,5 @@ ENV PATH="/usr/local/bin:${PATH}"
 
 WORKDIR /app
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/app/install.sh", "container"]
 CMD ["daemon"]

@@ -10,6 +10,9 @@
 
 #ifdef HAVE_MONGOC
 
+void mongo_library_init();
+void mongo_library_cleanup();
+
 struct MongoConn {
     mongoc_client_t* client{nullptr};
 

@@ -9,18 +9,46 @@
 #include "mariadb_conn.hpp"
 #include "mariadb_schema.hpp"
 #include "obs_log.hpp"
-#include "pipeline_health.hpp"
 #include "runtime_config.hpp"
 
+#include <cctype>
 #include <chrono>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <algorithm>
 #include <thread>
 
 namespace {
+
+// #region agent log
+void agent_debug_log(
+    const char* hypothesis_id,
+    const char* location,
+    const char* message,
+    const nlohmann::json& data) {
+    std::ofstream out("/home/iks/Projects/DataSync/.cursor/debug-e0d3ad.log", std::ios::app);
+    if (!out) {
+        return;
+    }
+    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    out << nlohmann::json{
+               {"sessionId", "e0d3ad"},
+               {"hypothesisId", hypothesis_id},
+               {"location", location},
+               {"message", message},
+               {"data", data},
+               {"timestamp", ts},
+           }.dump()
+        << '\n';
+}
+// #endregion
+
 
 struct CapturePosition {
     std::string binlog_file;
@@ -70,16 +98,28 @@ std::vector<std::string> fetch_table_columns(MYSQL* mysql, const std::string& sc
 }
 
 std::string mariadb_server_uuid(MYSQL* mysql) {
-    for (const char* sql : {"SELECT @@server_uuid", "SELECT @@server_uid", "SELECT @@server_id"}) {
-        try {
-            const std::string val = mariadb_scalar(mysql, sql);
-            if (!val.empty()) {
-                return val;
-            }
-        } catch (...) {
+    try {
+        const std::string uuid = mariadb_scalar(mysql, "SELECT @@server_uuid");
+        if (!uuid.empty() && uuid != "unknown") {
+            return uuid;
         }
+    } catch (...) {
+    }
+    try {
+        const std::string uid = mariadb_scalar(mysql, "SELECT @@server_uid");
+        if (!uid.empty()) {
+            return uid;
+        }
+    } catch (...) {
     }
     return {};
+}
+
+bool mariadb_legacy_server_identity(const std::string& id) {
+    if (id.empty() || id == "unknown") {
+        return true;
+    }
+    return std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
 }
 
 struct MasterStatusLite {
@@ -281,15 +321,40 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     });
     const std::string live_uuid = mariadb_server_uuid(mariadb.handle);
     if (!start_pos.server_uuid.empty() && !live_uuid.empty() && start_pos.server_uuid != live_uuid) {
-        upsert_capture_position(
-            log_pg,
-            conn_id,
-            start_pos.binlog_file,
-            start_pos.binlog_position,
-            live_uuid,
-            "gap_detected",
-            "server_uuid changed " + start_pos.server_uuid + " -> " + live_uuid);
-        throw std::runtime_error("server_uuid changed; gap_detected — run recovery");
+        if (mariadb_legacy_server_identity(start_pos.server_uuid) ||
+            mariadb_legacy_server_identity(live_uuid)) {
+            log_write(log_pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_kafka_capture",
+                .message = "capture server identity reconciled",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"stored", start_pos.server_uuid},
+                    {"live", live_uuid},
+                },
+            });
+            upsert_capture_position(
+                log_pg,
+                conn_id,
+                start_pos.binlog_file,
+                start_pos.binlog_position,
+                live_uuid,
+                "healthy",
+                "");
+        } else {
+            upsert_capture_position(
+                log_pg,
+                conn_id,
+                start_pos.binlog_file,
+                start_pos.binlog_position,
+                live_uuid,
+                "gap_detected",
+                "server_uuid changed " + start_pos.server_uuid + " -> " + live_uuid);
+            throw std::runtime_error("server_uuid changed; gap_detected — run recovery");
+        }
     }
 
     log_write(log_pg, {
@@ -367,17 +432,60 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                                const std::string& op,
                                const std::vector<std::string>& col_values) {
         const auto key = std::make_pair(schema, table);
+        // #region agent log
+        agent_debug_log(
+            "H3",
+            "mariadb_kafka_capture.cpp:publish_row:entry",
+            "binlog row handler invoked",
+            {
+                {"conn_id", conn_id},
+                {"schema", schema},
+                {"table", table},
+                {"op", op},
+                {"wanted_tables", static_cast<int>(wanted.size())},
+            });
+        // #endregion
         if (!wanted.count(key)) {
+            // #region agent log
+            agent_debug_log(
+                "H1",
+                "mariadb_kafka_capture.cpp:publish_row:not_wanted",
+                "row skipped: table not in capture catalog filter",
+                {
+                    {"conn_id", conn_id},
+                    {"schema", schema},
+                    {"table", table},
+                    {"op", op},
+                    {"tier", service_tier.value_or("all")},
+                });
+            // #endregion
+            return;
+        }
+        const auto cols_it = col_cache.find(key);
+        if (cols_it == col_cache.end()) {
+            // #region agent log
+            agent_debug_log(
+                "H3",
+                "mariadb_kafka_capture.cpp:publish_row:col_cache_miss",
+                "row skipped: column cache miss",
+                {{"conn_id", conn_id}, {"schema", schema}, {"table", table}, {"op", op}});
+            // #endregion
+            return;
+        }
+        const std::string op_char = op_char_from_mysql(op);
+        if (op_char.empty()) {
+            // #region agent log
+            agent_debug_log(
+                "H3",
+                "mariadb_kafka_capture.cpp:publish_row:op_empty",
+                "row skipped: unknown mysql op",
+                {{"conn_id", conn_id}, {"schema", schema}, {"table", table}, {"op", op}});
+            // #endregion
             return;
         }
         if (auto cid_it = catalog_id_by_table.find(key); cid_it != catalog_id_by_table.end()) {
             cdc_active_catalog_ids.insert(cid_it->second);
         }
-        const auto cols_it = col_cache.find(key);
-        if (cols_it == col_cache.end()) {
-            return;
-        }
-        const std::string op_char = op_char_from_mysql(op);
         nlohmann::json before = nullptr;
         nlohmann::json after = nullptr;
         const nlohmann::json row_json = row_dict_from_columns(cols_it->second, col_values);
@@ -406,6 +514,21 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             schema, table, row_for_key, pk_by_table[key]);
         try {
             producer.produce(topic, msg_key, event.to_kafka_dict().dump());
+            // #region agent log
+            agent_debug_log(
+                "H4",
+                "mariadb_kafka_capture.cpp:publish_row:produced",
+                "row published to kafka",
+                {
+                    {"conn_id", conn_id},
+                    {"schema", schema},
+                    {"table", table},
+                    {"op", op_char},
+                    {"topic", topic},
+                    {"binlog_file", binlog_start.file},
+                    {"binlog_position", binlog_start.position},
+                });
+            // #endregion
         } catch (const std::exception& ex) {
             log_write(log_pg, {
                 .level = LogLevel::Warning,
@@ -442,6 +565,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     const auto slice_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(std::max(1, rcfg.max_seconds));
     auto last_heartbeat = std::chrono::steady_clock::now() - std::chrono::hours(24);
+    int lagging_idle_chunks = 0;
     BinlogCliStats read_stats;
     read_stats.last_file = binlog_start.file;
     read_stats.last_position = binlog_start.position;
@@ -573,7 +697,29 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             }
 
             if (lagging && chunk_stalled) {
+                lagging_idle_chunks += 1;
+                const int quiet_exit = rcfg.quiet_exit_lagging_chunks > 0 ? rcfg.quiet_exit_lagging_chunks : 3;
+                if (lagging_idle_chunks >= quiet_exit) {
+                    log_write(log_pg, {
+                        .level = LogLevel::Info,
+                        .component = "cdc_kafka_capture",
+                        .message = "capture slice exiting after lagging idle chunks",
+                        .batch_id = batch_id,
+                        .conn_id = conn_id,
+                        .source_schema = std::nullopt,
+                        .source_table = std::nullopt,
+                        .context = {
+                            {"lagging_idle_chunks", lagging_idle_chunks},
+                            {"quiet_exit_lagging_chunks", quiet_exit},
+                            {"binlog_file", read_stats.last_file},
+                            {"binlog_position", read_stats.last_position},
+                        },
+                    });
+                    break;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            } else {
+                lagging_idle_chunks = 0;
             }
 
             log_write(log_pg, {
@@ -636,6 +782,9 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             }
             break;
         }
+        if (chunk.events > 0) {
+            lagging_idle_chunks = 0;
+        }
         log_write(log_pg, {
             .level = LogLevel::Info,
             .component = "cdc_kafka_capture",
@@ -669,6 +818,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             live_uuid,
             "failed",
             "kafka publish failed: " + err_detail.substr(0, 2000));
+        rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
         throw std::runtime_error("kafka publish failed: " + err_detail);
     }
 
@@ -691,6 +841,22 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                             .count();
 
     if (read_stats.events > 0 && pstats.events_published == 0) {
+        // #region agent log
+        agent_debug_log(
+            "H1",
+            "mariadb_kafka_capture.cpp:slice:read_not_published",
+            "binlog events read but none published to kafka",
+            {
+                {"conn_id", conn_id},
+                {"batch_id", batch_id},
+                {"binlog_events_read", read_stats.events},
+                {"events_published", pstats.events_published},
+                {"tables_watched", static_cast<int>(wanted.size())},
+                {"tier", service_tier.value_or("all")},
+                {"binlog_file", read_stats.last_file},
+                {"binlog_position", read_stats.last_position},
+            });
+        // #endregion
         log_write(log_pg, {
             .level = LogLevel::Warning,
             .component = "cdc_kafka_capture",
@@ -728,21 +894,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             {"tables_watched", static_cast<int>(wanted.size())},
         },
     });
-
-    try {
-        update_pipeline_health_capture(log_pg, conn_id, "mariadb");
-    } catch (const std::exception& ex) {
-        log_write(log_pg, {
-            .level = LogLevel::Warning,
-            .component = "cdc_kafka_capture",
-            .message = "pipeline_health capture refresh failed",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {{"error", ex.what()}},
-        });
-    }
 
     return stats;
     } catch (const std::exception& ex) {

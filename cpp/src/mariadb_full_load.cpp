@@ -156,9 +156,11 @@ struct PkRange {
 bool is_integer_pk_type(const MariaDbColumn& col) {
     std::string lower = col.mysql_type;
     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
-    return lower.find("int") != std::string::npos || lower.find("decimal") != std::string::npos ||
-           lower.find("numeric") != std::string::npos || lower.find("float") != std::string::npos ||
-           lower.find("double") != std::string::npos;
+    if (lower.find("decimal") != std::string::npos || lower.find("numeric") != std::string::npos ||
+        lower.find("float") != std::string::npos || lower.find("double") != std::string::npos) {
+        return false;
+    }
+    return lower.find("int") != std::string::npos;
 }
 
 MariaDbRetryOptions mariadb_retry_options(RuntimeConfig& runtime, const std::string& conn_id) {
@@ -321,7 +323,12 @@ long long copy_rows_keyset(
                 if (i) {
                     line << ',';
                 }
-                line << mariadb_format_copy_cell(row[i], lens ? lens[i] : 0, cols[i]);
+                std::string cell;
+                if (!mariadb_format_copy_cell(row[i], lens ? lens[i] : 0, cols[i], cell)) {
+                    mysql_free_result(res);
+                    throw std::runtime_error("NULL primary key in source row");
+                }
+                line << cell;
             }
             line << ',' << csv_escape(load_ts) << ',' << csv_escape(load_date) << ",MariaDB,"
                  << csv_escape(snapshot_id);
@@ -710,7 +717,9 @@ void mark_catalog_failed(
         vals);
 }
 
-bool load_one_table(
+enum class TableLoadOutcome { Success, Skipped };
+
+TableLoadOutcome load_one_table(
     const AppConfig& cfg,
     PGconn* log_pg,
     std::mutex* log_mtx,
@@ -757,7 +766,7 @@ bool load_one_table(
             target.conn_id,
             target.source_schema,
             target.source_table);
-        return false;
+        return TableLoadOutcome::Skipped;
     }
 
     {
@@ -848,7 +857,7 @@ bool load_one_table(
         target.conn_id,
         target.source_schema,
         target.source_table);
-    return true;
+    return TableLoadOutcome::Success;
 }
 
 }  // namespace
@@ -933,7 +942,7 @@ FullLoadRunStats run_mariadb_full_load(
         runtime.reload(app_pg.raw);
         reactivate_full_load_after_cooldown(app_pg.raw, runtime, conn_id);
 
-        const MariaDbPreflightResult preflight = check_mariadb_cdc_ready(order_db.handle);
+        const MariaDbPreflightResult preflight = check_mariadb_load_ready(order_db.handle);
         for (const auto& w : preflight.warnings) {
             log_fl(
                 log_pg,
@@ -949,16 +958,14 @@ FullLoadRunStats run_mariadb_full_load(
             for (const auto& e : preflight.errors) {
                 err_ctx.push_back(e);
             }
-            for (const auto& t : conn_targets) {
-                stats.tables_processed += 1;
-                stats.tables_failed += 1;
-            }
+            stats.tables_processed += static_cast<int>(conn_targets.size());
+            stats.tables_failed += static_cast<int>(conn_targets.size());
             log_fl(
                 log_pg,
                 nullptr,
                 LogLevel::Error,
                 batch_id,
-                "full load conn skipped: mariadb cdc preflight failed",
+                "full load conn skipped: mariadb load preflight failed",
                 {{"errors", err_ctx}},
                 conn_id);
             continue;
@@ -1032,14 +1039,14 @@ FullLoadRunStats run_mariadb_full_load(
                     pool.emplace_back([&, target]() {
                         long long rows = 0;
                         try {
-                            const bool ok = load_one_table(cfg, log_pg, &log_mtx, *src, target, batch_id, rows);
+                            const auto outcome = load_one_table(cfg, log_pg, &log_mtx, *src, target, batch_id, rows);
                             std::lock_guard<std::mutex> lock(stats_mtx);
                             stats.tables_processed += 1;
-                            if (ok) {
+                            if (outcome == TableLoadOutcome::Success) {
                                 stats.tables_success += 1;
                                 stats.total_rows += rows;
                             } else {
-                                stats.tables_failed += 1;
+                                stats.tables_skipped += 1;
                             }
                         } catch (const std::exception& ex) {
                             try {
@@ -1080,6 +1087,7 @@ FullLoadRunStats run_mariadb_full_load(
         stats.tables_failed == 0 ? "full load completed" : "full load completed with errors",
         {{"tables_processed", stats.tables_processed},
          {"tables_success", stats.tables_success},
+         {"tables_skipped", stats.tables_skipped},
          {"tables_failed", stats.tables_failed},
          {"total_rows", stats.total_rows},
          {"duration_ms", elapsed_ms(run_start)}});

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <bson/bson.h>
 #include <chrono>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -247,6 +248,14 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
     MongoConn mongo(*source);
     int published = 0;
     int changes_read = 0;
+    struct MongoPendingCommit {
+        long long catalog_id{0};
+        std::string source_database;
+        std::string source_table;
+        nlohmann::json resume_token;
+        bool has_token{false};
+    };
+    std::vector<MongoPendingCommit> pending_commits;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(rcfg.max_seconds);
 
     for (const auto& coll : collections) {
@@ -256,6 +265,7 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
 
         mark_catalog_cdc_in_progress(log_pg, coll.catalog_id);
 
+        bool coll_failed = false;
         nlohmann::json resume_after = get_stored_resume_token(
             log_pg, conn_id, coll.source_database, coll.source_table);
         nlohmann::json last_token = resume_after;
@@ -280,6 +290,8 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
 
         if (!stream) {
             mongoc_collection_destroy(collection);
+            bson_destroy(&pipeline);
+            rollback_cdc_in_progress_ids(log_pg, {coll.catalog_id});
             stats.errors += 1;
             continue;
         }
@@ -289,7 +301,7 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
             if (!mongoc_change_stream_next(stream, &change)) {
                 bson_error_t stream_err;
                 if (mongoc_change_stream_error_document(stream, &stream_err, nullptr)) {
-                    const std::string err_msg = stream_err.message ? stream_err.message : "";
+                    const std::string err_msg = stream_err.message;
                     const bool invalidate_resume =
                         err_msg.find("invalidate") != std::string::npos;
                     if (invalidate_resume) {
@@ -319,12 +331,16 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
                         if (!stream) {
                             mongoc_collection_destroy(collection);
                             bson_destroy(&pipeline);
+                            rollback_cdc_in_progress_ids(log_pg, {coll.catalog_id});
                             stats.errors += 1;
+                            coll_failed = true;
                             break;
                         }
                         continue;
                     }
                     stats.errors += 1;
+                    rollback_cdc_in_progress_ids(log_pg, {coll.catalog_id});
+                    coll_failed = true;
                     log_write(log_pg, {
                         .level = LogLevel::Error,
                         .component = "cdc_kafka_mongo_capture",
@@ -416,8 +432,10 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
             published += 1;
         }
 
-        if (mongoc_change_stream_error_document(stream, nullptr, nullptr)) {
+        if (!coll_failed && stream && mongoc_change_stream_error_document(stream, nullptr, nullptr)) {
+            coll_failed = true;
             stats.errors += 1;
+            rollback_cdc_in_progress_ids(log_pg, {coll.catalog_id});
             log_write(log_pg, {
                 .level = LogLevel::Error,
                 .component = "cdc_kafka_mongo_capture",
@@ -427,22 +445,44 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
                 .source_schema = coll.source_database,
                 .source_table = coll.source_table,
             });
-        } else if (!last_token.is_null()) {
-            upsert_resume_token(log_pg, conn_id, coll.source_database, coll.source_table, last_token);
+        } else if (!coll_failed && !last_token.is_null()) {
+            MongoPendingCommit pending;
+            pending.catalog_id = coll.catalog_id;
+            pending.source_database = coll.source_database;
+            pending.source_table = coll.source_table;
+            pending.resume_token = last_token;
+            pending.has_token = true;
+            pending_commits.push_back(std::move(pending));
         }
 
-        mongoc_change_stream_destroy(stream);
+        if (stream) {
+            mongoc_change_stream_destroy(stream);
+        }
         mongoc_collection_destroy(collection);
-        mark_catalog_cdc_success(log_pg, coll.catalog_id);
-        stats.collections += 1;
+        bson_destroy(&pipeline);
     }
 
     const int queued = producer.flush(30);
     const KafkaProducerStats pstats = producer.stats();
     if (pstats.errors > 0 || queued > 0) {
+        std::set<long long> rollback_ids;
+        for (const auto& p : pending_commits) {
+            rollback_ids.insert(p.catalog_id);
+        }
+        if (!rollback_ids.empty()) {
+            rollback_cdc_in_progress_ids(log_pg, rollback_ids);
+        }
         const std::string err_detail =
             !pstats.first_error.empty() ? pstats.first_error : std::to_string(queued) + " messages still queued";
         throw std::runtime_error("kafka publish failed: " + err_detail);
+    }
+
+    for (const auto& p : pending_commits) {
+        if (p.has_token) {
+            upsert_resume_token(log_pg, conn_id, p.source_database, p.source_table, p.resume_token);
+        }
+        mark_catalog_cdc_success(log_pg, p.catalog_id);
+        stats.collections += 1;
     }
 
     stats.events_published = pstats.events_published;

@@ -35,4 +35,4 @@ CatalogSyncStats sync_mongo_catalog(
 /** Discover + prune all active connections. Returns failure count. */
 int sync_all_catalogs(const AppConfig& cfg, PGconn* log_pg, const std::string& batch_id);
 
-int fetch_catalog_headline_counts(const AppConfig& cfg, int& total_out, int& active_out);
+void fetch_catalog_headline_counts(const AppConfig& cfg, int& total_out, int& active_out);

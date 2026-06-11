@@ -83,3 +83,17 @@ MariaDbPreflightResult check_mariadb_cdc_ready(MYSQL* mysql) {
 
     return result;
 }
+
+MariaDbPreflightResult check_mariadb_load_ready(MYSQL* mysql) {
+    MariaDbPreflightResult result;
+    if (!mysql) {
+        result.ok = false;
+        result.errors.push_back("mysql handle is null");
+        return result;
+    }
+    if (mysql_query(mysql, "SELECT 1") != 0) {
+        result.ok = false;
+        result.errors.push_back(std::string("connection check failed: ") + mysql_error(mysql));
+    }
+    return result;
+}

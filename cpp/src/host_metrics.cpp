@@ -161,13 +161,16 @@ HostMetricsSlice HostMetricsSampler::current_snapshot() const {
         out.host_cpu_percent =
             static_cast<double>(cpu_delta - idle_delta) * 100.0 / static_cast<double>(cpu_delta);
     }
-    if (now.process_rss_kb > 0) {
-        out.host_mem_used_mb = now.process_rss_kb / 1024;
-        out.process_rss_mb = out.host_mem_used_mb;
-        if (now.mem_total_kb > 0) {
+    if (now.mem_total_kb > 0 && now.mem_avail_kb >= 0) {
+        const long long used_kb = now.mem_total_kb - now.mem_avail_kb;
+        if (used_kb >= 0) {
+            out.host_mem_used_mb = used_kb / 1024;
             out.host_mem_percent =
-                static_cast<int>((now.process_rss_kb * 100) / now.mem_total_kb);
+                static_cast<int>((used_kb * 100) / now.mem_total_kb);
         }
+    }
+    if (now.process_rss_kb > 0) {
+        out.process_rss_mb = now.process_rss_kb / 1024;
     }
     const long long rx_delta = now.net_rx_bytes - start_.net_rx_bytes;
     const long long tx_delta = now.net_tx_bytes - start_.net_tx_bytes;

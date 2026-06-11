@@ -102,8 +102,8 @@ MYSQL* MariaDbConn::open_handle(const MariaDbSource& src) {
     return raw;
 }
 
-MariaDbConn::MariaDbConn(const MariaDbSource& src) : source_(&src) {
-    handle = open_handle(src);
+MariaDbConn::MariaDbConn(const MariaDbSource& src) : source_(src) {
+    handle = open_handle(source_);
 }
 
 MariaDbConn::~MariaDbConn() {
@@ -114,14 +114,11 @@ MariaDbConn::~MariaDbConn() {
 }
 
 void MariaDbConn::reconnect() {
-    if (!source_) {
-        throw std::runtime_error("MariaDB reconnect failed: missing source");
-    }
     if (handle) {
         mysql_close(handle);
         handle = nullptr;
     }
-    handle = open_handle(*source_);
+    handle = open_handle(source_);
 }
 
 int mariadb_retry_attempt_limit(int configured) {

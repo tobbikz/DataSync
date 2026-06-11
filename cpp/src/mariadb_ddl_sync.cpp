@@ -7,6 +7,15 @@
 
 namespace {
 
+std::string mysql_escape_literal(const std::string& value) {
+    std::string out = "'";
+    for (char c : value) {
+        out += (c == '\'') ? "''" : std::string(1, c);
+    }
+    out += "'";
+    return out;
+}
+
 bool pg_column_exists(PGconn* pg, const std::string& schema, const std::string& table, const std::string& column) {
     const char* vals[] = {schema.c_str(), table.c_str(), column.c_str()};
     PGresult* res = PQexecParams(
@@ -182,8 +191,9 @@ struct IndexDef {
 std::vector<IndexDef> fetch_mariadb_indexes(MYSQL* mysql, const std::string& schema, const std::string& table) {
     const std::string sql =
         "SELECT index_name, non_unique, column_name, seq_in_index FROM information_schema.statistics "
-        "WHERE table_schema='" +
-        schema + "' AND table_name='" + table + "' ORDER BY index_name, seq_in_index";
+        "WHERE table_schema=" +
+        mysql_escape_literal(schema) + " AND table_name=" + mysql_escape_literal(table) +
+        " ORDER BY index_name, seq_in_index";
 
     if (mysql_query(mysql, sql.c_str()) != 0) {
         throw std::runtime_error(std::string("index scan failed: ") + mysql_error(mysql));
@@ -259,8 +269,9 @@ std::vector<ForeignKeyDef> fetch_mariadb_foreign_keys_once(MYSQL* mysql, const s
         "SELECT constraint_name, column_name, referenced_table_schema, referenced_table_name, "
         "referenced_column_name, ordinal_position "
         "FROM information_schema.key_column_usage "
-        "WHERE table_schema='" +
-        schema + "' AND table_name='" + table + "' AND referenced_table_name IS NOT NULL "
+        "WHERE table_schema=" +
+        mysql_escape_literal(schema) + " AND table_name=" + mysql_escape_literal(table) +
+        " AND referenced_table_name IS NOT NULL "
         "ORDER BY constraint_name, ordinal_position";
 
     if (mysql_query(mysql, sql.c_str()) != 0) {
@@ -359,12 +370,15 @@ DdlSyncResult sync_mariadb_columns_to_lake(
     MYSQL* mysql,
     const std::string& schema,
     const std::string& table,
-    const RuntimeConfig& cfg,
-    const std::string& conn_id) {
+    const RuntimeConfig& /*cfg*/,
+    const std::string& /*conn_id*/) {
     const auto cols = fetch_mariadb_columns(mysql, schema, table);
     if (!pg_lake_table_exists(pg, schema, table)) {
         ensure_lake_table_base(pg, schema, table, cols);
         return {};
     }
-    return sync_mariadb_ddl_after_truncate(pg, mysql, schema, table, cols, cfg, conn_id);
+    DdlSyncResult result;
+    result.columns_added = sync_missing_columns(pg, schema, table, cols);
+    result.columns_widened = sync_binary_column_types(pg, schema, table, cols);
+    return result;
 }

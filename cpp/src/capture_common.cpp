@@ -17,6 +17,7 @@
 #include "mongo_lake.hpp"
 #include "obs_log.hpp"
 
+#include <algorithm>
 #include <sstream>
 #include <chrono>
 #include <map>
@@ -117,7 +118,7 @@ int capture_slice_max_seconds(
     const CdcConfig* cdc,
     const std::string& conn_id,
     const std::string& component) {
-    const int fallback = (cdc && cdc->slice_max_seconds > 0) ? cdc->slice_max_seconds : 300;
+    const int fallback = (cdc && cdc->slice_max_seconds > 0) ? cdc->slice_max_seconds : 15;
     return runtime.get_int("capture_max_seconds", fallback, component, conn_id);
 }
 
@@ -153,6 +154,8 @@ CaptureRuntimeConfig load_mariadb_capture_runtime(
         runtime.get_int("capture_producer_queue_max_kbytes", 1048576, "cdc_kafka_capture", conn_id);
     cfg.topic_partitions = runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_capture", conn_id);
     cfg.idle_poll_seconds = runtime.get_int("capture_idle_poll_seconds", 3, "cdc_kafka_capture", conn_id);
+    cfg.quiet_exit_lagging_chunks =
+        runtime.get_int("capture_quiet_exit_lagging_chunks", 3, "cdc_kafka_capture", conn_id);
     cfg.heartbeat_seconds = runtime.get_int("capture_heartbeat_seconds", 60, "cdc_kafka_capture", conn_id);
     return cfg;
 }
@@ -812,7 +815,8 @@ void enable_cdc_after_full_load(
     const std::string& conn_id,
     const std::optional<std::string>& service_tier,
     const std::string& db_engine,
-    const std::string& batch_id) {
+    const std::string& batch_id,
+    bool expect_updates) {
     std::string sql = R"(
         UPDATE cdc_catalog.catalog
         SET cdc_enabled = true,
@@ -823,10 +827,9 @@ void enable_cdc_after_full_load(
         WHERE conn_id = $1
           AND db_engine = $2::cdc_catalog.db_engine
           AND active = true
-          AND needs_full_load = false
           AND has_pk = true
-          AND status = 'success'
-          AND NOT cdc_enabled
+          AND status NOT IN ('skipped', 'disabled')
+          AND (NOT cdc_enabled OR needs_full_load = true)
     )";
     std::vector<const char*> vals = {conn_id.c_str(), db_engine.c_str()};
     std::string tier_val;
@@ -851,14 +854,20 @@ void enable_cdc_after_full_load(
     }
 
     log_write(pg, {
-        .level = LogLevel::Info,
+        .level = (expect_updates && count == 0) ? LogLevel::Warning : LogLevel::Info,
         .component = "cdc_catalog_onboard",
-        .message = "enabled cdc for loaded tables",
+        .message = (expect_updates && count == 0) ? "enable cdc after full-load: no rows updated"
+                                                   : "enabled cdc for loaded tables",
         .batch_id = batch_id,
         .conn_id = conn_id,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"count", count}, {"db_engine", db_engine}, {"tier", service_tier.value_or("")}},
+        .context = {
+            {"count", count},
+            {"db_engine", db_engine},
+            {"tier", service_tier.value_or("")},
+            {"expect_updates", expect_updates},
+        },
     });
 }
 
@@ -949,9 +958,22 @@ void clear_stale_full_load_in_progress(PGconn* pg, const std::string& conn_id, c
 
 void rollback_cdc_in_progress_ids(PGconn* pg, const std::set<long long>& catalog_ids) {
     for (long long catalog_id : catalog_ids) {
-        if (catalog_id > 0) {
-            mark_catalog_cdc_success(pg, catalog_id);
+        if (catalog_id <= 0) {
+            continue;
         }
+        const std::string id = std::to_string(catalog_id);
+        const char* vals[] = {id.c_str()};
+        pg_exec_params_simple(
+            pg,
+            R"(
+            UPDATE cdc_catalog.catalog
+            SET status = 'success',
+                updated_at = now()
+            WHERE catalog_id = $1::bigint
+              AND status = 'cdc_in_progress'
+            )",
+            1,
+            vals);
     }
 }
 
@@ -1208,7 +1230,19 @@ void log_cdc_skip_no_tables(
 
     std::string hint = "capture requires active=true, cdc_enabled=true, needs_full_load=false, has_pk=true, status not skipped/disabled";
     if (reasons.active_total == 0 && !catalog_sample.empty()) {
-        hint = "rows exist but active=false on all — run: UPDATE cdc_catalog.catalog SET active=true WHERE ...";
+        const bool any_active = std::any_of(
+            catalog_sample.begin(),
+            catalog_sample.end(),
+            [](const nlohmann::json& row) {
+                const auto it = row.find("active");
+                return it != row.end() && it->is_string() && *it == "t";
+            });
+        if (tier && !tier->empty() && any_active) {
+            hint = "tables exist for conn but none on tier " + *tier +
+                   " — check cdc_catalog.catalog.service_tier or run apply on matching tier";
+        } else if (!any_active) {
+            hint = "rows exist but active=false on all — run: UPDATE cdc_catalog.catalog SET active=true WHERE ...";
+        }
     } else if (reasons.apply_ready == 0 && reasons.needs_full_load > 0) {
         hint = "needs_full_load still true — run full-load or UPDATE needs_full_load=false after load";
     } else if (reasons.apply_ready == 0 && reasons.cdc_disabled > 0) {
@@ -1705,7 +1739,7 @@ bool onboard_conn_after_full_load(
     const std::string& tier,
     const std::string& db_engine,
     const std::string& batch_id) {
-    enable_cdc_after_full_load(pg, conn_id, tier, db_engine, batch_id);
+    enable_cdc_after_full_load(pg, conn_id, tier, db_engine, batch_id, true);
 #ifdef HAVE_FREETDS
     if (db_engine == "mssql") {
         seed_mssql_cdc_lsn_for_conn(cfg, pg, conn_id, tier, batch_id);

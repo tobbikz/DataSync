@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -115,7 +116,10 @@ KafkaProducer::~KafkaProducer() {
     }
 #ifdef HAVE_RDKAFKA
     if (impl_->body.producer) {
-        rd_kafka_flush(impl_->body.producer, 0);
+        const int remaining = rd_kafka_flush(impl_->body.producer, 5000);
+        if (remaining > 0) {
+            std::cerr << "KafkaProducer destructor: " << remaining << " message(s) remain after flush\n";
+        }
         rd_kafka_destroy(impl_->body.producer);
     }
 #endif

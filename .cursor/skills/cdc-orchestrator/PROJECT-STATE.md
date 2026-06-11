@@ -67,11 +67,33 @@ Manual full-load (opcional):
 ./cpp/build/DataSync full-load --tier bronze --conn-id MARIADB_LOCAL
 ```
 
+## Sprint reciente — P0+P1 post-auditoría ronda 2 (2025-06-11)
+
+Fixes aplicados (12 items):
+
+- **Kafka:** COMMIT validation app+lake; catalog lake-key always resolve; lag -1 on probe fail
+- **CDC:** catchup full-load gate; mongo error rollback; candidates filter; lock-skip no error
+- **Load:** mongo mid-load type widen; MSSQL UTC timestamps; MSSQL tables_skipped parity
+- **Infra:** dbcmd literal SQL (no dbfcmd % hazard)
+
+Build: `cpp/build-kafka` → `DataSync` OK.
+
+## Re-auditoría ronda 3 — aplicada (2025-06-11)
+
+Fixes (evitando `mariadb_kafka_capture.cpp` — debug agente paralelo):
+
+- **Kafka:** lake COMMIT antes de audit COMMIT; max offset por valor; parse-skip commit offsets
+- **CDC:** catchup reset solo `pos.kafka_partition`; fetch_apply_position via catalog source keys
+- **MSSQL/Mongo capture:** flush antes de LSN/resume + mark success; rollback on flush fail
+- **Infra:** PgTxn destructor no-throw
+
+Build: `cpp/build-kafka` OK.
+
 ## Próximo sprint
 
-1. **Mongo prod onboard** — conexión real en `connections`, discover, full-load por colección
-2. Migración prod — DB `DataSync` separada de `DataLake`; discover schemas reales
-3. Prometheus exporter sobre métricas PG
+1. Coordinar con agente src (apply hang bronze, debug capture instrumentation)
+2. Load P1 restantes (FK composite PK, unsigned INT, Mongo JSONB)
+3. Infra medium (runtime reload log, dedup orphan keys)
 
 ## Env vars (Docker)
 

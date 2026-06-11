@@ -50,7 +50,13 @@ struct PgTxn {
     }
 
     ~PgTxn() {
-        exec(ok ? "COMMIT" : "ROLLBACK");
+        if (!conn) {
+            return;
+        }
+        PGresult* res = PQexec(conn, ok ? "COMMIT" : "ROLLBACK");
+        if (res) {
+            PQclear(res);
+        }
     }
 
     void exec(const std::string& sql) {
@@ -510,6 +516,19 @@ std::vector<std::string> list_mssql_target_databases(MssqlConn& mssql, const std
     return out;
 }
 
+std::string mssql_quote_literal(const std::string& value) {
+    std::string out = "N'";
+    for (const char c : value) {
+        if (c == '\'') {
+            out += "''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('\'');
+    return out;
+}
+
 std::string fetch_mssql_primary_key(MssqlConn& mssql, const std::string& schema, const std::string& table) {
     const std::string sql =
         "SELECT c.name FROM sys.indexes i "
@@ -517,7 +536,8 @@ std::string fetch_mssql_primary_key(MssqlConn& mssql, const std::string& schema,
         "INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id "
         "INNER JOIN sys.tables t ON i.object_id = t.object_id "
         "INNER JOIN sys.schemas s ON t.schema_id = s.schema_id "
-        "WHERE i.is_primary_key = 1 AND s.name = '" + schema + "' AND t.name = '" + table + "' "
+        "WHERE i.is_primary_key = 1 AND s.name = " + mssql_quote_literal(schema) + " AND t.name = " +
+        mssql_quote_literal(table) + " "
         "ORDER BY ic.key_ordinal";
     const MssqlQueryResult result = mssql.query(sql);
     std::ostringstream pk;
@@ -695,9 +715,10 @@ std::vector<CatalogObjectKey> fetch_mongo_objects(MongoConn& mongo, const std::s
         }
 
         bson_error_t coll_error{};
-        char** collections = mongoc_database_get_collection_names_with_opts(
-            mongoc_client_get_database(mongo.client, db.c_str()), nullptr, &coll_error);
+        mongoc_database_t* database = mongoc_client_get_database(mongo.client, db.c_str());
+        char** collections = mongoc_database_get_collection_names_with_opts(database, nullptr, &coll_error);
         if (!collections) {
+            mongoc_database_destroy(database);
             bson_strfreev(db_names);
             throw std::runtime_error(
                 std::string("MongoDB list collections failed for ") + db + ": " + coll_error.message);
@@ -707,6 +728,7 @@ std::vector<CatalogObjectKey> fetch_mongo_objects(MongoConn& mongo, const std::s
             out.push_back({db, db, collections[j]});
         }
         bson_strfreev(collections);
+        mongoc_database_destroy(database);
     }
     bson_strfreev(db_names);
     return out;
@@ -1047,10 +1069,9 @@ int sync_all_catalogs(const AppConfig& cfg, PGconn* log_pg, const std::string& b
     return failures;
 }
 
-int fetch_catalog_headline_counts(const AppConfig& cfg, int& total_out, int& active_out) {
+void fetch_catalog_headline_counts(const AppConfig& cfg, int& total_out, int& active_out) {
     PgConn pg(cfg.datasync.conn_string());
     auto [total, active] = fetch_catalog_counts(pg);
     total_out = total;
     active_out = active;
-    return 0;
 }

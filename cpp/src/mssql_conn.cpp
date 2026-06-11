@@ -1,5 +1,6 @@
 #include "mssql_conn.hpp"
 
+#include <mutex>
 #include <sstream>
 
 std::string sanitize_mssql_text_for_pg(const std::string& in) {
@@ -91,22 +92,21 @@ namespace {
 
 thread_local std::string g_last_mssql_dblib_error;
 
+std::once_flag g_dbinit_once;
+
 void ensure_db_library_init() {
-    static bool initialized = false;
-    if (initialized) {
-        return;
-    }
-    if (dbinit() == FAIL) {
-        throw std::runtime_error("dbinit failed");
-    }
-    dberrhandle(
-        [](DBPROCESS*, int, int, int, char* dberrstr, char*) -> int {
-            if (dberrstr && dberrstr[0]) {
-                g_last_mssql_dblib_error = dberrstr;
-            }
-            return INT_CANCEL;
-        });
-    initialized = true;
+    std::call_once(g_dbinit_once, [] {
+        if (dbinit() == FAIL) {
+            throw std::runtime_error("dbinit failed");
+        }
+        dberrhandle(
+            [](DBPROCESS*, int, int, int, char* dberrstr, char*) -> int {
+                if (dberrstr && dberrstr[0]) {
+                    g_last_mssql_dblib_error = dberrstr;
+                }
+                return INT_CANCEL;
+            });
+    });
 }
 
 std::string format_dberror(DBPROCESS* db) {
@@ -128,9 +128,9 @@ std::string format_dberror(DBPROCESS* db) {
     return "unknown DB-Library error";
 }
 
-bool run_dbsql(DBPROCESS* db, const std::string& sql) {
+bool run_dbsql_impl(DBPROCESS* db, const std::string& sql) {
     g_last_mssql_dblib_error.clear();
-    if (dbfcmd(db, "%s", sql.c_str()) == FAIL) {
+    if (dbcmd(db, sql.c_str()) == FAIL) {
         throw std::runtime_error("MSSQL dbcmd failed: " + format_dberror(db));
     }
     if (dbsqlexec(db) == FAIL) {
@@ -140,6 +140,10 @@ bool run_dbsql(DBPROCESS* db, const std::string& sql) {
 }
 
 }  // namespace
+
+bool run_dbsql(DBPROCESS* db, const std::string& sql) {
+    return run_dbsql_impl(db, sql);
+}
 
 MssqlConn::MssqlConn(const MssqlSource& src) {
     ensure_db_library_init();

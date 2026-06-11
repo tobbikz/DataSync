@@ -35,15 +35,58 @@ struct ApplyPositionRow {
     nlohmann::json engine_meta = nlohmann::json::object();
 };
 
+bool catalog_still_needs_full_load(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& schema,
+    const std::string& table) {
+    const char* vals[] = {conn_id.c_str(), schema.c_str(), table.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT needs_full_load FROM cdc_catalog.catalog
+        WHERE conn_id = $1 AND source_schema = $2 AND source_table = $3
+        )",
+        3,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    bool needs = true;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        needs = (PQgetvalue(res, 0, 0)[0] == 't');
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return needs;
+}
+
 int table_lag_seconds(PGconn* pg, const char* last_applied, int lag_col, int default_stale) {
-    (void)pg;
+    int computed = default_stale + 1;
+    if (last_applied && *last_applied && pg) {
+        const char* vals[] = {last_applied};
+        PGresult* res = PQexecParams(
+            pg,
+            "SELECT GREATEST(0, EXTRACT(EPOCH FROM (now() - $1::timestamptz))::int)",
+            1,
+            nullptr,
+            vals,
+            nullptr,
+            nullptr,
+            0);
+        if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+            computed = std::atoi(PQgetvalue(res, 0, 0));
+        }
+        if (res) {
+            PQclear(res);
+        }
+    }
     if (lag_col >= 0) {
-        return std::max(0, lag_col);
+        return std::max(computed, lag_col);
     }
-    if (!last_applied || !*last_applied) {
-        return default_stale + 1;
-    }
-    return default_stale + 1;
+    return computed;
 }
 
 ApplyPositionRow fetch_apply_position(
@@ -59,7 +102,7 @@ ApplyPositionRow fetch_apply_position(
                c.source_database, c.engine_meta::text
         FROM cdc_catalog.apply_position ap
         JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
-        WHERE ap.conn_id = $1 AND ap.source_schema = $2 AND ap.source_table = $3
+        WHERE ap.conn_id = $1 AND c.source_schema = $2 AND c.source_table = $3
         )",
         3,
         nullptr,
@@ -150,7 +193,12 @@ CatchupResult run_table_catchup(
 
     const ApplyPositionRow pos = fetch_apply_position(log_pg, conn_id, schema, table);
     const std::string svc_tier = tier && !tier->empty() ? *tier : pos.service_tier;
+    auto tier_lock = TierFullLoadLock::try_acquire(conn_id, svc_tier);
+    if (!tier_lock || !tier_lock->holds()) {
+        throw std::runtime_error("catchup skipped: tier full-load lock held");
+    }
     const std::string consumer_group = kafka_apply_consumer_group(runtime, log_pg, conn_id, svc_tier);
+    const std::optional<std::string> conn_filter = conn_id;
 
 #ifdef HAVE_RDKAFKA
     const long long backlog_before =
@@ -175,34 +223,31 @@ CatchupResult run_table_catchup(
 
     flag_table_for_full_load(log_pg, conn_id, schema, table, db_engine);
 
+    FullLoadRunStats fl_stats;
     if (db_engine == "mssql") {
-        run_mssql_full_load(cfg, log_pg, batch_id, svc_tier);
+        fl_stats = run_mssql_full_load(cfg, log_pg, batch_id, svc_tier, conn_filter);
     } else if (db_engine == "mongodb") {
-        run_mongo_full_load(cfg, log_pg, batch_id, svc_tier);
+        fl_stats = run_mongo_full_load(cfg, log_pg, batch_id, svc_tier, conn_filter);
     } else {
-        run_mariadb_full_load(cfg, log_pg, batch_id, svc_tier);
+        fl_stats = run_mariadb_full_load(cfg, log_pg, batch_id, svc_tier, conn_filter);
+    }
+    const bool still_needs_fl = catalog_still_needs_full_load(log_pg, conn_id, schema, table);
+    if (full_load_process_exit_code(fl_stats) != 0 || fl_stats.tables_failed > 0 || still_needs_fl) {
+        throw std::runtime_error(
+            "catchup full-load failed: tables_failed=" + std::to_string(fl_stats.tables_failed) +
+            " tables_success=" + std::to_string(fl_stats.tables_success) +
+            " needs_full_load=" + (still_needs_fl ? "true" : "false"));
     }
 
 #ifdef HAVE_RDKAFKA
-    const int topic_partitions = (db_engine == "mssql")
-        ? runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mssql_capture", conn_id)
-        : (db_engine == "mongodb")
-            ? runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mongo_capture", conn_id)
-            : runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_capture", conn_id);
-    long long new_offset = 0;
-    for (int partition = 0; partition < topic_partitions; ++partition) {
-        const long long off =
-            reset_apply_offset_to_end(bootstrap, consumer_group, pos.kafka_topic, partition);
-        if (partition == pos.kafka_partition) {
-            new_offset = off;
-        }
-    }
+    const long long new_offset =
+        reset_apply_offset_to_end(bootstrap, consumer_group, pos.kafka_topic, pos.kafka_partition);
 #else
     const long long new_offset = 0;
 #endif
 
     update_apply_position_after_catchup(log_pg, pos.catalog_id, new_offset, conn_id, schema, table);
-    enable_cdc_after_full_load(log_pg, conn_id, svc_tier, db_engine, batch_id);
+    enable_cdc_after_full_load(log_pg, conn_id, svc_tier, db_engine, batch_id, true);
 
 #ifdef HAVE_RDKAFKA
     const long long backlog_after =
@@ -247,6 +292,8 @@ std::vector<CatchupCandidate> find_catchup_candidates(
     const int default_stale = runtime.get_int("apply_max_table_staleness_seconds", 900, "cdc_kafka_apply", conn_id);
     const int lag_seconds_threshold = runtime.get_int("apply_catchup_lag_seconds", 300, "cdc_kafka_apply", conn_id);
     const int kafka_lag_threshold = runtime.get_int("apply_catchup_kafka_messages", 500000, "cdc_kafka_apply", conn_id);
+    const int min_kafka_for_time_catchup =
+        runtime.get_int("apply_catchup_min_kafka_messages", 1000, "cdc_kafka_apply", conn_id);
     const std::string bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
 
     const char* vals[] = {conn_id.c_str()};
@@ -261,6 +308,8 @@ std::vector<CatchupCandidate> find_catchup_candidates(
         WHERE c.conn_id = $1
           AND c.active = true
           AND c.cdc_enabled = true
+          AND NOT c.needs_full_load
+          AND c.status::text != 'full_load_in_progress'
         ORDER BY c.source_schema, c.source_table
         )",
         1,
@@ -303,7 +352,10 @@ std::vector<CatchupCandidate> find_catchup_candidates(
         const long long kafka_lag = 0;
 #endif
 
-        if (lag_s >= lag_seconds_threshold || kafka_lag >= kafka_lag_threshold) {
+        const bool backlog_catchup = kafka_lag >= kafka_lag_threshold;
+        const bool time_catchup =
+            lag_s >= lag_seconds_threshold && kafka_lag >= min_kafka_for_time_catchup;
+        if (backlog_catchup || time_catchup) {
             candidates.push_back({schema, table, lag_s, kafka_lag});
         }
     }
@@ -327,19 +379,6 @@ std::vector<CatchupResult> run_catchup_if_needed(
     RuntimeConfig runtime;
     runtime.reload(log_pg);
     if (!runtime.get_bool("apply_catchup_enabled", true, "cdc_kafka_apply", conn_id)) {
-        return {};
-    }
-    if (tier && !tier->empty() && full_load_tier_busy(conn_id, *tier)) {
-        log_write(log_pg, {
-            .level = LogLevel::Info,
-            .component = "cdc_kafka_apply",
-            .message = "catchup skipped: tier full-load lock held",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {{"tier", *tier}},
-        });
         return {};
     }
     const int max_tables = runtime.get_int("apply_catchup_max_tables", 1, "cdc_kafka_apply", conn_id);
@@ -394,23 +433,30 @@ std::vector<CatchupResult> run_catchup_if_needed(
                 batch_id,
                 db_engine));
         } catch (const std::exception& ex) {
+            const std::string err = ex.what();
+            const bool lock_skipped = err.find("tier full-load lock held") != std::string::npos;
             CatchupResult failed;
-            failed.error = ex.what();
+            if (!lock_skipped) {
+                failed.error = err;
+            }
             failed.payload = {
                 {"source_schema", cand.source_schema},
                 {"source_table", cand.source_table},
-                {"error", ex.what()},
             };
+            if (!lock_skipped) {
+                failed.payload["error"] = err;
+            }
             results.push_back(std::move(failed));
             log_write(log_pg, {
-                .level = LogLevel::Error,
+                .level = lock_skipped ? LogLevel::Info : LogLevel::Error,
                 .component = "cdc_kafka_apply",
-                .message = "catchup full-load failed",
+                .message = lock_skipped ? "catchup skipped: tier full-load lock held"
+                                        : "catchup full-load failed",
                 .batch_id = batch_id,
                 .conn_id = conn_id,
                 .source_schema = cand.source_schema,
                 .source_table = cand.source_table,
-                .context = {{"error", std::string(ex.what()).substr(0, 500)}},
+                .context = {{"error", err.substr(0, 500)}},
             });
         }
     }

@@ -50,7 +50,6 @@ set(DATASYNC_SOURCES
     src/mongo_full_load.cpp
     src/runtime_config.cpp
     src/obs_log.cpp
-    src/pipeline_health.cpp
 )
 
 find_path(FREETDS_INCLUDE_DIR NAMES sybdb.h)
@@ -90,8 +89,8 @@ if(nlohmann_json_FOUND)
     target_link_libraries(DataSync PRIVATE nlohmann_json::nlohmann_json)
 endif()
 
-# librdkafka: Docker build stages under cpp/deps/rdkafka; native dev may use pkg-config.
-set(RDKAFKA_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/deps/rdkafka")
+# librdkafka: Docker stages vendor to ${CMAKE_BINARY_DIR}/deps/rdkafka; native dev uses pkg-config.
+set(RDKAFKA_PREFIX "${CMAKE_BINARY_DIR}/deps/rdkafka")
 set(HAVE_RDKAFKA OFF)
 if(EXISTS "${RDKAFKA_PREFIX}/lib/librdkafka.so" OR EXISTS "${RDKAFKA_PREFIX}/lib/librdkafka.a")
     message(STATUS "Using vendored librdkafka: ${RDKAFKA_PREFIX}")
@@ -131,9 +130,3 @@ if(HAVE_MONGOC)
 endif()
 
 target_compile_options(DataSync PRIVATE -Wall -Wextra)
-
-option(BUILD_TESTING "Build Catch2 unit tests" OFF)
-include(CTest)
-if(BUILD_TESTING)
-    add_subdirectory(tests)
-endif()

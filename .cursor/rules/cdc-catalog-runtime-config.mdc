@@ -18,7 +18,7 @@ All tunables (batch size, workers, parallelism, retention, DDL flags) come from 
 
 ## Table
 
-DDL: `sql/004_cdc_catalog_runtime_config.sql`
+DDL: `prod_ops.sql` → `@section:datasync_baseline` + incremental seeds
 
 | Key | Component | Example |
 |-----|-----------|---------|

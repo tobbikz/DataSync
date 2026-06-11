@@ -3,6 +3,7 @@
 #include <libpq-fe.h>
 
 #include <cstddef>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -37,6 +38,7 @@ public:
         const std::string& conn_id = "") const;
 
 private:
+    mutable std::shared_mutex mutex_;
     std::unordered_map<std::string, std::string> values_;
 
     static std::string make_lookup_key(

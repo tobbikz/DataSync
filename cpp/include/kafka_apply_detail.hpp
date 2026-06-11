@@ -5,6 +5,7 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -77,6 +78,15 @@ nlohmann::json apply_events_batch(
     const ApplyBatchOptions& options = {});
 
 ApplyEvent parse_apply_event(const nlohmann::json& obj);
+
+/** Fill schema_name/table_name from event_id (pos|schema.table|op|pk) when missing. */
+bool fill_table_key_from_event_id(ApplyEvent& event, const std::string& db_engine = "mariadb");
+
+/** Resolve schema/table from cdc_catalog.catalog when catalog_id > 0; overwrites with lake names. */
+bool resolve_event_lake_key_from_catalog(
+    PGconn* pg,
+    const std::string& conn_id,
+    ApplyEvent& event);
 
 std::unordered_set<std::string> filter_new_event_ids(PGconn* pg, const std::vector<std::string>& event_ids);
 

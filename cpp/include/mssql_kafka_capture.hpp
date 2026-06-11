@@ -1,7 +1,6 @@
 #pragma once
 
 #include "config.hpp"
-#include "mssql_conn.hpp"
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
@@ -17,6 +16,9 @@ struct MssqlCaptureStats {
     long long duration_ms{0};
 };
 
+#ifdef HAVE_FREETDS
+#include "mssql_conn.hpp"
+
 /** Seed cdc_mssql_lsn to max LSN at full-load start for one table (skip if row exists). */
 bool seed_mssql_cdc_lsn_for_table_if_absent(
     PGconn* log_pg,
@@ -25,6 +27,7 @@ bool seed_mssql_cdc_lsn_for_table_if_absent(
     const std::string& database,
     const std::string& schema,
     const std::string& table);
+#endif
 
 /** Seed all catalog tables for conn; skips tables that already have LSN rows. */
 int seed_mssql_cdc_lsn_for_conn(

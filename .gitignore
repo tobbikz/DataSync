@@ -3,10 +3,8 @@ config.json
 cpp/config.json
 **/config.cdc-test.json
 
-# C++ build artifacts
+# C++ build (cmake -B cpp/build + vendored deps/rdkafka in Docker)
 cpp/build/
-cpp/build-rdkafka/
-cpp/deps/
 
 # Python
 __pycache__/

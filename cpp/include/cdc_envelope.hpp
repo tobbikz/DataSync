@@ -35,4 +35,5 @@ nlohmann::json row_dict_from_columns(
     const std::vector<std::string>& columns,
     const std::vector<std::string>& col_values);
 
+/** Returns c/u/d for known ops; empty string for unknown (callers must skip publish). */
 std::string op_char_from_mysql(const std::string& mysql_op);
