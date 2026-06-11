@@ -74,13 +74,23 @@ struct KafkaBootstrapResolved {
 KafkaBootstrapResolved resolve_kafka_bootstrap(RuntimeConfig& runtime, const std::string& conn_id);
 
 /** Topic prefix is always conn_id (not runtime_config). */
-std::string topic_prefix_for_conn(const std::string& conn_id);
+inline std::string topic_prefix_for_conn(const std::string& conn_id) {
+    if (conn_id.empty()) {
+        return "UNKNOWN_CONN";
+    }
+    return conn_id;
+}
 
-std::string runtime_topic_prefix(
+inline std::string runtime_topic_prefix(
     RuntimeConfig& runtime,
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& db_engine);
+    const std::string& db_engine) {
+    (void)runtime;
+    (void)pg;
+    (void)db_engine;
+    return topic_prefix_for_conn(conn_id);
+}
 
 /** Log why capture/apply found zero eligible tables (cdc_catalog.logs). */
 void log_cdc_skip_no_tables(

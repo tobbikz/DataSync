@@ -96,24 +96,6 @@ KafkaBootstrapResolved resolve_kafka_bootstrap(RuntimeConfig& runtime, const std
     return out;
 }
 
-std::string topic_prefix_for_conn(const std::string& conn_id) {
-    if (conn_id.empty()) {
-        return "UNKNOWN_CONN";
-    }
-    return conn_id;
-}
-
-std::string runtime_topic_prefix(
-    RuntimeConfig& runtime,
-    PGconn* pg,
-    const std::string& conn_id,
-    const std::string& db_engine) {
-    (void)runtime;
-    (void)pg;
-    (void)db_engine;
-    return topic_prefix_for_conn(conn_id);
-}
-
 std::string kafka_apply_consumer_group(
     RuntimeConfig& runtime,
     PGconn* pg,

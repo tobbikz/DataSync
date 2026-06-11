@@ -3,7 +3,9 @@
 #include "mariadb_schema.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
+#include <ctime>
 #include <iomanip>
 #include <regex>
 #include <sstream>

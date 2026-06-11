@@ -20,6 +20,7 @@ set(DATASYNC_SOURCES
     src/mariadb_preflight.cpp
     src/mariadb_schema.cpp
     src/mariadb_datetime.cpp
+    src/mariadb_copy_format.cpp
     src/mariadb_ddl_sync.cpp
     src/mariadb_ddl_sync_run.cpp
     src/mariadb_full_load.cpp
@@ -27,6 +28,7 @@ set(DATASYNC_SOURCES
     src/mariadb_binlog_cli.cpp
     src/mariadb_cdc.cpp
     src/kafka_apply.cpp
+    src/kafka_apply_parse.cpp
     src/kafka_topics.cpp
     src/kafka_apply_native.cpp
     src/kafka_lag.cpp
@@ -129,3 +131,8 @@ if(HAVE_MONGOC)
 endif()
 
 target_compile_options(DataSync PRIVATE -Wall -Wextra)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
