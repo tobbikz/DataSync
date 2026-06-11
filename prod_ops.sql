@@ -1324,123 +1324,107 @@ DROP FUNCTION IF EXISTS cdc_catalog.refresh_pipeline_health_live(
 
 DROP TABLE IF EXISTS cdc_catalog.pipeline_health;
 
--- Idempotent runtime_config seeds (safe to re-run on every install).
--- Credentials live in config.json / cdc_catalog.connections only.
+-- Migration 002: canonical runtime_config (22 global rows) + one-time reconcile history reset.
+-- Latency/mirror knobs (apply_max_seconds, apply_append_only, capture_max_seconds, catchup thresholds)
+-- are C++ binary defaults — not runtime_config.
+-- Credentials: config.json + cdc_catalog.connections. Kafka bootstrap patched by install.sh (KAFKA_BOOTSTRAP).
 
-INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
-VALUES
-    ('logs_retention_days', 'global', '', '7'::jsonb, 'Purge cdc_catalog.logs retention'),
-    ('reconcile_interval_hours', 'cdc_kafka_reconcile', '', '4'::jsonb, 'Hours between reconcile-loop runs'),
-    ('reconcile_enabled', 'cdc_kafka_reconcile', '', 'true'::jsonb, 'Enable reconciliation pipeline'),
-    ('applied_events_retention_days', 'cdc_kafka_apply', '', '7'::jsonb, 'Dedup audit retention'),
-    ('apply_process_rss_cap_mb', 'cdc_kafka_apply', '', '10240'::jsonb, 'Soft RSS cap MB for native apply'),
-    ('apply_batch_size', 'cdc_kafka_apply', '', '50000'::jsonb, 'Apply batch before flush'),
-    ('apply_max_seconds', 'cdc_kafka_apply', '', '300'::jsonb, 'Apply slice max seconds'),
-    ('apply_max_events', 'cdc_kafka_apply', '', '10000000'::jsonb, 'Apply slice max events per conn/tier'),
-    ('apply_worker_count', 'cdc_kafka_apply', '', '1'::jsonb, 'Native apply worker threads (overrides config.json tier apply_workers)'),
-    ('capture_max_seconds', 'cdc_kafka_capture', '', '300'::jsonb, 'MariaDB capture slice max'),
-    ('capture_max_events', 'cdc_kafka_capture', '', '10000000'::jsonb, 'MariaDB capture slice max binlog events'),
-    ('capture_producer_queue_max_messages', 'cdc_kafka_capture', '', '500000'::jsonb, 'Kafka producer queue depth'),
-    ('capture_producer_queue_max_kbytes', 'cdc_kafka_capture', '', '1048576'::jsonb, 'Kafka producer queue memory KB'),
-    ('kafka_topic_mode', 'global', '', '"bucketed"'::jsonb, 'Kafka topic layout'),
-    ('kafka_topic_buckets', 'global', '', '64'::jsonb, 'Bucket count when bucketed mode'),
-    ('catalog_sync_interval_rounds', 'catalog', '', '12'::jsonb, 'Daemon: run discover every N rounds (1=every round)'),
-    ('full_load_max_fail_retries', 'mariadb_load', '', '5'::jsonb, 'Pause full-load retries after N failures (needs_full_load=false)'),
-    ('full_load_failed_cooldown_minutes', 'mariadb_load', '', '240'::jsonb, 'Re-enable paused full-load tables after cooldown minutes')
-ON CONFLICT (config_key, component, conn_id) DO NOTHING;
-
-SELECT config_key, component, conn_id, config_value
-FROM cdc_catalog.runtime_config
-WHERE (config_key, component) IN (
-    ('debezium_topic_prefix', 'cdc_kafka_apply'),
-    ('debezium_connect_url', 'cdc_kafka_health'),
-    ('debezium_connector_name', 'cdc_kafka_health'),
-    ('capture_topic_prefix', 'cdc_kafka_capture'),
-    ('kafka_topic_prefix', 'cdc_kafka_apply'),
-    ('capture_binlog_mode', 'cdc_kafka_capture')
-)
-   OR (config_key = 'cdc_apply_batch_size' AND component = 'mariadb_cdc')
-   OR component = 'cdc_kafka_health';
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 2) THEN
+        TRUNCATE cdc_catalog.reconciliation_run RESTART IDENTITY CASCADE;
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (2, 'canonical runtime_config; reconciliation_run history reset');
+        RAISE NOTICE 'migration 002: reconciliation_run truncated';
+    END IF;
+END $$;
 
 DELETE FROM cdc_catalog.runtime_config
-WHERE (config_key, component) IN (
-    ('debezium_topic_prefix', 'cdc_kafka_apply'),
-    ('debezium_connect_url', 'cdc_kafka_health'),
-    ('debezium_connector_name', 'cdc_kafka_health'),
-    ('capture_topic_prefix', 'cdc_kafka_capture'),
-    ('kafka_topic_prefix', 'cdc_kafka_apply'),
-    ('capture_binlog_mode', 'cdc_kafka_capture')
-)
+WHERE component = 'cdc_kafka_health'
+   OR (config_key, component) IN (
+        ('debezium_topic_prefix', 'cdc_kafka_apply'),
+        ('debezium_connect_url', 'cdc_kafka_health'),
+        ('debezium_connector_name', 'cdc_kafka_health'),
+        ('capture_topic_prefix', 'cdc_kafka_capture'),
+        ('kafka_topic_prefix', 'cdc_kafka_apply'),
+        ('capture_binlog_mode', 'cdc_kafka_capture')
+    )
    OR (config_key = 'cdc_apply_batch_size' AND component = 'mariadb_cdc')
-   OR component = 'cdc_kafka_health';
+   OR (config_key, component) IN (
+        ('apply_max_seconds', 'cdc_kafka_apply'),
+        ('capture_max_seconds', 'cdc_kafka_capture'),
+        ('apply_append_only', 'cdc_kafka_apply'),
+        ('apply_exit_on_targets_met', 'cdc_kafka_apply'),
+        ('apply_empty_poll_quiet_threshold', 'cdc_kafka_apply'),
+        ('apply_catchup_enabled', 'cdc_kafka_apply'),
+        ('apply_catchup_kafka_messages', 'cdc_kafka_apply'),
+        ('apply_catchup_lag_seconds', 'cdc_kafka_apply'),
+        ('apply_catchup_max_tables', 'cdc_kafka_apply'),
+        ('apply_catchup_min_kafka_messages', 'cdc_kafka_apply'),
+        ('kafka_topic_partitions', 'cdc_kafka_capture'),
+        ('kafka_topic_partitions', 'cdc_kafka_apply')
+    );
 
-\echo '=== runtime_config row count after cleanup ==='
+DELETE FROM cdc_catalog.runtime_config
+WHERE (config_key, component, COALESCE(conn_id, '')) NOT IN (
+    ('capture_producer_queue_max_messages', 'cdc_kafka_capture', ''),
+    ('capture_producer_queue_max_kbytes',   'cdc_kafka_capture', ''),
+    ('apply_worker_count',                  'cdc_kafka_apply', ''),
+    ('full_load_max_fail_retries',          'mariadb_load', ''),
+    ('full_load_failed_cooldown_minutes',   'mariadb_load', ''),
+    ('kafka_bootstrap_servers',             'cdc_kafka_apply', ''),
+    ('apply_batch_size',                    'cdc_kafka_apply', ''),
+    ('apply_dedup_enabled',                 'cdc_kafka_apply', ''),
+    ('capture_quiet_exit_lagging_chunks',   'cdc_kafka_capture', ''),
+    ('capture_max_events',                  'cdc_kafka_capture', ''),
+    ('apply_max_events',                    'cdc_kafka_apply', ''),
+    ('full_load_batch_size',                'mariadb_load', ''),
+    ('full_load_workers',                   'mariadb_load', ''),
+    ('logs_retention_days',                 'global', ''),
+    ('reconcile_interval_hours',             'cdc_kafka_reconcile', ''),
+    ('reconcile_enabled',                   'cdc_kafka_reconcile', ''),
+    ('applied_events_retention_days',       'cdc_kafka_apply', ''),
+    ('apply_process_rss_cap_mb',            'cdc_kafka_apply', ''),
+    ('kafka_topic_mode',                    'global', ''),
+    ('kafka_topic_buckets',                 'global', ''),
+    ('catalog_sync_interval_rounds',        'catalog', ''),
+    ('full_load_parallel_tables',           'mariadb_load', '')
+);
+
+INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
+VALUES
+    ('capture_producer_queue_max_messages', 'cdc_kafka_capture', '', '500000'::jsonb, 'Kafka producer queue depth'),
+    ('capture_producer_queue_max_kbytes',   'cdc_kafka_capture', '', '1048576'::jsonb, 'Kafka producer queue memory KB'),
+    ('apply_worker_count',                  'cdc_kafka_apply',   '', '1'::jsonb, 'Native apply worker threads (overrides config.json tier apply_workers)'),
+    ('full_load_max_fail_retries',          'mariadb_load',    '', '5'::jsonb, 'Pause full-load retries after N failures (needs_full_load=false)'),
+    ('full_load_failed_cooldown_minutes',   'mariadb_load',    '', '240'::jsonb, 'Re-enable paused full-load tables after cooldown minutes'),
+    ('kafka_bootstrap_servers',             'cdc_kafka_apply',   '', '"127.0.0.1:9092"'::jsonb, 'Kafka bootstrap (overridden by install.sh KAFKA_BOOTSTRAP)'),
+    ('apply_batch_size',                    'cdc_kafka_apply',   '', '500'::jsonb, 'Apply batch before flush'),
+    ('apply_dedup_enabled',                 'cdc_kafka_apply',   '', 'true'::jsonb, 'Dedup applied events audit'),
+    ('capture_quiet_exit_lagging_chunks',   'cdc_kafka_capture', '', '3'::jsonb, 'Exit after N lagging idle binlog chunks'),
+    ('capture_max_events',                  'cdc_kafka_capture', '', '2000000'::jsonb, 'MariaDB capture slice max binlog events'),
+    ('apply_max_events',                    'cdc_kafka_apply',   '', '2000000'::jsonb, 'Apply slice max events per conn/tier'),
+    ('full_load_batch_size',                'mariadb_load',    '', '50000'::jsonb, 'MariaDB full-load COPY batch size'),
+    ('full_load_workers',                   'mariadb_load',    '', '4'::jsonb, 'MariaDB full-load keyset workers per table'),
+    ('logs_retention_days',                 'global',          '', '7'::jsonb, 'Purge cdc_catalog.logs retention'),
+    ('reconcile_interval_hours',             'cdc_kafka_reconcile', '', '4'::jsonb, 'Hours between reconcile-loop runs'),
+    ('reconcile_enabled',                   'cdc_kafka_reconcile', '', 'true'::jsonb, 'Enable reconciliation pipeline'),
+    ('applied_events_retention_days',       'cdc_kafka_apply',   '', '7'::jsonb, 'Dedup audit retention'),
+    ('apply_process_rss_cap_mb',            'cdc_kafka_apply',   '', '10240'::jsonb, 'Soft RSS cap MB for native apply'),
+    ('kafka_topic_mode',                    'global',          '', '"bucketed"'::jsonb, 'Kafka topic layout'),
+    ('kafka_topic_buckets',                 'global',          '', '64'::jsonb, 'Bucket count when bucketed mode'),
+    ('catalog_sync_interval_rounds',        'catalog',         '', '12'::jsonb, 'Daemon: run discover every N rounds (1=every round)'),
+    ('full_load_parallel_tables',           'mariadb_load',    '', '4'::jsonb, 'Parallel full-load tables per conn')
+ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
+    config_value = EXCLUDED.config_value,
+    description  = EXCLUDED.description,
+    updated_at   = now();
+
+\echo '=== runtime_config canonical (expect 22 rows) ==='
 SELECT COUNT(*) AS runtime_config_rows FROM cdc_catalog.runtime_config;
-
--- === 2. Slice / worker tuning ===
-
-INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
-VALUES
-    ('apply_max_seconds', 'cdc_kafka_apply', '', '900'::jsonb,
-     'Apply slice max seconds (runtime overrides config.json)'),
-    ('apply_max_events', 'cdc_kafka_apply', '', '1000000'::jsonb,
-     'Apply slice max Kafka events'),
-    ('apply_worker_count', 'cdc_kafka_apply', '', '6'::jsonb,
-     'Native apply worker threads (catalog_id hash sharding)'),
-    ('capture_max_seconds', 'cdc_kafka_capture', '', '900'::jsonb,
-     'MariaDB capture slice max seconds'),
-    ('capture_max_events', 'cdc_kafka_capture', '', '1000000'::jsonb,
-     'MariaDB capture slice max binlog events published'),
-    ('full_load_max_fail_retries', 'mariadb_load', '', '5'::jsonb,
-     'Pause full-load after N COPY failures (needs_full_load=false)'),
-    ('full_load_failed_cooldown_minutes', 'mariadb_load', '', '240'::jsonb,
-     'Re-enable paused full-load tables after cooldown')
-ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
-    config_value = EXCLUDED.config_value,
-    description = EXCLUDED.description,
-    updated_at = now();
-
-\echo '=== slice / worker keys (global) ==='
-SELECT config_key, component, conn_id, config_value, updated_at
-FROM cdc_catalog.runtime_config
-WHERE config_key IN (
-    'apply_max_seconds', 'apply_max_events', 'apply_worker_count',
-    'capture_max_seconds', 'capture_max_events',
-    'full_load_max_fail_retries', 'full_load_failed_cooldown_minutes'
-)
-ORDER BY config_key;
-
--- === 3. Apply / catch-up / full-load parallelism ===
-
-INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
-VALUES
-    ('apply_batch_size', 'cdc_kafka_apply', '', '50000'::jsonb, 'Rows before PG flush'),
-    ('kafka_topic_partitions', 'cdc_kafka_capture', '', '6'::jsonb, 'Partitions per bucket topic (capture)'),
-    ('kafka_topic_partitions', 'cdc_kafka_apply', '', '6'::jsonb, 'Partitions per bucket topic (apply)'),
-    ('apply_catchup_enabled', 'cdc_kafka_apply', '', 'true'::jsonb, 'Mini full-load on high lag'),
-    ('apply_catchup_kafka_messages', 'cdc_kafka_apply', '', '20000'::jsonb, 'Trigger catch-up (LiveChat-scale lag)'),
-    ('apply_catchup_lag_seconds', 'cdc_kafka_apply', '', '180'::jsonb, 'Apply lag seconds trigger'),
-    ('apply_catchup_max_tables', 'cdc_kafka_apply', '', '2'::jsonb, 'Max catch-up tables per slice'),
-    ('capture_quiet_exit_lagging_chunks', 'cdc_kafka_capture', '', '3'::jsonb, 'Exit capture slice after N lagging idle binlog chunks'),
-    ('apply_process_rss_cap_mb', 'cdc_kafka_apply', '', '10240'::jsonb, 'Soft RSS cap MB'),
-    ('full_load_parallel_tables', 'mariadb_load', '', '4'::jsonb, 'Parallel full-load tables per conn'),
-    ('reconcile_enabled', 'cdc_kafka_reconcile', '', 'true'::jsonb, 'Enable reconcile loop'),
-    ('reconcile_interval_hours', 'cdc_kafka_reconcile', '', '4'::jsonb, 'Hours between reconcile runs'),
-    ('logs_retention_days', 'global', '', '7'::jsonb, 'Purge cdc_catalog.logs retention')
-ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
-    config_value = EXCLUDED.config_value,
-    description = EXCLUDED.description,
-    updated_at = now();
-
-\echo '=== apply / catchup / full-load parallel ==='
 SELECT config_key, component, config_value
 FROM cdc_catalog.runtime_config
-WHERE config_key IN (
-    'apply_batch_size', 'kafka_topic_partitions', 'apply_catchup_enabled',
-    'apply_catchup_kafka_messages', 'full_load_parallel_tables',
-    'reconcile_enabled', 'logs_retention_days'
-)
-ORDER BY config_key, component;
+ORDER BY component, config_key;
 
 -- @section:monitoring_views
 
