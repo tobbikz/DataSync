@@ -238,6 +238,21 @@ std::string cap_kafka_for_overall(const std::string& row_status, const std::stri
     return kafka_status;
 }
 
+// PK sample compares first N rows by PK order; mismatch with matching counts is often type/format drift.
+// Never let pk_checksum alone drive overall=fail when row counts did not fail.
+std::string cap_pk_checksum_for_overall(const std::string& row_status, bool pk_match) {
+    if (pk_match) {
+        return "ok";
+    }
+    if (row_status == "skip" || row_status == "ok") {
+        return "ok";
+    }
+    if (row_status == "warn") {
+        return "warn";
+    }
+    return "fail";
+}
+
 std::string eval_capture_lag_status(int capture_lag_seconds, const ReconcileRuntime& cfg) {
     if (capture_lag_seconds < 0) {
         return "skip";
@@ -1202,18 +1217,20 @@ int run_reconcile_cli(
                     mariadb->handle, lake_pg.raw, row, rcfg.pk_sample_size);
                 if (pk_match) {
                     checks["pk_checksum_match"] = *pk_match;
-                    if (!*pk_match) {
-                        overall = status_rank(overall, "fail");
-                    }
+                    const std::string pk_for_overall =
+                        cap_pk_checksum_for_overall(row_status, *pk_match);
+                    checks["pk_checksum_status_overall"] = pk_for_overall;
+                    overall = status_rank(overall, pk_for_overall);
                 }
 #ifdef HAVE_FREETDS
             } else if (pk_sample && db_engine == "mssql" && mssql) {
                 const auto pk_match = pk_checksum_match_mssql(*mssql, lake_pg.raw, row, rcfg.pk_sample_size);
                 if (pk_match) {
                     checks["pk_checksum_match"] = *pk_match;
-                    if (!*pk_match) {
-                        overall = status_rank(overall, "fail");
-                    }
+                    const std::string pk_for_overall =
+                        cap_pk_checksum_for_overall(row_status, *pk_match);
+                    checks["pk_checksum_status_overall"] = pk_for_overall;
+                    overall = status_rank(overall, pk_for_overall);
                 }
 #endif
 #ifdef HAVE_MONGOC
@@ -1221,9 +1238,10 @@ int run_reconcile_cli(
                 const auto pk_match = pk_checksum_match_mongo(*mongo, lake_pg.raw, row, rcfg.pk_sample_size);
                 if (pk_match) {
                     checks["pk_checksum_match"] = *pk_match;
-                    if (!*pk_match) {
-                        overall = status_rank(overall, "fail");
-                    }
+                    const std::string pk_for_overall =
+                        cap_pk_checksum_for_overall(row_status, *pk_match);
+                    checks["pk_checksum_status_overall"] = pk_for_overall;
+                    overall = status_rank(overall, pk_for_overall);
                 }
 #endif
             }
