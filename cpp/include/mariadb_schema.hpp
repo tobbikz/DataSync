@@ -26,6 +26,9 @@ std::string sanitize_mariadb_text_for_pg(const std::string& value);
 /** Strip/replace invalid UTF-8 so nlohmann::json can serialize capture payloads. */
 std::string sanitize_utf8_for_json(const std::string& value);
 
+/** Binlog BLOB/BINARY cell → \\xHEX JSON string (valid UTF-8 for Kafka). */
+std::string mariadb_binary_cell_to_json_hex(const std::string& binlog_cell);
+
 /** Raw cell value when MariaDB sends NULL but the lake column is NOT NULL (schema drift). */
 std::string mariadb_not_null_copy_default(const MariaDbColumn& col);
 

@@ -27,42 +27,6 @@ std::string to_lower_copy(std::string s) {
     return s;
 }
 
-/** Normalize mariadb-binlog binary cells: _binary '\\x..', X'HEX', 0xHEX. */
-std::string normalize_binlog_binary_cell(std::string raw) {
-    raw = trim_copy(std::move(raw));
-    if (raw == "NULL" || raw.empty()) {
-        return raw;
-    }
-    const std::string lower = to_lower_copy(raw);
-    if (lower.rfind("_binary", 0) == 0) {
-        raw = trim_copy(raw.substr(7));
-    }
-    if (raw.size() >= 2 && raw.front() == '\'' && raw.back() == '\'') {
-        std::string inner = raw.substr(1, raw.size() - 2);
-        std::string unescaped;
-        unescaped.reserve(inner.size());
-        for (std::size_t i = 0; i < inner.size(); ++i) {
-            if (inner[i] == '\'' && i + 1 < inner.size() && inner[i + 1] == '\'') {
-                unescaped += '\'';
-                ++i;
-            } else {
-                unescaped += inner[i];
-            }
-        }
-        return unescaped;
-    }
-    if (raw.size() >= 3 && (raw[0] == 'X' || raw[0] == 'x') && raw[1] == '\'') {
-        const auto close = raw.rfind('\'');
-        if (close != std::string::npos && close > 2) {
-            return raw.substr(2, close - 2);
-        }
-    }
-    if (raw.size() >= 2 && (raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X'))) {
-        return raw.substr(2);
-    }
-    return raw;
-}
-
 }  // namespace
 
 std::string utc_iso_timestamp_now() {
@@ -83,7 +47,7 @@ nlohmann::json parse_sql_literal(const std::string& raw) {
     const std::string lower = to_lower_copy(trimmed);
     if (lower.rfind("_binary", 0) == 0 || (trimmed.size() >= 2 && trimmed[0] == '0' && (trimmed[1] == 'x' || trimmed[1] == 'X')) ||
         (trimmed.size() >= 2 && (trimmed[0] == 'X' || trimmed[0] == 'x') && trimmed[1] == '\'')) {
-        return normalize_binlog_binary_cell(raw);
+        return mariadb_binary_cell_to_json_hex(raw);
     }
     if (raw.size() >= 2 && raw.front() == '\'' && raw.back() == '\'') {
         std::string inner = raw.substr(1, raw.size() - 2);

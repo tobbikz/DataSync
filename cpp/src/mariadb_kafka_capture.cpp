@@ -13,7 +13,6 @@
 
 #include <cctype>
 #include <chrono>
-#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
@@ -23,32 +22,6 @@
 #include <thread>
 
 namespace {
-
-// #region agent log
-void agent_debug_log(
-    const char* hypothesis_id,
-    const char* location,
-    const char* message,
-    const nlohmann::json& data) {
-    std::ofstream out("/home/iks/Projects/DataSync/.cursor/debug-e0d3ad.log", std::ios::app);
-    if (!out) {
-        return;
-    }
-    const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-    out << nlohmann::json{
-               {"sessionId", "e0d3ad"},
-               {"hypothesisId", hypothesis_id},
-               {"location", location},
-               {"message", message},
-               {"data", data},
-               {"timestamp", ts},
-           }.dump()
-        << '\n';
-}
-// #endregion
-
 
 struct CapturePosition {
     std::string binlog_file;
@@ -438,55 +411,15 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                                const std::string& op,
                                const std::vector<std::string>& col_values) {
         const auto key = std::make_pair(schema, table);
-        // #region agent log
-        agent_debug_log(
-            "H3",
-            "mariadb_kafka_capture.cpp:publish_row:entry",
-            "binlog row handler invoked",
-            {
-                {"conn_id", conn_id},
-                {"schema", schema},
-                {"table", table},
-                {"op", op},
-                {"wanted_tables", static_cast<int>(wanted.size())},
-            });
-        // #endregion
         if (!wanted.count(key)) {
-            // #region agent log
-            agent_debug_log(
-                "H1",
-                "mariadb_kafka_capture.cpp:publish_row:not_wanted",
-                "row skipped: table not in capture catalog filter",
-                {
-                    {"conn_id", conn_id},
-                    {"schema", schema},
-                    {"table", table},
-                    {"op", op},
-                    {"tier", service_tier.value_or("all")},
-                });
-            // #endregion
             return;
         }
         const auto cols_it = col_cache.find(key);
         if (cols_it == col_cache.end()) {
-            // #region agent log
-            agent_debug_log(
-                "H3",
-                "mariadb_kafka_capture.cpp:publish_row:col_cache_miss",
-                "row skipped: column cache miss",
-                {{"conn_id", conn_id}, {"schema", schema}, {"table", table}, {"op", op}});
-            // #endregion
             return;
         }
         const std::string op_char = op_char_from_mysql(op);
         if (op_char.empty()) {
-            // #region agent log
-            agent_debug_log(
-                "H3",
-                "mariadb_kafka_capture.cpp:publish_row:op_empty",
-                "row skipped: unknown mysql op",
-                {{"conn_id", conn_id}, {"schema", schema}, {"table", table}, {"op", op}});
-            // #endregion
             return;
         }
         if (auto cid_it = catalog_id_by_table.find(key); cid_it != catalog_id_by_table.end()) {
@@ -520,21 +453,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             schema, table, row_for_key, pk_by_table[key]);
         try {
             producer.produce(topic, msg_key, event.to_kafka_dict().dump());
-            // #region agent log
-            agent_debug_log(
-                "H4",
-                "mariadb_kafka_capture.cpp:publish_row:produced",
-                "row published to kafka",
-                {
-                    {"conn_id", conn_id},
-                    {"schema", schema},
-                    {"table", table},
-                    {"op", op_char},
-                    {"topic", topic},
-                    {"binlog_file", binlog_start.file},
-                    {"binlog_position", binlog_start.position},
-                });
-            // #endregion
         } catch (const std::exception& ex) {
             log_write(log_pg, {
                 .level = LogLevel::Warning,
@@ -854,22 +772,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                             .count();
 
     if (read_stats.events > 0 && pstats.events_published == 0) {
-        // #region agent log
-        agent_debug_log(
-            "H1",
-            "mariadb_kafka_capture.cpp:slice:read_not_published",
-            "binlog events read but none published to kafka",
-            {
-                {"conn_id", conn_id},
-                {"batch_id", batch_id},
-                {"binlog_events_read", read_stats.events},
-                {"events_published", pstats.events_published},
-                {"tables_watched", static_cast<int>(wanted.size())},
-                {"tier", service_tier.value_or("all")},
-                {"binlog_file", read_stats.last_file},
-                {"binlog_position", read_stats.last_position},
-            });
-        // #endregion
         log_write(log_pg, {
             .level = LogLevel::Warning,
             .component = "cdc_kafka_capture",

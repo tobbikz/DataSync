@@ -236,6 +236,18 @@ std::string sanitize_mariadb_text_for_pg(const std::string& in) {
     return sanitize_utf8_for_json(out);
 }
 
+std::string mariadb_binary_cell_to_json_hex(const std::string& binlog_cell) {
+    const auto bytes = bytea_payload_to_bytes(binlog_cell);
+    static const char hex[] = "0123456789abcdef";
+    std::string out = "\\x";
+    out.reserve(2 + bytes.size() * 2);
+    for (std::uint8_t b : bytes) {
+        out.push_back(hex[b >> 4]);
+        out.push_back(hex[b & 0x0f]);
+    }
+    return out;
+}
+
 std::string sanitize_utf8_for_json(const std::string& in) {
     std::string out;
     out.reserve(in.size());
