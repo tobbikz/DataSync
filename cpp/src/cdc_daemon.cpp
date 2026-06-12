@@ -12,12 +12,9 @@
 #include "runtime_config.hpp"
 #include "service_tiers.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <atomic>
 #include <chrono>
 #include <csignal>
-#include <fstream>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -26,34 +23,6 @@
 namespace {
 
 AppConfig snapshot_app_config(const AppConfig& cfg);
-
-// #region agent log
-void agent_debug_ndjson(
-    const char* hypothesis_id,
-    const char* location,
-    const char* message,
-    const nlohmann::json& data) {
-    try {
-        std::ofstream f("/home/iks/Projects/DataSync/.cursor/debug-e0d3ad.log", std::ios::app);
-        if (!f) {
-            return;
-        }
-        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count();
-        nlohmann::json row = {
-            {"sessionId", "e0d3ad"},
-            {"hypothesisId", hypothesis_id},
-            {"location", location},
-            {"message", message},
-            {"data", data},
-            {"timestamp", ts},
-        };
-        f << row.dump() << '\n';
-    } catch (...) {
-    }
-}
-// #endregion
 
 std::atomic<bool> g_shutdown{false};
 std::atomic<int> g_catalog_sync_round{0};
@@ -136,19 +105,9 @@ void spawn_daemon_full_load_detached(
          batch_id = std::move(batch_id),
          pending_before,
          db_engine = std::move(db_engine)]() {
-            agent_debug_ndjson(
-                "A",
-                "cdc_daemon.cpp:spawn_daemon_full_load_detached",
-                "full_load background thread started",
-                {{"conn_id", conn_id}, {"tier", tier_code}, {"pending_tables", pending_before}});
             try {
                 PgConn pg(cfg.datasync.conn_string());
                 if (!pg.raw) {
-                    agent_debug_ndjson(
-                        "A",
-                        "cdc_daemon.cpp:spawn_daemon_full_load_detached",
-                        "full_load background thread failed: no PG",
-                        {{"conn_id", conn_id}, {"tier", tier_code}});
                     return;
                 }
                 const auto outcome =
@@ -167,11 +126,6 @@ void spawn_daemon_full_load_detached(
                             {"phase", "full_load_background"},
                         },
                     });
-                    agent_debug_ndjson(
-                        "B",
-                        "cdc_daemon.cpp:spawn_daemon_full_load_detached",
-                        "full_load tier lock not acquired in thread",
-                        {{"conn_id", conn_id}, {"tier", tier_code}});
                     return;
                 }
                 if (!outcome->ran) {
@@ -197,14 +151,6 @@ void spawn_daemon_full_load_detached(
                         {"phase", "full_load_background"},
                     },
                 });
-                agent_debug_ndjson(
-                    "A",
-                    "cdc_daemon.cpp:spawn_daemon_full_load_detached",
-                    "full_load background thread finished",
-                    {{"conn_id", conn_id},
-                     {"tier", tier_code},
-                     {"exit_code", outcome->exit_code},
-                     {"tables_loaded", outcome->tables_loaded}});
             } catch (const std::exception& ex) {
                 try {
                     PgConn pg(cfg.datasync.conn_string());
@@ -220,11 +166,6 @@ void spawn_daemon_full_load_detached(
                     }
                 } catch (...) {
                 }
-                agent_debug_ndjson(
-                    "A",
-                    "cdc_daemon.cpp:spawn_daemon_full_load_detached",
-                    "full_load background thread exception",
-                    {{"conn_id", conn_id}, {"tier", tier_code}, {"error", ex.what()}});
             }
         })
         .detach();
@@ -278,23 +219,6 @@ int run_one_cycle(
             batch_id,
             pending_before,
             db_engine);
-        agent_debug_ndjson(
-            "C",
-            "cdc_daemon.cpp:run_one_cycle",
-            "cycle spawned detached full-load; continuing CDC without join",
-            {{"conn_id", conn_id},
-             {"tier", tier.tier_code},
-             {"pending_tables", pending_before},
-             {"batch_id", batch_id}});
-    } else if (pending_before > 0 && tier_full_load_busy) {
-        agent_debug_ndjson(
-            "B",
-            "cdc_daemon.cpp:run_one_cycle",
-            "cycle skipped full-load spawn: tier lock busy",
-            {{"conn_id", conn_id},
-             {"tier", tier.tier_code},
-             {"pending_tables", pending_before},
-             {"batch_id", batch_id}});
     }
 
     const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, tier.tier_code, batch_id);
@@ -352,17 +276,6 @@ int run_one_cycle(
             {"errors", cycle_errors},
         },
     });
-
-    agent_debug_ndjson(
-        "C",
-        "cdc_daemon.cpp:run_one_cycle",
-        "daemon cycle completed without waiting on full-load",
-        {{"conn_id", conn_id},
-         {"tier", tier.tier_code},
-         {"batch_id", batch_id},
-         {"full_load_spawned", full_load_spawned},
-         {"full_load_tier_busy", tier_full_load_busy},
-         {"cycle_errors", cycle_errors}});
 
     return cycle_errors == 0 ? 0 : 1;
 }
