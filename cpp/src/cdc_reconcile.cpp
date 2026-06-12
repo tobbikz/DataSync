@@ -77,6 +77,7 @@ struct ReconcileRuntime {
     long long kafka_lag_fail{10000};
     int capture_lag_warn_seconds{300};
     int capture_lag_fail_seconds{900};
+    int apply_inactive_seconds{3600};
 };
 
 ReconcileRuntime load_reconcile_runtime(RuntimeConfig& runtime, PGconn* pg, const std::string& conn_id) {
@@ -106,6 +107,8 @@ ReconcileRuntime load_reconcile_runtime(RuntimeConfig& runtime, PGconn* pg, cons
         runtime.get_int("reconcile_capture_lag_warn_seconds", 300, "cdc_kafka_reconcile", conn_id);
     cfg.capture_lag_fail_seconds =
         runtime.get_int("reconcile_capture_lag_fail_seconds", 900, "cdc_kafka_reconcile", conn_id);
+    cfg.apply_inactive_seconds =
+        runtime.get_int("apply_inactive_seconds", 3600, "cdc_kafka_apply", conn_id);
     return cfg;
 }
 
@@ -216,6 +219,23 @@ std::string eval_kafka_lag_status(long long kafka_lag, const ReconcileRuntime& c
         return "warn";
     }
     return "ok";
+}
+
+// Bucketed topics share partition watermarks; quiet tables show inflated lag vs their offset.
+// Never let kafka alone drive overall=fail/warn when row counts did not fail.
+std::string cap_kafka_for_overall(const std::string& row_status, const std::string& kafka_status) {
+    if (kafka_status == "skip") {
+        return "skip";
+    }
+    if (row_status == "skip") {
+        return "skip";
+    }
+    if (row_status != "fail") {
+        if (kafka_status == "fail" || kafka_status == "warn") {
+            return "ok";
+        }
+    }
+    return kafka_status;
 }
 
 std::string eval_capture_lag_status(int capture_lag_seconds, const ReconcileRuntime& cfg) {
@@ -450,6 +470,7 @@ long long mongo_collection_count(MongoConn& mongo, const std::string& database, 
 
 struct ApplyMeta {
     int apply_lag_seconds{-1};
+    int seconds_since_last_apply{-1};
     std::string apply_status;
     std::string kafka_topic;
     int kafka_partition{-1};
@@ -463,7 +484,13 @@ ApplyMeta fetch_apply_meta(PGconn* pg, long long catalog_id) {
     PGresult* res = PQexecParams(
         pg,
         R"(
-        SELECT apply_lag_seconds, status::text, kafka_topic, kafka_partition, kafka_offset
+        SELECT
+            apply_lag_seconds,
+            status::text,
+            kafka_topic,
+            kafka_partition,
+            kafka_offset,
+            extract(epoch FROM (now() - last_applied_at))::integer
         FROM cdc_catalog.apply_position
         WHERE catalog_id = $1::bigint
         )",
@@ -490,8 +517,18 @@ ApplyMeta fetch_apply_meta(PGconn* pg, long long catalog_id) {
     if (PQgetvalue(res, 0, 4) && PQgetvalue(res, 0, 4)[0]) {
         out.kafka_offset = std::atoll(PQgetvalue(res, 0, 4));
     }
+    if (PQgetvalue(res, 0, 5) && PQgetvalue(res, 0, 5)[0]) {
+        out.seconds_since_last_apply = std::atoi(PQgetvalue(res, 0, 5));
+    }
     PQclear(res);
     return out;
+}
+
+bool is_apply_inactive_table(const ApplyMeta& meta, int inactive_seconds) {
+    if (meta.seconds_since_last_apply >= 0 && meta.seconds_since_last_apply > inactive_seconds) {
+        return true;
+    }
+    return false;
 }
 
 int fetch_capture_lag_seconds(
@@ -1127,25 +1164,35 @@ int run_reconcile_cli(
             checks["apply_lag_status"] = lag_status;
 
 #ifdef HAVE_RDKAFKA
-            long long kafka_lag = -1;
+            long long kafka_lag_probe = -1;
             if (kafka_probe && !apply_meta.kafka_topic.empty() && apply_meta.kafka_offset >= 0) {
-                kafka_lag = compute_kafka_consumer_lag(
+                kafka_lag_probe = compute_kafka_consumer_lag(
                     kafka_probe->rk,
                     apply_meta.kafka_topic,
                     apply_meta.kafka_partition,
                     apply_meta.kafka_offset);
             }
-            const std::string kafka_status_raw = eval_kafka_lag_status(kafka_lag, rcfg);
-            std::string kafka_status = kafka_status_raw;
-            if (!full_mode && kafka_status == "fail") {
-                kafka_status = "warn";
+            const bool kafka_inactive_table =
+                is_apply_inactive_table(apply_meta, rcfg.apply_inactive_seconds);
+            const std::string kafka_status_raw = kafka_inactive_table
+                ? "skip"
+                : eval_kafka_lag_status(kafka_lag_probe, rcfg);
+            const std::string kafka_for_overall =
+                cap_kafka_for_overall(row_status, kafka_status_raw);
+            checks["kafka_consumer_lag"] = kafka_inactive_table ? 0 : kafka_lag_probe;
+            checks["kafka_consumer_lag_probe"] = kafka_lag_probe;
+            checks["kafka_inactive_table"] = kafka_inactive_table;
+            if (kafka_inactive_table) {
+                checks["kafka_lag_skip_reason"] = "inactive_table_bucket_lag";
             }
-            checks["kafka_consumer_lag"] = kafka_lag;
-            checks["kafka_lag_status"] = kafka_status;
+            checks["kafka_lag_status_raw"] = kafka_status_raw;
+            checks["kafka_lag_status"] = kafka_status_raw;
+            checks["kafka_lag_status_overall"] = kafka_for_overall;
             checks["kafka_topic"] = apply_meta.kafka_topic;
             checks["kafka_partition"] = apply_meta.kafka_partition;
             checks["kafka_offset"] = apply_meta.kafka_offset;
-            overall = status_rank(overall, kafka_status);
+            checks["seconds_since_last_apply"] = apply_meta.seconds_since_last_apply;
+            overall = status_rank(overall, kafka_for_overall);
 #else
             checks["kafka_consumer_lag"] = nullptr;
 #endif
