@@ -77,6 +77,7 @@ struct ReconcileRuntime {
     long long kafka_lag_fail{10000};
     int capture_lag_warn_seconds{300};
     int capture_lag_fail_seconds{900};
+    bool auto_full_load_on_row_fail{true};
 };
 
 ReconcileRuntime load_reconcile_runtime(RuntimeConfig& runtime, PGconn* pg, const std::string& conn_id) {
@@ -106,6 +107,8 @@ ReconcileRuntime load_reconcile_runtime(RuntimeConfig& runtime, PGconn* pg, cons
         runtime.get_int("reconcile_capture_lag_warn_seconds", 300, "cdc_kafka_reconcile", conn_id);
     cfg.capture_lag_fail_seconds =
         runtime.get_int("reconcile_capture_lag_fail_seconds", 900, "cdc_kafka_reconcile", conn_id);
+    cfg.auto_full_load_on_row_fail =
+        runtime.get_bool("reconcile_auto_full_load_on_row_fail", true, "cdc_kafka_reconcile", conn_id);
     return cfg;
 }
 
@@ -743,6 +746,56 @@ void insert_reconcile_result(
     }
 }
 
+void maybe_remediate_row_count_fail(
+    PGconn* pg,
+    const CatalogReconcileRow& row,
+    const std::string& db_engine,
+    const std::string& batch_id,
+    long long source_rows,
+    long long lake_rows,
+    const std::string& row_status,
+    bool full_mode,
+    bool auto_enabled) {
+    if (!full_mode || !auto_enabled || row_status != "fail" || source_rows < 0 || lake_rows < 0) {
+        return;
+    }
+
+    flag_table_for_full_load(pg, row.conn_id, row.source_schema, row.source_table, db_engine, batch_id);
+
+    const long long delta = source_rows - lake_rows;
+    std::ostringstream err;
+    err << "reconcile auto full-load: source=" << source_rows << " lake=" << lake_rows << " delta=" << delta;
+    const std::string trunc = err.str().substr(0, 950);
+    const std::string id = std::to_string(row.catalog_id);
+    const char* vals[] = {id.c_str(), trunc.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET last_error = $2,
+            last_error_at = now()
+        WHERE catalog_id = $1::bigint
+        )",
+        2,
+        vals);
+
+    log_write(pg, {
+        .level = LogLevel::Warning,
+        .component = "reconcile",
+        .message = "reconcile auto full-load flagged",
+        .batch_id = batch_id,
+        .conn_id = row.conn_id,
+        .source_schema = row.source_schema,
+        .source_table = row.source_table,
+        .context = {
+            {"catalog_id", row.catalog_id},
+            {"source_row_count", source_rows},
+            {"lake_row_count", lake_rows},
+            {"row_count_delta", delta},
+        },
+    });
+}
+
 int count_stale_tables(PGconn* pg, const std::string& conn_id, const std::string& tier) {
     const char* vals[] = {conn_id.c_str(), tier.c_str()};
     PGresult* res = PQexecParams(
@@ -1183,6 +1236,17 @@ int run_reconcile_cli(
 
             insert_reconcile_result(
                 log_pg, run_id, row, source_rows, lake_rows, row_status, apply_meta, overall, checks);
+
+            maybe_remediate_row_count_fail(
+                log_pg,
+                row,
+                db_engine,
+                batch_id,
+                source_rows,
+                lake_rows,
+                row_status,
+                full_mode,
+                rcfg.auto_full_load_on_row_fail);
 
             if (overall == "fail") {
                 tables_fail += 1;
