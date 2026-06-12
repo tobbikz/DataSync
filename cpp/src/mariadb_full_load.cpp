@@ -168,6 +168,20 @@ std::vector<std::string> split_pk_columns(const std::string& pk_columns) {
     return out;
 }
 
+void apply_catalog_pk_columns(std::vector<MariaDbColumn>& cols, const std::vector<std::string>& pk_cols) {
+    if (pk_cols.empty()) {
+        return;
+    }
+    for (auto& col : cols) {
+        for (const auto& pk : pk_cols) {
+            if (col.name == pk) {
+                col.is_pk = true;
+                break;
+            }
+        }
+    }
+}
+
 std::string utc_now_ts() {
     const auto now = std::chrono::system_clock::now();
     const std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -858,6 +872,7 @@ TableLoadOutcome load_one_table(
 
     auto cols = fetch_mariadb_columns(mariadb.handle, target.source_schema, target.source_table);
     const auto pk_cols = split_pk_columns(target.pk_columns);
+    apply_catalog_pk_columns(cols, pk_cols);
 
     const int partition_months =
         runtime.get_int("lake_partition_months_ahead", 3, "mariadb_load", target.conn_id);
