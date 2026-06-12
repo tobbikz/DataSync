@@ -12,9 +12,12 @@
 #include "runtime_config.hpp"
 #include "service_tiers.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <fstream>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -22,14 +25,35 @@
 
 namespace {
 
-struct JoinOnExit {
-    std::thread& thread;
-    ~JoinOnExit() {
-        if (thread.joinable()) {
-            thread.join();
+AppConfig snapshot_app_config(const AppConfig& cfg);
+
+// #region agent log
+void agent_debug_ndjson(
+    const char* hypothesis_id,
+    const char* location,
+    const char* message,
+    const nlohmann::json& data) {
+    try {
+        std::ofstream f("/home/iks/Projects/DataSync/.cursor/debug-e0d3ad.log", std::ios::app);
+        if (!f) {
+            return;
         }
+        const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+        nlohmann::json row = {
+            {"sessionId", "e0d3ad"},
+            {"hypothesisId", hypothesis_id},
+            {"location", location},
+            {"message", message},
+            {"data", data},
+            {"timestamp", ts},
+        };
+        f << row.dump() << '\n';
+    } catch (...) {
     }
-};
+}
+// #endregion
 
 std::atomic<bool> g_shutdown{false};
 std::atomic<int> g_catalog_sync_round{0};
@@ -98,6 +122,114 @@ int run_apply_workers(
     return failures.load() > 0 ? 1 : 0;
 }
 
+void spawn_daemon_full_load_detached(
+    AppConfig cfg,
+    std::string conn_id,
+    std::string tier_code,
+    std::string batch_id,
+    int pending_before,
+    std::string db_engine) {
+    std::thread(
+        [cfg = std::move(cfg),
+         conn_id = std::move(conn_id),
+         tier_code = std::move(tier_code),
+         batch_id = std::move(batch_id),
+         pending_before,
+         db_engine = std::move(db_engine)]() {
+            agent_debug_ndjson(
+                "A",
+                "cdc_daemon.cpp:spawn_daemon_full_load_detached",
+                "full_load background thread started",
+                {{"conn_id", conn_id}, {"tier", tier_code}, {"pending_tables", pending_before}});
+            try {
+                PgConn pg(cfg.datasync.conn_string());
+                if (!pg.raw) {
+                    agent_debug_ndjson(
+                        "A",
+                        "cdc_daemon.cpp:spawn_daemon_full_load_detached",
+                        "full_load background thread failed: no PG",
+                        {{"conn_id", conn_id}, {"tier", tier_code}});
+                    return;
+                }
+                const auto outcome =
+                    try_run_daemon_full_load_isolated(cfg, pg.raw, conn_id, tier_code, batch_id);
+                if (!outcome) {
+                    log_write(pg.raw, {
+                        .level = LogLevel::Info,
+                        .component = "cdc_daemon",
+                        .message = "daemon full-load skipped: tier lock held by another full-load",
+                        .batch_id = batch_id,
+                        .conn_id = conn_id,
+                        .context = {
+                            {"tier", tier_code},
+                            {"db_engine", db_engine},
+                            {"pending_tables", pending_before},
+                            {"phase", "full_load_background"},
+                        },
+                    });
+                    agent_debug_ndjson(
+                        "B",
+                        "cdc_daemon.cpp:spawn_daemon_full_load_detached",
+                        "full_load tier lock not acquired in thread",
+                        {{"conn_id", conn_id}, {"tier", tier_code}});
+                    return;
+                }
+                if (!outcome->ran) {
+                    return;
+                }
+                const bool partial_ok = outcome->tables_loaded > 0 && outcome->exit_code != 0;
+                log_write(pg.raw, {
+                    .level = outcome->exit_code == 0 ? LogLevel::Info : LogLevel::Warning,
+                    .component = "cdc_daemon",
+                    .message = outcome->exit_code == 0
+                                   ? "daemon full-load background finished"
+                                   : (partial_ok ? "daemon full-load background partial"
+                                                 : "daemon full-load background failed"),
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .context = {
+                        {"tier", tier_code},
+                        {"db_engine", db_engine},
+                        {"full_load_exit", outcome->exit_code},
+                        {"pending_tables", outcome->pending_tables},
+                        {"pending_after", outcome->pending_after},
+                        {"tables_loaded", outcome->tables_loaded},
+                        {"phase", "full_load_background"},
+                    },
+                });
+                agent_debug_ndjson(
+                    "A",
+                    "cdc_daemon.cpp:spawn_daemon_full_load_detached",
+                    "full_load background thread finished",
+                    {{"conn_id", conn_id},
+                     {"tier", tier_code},
+                     {"exit_code", outcome->exit_code},
+                     {"tables_loaded", outcome->tables_loaded}});
+            } catch (const std::exception& ex) {
+                try {
+                    PgConn pg(cfg.datasync.conn_string());
+                    if (pg.raw) {
+                        log_write(pg.raw, {
+                            .level = LogLevel::Error,
+                            .component = "cdc_daemon",
+                            .message = "daemon full-load background failed",
+                            .batch_id = batch_id,
+                            .conn_id = conn_id,
+                            .context = {{"tier", tier_code}, {"error", ex.what()}},
+                        });
+                    }
+                } catch (...) {
+                }
+                agent_debug_ndjson(
+                    "A",
+                    "cdc_daemon.cpp:spawn_daemon_full_load_detached",
+                    "full_load background thread exception",
+                    {{"conn_id", conn_id}, {"tier", tier_code}, {"error", ex.what()}});
+            }
+        })
+        .detach();
+}
+
 int run_one_cycle(
     const AppConfig& cfg,
     PGconn* log_pg,
@@ -117,11 +249,12 @@ int run_one_cycle(
         .context = {{"tier", tier.tier_code}, {"db_engine", db_engine}},
     });
 
-    std::optional<DaemonFullLoadOutcome> full_load_outcome;
-    std::thread full_load_thread;
     const int pending_before =
         count_full_load_pending(log_pg, conn_id, tier.tier_code, db_engine);
-    if (pending_before > 0) {
+    const bool tier_full_load_busy = full_load_tier_busy(conn_id, tier.tier_code);
+    bool full_load_spawned = false;
+    if (pending_before > 0 && !tier_full_load_busy) {
+        full_load_spawned = true;
         log_write(log_pg, {
             .level = LogLevel::Info,
             .component = "cdc_daemon",
@@ -135,40 +268,34 @@ int run_one_cycle(
                 {"db_engine", db_engine},
                 {"pending_tables", pending_before},
                 {"phase", "full_load_background"},
+                {"non_blocking", true},
             },
         });
-        full_load_thread = std::thread(
-            [&cfg, &full_load_outcome, conn_id, tier_code = tier.tier_code, batch_id, pending_before]() {
-                try {
-                    PgConn pg(cfg.datasync.conn_string());
-                    if (!pg.raw) {
-                        DaemonFullLoadOutcome failed;
-                        failed.ran = true;
-                        failed.exit_code = 1;
-                        failed.pending_tables = pending_before;
-                        full_load_outcome = failed;
-                        return;
-                    }
-                    const auto outcome =
-                        try_run_daemon_full_load_isolated(cfg, pg.raw, conn_id, tier_code, batch_id);
-                    if (outcome) {
-                        full_load_outcome = *outcome;
-                    } else {
-                        DaemonFullLoadOutcome skipped;
-                        skipped.pending_tables = pending_before;
-                        full_load_outcome = skipped;
-                    }
-                } catch (const std::exception&) {
-                    DaemonFullLoadOutcome failed;
-                    failed.ran = true;
-                    failed.exit_code = 1;
-                    failed.pending_tables = pending_before;
-                    full_load_outcome = failed;
-                }
-            });
+        spawn_daemon_full_load_detached(
+            snapshot_app_config(cfg),
+            conn_id,
+            tier.tier_code,
+            batch_id,
+            pending_before,
+            db_engine);
+        agent_debug_ndjson(
+            "C",
+            "cdc_daemon.cpp:run_one_cycle",
+            "cycle spawned detached full-load; continuing CDC without join",
+            {{"conn_id", conn_id},
+             {"tier", tier.tier_code},
+             {"pending_tables", pending_before},
+             {"batch_id", batch_id}});
+    } else if (pending_before > 0 && tier_full_load_busy) {
+        agent_debug_ndjson(
+            "B",
+            "cdc_daemon.cpp:run_one_cycle",
+            "cycle skipped full-load spawn: tier lock busy",
+            {{"conn_id", conn_id},
+             {"tier", tier.tier_code},
+             {"pending_tables", pending_before},
+             {"batch_id", batch_id}});
     }
-
-    JoinOnExit join_full_load{full_load_thread};
 
     const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, tier.tier_code, batch_id);
     const int pre_rc = pre.errors > 0 ? 1 : 0;
@@ -206,53 +333,6 @@ int run_one_cycle(
         });
     }
 
-    if (full_load_outcome && !full_load_outcome->ran && pending_before > 0) {
-        log_write(log_pg, {
-            .level = LogLevel::Info,
-            .component = "cdc_daemon",
-            .message = "daemon full-load skipped: tier lock held by another full-load",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {
-                {"tier", tier.tier_code},
-                {"db_engine", db_engine},
-                {"pending_tables", pending_before},
-                {"phase", "full_load_background"},
-            },
-        });
-    }
-
-    if (full_load_outcome && full_load_outcome->ran) {
-        const DaemonFullLoadOutcome& full_load = *full_load_outcome;
-        const bool partial_ok = full_load.tables_loaded > 0 && full_load.exit_code != 0;
-        log_write(log_pg, {
-            .level = full_load.exit_code == 0 ? LogLevel::Info : LogLevel::Warning,
-            .component = "cdc_daemon",
-            .message = full_load.exit_code == 0
-                           ? "daemon full-load background finished"
-                           : (partial_ok ? "daemon full-load background partial"
-                                         : "daemon full-load background failed"),
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {
-                {"tier", tier.tier_code},
-                {"db_engine", db_engine},
-                {"full_load_exit", full_load.exit_code},
-                {"pending_tables", full_load.pending_tables},
-                {"pending_after", full_load.pending_after},
-                {"tables_loaded", full_load.tables_loaded},
-                {"phase", "full_load_background"},
-            },
-        });
-        if (full_load.exit_code != 0) {
-            cycle_errors += 1;
-        }
-    }
-
     log_write(log_pg, {
         .level = cycle_errors ? LogLevel::Warning : LogLevel::Info,
         .component = "cdc_daemon",
@@ -266,10 +346,23 @@ int run_one_cycle(
             {"db_engine", db_engine},
             {"pre_apply_exit", pre_rc},
             {"apply_exit", apply_rc},
-            {"full_load_concurrent", pending_before > 0},
+            {"full_load_pending", pending_before},
+            {"full_load_tier_busy", tier_full_load_busy},
+            {"full_load_spawned", full_load_spawned},
             {"errors", cycle_errors},
         },
     });
+
+    agent_debug_ndjson(
+        "C",
+        "cdc_daemon.cpp:run_one_cycle",
+        "daemon cycle completed without waiting on full-load",
+        {{"conn_id", conn_id},
+         {"tier", tier.tier_code},
+         {"batch_id", batch_id},
+         {"full_load_spawned", full_load_spawned},
+         {"full_load_tier_busy", tier_full_load_busy},
+         {"cycle_errors", cycle_errors}});
 
     return cycle_errors == 0 ? 0 : 1;
 }
