@@ -77,7 +77,10 @@ struct ReconcileRuntime {
     long long kafka_lag_fail{10000};
     int capture_lag_warn_seconds{300};
     int capture_lag_fail_seconds{900};
-    bool auto_full_load_on_row_fail{true};
+    bool zombie_remediate_enabled{true};
+    int zombie_min_streak{3};
+    long long zombie_min_lake_excess{50000};
+    double zombie_min_lake_excess_pct{0.10};
 };
 
 ReconcileRuntime load_reconcile_runtime(RuntimeConfig& runtime, PGconn* pg, const std::string& conn_id) {
@@ -107,8 +110,14 @@ ReconcileRuntime load_reconcile_runtime(RuntimeConfig& runtime, PGconn* pg, cons
         runtime.get_int("reconcile_capture_lag_warn_seconds", 300, "cdc_kafka_reconcile", conn_id);
     cfg.capture_lag_fail_seconds =
         runtime.get_int("reconcile_capture_lag_fail_seconds", 900, "cdc_kafka_reconcile", conn_id);
-    cfg.auto_full_load_on_row_fail =
-        runtime.get_bool("reconcile_auto_full_load_on_row_fail", true, "cdc_kafka_reconcile", conn_id);
+    cfg.zombie_remediate_enabled =
+        runtime.get_bool("reconcile_zombie_remediate_enabled", true, "cdc_kafka_reconcile", conn_id);
+    cfg.zombie_min_streak =
+        runtime.get_int("reconcile_zombie_min_streak", 3, "cdc_kafka_reconcile", conn_id);
+    cfg.zombie_min_lake_excess =
+        runtime.get_int("reconcile_zombie_min_lake_excess", 50000, "cdc_kafka_reconcile", conn_id);
+    cfg.zombie_min_lake_excess_pct =
+        runtime_double(runtime, "reconcile_zombie_min_lake_excess_pct", 0.10, conn_id);
     return cfg;
 }
 
@@ -746,7 +755,61 @@ void insert_reconcile_result(
     }
 }
 
-void maybe_remediate_row_count_fail(
+void clear_reconcile_row_fail_streak(PGconn* pg, long long catalog_id) {
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET engine_meta = engine_meta - 'reconcile_row_fail_streak' - 'reconcile_last_row_delta',
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+          AND (engine_meta ? 'reconcile_row_fail_streak' OR engine_meta ? 'reconcile_last_row_delta')
+        )",
+        1,
+        vals);
+}
+
+int increment_reconcile_row_fail_streak(PGconn* pg, long long catalog_id, long long row_delta) {
+    const std::string id = std::to_string(catalog_id);
+    const std::string delta = std::to_string(row_delta);
+    const char* vals[] = {id.c_str(), delta.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET engine_meta = jsonb_set(
+                jsonb_set(
+                    COALESCE(engine_meta, '{}'::jsonb),
+                    '{reconcile_row_fail_streak}',
+                    to_jsonb(COALESCE((engine_meta->>'reconcile_row_fail_streak')::int, 0) + 1),
+                    true),
+                '{reconcile_last_row_delta}',
+                to_jsonb($2::bigint),
+                true),
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+        RETURNING (engine_meta->>'reconcile_row_fail_streak')::int
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    int streak = 0;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        streak = std::atoi(PQgetvalue(res, 0, 0));
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return streak;
+}
+
+/** Track row-count streak; remediate only persistent lake-excess zombies (duplicates), not transactional source-ahead gaps. */
+void handle_reconcile_row_count_streak(
     PGconn* pg,
     const CatalogReconcileRow& row,
     const std::string& db_engine,
@@ -755,19 +818,75 @@ void maybe_remediate_row_count_fail(
     long long lake_rows,
     const std::string& row_status,
     bool full_mode,
-    bool auto_enabled) {
-    if (!full_mode || !auto_enabled || row_status != "fail" || source_rows < 0 || lake_rows < 0) {
+    const ReconcileRuntime& rcfg) {
+    if (!full_mode || source_rows < 0 || lake_rows < 0) {
+        return;
+    }
+
+    const long long delta = source_rows - lake_rows;
+
+    if (row_status == "ok") {
+        clear_reconcile_row_fail_streak(pg, row.catalog_id);
+        return;
+    }
+
+    if (row_status != "fail") {
+        return;
+    }
+
+    const int streak = increment_reconcile_row_fail_streak(pg, row.catalog_id, delta);
+    const long long lake_excess = lake_rows - source_rows;
+
+    // Source ahead of lake = normal CDC / transactional lag — never auto full-load.
+    if (lake_excess <= 0) {
+        return;
+    }
+
+    if (!rcfg.zombie_remediate_enabled) {
+        return;
+    }
+
+    if (lake_excess < rcfg.zombie_min_lake_excess) {
+        return;
+    }
+
+    const double excess_pct =
+        source_rows > 0 ? static_cast<double>(lake_excess) / static_cast<double>(source_rows) : 1.0;
+    if (excess_pct < rcfg.zombie_min_lake_excess_pct) {
+        return;
+    }
+
+    if (streak < rcfg.zombie_min_streak) {
+        log_write(pg, {
+            .level = LogLevel::Info,
+            .component = "reconcile",
+            .message = "reconcile zombie candidate (streak below threshold)",
+            .batch_id = batch_id,
+            .conn_id = row.conn_id,
+            .source_schema = row.source_schema,
+            .source_table = row.source_table,
+            .context = {
+                {"catalog_id", row.catalog_id},
+                {"streak", streak},
+                {"streak_required", rcfg.zombie_min_streak},
+                {"lake_excess", lake_excess},
+                {"lake_excess_pct", excess_pct},
+                {"source_row_count", source_rows},
+                {"lake_row_count", lake_rows},
+            },
+        });
         return;
     }
 
     flag_table_for_full_load(pg, row.conn_id, row.source_schema, row.source_table, db_engine, batch_id);
+    clear_reconcile_row_fail_streak(pg, row.catalog_id);
 
-    const long long delta = source_rows - lake_rows;
     std::ostringstream err;
-    err << "reconcile auto full-load: source=" << source_rows << " lake=" << lake_rows << " delta=" << delta;
+    err << "reconcile zombie full-load: lake excess=" << lake_excess << " (" << static_cast<int>(excess_pct * 100)
+        << "%) streak=" << streak << " source=" << source_rows << " lake=" << lake_rows;
     const std::string trunc = err.str().substr(0, 950);
     const std::string id = std::to_string(row.catalog_id);
-    const char* vals[] = {id.c_str(), trunc.c_str()};
+    const char* err_vals[] = {id.c_str(), trunc.c_str()};
     pg_exec_params_simple(
         pg,
         R"(
@@ -777,18 +896,21 @@ void maybe_remediate_row_count_fail(
         WHERE catalog_id = $1::bigint
         )",
         2,
-        vals);
+        err_vals);
 
     log_write(pg, {
         .level = LogLevel::Warning,
         .component = "reconcile",
-        .message = "reconcile auto full-load flagged",
+        .message = "reconcile zombie table flagged for full-load",
         .batch_id = batch_id,
         .conn_id = row.conn_id,
         .source_schema = row.source_schema,
         .source_table = row.source_table,
         .context = {
             {"catalog_id", row.catalog_id},
+            {"streak", streak},
+            {"lake_excess", lake_excess},
+            {"lake_excess_pct", excess_pct},
             {"source_row_count", source_rows},
             {"lake_row_count", lake_rows},
             {"row_count_delta", delta},
@@ -1237,7 +1359,7 @@ int run_reconcile_cli(
             insert_reconcile_result(
                 log_pg, run_id, row, source_rows, lake_rows, row_status, apply_meta, overall, checks);
 
-            maybe_remediate_row_count_fail(
+            handle_reconcile_row_count_streak(
                 log_pg,
                 row,
                 db_engine,
@@ -1246,7 +1368,7 @@ int run_reconcile_cli(
                 lake_rows,
                 row_status,
                 full_mode,
-                rcfg.auto_full_load_on_row_fail);
+                rcfg);
 
             if (overall == "fail") {
                 tables_fail += 1;
