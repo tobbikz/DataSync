@@ -75,6 +75,9 @@ bool mariadb_format_copy_cell(const char* data, unsigned long len, const MariaDb
             out = csv_escape(mariadb_not_null_copy_default(col));
             return true;
         }
+        if (col.pg_type == "BOOLEAN") {
+            return csv_null();
+        }
         out = csv_escape("");
         return true;
     }
@@ -88,11 +91,26 @@ bool mariadb_format_copy_cell(const char* data, unsigned long len, const MariaDb
             return true;
         }
         if (col.pg_type == "TIMESTAMPTZ" || col.pg_type == "TIMESTAMP" || col.pg_type == "DATE" ||
-            col.pg_type == "TIME") {
+            col.pg_type == "TIME" || col.pg_type == "BOOLEAN") {
             return csv_null();
         }
         out = csv_escape("");
         return true;
+    }
+    if (col.pg_type == "BOOLEAN") {
+        if (s == "0" || s == "false" || s == "FALSE" || s == "f" || s == "F" || s == "no" || s == "NO") {
+            out = "f";
+            return true;
+        }
+        if (s == "1" || s == "true" || s == "TRUE" || s == "t" || s == "T" || s == "yes" || s == "YES") {
+            out = "t";
+            return true;
+        }
+        if (!col.is_nullable) {
+            out = "f";
+            return true;
+        }
+        return csv_null();
     }
     out = csv_escape(s);
     return true;

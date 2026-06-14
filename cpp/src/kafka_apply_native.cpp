@@ -1103,7 +1103,7 @@ int run_kafka_apply_native_cli(
         ? static_cast<int>(cfg.cdc.slice_max_events)
         : 10000000;
     const int max_seconds =
-        runtime.get_int("apply_max_seconds", 2, "cdc_kafka_apply", conn_id);
+        runtime.get_int("apply_max_seconds", slice_seconds_fallback, "cdc_kafka_apply", conn_id);
     const int max_events =
         runtime.get_int("apply_max_events", slice_events_fallback, "cdc_kafka_apply", conn_id);
     const int target = runtime.get_int("apply_target_events_per_table", 0, "cdc_kafka_apply", conn_id);
@@ -1736,7 +1736,6 @@ int run_kafka_apply_native_cli(
                 flush_batch();
             }
 
-            flush_batch();
             if (stop_slice_if_ready(true)) {
                 break;
             }
