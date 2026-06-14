@@ -920,6 +920,7 @@ TableLoadOutcome load_one_table(
     const int partition_months =
         runtime.get_int("lake_partition_months_ahead", 3, "mariadb_load", target.conn_id);
 
+    migrate_lake_table_schema(lake_pg.raw, target.source_schema, target.source_table, cols);
     ensure_lake_table_base(lake_pg.raw, target.source_schema, target.source_table, cols, partition_months);
 
     acquire_full_load_table_lock(lake_pg.raw, target.catalog_id);

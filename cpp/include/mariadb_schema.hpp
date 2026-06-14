@@ -61,3 +61,10 @@ void ensure_lake_table_base(
 void truncate_lake_table(PGconn* pg, const std::string& schema, const std::string& table);
 
 bool pg_lake_table_exists(PGconn* pg, const std::string& schema, const std::string& table);
+
+/** Drop and recreate the lake table if column types changed (e.g., int unsigned → bigint). */
+void migrate_lake_table_schema(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    const std::vector<MariaDbColumn>& cols);

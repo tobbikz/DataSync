@@ -162,7 +162,7 @@ bool mariadb_is_text_like_mysql_type(const std::string& t) {
 std::string mariadb_to_pg_type(const std::string& mysql_type_raw) {
     const std::string t = to_lower(mysql_type_raw);
     if (t.find("bigint") != std::string::npos) {
-        return "BIGINT";
+        return t.find("unsigned") != std::string::npos ? "NUMERIC" : "BIGINT";
     }
     if (t.rfind("bit", 0) == 0) {
         const auto open = t.find('(');
@@ -179,14 +179,18 @@ std::string mariadb_to_pg_type(const std::string& mysql_type_raw) {
         return "BOOLEAN";
     }
     if (t.find("int") != std::string::npos) {
-        if (t.find("tinyint") != std::string::npos || t.find("smallint") != std::string::npos) {
+        const bool is_unsigned = t.find("unsigned") != std::string::npos;
+        if (t.find("tinyint") != std::string::npos) {
             return "SMALLINT";
+        }
+        if (t.find("smallint") != std::string::npos) {
+            return is_unsigned ? "INTEGER" : "SMALLINT";
         }
         if (t.find("mediumint") != std::string::npos) {
             return "INTEGER";
         }
         if (t == "int" || t.rfind("int(", 0) == 0 || t.find("integer") != std::string::npos) {
-            return "INTEGER";
+            return is_unsigned ? "BIGINT" : "INTEGER";
         }
         return "NUMERIC";
     }
@@ -547,6 +551,60 @@ void ensure_lake_table_base(
 
 void truncate_lake_table(PGconn* pg, const std::string& schema, const std::string& table) {
     pg_exec(pg, "TRUNCATE TABLE " + pg_ident(schema) + "." + pg_ident(table) + " RESTART IDENTITY CASCADE");
+}
+
+std::string lake_column_data_type(PGconn* pg, const std::string& schema, const std::string& table, const std::string& column) {
+    const char* vals[] = {schema.c_str(), table.c_str(), column.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_schema = $1 AND table_name = $2 AND column_name = $3",
+        3,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    std::string result;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        result = PQgetvalue(res, 0, 0);
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return result;
+}
+
+void migrate_lake_table_schema(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    const std::vector<MariaDbColumn>& cols) {
+    if (!pg_lake_table_exists(pg, schema, table)) {
+        return;
+    }
+    for (const auto& col : cols) {
+        const std::string existing = lake_column_data_type(pg, schema, table, col.name);
+        if (existing.empty()) {
+            continue;
+        }
+        std::string desired = to_lower(col.pg_type);
+        if (desired == "timestamptz") {
+            desired = "timestamp with time zone";
+        } else if (desired == "time") {
+            desired = "time without time zone";
+        } else if (desired == "decimal" || desired == "numeric") {
+            desired = "numeric";
+        } else if (desired == "boolean") {
+            desired = "boolean";
+        } else if (desired == "double precision") {
+            desired = "double precision";
+        }
+        if (existing != desired) {
+            (void)pg_exec(pg, "DROP TABLE IF EXISTS " + pg_ident(schema) + "." + pg_ident(table) + " CASCADE");
+            return;
+        }
+    }
 }
 
 bool pg_lake_table_exists(PGconn* pg, const std::string& schema, const std::string& table) {
