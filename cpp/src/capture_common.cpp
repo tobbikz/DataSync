@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <sstream>
 #include <chrono>
+#include <fstream>
 #include <map>
 #include <set>
 #include <thread>
@@ -964,9 +965,85 @@ void mark_catalog_cdc_in_progress(PGconn* pg, long long catalog_id) {
         vals);
 }
 
+namespace {
+
+// #region agent log
+void agent_debug_log_skip_status(
+    const char* function,
+    long long catalog_id,
+    bool needs_full_load,
+    const char* hypothesis_id) {
+    try {
+        std::ofstream f("/home/iks/Projects/DataSync/.cursor/debug-e0d3ad.log", std::ios::app);
+        if (!f) {
+            return;
+        }
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        const nlohmann::json line = {
+            {"sessionId", "e0d3ad"},
+            {"hypothesisId", hypothesis_id},
+            {"location", function},
+            {"message", "skipped status change due to needs_full_load"},
+            {"catalog_id", catalog_id},
+            {"needs_full_load", needs_full_load},
+            {"timestamp", now_ms},
+        };
+        f << line.dump() << '\n';
+    } catch (...) {
+    }
+}
+// #endregion
+
+bool catalog_needs_full_load(PGconn* pg, long long catalog_id) {
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    PGresult* sel = PQexecParams(
+        pg,
+        R"(
+        SELECT needs_full_load
+        FROM cdc_catalog.catalog
+        WHERE catalog_id = $1::bigint
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    bool needs_full_load = false;
+    if (sel && PQresultStatus(sel) == PGRES_TUPLES_OK && PQntuples(sel) > 0) {
+        needs_full_load = std::string(PQgetvalue(sel, 0, 0)) == "t";
+    }
+    if (sel) {
+        PQclear(sel);
+    }
+    return needs_full_load;
+}
+
+}  // namespace
+
 void mark_catalog_cdc_success(PGconn* pg, long long catalog_id) {
     const std::string id = std::to_string(catalog_id);
     const char* vals[] = {id.c_str()};
+    const bool needs_full_load = catalog_needs_full_load(pg, catalog_id);
+    if (needs_full_load) {
+        // #region agent log
+        agent_debug_log_skip_status("mark_catalog_cdc_success", catalog_id, true, "H1");
+        // #endregion
+        pg_exec_params_simple(
+            pg,
+            R"(
+            UPDATE cdc_catalog.catalog
+            SET last_cdc_at = now(),
+                updated_at = now()
+            WHERE catalog_id = $1::bigint
+            )",
+            1,
+            vals);
+        return;
+    }
     pg_exec_params_simple(
         pg,
         R"(
@@ -1027,6 +1104,12 @@ void mark_catalog_reconcile_failed(
 void mark_catalog_reconcile_healed(PGconn* pg, long long catalog_id) {
     const std::string id = std::to_string(catalog_id);
     const char* vals[] = {id.c_str()};
+    if (catalog_needs_full_load(pg, catalog_id)) {
+        // #region agent log
+        agent_debug_log_skip_status("mark_catalog_reconcile_healed", catalog_id, true, "H2");
+        // #endregion
+        return;
+    }
     pg_exec_params_simple(
         pg,
         R"(
@@ -1037,6 +1120,7 @@ void mark_catalog_reconcile_healed(PGconn* pg, long long catalog_id) {
             updated_at = now()
         WHERE catalog_id = $1::bigint
           AND last_error LIKE 'reconcile:%'
+          AND NOT needs_full_load
         )",
         1,
         vals);
