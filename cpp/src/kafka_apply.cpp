@@ -1157,7 +1157,7 @@ long long apply_table_batch(
     }
     if (lines.empty()) {
         (void)skipped_missing_pk;
-        return static_cast<long long>(deletes.size() + upserts.size());
+        return static_cast<long long>(deletes.size() + upserts.size() - skipped_missing_pk);
     }
 
     const bool all_inserts =
@@ -1203,7 +1203,7 @@ long long apply_table_batch(
         copy_csv_lines(pg, "COPY " + fq + " (" + col_list_str + ") FROM STDIN WITH (FORMAT csv)", lines);
     }
 
-    return static_cast<long long>(deletes.size() + upserts.size());
+    return static_cast<long long>(deletes.size() + upserts.size() - skipped_missing_pk);
 }
 
 json apply_events_batch(
@@ -1433,6 +1433,43 @@ json apply_events_batch(
             } else {
                 upserts.push_back(std::move(e));
             }
+        }
+
+        int skipped_missing_pk = 0;
+        if (!meta.lake_pk.empty()) {
+            std::vector<ApplyEvent> valid_upserts;
+            valid_upserts.reserve(upserts.size());
+            for (auto& e : upserts) {
+                bool missing_pk = false;
+                for (const auto& pk_col : meta.lake_pk) {
+                    const json* pk_val = e.row.contains(pk_col) ? &e.row[pk_col] : nullptr;
+                    if (!pk_val || pk_val->is_null()) {
+                        missing_pk = true;
+                        break;
+                    }
+                }
+                if (missing_pk) {
+                    skipped_missing_pk += 1;
+                } else {
+                    valid_upserts.push_back(std::move(e));
+                }
+            }
+            upserts = std::move(valid_upserts);
+        }
+        if (skipped_missing_pk > 0) {
+            log_write(app_pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_kafka_apply_cpp",
+                .message = "apply skipped events with missing primary key",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = meta.catalog_source_schema,
+                .source_table = meta.catalog_source_table,
+                .context = {
+                    {"skipped_missing_pk", skipped_missing_pk},
+                    {"total_upserts", skipped_missing_pk + static_cast<int>(upserts.size())},
+                },
+            });
         }
 
         const auto table_start = std::chrono::steady_clock::now();
