@@ -1000,6 +1000,48 @@ void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string
         vals);
 }
 
+void mark_catalog_reconcile_failed(
+    PGconn* pg,
+    long long catalog_id,
+    const std::string& error,
+    bool needs_full_load) {
+    const std::string id = std::to_string(catalog_id);
+    const std::string trunc = error.substr(0, 1000);
+    const char* needs_fl = needs_full_load ? "true" : "false";
+    const char* vals[] = {id.c_str(), trunc.c_str(), needs_fl};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET status = 'failed',
+            last_error = $2,
+            last_error_at = now(),
+            needs_full_load = $3::boolean,
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+        )",
+        3,
+        vals);
+}
+
+void mark_catalog_reconcile_healed(PGconn* pg, long long catalog_id) {
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET status = 'success',
+            last_error = NULL,
+            last_error_at = NULL,
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+          AND last_error LIKE 'reconcile:%'
+        )",
+        1,
+        vals);
+}
+
 void clear_stale_full_load_in_progress(PGconn* pg, const std::string& conn_id, const std::string& db_engine) {
     const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
     pg_exec_params_simple(

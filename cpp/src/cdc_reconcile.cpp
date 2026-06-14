@@ -195,6 +195,40 @@ std::string eval_row_count_status(long long source_rows, long long lake_rows, co
     return "ok";
 }
 
+std::string classify_row_drift(long long source_rows, long long lake_rows) {
+    if (source_rows < 0 || lake_rows < 0) {
+        return "unknown";
+    }
+    const long long delta = source_rows - lake_rows;
+    if (delta == 0) {
+        return "none";
+    }
+    if (delta > 0) {
+        return "source_ahead";
+    }
+    return "append_zombie";
+}
+
+bool reconcile_failure_needs_full_load(const std::string& drift_kind, const std::string& row_status) {
+    if (row_status != "fail") {
+        return false;
+    }
+    return drift_kind == "source_ahead" || drift_kind == "append_zombie";
+}
+
+std::string reconcile_failure_message(
+    const std::string& drift_kind,
+    long long source_rows,
+    long long lake_rows,
+    const std::string& row_status,
+    const std::string& overall_status) {
+    std::ostringstream oss;
+    oss << "reconcile: " << drift_kind << " row_count_" << row_status
+        << " (source=" << source_rows << " lake=" << lake_rows << " delta=" << (source_rows - lake_rows)
+        << ", overall=" << overall_status << ")";
+    return oss.str();
+}
+
 std::string eval_apply_lag_status(int apply_lag_seconds, const ReconcileRuntime& cfg) {
     if (apply_lag_seconds < 0) {
         return "skip";
@@ -1147,24 +1181,22 @@ int run_reconcile_cli(
         runtime.reload(log_pg);
         try {
             long long source_rows = -1;
-            if (full_mode) {
-                if (db_engine == "mariadb" && mariadb) {
-                    source_rows = mariadb_table_count(mariadb->handle, row.source_schema, row.source_table);
+            if (db_engine == "mariadb" && mariadb) {
+                source_rows = mariadb_table_count(mariadb->handle, row.source_schema, row.source_table);
 #ifdef HAVE_FREETDS
-                } else if (db_engine == "mssql" && mssql) {
-                    source_rows =
-                        mssql_table_count(*mssql, row.source_database, row.source_schema, row.source_table);
+            } else if (db_engine == "mssql" && mssql) {
+                source_rows =
+                    mssql_table_count(*mssql, row.source_database, row.source_schema, row.source_table);
 #endif
 #ifdef HAVE_MONGOC
-                } else if (db_engine == "mongodb" && mongo) {
-                    source_rows = mongo_collection_count(*mongo, row.source_database, row.source_table);
+            } else if (db_engine == "mongodb" && mongo) {
+                source_rows = mongo_collection_count(*mongo, row.source_database, row.source_table);
 #endif
-                }
             }
 
             const long long lake_rows = pg_table_count(lake_pg.raw, row.lake_schema, row.lake_table);
-            const std::string row_status =
-                full_mode ? eval_row_count_status(source_rows, lake_rows, rcfg) : "skip";
+            const std::string row_status = eval_row_count_status(source_rows, lake_rows, rcfg);
+            const std::string drift_kind = classify_row_drift(source_rows, lake_rows);
             const ApplyMeta apply_meta = fetch_apply_meta(log_pg, row.catalog_id);
             const std::string lag_status = eval_apply_lag_status(apply_meta.apply_lag_seconds, rcfg);
             const int capture_lag_seconds = fetch_capture_lag_seconds(log_pg, conn_id, db_engine, row);
@@ -1177,7 +1209,12 @@ int run_reconcile_cli(
             checks["capture_lag_status"] = capture_status;
             checks["row_count_status"] = row_status;
             checks["apply_lag_status"] = lag_status;
+            checks["drift_kind"] = drift_kind;
+            if (source_rows >= 0 && lake_rows >= 0) {
+                checks["row_count_delta"] = source_rows - lake_rows;
+            }
 
+            bool kafka_inactive_table = false;
 #ifdef HAVE_RDKAFKA
             long long kafka_lag_probe = -1;
             if (kafka_probe && !apply_meta.kafka_topic.empty() && apply_meta.kafka_offset >= 0) {
@@ -1187,8 +1224,7 @@ int run_reconcile_cli(
                     apply_meta.kafka_partition,
                     apply_meta.kafka_offset);
             }
-            const bool kafka_inactive_table =
-                is_apply_inactive_table(apply_meta, rcfg.apply_inactive_seconds);
+            kafka_inactive_table = is_apply_inactive_table(apply_meta, rcfg.apply_inactive_seconds);
             const std::string kafka_status_raw = kafka_inactive_table
                 ? "skip"
                 : eval_kafka_lag_status(kafka_lag_probe, rcfg);
@@ -1211,6 +1247,18 @@ int run_reconcile_cli(
 #else
             checks["kafka_consumer_lag"] = nullptr;
 #endif
+
+            {
+                const bool pipeline_healthy =
+                    lag_status != "fail" && capture_status != "fail";
+                const bool static_gap_candidate =
+                    pipeline_healthy && row_status == "fail" &&
+                    (drift_kind == "source_ahead" || drift_kind == "append_zombie");
+                checks["static_gap_detected"] = static_gap_candidate;
+                if (static_gap_candidate && kafka_inactive_table) {
+                    checks["static_gap_reason"] = "pipeline_healthy_row_drift_inactive_table";
+                }
+            }
 
             if (pk_sample && db_engine == "mariadb" && mariadb) {
                 const auto pk_match = pk_checksum_match_mariadb(
@@ -1250,6 +1298,17 @@ int run_reconcile_cli(
                 log_pg, run_id, row, source_rows, lake_rows, row_status, apply_meta, overall, checks);
 
             if (overall == "fail") {
+                const bool needs_fl = reconcile_failure_needs_full_load(drift_kind, row_status);
+                mark_catalog_reconcile_failed(
+                    log_pg,
+                    row.catalog_id,
+                    reconcile_failure_message(drift_kind, source_rows, lake_rows, row_status, overall),
+                    needs_fl);
+            } else if (overall == "ok" && row_status == "ok") {
+                mark_catalog_reconcile_healed(log_pg, row.catalog_id);
+            }
+
+            if (overall == "fail") {
                 tables_fail += 1;
             } else if (overall == "warn") {
                 tables_warn += 1;
@@ -1271,6 +1330,8 @@ int run_reconcile_cli(
                     {"lake_row_count", lake_rows},
                     {"row_count_delta", source_rows >= 0 && lake_rows >= 0 ? source_rows - lake_rows : 0},
                     {"row_count_status", row_status},
+                    {"drift_kind", drift_kind},
+                    {"static_gap_detected", checks.value("static_gap_detected", false)},
                     {"apply_lag_seconds", apply_meta.apply_lag_seconds},
                     {"apply_lag_status", lag_status},
                     {"capture_lag_seconds", capture_lag_seconds},

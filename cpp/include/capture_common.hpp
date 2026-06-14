@@ -215,6 +215,16 @@ void mark_catalog_cdc_success(PGconn* pg, long long catalog_id);
 /** Record CDC apply failure on catalog (status failed + last_error). */
 void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string& error);
 
+/** Reconcile drift: status failed, optional needs_full_load (source_ahead / append_zombie). */
+void mark_catalog_reconcile_failed(
+    PGconn* pg,
+    long long catalog_id,
+    const std::string& error,
+    bool needs_full_load);
+
+/** Clear reconcile-only failure when table passes a subsequent reconcile run. */
+void mark_catalog_reconcile_healed(PGconn* pg, long long catalog_id);
+
 /** Reset stale full_load_in_progress rows (crash/reload) back to pending. */
 void clear_stale_full_load_in_progress(PGconn* pg, const std::string& conn_id, const std::string& db_engine);
 
