@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <iomanip>
 #include <map>
 #include <mutex>
@@ -650,7 +651,7 @@ std::vector<CatalogTableRow> fetch_full_load_targets(PGconn* pg, const std::opti
             WHERE db_engine = 'mariadb'
               AND active = true
               AND needs_full_load = true
-              AND status NOT IN ('skipped', 'disabled')
+              AND status NOT IN ('skipped', 'disabled', 'full_load_in_progress')
               AND service_tier::text = lower($1)
             ORDER BY conn_id, source_schema, source_table
             )",
@@ -689,7 +690,7 @@ std::vector<CatalogTableRow> fetch_full_load_targets(PGconn* pg, const std::opti
         WHERE db_engine = 'mariadb'
           AND active = true
           AND needs_full_load = true
-          AND status NOT IN ('skipped', 'disabled')
+          AND status NOT IN ('skipped', 'disabled', 'full_load_in_progress')
         ORDER BY conn_id, source_schema, source_table
         )");
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -800,6 +801,68 @@ void mark_catalog_failed(
 
 enum class TableLoadOutcome { Success, Skipped };
 
+// #region agent log
+void agent_debug_log_full_load(
+    const char* location,
+    const char* hypothesis_id,
+    long long catalog_id,
+    const nlohmann::json& data) {
+    try {
+        std::ofstream f("/home/iks/Projects/DataSync/.cursor/debug-e0d3ad.log", std::ios::app);
+        if (!f) {
+            return;
+        }
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        const nlohmann::json line = {
+            {"sessionId", "e0d3ad"},
+            {"hypothesisId", hypothesis_id},
+            {"location", location},
+            {"catalog_id", catalog_id},
+            {"data", data},
+            {"timestamp", now_ms},
+        };
+        f << line.dump() << '\n';
+    } catch (...) {
+    }
+}
+// #endregion
+
+long long lake_table_row_count(PGconn* pg, const std::string& schema, const std::string& table) {
+    const std::string sql =
+        "SELECT COUNT(*)::bigint FROM " + pg_ident(schema) + "." + pg_ident(table);
+    PGresult* res = PQexec(pg, sql.c_str());
+    long long count = -1;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        count = std::atoll(PQgetvalue(res, 0, 0));
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return count;
+}
+
+void acquire_full_load_table_lock(PGconn* pg, long long catalog_id) {
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    pg_exec_params_simple(
+        pg,
+        "SELECT pg_advisory_lock($1::bigint)",
+        1,
+        vals);
+}
+
+void release_full_load_table_lock(PGconn* pg, long long catalog_id) {
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    pg_exec_params_simple(
+        pg,
+        "SELECT pg_advisory_unlock($1::bigint)",
+        1,
+        vals);
+}
+
 TableLoadOutcome load_one_table(
     const AppConfig& cfg,
     PGconn* log_pg,
@@ -850,6 +913,54 @@ TableLoadOutcome load_one_table(
         return TableLoadOutcome::Skipped;
     }
 
+    auto cols = fetch_mariadb_columns(mariadb.handle, target.source_schema, target.source_table);
+    const auto pk_cols = split_pk_columns(target.pk_columns);
+    apply_catalog_pk_columns(cols, pk_cols);
+
+    const int partition_months =
+        runtime.get_int("lake_partition_months_ahead", 3, "mariadb_load", target.conn_id);
+
+    ensure_lake_table_base(lake_pg.raw, target.source_schema, target.source_table, cols, partition_months);
+
+    acquire_full_load_table_lock(lake_pg.raw, target.catalog_id);
+    const long long rows_before_truncate =
+        lake_table_row_count(lake_pg.raw, target.source_schema, target.source_table);
+    // #region agent log
+    agent_debug_log_full_load(
+        "load_one_table:pre_truncate",
+        "H3",
+        target.catalog_id,
+        {{"rows_before_truncate", rows_before_truncate},
+         {"schema", target.source_schema},
+         {"table", target.source_table}});
+    // #endregion
+
+    truncate_lake_table(lake_pg.raw, target.source_schema, target.source_table);
+
+    const long long rows_after_truncate =
+        lake_table_row_count(lake_pg.raw, target.source_schema, target.source_table);
+    // #region agent log
+    agent_debug_log_full_load(
+        "load_one_table:post_truncate",
+        "H4",
+        target.catalog_id,
+        {{"rows_before_truncate", rows_before_truncate},
+         {"rows_after_truncate", rows_after_truncate},
+         {"schema", target.source_schema},
+         {"table", target.source_table}});
+    // #endregion
+
+    log_fl(
+        log_pg,
+        log_mtx,
+        rows_after_truncate == 0 ? LogLevel::Info : LogLevel::Warning,
+        batch_id,
+        rows_after_truncate == 0 ? "lake table truncated" : "lake table truncate incomplete",
+        {{"rows_before_truncate", rows_before_truncate}, {"rows_after_truncate", rows_after_truncate}},
+        target.conn_id,
+        target.source_schema,
+        target.source_table);
+
     {
         RuntimeConfig bookmark_runtime;
         bookmark_runtime.reload(app_pg.raw);
@@ -869,27 +980,6 @@ TableLoadOutcome load_one_table(
                 target.source_table);
         }
     }
-
-    auto cols = fetch_mariadb_columns(mariadb.handle, target.source_schema, target.source_table);
-    const auto pk_cols = split_pk_columns(target.pk_columns);
-    apply_catalog_pk_columns(cols, pk_cols);
-
-    const int partition_months =
-        runtime.get_int("lake_partition_months_ahead", 3, "mariadb_load", target.conn_id);
-
-    ensure_lake_table_base(lake_pg.raw, target.source_schema, target.source_table, cols, partition_months);
-    truncate_lake_table(lake_pg.raw, target.source_schema, target.source_table);
-
-    log_fl(
-        log_pg,
-        log_mtx,
-        LogLevel::Info,
-        batch_id,
-        "lake table truncated",
-        {},
-        target.conn_id,
-        target.source_schema,
-        target.source_table);
 
     const DdlSyncResult ddl = sync_mariadb_ddl_after_truncate(
         lake_pg.raw, mariadb.handle, target.source_schema, target.source_table, cols, runtime, target.conn_id);
@@ -950,10 +1040,14 @@ TableLoadOutcome load_one_table(
         LogLevel::Info,
         batch_id,
         "table full load completed",
-        {{"rows_loaded", rows_out}, {"duration_ms", elapsed_ms(start)}, {"workers", workers}},
+        {{"rows_loaded", rows_out},
+         {"rows_before_truncate", rows_before_truncate},
+         {"duration_ms", elapsed_ms(start)},
+         {"workers", workers}},
         target.conn_id,
         target.source_schema,
         target.source_table);
+    release_full_load_table_lock(lake_pg.raw, target.catalog_id);
     return TableLoadOutcome::Success;
 }
 
@@ -999,7 +1093,9 @@ FullLoadRunStats run_mariadb_full_load(
         conn_ids.insert(t.conn_id);
     }
     for (const auto& cid : conn_ids) {
-        clear_stale_full_load_in_progress(app_pg.raw, cid, "mariadb");
+        const int stale_minutes =
+            runtime.get_int("full_load_stale_in_progress_minutes", 30, "mariadb_load", cid);
+        clear_stale_full_load_in_progress(app_pg.raw, cid, "mariadb", stale_minutes);
     }
 
     if (targets.empty()) {

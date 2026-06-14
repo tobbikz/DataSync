@@ -856,7 +856,7 @@ FullLoadRunStats run_mssql_full_load(
         conn_ids.insert(t.conn_id);
     }
     for (const auto& cid : conn_ids) {
-        clear_stale_full_load_in_progress(app_pg.raw, cid, "mssql");
+        clear_stale_full_load_in_progress(app_pg.raw, cid, "mssql", 30);
     }
 
     if (targets.empty()) {

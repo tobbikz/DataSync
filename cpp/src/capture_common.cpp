@@ -1126,8 +1126,13 @@ void mark_catalog_reconcile_healed(PGconn* pg, long long catalog_id) {
         vals);
 }
 
-void clear_stale_full_load_in_progress(PGconn* pg, const std::string& conn_id, const std::string& db_engine) {
-    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
+void clear_stale_full_load_in_progress(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine,
+    int stale_minutes) {
+    const std::string mins = std::to_string(std::max(1, stale_minutes));
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str(), mins.c_str()};
     pg_exec_params_simple(
         pg,
         R"(
@@ -1138,8 +1143,9 @@ void clear_stale_full_load_in_progress(PGconn* pg, const std::string& conn_id, c
           AND db_engine = $2::cdc_catalog.db_engine
           AND status = 'full_load_in_progress'
           AND needs_full_load = true
+          AND updated_at < now() - make_interval(mins => $3::int)
         )",
-        2,
+        3,
         vals);
 }
 

@@ -521,7 +521,7 @@ int run_cdc_daemon(
 
     for (const auto& conn_id : conn_ids_initial) {
         const std::string db_engine = conn_engine(cfg, conn_id);
-        clear_stale_full_load_in_progress(log_pg, conn_id, db_engine);
+        clear_stale_full_load_in_progress(log_pg, conn_id, db_engine, 30);
         clear_stale_cdc_in_progress(log_pg, conn_id, std::nullopt, db_engine);
         log_write(log_pg, {
             .level = LogLevel::Info,

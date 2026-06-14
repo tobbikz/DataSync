@@ -226,7 +226,11 @@ void mark_catalog_reconcile_failed(
 void mark_catalog_reconcile_healed(PGconn* pg, long long catalog_id);
 
 /** Reset stale full_load_in_progress rows (crash/reload) back to pending. */
-void clear_stale_full_load_in_progress(PGconn* pg, const std::string& conn_id, const std::string& db_engine);
+void clear_stale_full_load_in_progress(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine,
+    int stale_minutes = 30);
 
 /** Reset stale cdc_in_progress rows (crash/reload) back to success. Returns rows updated. */
 int clear_stale_cdc_in_progress(
