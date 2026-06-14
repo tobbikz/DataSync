@@ -257,6 +257,10 @@ std::string sanitize_utf8_for_json(const std::string& in) {
     out.reserve(in.size());
     for (std::size_t i = 0; i < in.size();) {
         const unsigned char c = static_cast<unsigned char>(in[i]);
+        if (c == 0x00) {
+            ++i;
+            continue;
+        }
         if (c < 0x80) {
             out.push_back(static_cast<char>(c));
             ++i;
@@ -264,6 +268,11 @@ std::string sanitize_utf8_for_json(const std::string& in) {
         }
         std::size_t len = 0;
         if ((c & 0xE0) == 0xC0) {
+            if (c < 0xC2) {
+                out.push_back('?');
+                ++i;
+                continue;
+            }
             len = 2;
         } else if ((c & 0xF0) == 0xE0) {
             len = 3;
@@ -286,6 +295,14 @@ std::string sanitize_utf8_for_json(const std::string& in) {
                 valid = false;
                 break;
             }
+        }
+        if (valid && len == 3 && c == 0xED && (in[i + 1] & 0xA0) == 0xA0) {
+            valid = false;
+        }
+        if (valid && len == 4) {
+            const unsigned char c2 = static_cast<unsigned char>(in[i + 1]);
+            if (c == 0xF0 && c2 < 0x90) valid = false;
+            else if (c == 0xF4 && c2 > 0x8F) valid = false;
         }
         if (!valid) {
             out.push_back('?');
