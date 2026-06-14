@@ -32,6 +32,7 @@ set(DATASYNC_SOURCES
     src/kafka_topics.cpp
     src/kafka_apply_native.cpp
     src/kafka_lag.cpp
+    src/kafka_log_purge.cpp
     src/host_metrics.cpp
     src/kafka_producer.cpp
     src/cdc_envelope.cpp

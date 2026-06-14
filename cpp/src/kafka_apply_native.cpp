@@ -4,6 +4,7 @@
 #include "kafka_apply_detail.hpp"
 #include "host_metrics.hpp"
 #include "kafka_lag.hpp"
+#include "kafka_log_purge.hpp"
 #include "kafka_topics.hpp"
 #include "capture_common.hpp"
 
@@ -26,6 +27,7 @@
 #include <chrono>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -959,6 +961,83 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
     return batch_offsets;
 }
 
+std::mutex g_kafka_purge_mu;
+std::map<std::string, std::chrono::steady_clock::time_point> g_kafka_purge_last;
+
+void maybe_purge_kafka_consumed_logs(
+    PGconn* log_pg,
+    RuntimeConfig& runtime,
+    const std::string& conn_id,
+    const std::optional<std::string>& service_tier,
+    const std::string& batch_id,
+    const std::string& bootstrap) {
+    runtime.reload(log_pg);
+    if (!runtime.get_bool("kafka_purge_consumed_enabled", true, "cdc_kafka_apply", conn_id)) {
+        return;
+    }
+    const int interval_s =
+        runtime.get_int("kafka_purge_consumed_interval_seconds", 300, "cdc_kafka_apply", conn_id);
+    const int max_lag =
+        runtime.get_int("kafka_purge_consumed_max_lag", 0, "cdc_kafka_apply", conn_id);
+    const long long min_deletable = static_cast<long long>(runtime.get_int(
+        "kafka_purge_consumed_min_deletable_offsets", 1000, "cdc_kafka_apply", conn_id));
+
+    const std::string tier = service_tier.value_or("");
+    const std::string throttle_key = conn_id + "|" + tier;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(g_kafka_purge_mu);
+        const auto it = g_kafka_purge_last.find(throttle_key);
+        if (it != g_kafka_purge_last.end()) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count();
+            if (elapsed < interval_s) {
+                return;
+            }
+        }
+        g_kafka_purge_last[throttle_key] = now;
+    }
+
+    const std::string consumer_group = kafka_apply_consumer_group(runtime, log_pg, conn_id, tier);
+    const std::string topic_prefix = topic_prefix_for_conn(conn_id);
+    try {
+        const KafkaPurgeConsumedResult purged = purge_kafka_consumed_logs(
+            bootstrap, consumer_group, topic_prefix, max_lag, min_deletable);
+        if (purged.partitions_purged > 0) {
+            log_write(log_pg, {
+                .level = LogLevel::Info,
+                .component = "cdc_kafka_apply",
+                .message = "kafka consumed log segments purged",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"consumer_group", consumer_group},
+                    {"topic_prefix", topic_prefix},
+                    {"partitions_checked", purged.partitions_checked},
+                    {"partitions_purged", purged.partitions_purged},
+                    {"deletable_offsets", purged.deletable_offsets},
+                    {"max_lag", max_lag},
+                },
+            });
+        }
+    } catch (const std::exception& ex) {
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_kafka_apply",
+            .message = "kafka consumed log purge failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"consumer_group", consumer_group},
+                {"error", ex.what()},
+            },
+        });
+    }
+}
+
 }  // namespace
 
 int run_kafka_apply_native_cli(
@@ -1842,6 +1921,9 @@ int run_kafka_apply_native_cli(
         }
     } catch (...) {
     }
+
+    maybe_purge_kafka_consumed_logs(
+        log_pg, runtime, conn_id, service_tier, batch_id, bootstrap);
 
     rd_kafka_consumer_close(rk);
     rd_kafka_destroy(rk);
