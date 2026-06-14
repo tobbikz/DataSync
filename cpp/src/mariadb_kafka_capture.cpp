@@ -409,7 +409,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                                const std::string& schema,
                                const std::string& table,
                                const std::string& op,
-                               const std::vector<std::string>& col_values) {
+                               const std::vector<std::string>& col_values,
+                               const std::vector<std::string>* before_col_values) {
         const auto key = std::make_pair(schema, table);
         if (!wanted.count(key)) {
             return;
@@ -430,6 +431,9 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         const nlohmann::json row_json = row_dict_from_columns(cols_it->second, col_values);
         if (op == "DELETE") {
             before = row_json;
+        } else if (before_col_values != nullptr) {
+            before = row_dict_from_columns(cols_it->second, *before_col_values);
+            after = row_json;
         } else {
             after = row_json;
         }

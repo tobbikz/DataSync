@@ -38,39 +38,11 @@ json row_for_apply_json(const json& data) {
     return data.contains("after") && data["after"].is_object() ? data["after"] : json::object();
 }
 
-void normalize_apply_row(json& row, const std::vector<std::string>& pk_cols) {
-    if (row.contains("mongo_id") && !row["mongo_id"].is_null()) {
-        row["mongo_id"] = mongo_object_id_text(row["mongo_id"]);
-    }
-    for (const auto& col : pk_cols) {
-        if (!row.contains(col) || row[col].is_null() || !row[col].is_string()) {
-            continue;
-        }
-        const std::string s = row[col].get<std::string>();
-        if (s.empty()) {
-            continue;
-        }
-        bool numeric = true;
-        for (char c : s) {
-            if (!std::isdigit(static_cast<unsigned char>(c)) && c != '-') {
-                numeric = false;
-                break;
-            }
-        }
-        if (numeric) {
-            try {
-                row[col] = std::stoll(s);
-            } catch (...) {
-            }
-        }
-    }
-}
-
 std::string build_event_id(
     const json& data,
+    const json& row,
     const std::vector<std::string>& pk_cols,
     const std::string& db_engine = "mariadb") {
-    const json row = row_for_apply_json(data);
     std::ostringstream pk_part;
     bool any = false;
     for (const auto& col : pk_cols) {
@@ -127,6 +99,53 @@ std::string build_event_id(
 }
 
 }  // namespace
+
+void normalize_apply_row(json& row, const std::vector<std::string>& pk_cols) {
+    if (row.contains("mongo_id") && !row["mongo_id"].is_null()) {
+        row["mongo_id"] = mongo_object_id_text(row["mongo_id"]);
+    }
+    for (const auto& col : pk_cols) {
+        if (!row.contains(col) || row[col].is_null() || !row[col].is_string()) {
+            continue;
+        }
+        const std::string s = row[col].get<std::string>();
+        if (s.empty()) {
+            continue;
+        }
+        bool numeric = true;
+        for (char c : s) {
+            if (!std::isdigit(static_cast<unsigned char>(c)) && c != '-') {
+                numeric = false;
+                break;
+            }
+        }
+        if (numeric) {
+            try {
+                row[col] = std::stoll(s);
+            } catch (...) {
+            }
+        }
+    }
+}
+
+void enrich_apply_row_from_payload(
+    json& row,
+    const json& data,
+    const std::string& op,
+    const std::vector<std::string>& pk_cols) {
+    if (op != "u" && op != "UPDATE") {
+        normalize_apply_row(row, pk_cols);
+        return;
+    }
+    const json before =
+        data.contains("before") && data["before"].is_object() ? data["before"] : json::object();
+    for (auto it = before.begin(); it != before.end(); ++it) {
+        if (!row.contains(it.key()) || row[it.key()].is_null()) {
+            row[it.key()] = it.value();
+        }
+    }
+    normalize_apply_row(row, pk_cols);
+}
 
 namespace {
 
@@ -247,7 +266,7 @@ bool parse_kafka_payload(
 
     out.op = op_char(data);
     out.row = row_for_apply_json(data);
-    normalize_apply_row(out.row, pk_cols);
+    enrich_apply_row_from_payload(out.row, data, out.op, pk_cols);
     out.topic = topic;
     out.partition = partition;
     out.offset = offset;
@@ -304,7 +323,7 @@ bool parse_kafka_payload(
         }
     }
 
-    out.event_id = build_event_id(data, pk_cols, actual_engine);
+    out.event_id = build_event_id(data, out.row, pk_cols, actual_engine);
     fill_table_key_from_event_id(out, actual_engine);
     return !out.schema_name.empty() && !out.table_name.empty();
 }

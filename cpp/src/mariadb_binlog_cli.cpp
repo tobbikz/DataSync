@@ -184,6 +184,13 @@ BinlogCliStats read_remote_binlog_cli(
         std::map<int, std::string> chosen = set_cols;
         if (pending_op == "DELETE") {
             chosen = where_cols;
+        } else if (pending_op == "UPDATE") {
+            // SET carries changed columns only; merge WHERE so PK/unchanged cols are present.
+            for (const auto& [idx, val] : where_cols) {
+                if (!chosen.count(idx)) {
+                    chosen[idx] = val;
+                }
+            }
         } else if (chosen.empty()) {
             chosen = where_cols;
         }
@@ -205,7 +212,20 @@ BinlogCliStats read_remote_binlog_cli(
             }
         }
 
-        on_row(pending_schema, pending_table, pending_op, values);
+        const std::vector<std::string>* before_values = nullptr;
+        std::vector<std::string> before_vec;
+        if (pending_op == "UPDATE" && !where_cols.empty()) {
+            const int before_max = where_cols.rbegin()->first;
+            before_vec.assign(static_cast<std::size_t>(before_max + 1), std::string{});
+            for (const auto& [idx, val] : where_cols) {
+                if (idx >= 0 && idx < static_cast<int>(before_vec.size())) {
+                    before_vec[static_cast<std::size_t>(idx)] = sql_literal_from_binlog_value(val);
+                }
+            }
+            before_values = &before_vec;
+        }
+
+        on_row(pending_schema, pending_table, pending_op, values, before_values);
         stats.events += 1;
         if (pending_op == "DELETE") {
             stats.deletes += 1;

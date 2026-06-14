@@ -277,7 +277,8 @@ CdcRunStats run_cdc_for_conn(
         [&](const std::string& schema,
             const std::string& table,
             const std::string& op,
-            const std::vector<std::string>& col_values) {
+            const std::vector<std::string>& col_values,
+            const std::vector<std::string>* /*before_col_values*/) {
             const TableKey key{schema, table};
             if (!wanted.count(key)) {
                 return;

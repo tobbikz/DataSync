@@ -111,4 +111,17 @@ bool parse_kafka_payload(
     const std::vector<std::string>& pk_cols,
     const std::string& db_engine = "mariadb");
 
+/** Fill missing/null columns from CDC before image (partial UPDATE payloads). */
+void enrich_apply_row_from_payload(
+    nlohmann::json& row,
+    const nlohmann::json& data,
+    const std::string& op,
+    const std::vector<std::string>& pk_cols);
+
+/** COPY cell formatter for lake apply (shared with unit tests). */
+std::string json_cell_csv(
+    const nlohmann::json& val,
+    const std::string& pg_type = "",
+    bool mssql_text = false);
+
 }  // namespace kafka_apply_detail

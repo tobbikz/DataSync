@@ -302,8 +302,37 @@ std::string sanitize_numeric_string_for_pg(const std::string& s) {
 
 }  // namespace
 
-std::string json_cell_csv(const json& val_in, const std::string& pg_type = "", bool mssql_text = false) {
+std::string format_boolean_copy_cell(const json& val) {
+    if (val.is_boolean()) {
+        return val.get<bool>() ? "t" : "f";
+    }
+    if (val.is_number_integer() || val.is_number_unsigned()) {
+        return val.get<long long>() != 0 ? "t" : "f";
+    }
+    if (val.is_string()) {
+        const std::string s = val.get<std::string>();
+        if (s.empty()) {
+            return "f";
+        }
+        if (s == "0" || s == "false" || s == "FALSE" || s == "f" || s == "F" || s == "no" || s == "NO") {
+            return "f";
+        }
+        if (s == "1" || s == "true" || s == "TRUE" || s == "t" || s == "T" || s == "yes" || s == "YES") {
+            return "t";
+        }
+        return "f";
+    }
+    return "f";
+}
+
+std::string json_cell_csv(const json& val_in, const std::string& pg_type, bool mssql_text) {
     json val = val_in;
+    if (pg_type == "BOOLEAN" || pg_type == "bool") {
+        if (val.is_null()) {
+            return "";
+        }
+        return format_boolean_copy_cell(val);
+    }
     if (val.is_string() && is_numeric_pg_type(pg_type)) {
         const std::string s = sanitize_numeric_string_for_pg(val.get<std::string>());
         if (s.empty()) {
@@ -322,7 +351,7 @@ std::string json_cell_csv(const json& val_in, const std::string& pg_type = "", b
         return "";
     }
     if (val.is_boolean()) {
-        return val.get<bool>() ? "true" : "false";
+        return format_boolean_copy_cell(val);
     }
     if (val.is_number_integer() || val.is_number_unsigned()) {
         const long long n = val.get<long long>();
@@ -364,8 +393,14 @@ std::string json_cell_csv(const json& val_in, const std::string& pg_type = "", b
     return csv_escape_local(s);
 }
 
-std::string json_cell_sql(const json& val_in, const std::string& pg_type = "") {
+std::string json_cell_sql(const json& val_in, const std::string& pg_type) {
     json val = val_in;
+    if (pg_type == "BOOLEAN" || pg_type == "bool") {
+        if (val.is_null()) {
+            return "NULL";
+        }
+        return format_boolean_copy_cell(val) == "t" ? "true" : "false";
+    }
     if (val.is_string() && is_numeric_pg_type(pg_type)) {
         const std::string s = sanitize_numeric_string_for_pg(val.get<std::string>());
         if (s.empty()) {
@@ -1091,7 +1126,20 @@ long long apply_table_batch(
     std::vector<std::string> lines;
     lines.reserve(upserts.size());
     int row_index = 0;
+    int skipped_missing_pk = 0;
     for (const auto& e : upserts) {
+        bool missing_pk = false;
+        for (const auto& pk_col : lake_pk_cols) {
+            const json* pk_val = e.row.contains(pk_col) ? &e.row[pk_col] : nullptr;
+            if (!pk_val || pk_val->is_null()) {
+                missing_pk = true;
+                break;
+            }
+        }
+        if (missing_pk) {
+            skipped_missing_pk += 1;
+            continue;
+        }
         const std::string row_ts = unique_load_timestamptz(e.ts_ms, row_index++);
         const std::string row_date = lake_columns::date_from_timestamptz(row_ts);
         std::ostringstream line;
@@ -1106,6 +1154,10 @@ long long apply_table_batch(
         line << ',' << csv_escape_local(row_ts) << ',' << csv_escape_local(row_date) << ','
              << csv_escape_local(source_system) << ',' << csv_escape_local(batch_id);
         lines.push_back(line.str());
+    }
+    if (lines.empty()) {
+        (void)skipped_missing_pk;
+        return static_cast<long long>(deletes.size() + upserts.size());
     }
 
     const bool all_inserts =
