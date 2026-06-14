@@ -2070,6 +2070,12 @@ void ensure_kafka_topics_exist(
         return;
     }
 
+    // Match docker-compose broker defaults (3d time cap + 1GiB/partition + 128MiB segments).
+    constexpr const char* kRetentionMs = "259200000";
+    constexpr const char* kRetentionBytes = "1073741824";
+    constexpr const char* kSegmentBytes = "134217728";
+    constexpr const char* kCleanupPolicy = "delete";
+
     char errstr[512]{0};
     rd_kafka_conf_t* conf = rd_kafka_conf_new();
     if (rd_kafka_conf_set(conf, "bootstrap.servers", bootstrap.c_str(), errstr, sizeof(errstr)) !=
@@ -2094,6 +2100,10 @@ void ensure_kafka_topics_exist(
             throw std::runtime_error(
                 std::string("NewTopic failed for ") + topic + ": " + errstr);
         }
+        rd_kafka_NewTopic_set_config(nt, "retention.ms", kRetentionMs);
+        rd_kafka_NewTopic_set_config(nt, "retention.bytes", kRetentionBytes);
+        rd_kafka_NewTopic_set_config(nt, "segment.bytes", kSegmentBytes);
+        rd_kafka_NewTopic_set_config(nt, "cleanup.policy", kCleanupPolicy);
         new_topics.push_back(nt);
     }
 

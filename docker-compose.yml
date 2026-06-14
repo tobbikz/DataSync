@@ -26,6 +26,17 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Log retention: 3 days OR per-partition byte cap (whichever triggers first).
+      # Without retention.bytes, high CDC volume can fill disk within the time window.
+      KAFKA_LOG_RETENTION_MS: "259200000"
+      KAFKA_LOG_RETENTION_BYTES: "1073741824"
+      KAFKA_LOG_SEGMENT_BYTES: "134217728"
+      KAFKA_LOG_SEGMENT_MS: "86400000"
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: "300000"
+      KAFKA_LOG_CLEANUP_POLICY: delete
+      KAFKA_LOG_CLEANER_ENABLE: "true"
+      # Expire stale consumer group offsets (unrelated to log segments, frees __consumer_offsets).
+      KAFKA_OFFSETS_RETENTION_MINUTES: "10080"
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "127.0.0.1:9092"]
       interval: 10s
