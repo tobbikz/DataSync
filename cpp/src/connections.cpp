@@ -48,7 +48,8 @@ std::string normalize_mariadb_host(std::string host, bool force_tcp) {
 
 MariaDbSource row_to_mariadb(PGresult* res, int row) {
     MariaDbSource src;
-    src.conn_id = PQgetvalue(res, row, 0);
+    const char* conn_id_val = PQgetvalue(res, row, 0);
+    src.conn_id = conn_id_val ? conn_id_val : "";
     const std::string raw_host = PQgetvalue(res, row, 2) ? PQgetvalue(res, row, 2) : "localhost";
     src.password = PQgetvalue(res, row, 6) ? PQgetvalue(res, row, 6) : "";
     src.host = normalize_mariadb_host(raw_host, !src.password.empty());
@@ -60,7 +61,8 @@ MariaDbSource row_to_mariadb(PGresult* res, int row) {
 
 MssqlSource row_to_mssql(PGresult* res, int row) {
     MssqlSource src;
-    src.conn_id = PQgetvalue(res, row, 0);
+    const char* conn_id_val = PQgetvalue(res, row, 0);
+    src.conn_id = conn_id_val ? conn_id_val : "";
     src.host = normalize_tcp_host(PQgetvalue(res, row, 2) ? PQgetvalue(res, row, 2) : "localhost");
     src.port = parse_port(PQgetvalue(res, row, 3), 1433);
     src.db_name = PQgetvalue(res, row, 4) ? PQgetvalue(res, row, 4) : "";
@@ -71,7 +73,8 @@ MssqlSource row_to_mssql(PGresult* res, int row) {
 
 MongoSource row_to_mongo(PGresult* res, int row) {
     MongoSource src;
-    src.conn_id = PQgetvalue(res, row, 0);
+    const char* conn_id_val = PQgetvalue(res, row, 0);
+    src.conn_id = conn_id_val ? conn_id_val : "";
     src.host = normalize_tcp_host(PQgetvalue(res, row, 2) ? PQgetvalue(res, row, 2) : "localhost");
     src.port = parse_port(PQgetvalue(res, row, 3), 27017);
     src.db_name = PQgetvalue(res, row, 4) ? PQgetvalue(res, row, 4) : "";

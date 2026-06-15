@@ -135,8 +135,10 @@ CapturePosition read_capture_position(PGconn* pg, const std::string& conn_id) {
     }
 
     CapturePosition pos;
-    pos.binlog_file = PQgetvalue(res, 0, 0);
-    pos.binlog_position = std::atoll(PQgetvalue(res, 0, 1));
+    const char* bf = PQgetvalue(res, 0, 0);
+    pos.binlog_file = bf ? bf : "";
+    const char* bp = PQgetvalue(res, 0, 1);
+    pos.binlog_position = bp ? std::atoll(bp) : 0;
     if (PQgetvalue(res, 0, 2)) {
         pos.server_uuid = PQgetvalue(res, 0, 2);
     }
@@ -423,7 +425,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                                const std::string& table,
                                const std::string& op,
                                const std::vector<std::string>& col_values,
-                               const std::vector<std::string>* before_col_values) {
+                               const std::vector<std::string>* before_col_values,
+                               long long event_position) {
         const auto key = std::make_pair(schema, table);
         if (!wanted.count(key)) {
             return;
@@ -459,7 +462,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         event.before = before;
         event.after = after;
         event.binlog_file = binlog_start.file;
-        event.binlog_pos = binlog_start.position;
+        event.binlog_pos = event_position > 0 ? event_position : binlog_start.position;
         event.ts_ms = now_ms();
         event.ingestion_ts = utc_iso_timestamp_now();
 
@@ -557,14 +560,14 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         const int chunk_sec = lagging
                                   ? std::max(1, std::min(static_cast<int>(remaining_sec), 30))
                                   : std::max(1, std::min(idle_cap, static_cast<int>(remaining_sec)));
-        const int events_left = rcfg.max_events - static_cast<int>(read_stats.events);
+        const long long events_left = rcfg.max_events - read_stats.events;
 
         const BinlogPosition chunk_start = binlog_start;
         const BinlogCliStats chunk = read_remote_binlog_cli(
             *source,
             binlog_start,
             chunk_sec,
-            events_left,
+            static_cast<int>(std::min<long long>(events_left, 2147483647)),
             publish_row,
             [&]() { return std::chrono::steady_clock::now() >= slice_deadline; });
 
@@ -759,8 +762,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         upsert_capture_position(
             log_pg,
             conn_id,
-            start_pos.binlog_file,
-            start_pos.binlog_position,
+            read_stats.last_file,
+            read_stats.last_position,
             live_uuid,
             "failed",
             "kafka publish failed: " + err_detail.substr(0, 2000));

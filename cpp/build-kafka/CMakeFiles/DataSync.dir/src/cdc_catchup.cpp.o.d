@@ -320,8 +320,8 @@ CMakeFiles/DataSync.dir/src/cdc_catchup.cpp.o: \
  /usr/include/nlohmann/thirdparty/hedley/hedley_undef.hpp \
  /home/iks/Projects/DataSync/cpp/include/capture_common.hpp \
  /home/iks/Projects/DataSync/cpp/include/runtime_config.hpp \
- /usr/include/c++/15.2.1/shared_mutex /usr/include/c++/15.2.1/set \
- /usr/include/c++/15.2.1/bits/stl_set.h \
+ /usr/include/c++/15.2.1/shared_mutex /usr/include/c++/15.2.1/atomic \
+ /usr/include/c++/15.2.1/set /usr/include/c++/15.2.1/bits/stl_set.h \
  /usr/include/c++/15.2.1/bits/stl_multiset.h \
  /home/iks/Projects/DataSync/cpp/include/daemon_full_load.hpp \
  /usr/include/c++/15.2.1/mutex /usr/include/c++/15.2.1/bits/unique_lock.h \

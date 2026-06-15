@@ -62,7 +62,9 @@ void rebalance_cb(rd_kafka_t* rk, rd_kafka_resp_err_t err,
                   rd_kafka_topic_partition_list_t* partitions, void* opaque) {
     auto* ctx = static_cast<KafkaApplyContext*>(opaque);
     if (err == RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS) {
-        rd_kafka_commit(rk, partitions, 0);
+        if (partitions) {
+            rd_kafka_commit(rk, partitions, 0);
+        }
         if (ctx) {
             log_write(ctx->log_pg, {
                 .level = LogLevel::Warning,
@@ -70,7 +72,7 @@ void rebalance_cb(rd_kafka_t* rk, rd_kafka_resp_err_t err,
                 .message = "kafka partitions revoked, committed offsets",
                 .batch_id = ctx->batch_id,
                 .conn_id = ctx->conn_id,
-                .context = {{"partition_count", static_cast<int>(partitions->cnt)}},
+                .context = {{"partition_count", partitions ? static_cast<int>(partitions->cnt) : 0}},
             });
         }
     } else if (err == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS) {
@@ -81,7 +83,7 @@ void rebalance_cb(rd_kafka_t* rk, rd_kafka_resp_err_t err,
                 .message = "kafka partitions assigned",
                 .batch_id = ctx->batch_id,
                 .conn_id = ctx->conn_id,
-                .context = {{"partition_count", static_cast<int>(partitions->cnt)}},
+                .context = {{"partition_count", partitions ? static_cast<int>(partitions->cnt) : 0}},
             });
         }
     }
@@ -165,8 +167,7 @@ std::pair<bool, std::string> should_stop_slice(
     const std::map<TableKey, bool>& met,
     int target,
     const std::set<TableKey>& stale_keys,
-    bool allow_quiet,
-    const std::map<TableKey, int>* processed) {
+    bool allow_quiet) {
     std::vector<TableKey> active;
     for (const auto& key : wanted) {
         if (!quarantined.count(key)) {
@@ -177,31 +178,10 @@ std::pair<bool, std::string> should_stop_slice(
         return {true, "all_quarantined"};
     }
 
-    const std::map<TableKey, int>& progress = processed ? *processed : applied;
-    for (const auto& key : active) {
-        if (stale_keys.count(key)) {
-            const int seen_n = seen.count(key) ? seen.at(key) : 0;
-            const int prog_n = progress.count(key) ? progress.at(key) : 0;
-            if (seen_n > prog_n) {
-                return {false, "stale_priority"};
-            }
-        }
-    }
-
     bool all_ok = true;
     for (const auto& key : active) {
         if (!slice_satisfied(key, met, seen, applied, target, allow_quiet)) {
             all_ok = false;
-            break;
-        }
-    }
-
-    bool has_unapplied = false;
-    for (const auto& key : active) {
-        const int seen_n = seen.count(key) ? seen.at(key) : 0;
-        const int prog_n = progress.count(key) ? progress.at(key) : 0;
-        if (seen_n > prog_n) {
-            has_unapplied = true;
             break;
         }
     }
@@ -215,6 +195,16 @@ std::pair<bool, std::string> should_stop_slice(
                 has_stale_unapplied = true;
                 break;
             }
+        }
+    }
+
+    bool has_unapplied = false;
+    for (const auto& key : active) {
+        const int seen_n = seen.count(key) ? seen.at(key) : 0;
+        const int applied_n = applied.count(key) ? applied.at(key) : 0;
+        if (seen_n > applied_n) {
+            has_unapplied = true;
+            break;
         }
     }
 
@@ -355,11 +345,16 @@ std::vector<CatalogMeta> fetch_catalog_tables(
     }
     for (int i = 0; i < PQntuples(res); ++i) {
         CatalogMeta meta;
-        meta.catalog_id = std::atoll(PQgetvalue(res, i, 0));
-        const std::string src_db = PQgetvalue(res, i, 2);
-        const std::string src_schema = PQgetvalue(res, i, 3);
-        const std::string src_table = PQgetvalue(res, i, 4);
-        meta.pk_columns = PQgetvalue(res, i, 5);
+        const char* cid_str = PQgetvalue(res, i, 0);
+        meta.catalog_id = cid_str ? std::atoll(cid_str) : 0;
+        const char* sdb = PQgetvalue(res, i, 2);
+        const char* ssch = PQgetvalue(res, i, 3);
+        const char* stbl = PQgetvalue(res, i, 4);
+        const char* spk = PQgetvalue(res, i, 5);
+        const std::string src_db = sdb ? sdb : "";
+        const std::string src_schema = ssch ? ssch : "";
+        const std::string src_table = stbl ? stbl : "";
+        meta.pk_columns = spk ? spk : "";
         meta.source_table = src_table;
         meta.source_database = src_db;
         if (db_engine == "mongodb") {
@@ -500,7 +495,9 @@ void insert_fairness_metrics(
     long long events_seen,
     long long events_applied,
     long long duration_ms,
-    int wanted) {
+    int wanted,
+    long long parse_skipped = 0,
+    int dropped_unrecoverable = 0) {
     const std::string tier_val = tier.value_or("");
     const std::string seen = std::to_string(events_seen);
     const std::string applied = std::to_string(events_applied);
@@ -509,6 +506,8 @@ void insert_fairness_metrics(
     const std::string met = std::to_string(counts.tables_met_target);
     const std::string starved = std::to_string(counts.tables_starved);
     const std::string quiet = std::to_string(counts.tables_quiet);
+    const std::string skipped = std::to_string(parse_skipped);
+    const std::string dropped = std::to_string(dropped_unrecoverable);
     const std::string ctx = json{{"tables_active", counts.tables_active}}.dump();
     const char* vals[] = {
         batch_id.c_str(),
@@ -522,6 +521,8 @@ void insert_fairness_metrics(
         seen.c_str(),
         applied.c_str(),
         duration.c_str(),
+        skipped.c_str(),
+        dropped.c_str(),
         ctx.c_str()};
     pg_exec_params_simple(
         pg,
@@ -529,11 +530,12 @@ void insert_fairness_metrics(
         INSERT INTO cdc_catalog.cdc_run_fairness_metrics
             (batch_id, conn_id, service_tier, stop_reason,
              tables_total, tables_met_target, tables_starved, tables_quiet,
-             events_seen, events_applied, duration_ms, context)
+             events_seen, events_applied, duration_ms,
+             parse_skipped, dropped_unrecoverable, context)
         VALUES ($1, $2, NULLIF($3, ''), $4, $5::integer, $6::integer, $7::integer, $8::integer,
-                $9::bigint, $10::bigint, $11::integer, $12::jsonb)
+                $9::bigint, $10::bigint, $11::integer, $12::bigint, $13::bigint, $14::jsonb)
         )",
-        12,
+        14,
         vals);
 }
 
@@ -796,8 +798,10 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
     bool audit_enabled,
     long long& events_applied,
     int& errors,
+    int& dropped_unrecoverable,
     std::map<TableKey, int>& applied_by_table,
     const std::map<TableKey, int>& seen_by_table,
+    const std::map<TableKey, int>& parse_skipped_by_table,
     const std::map<TableKey, CatalogMeta>& meta_by_key,
     const std::string& source_system = "MariaDB",
     const std::string& db_engine = "mariadb",
@@ -901,6 +905,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
         for (const auto& [state_key, skipped] : dedup_skipped_by_state) {
             options.slice_table_state[state_key].dedup_skipped += skipped;
         }
+        options.parse_skipped_by_table = &parse_skipped_by_table;
         std::map<std::string, std::tuple<std::string, int, long long>> last_kafka_by_state;
         for (const auto& e : to_apply) {
             const TableKey lake_key{e.schema_name, e.table_name};
@@ -928,6 +933,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
         const long long applied_n = result.value("applied", 0LL);
         events_applied += applied_n;
         errors += batch_table_errors;
+        dropped_unrecoverable += result.value("dropped_unrecoverable", 0);
 
         std::set<std::pair<std::string, int>> dirty_partitions;
         for (const auto& e : failed_events) {
@@ -1439,13 +1445,14 @@ int run_kafka_apply_native_cli(
 
     std::map<TableKey, int> seen_by_table;
     std::map<TableKey, int> applied_by_table;
-    std::map<TableKey, int> processed_by_table;
+    std::map<TableKey, int> parse_skipped_by_table;
     std::map<TableKey, bool> met;
     std::map<std::pair<std::string, int>, long long> last_offsets;
 
     long long events_seen = 0;
     long long events_applied = 0;
     long long parse_skipped = 0;
+    int dropped_unrecoverable_total = 0;
     int errors = 0;
     std::string stop_reason = "unknown";
     bool loop_exited_early = false;
@@ -1470,6 +1477,7 @@ int run_kafka_apply_native_cli(
         }
         for (int retry = 0; retry < 3; ++retry) {
             try {
+                int dropped = 0;
                 auto batch_offsets = flush_pending_batch(
                     app_pg.raw,
                     lake_pg.raw,
@@ -1481,8 +1489,10 @@ int run_kafka_apply_native_cli(
                     audit_enabled,
                     events_applied,
                     errors,
+                    dropped,
                     applied_by_table,
                     seen_by_table,
+                    parse_skipped_by_table,
                     meta_by_key,
                     source_system,
                     db_engine,
@@ -1492,6 +1502,7 @@ int run_kafka_apply_native_cli(
                     rk,
                     &catchup_tables,
                     &host_sampler);
+                dropped_unrecoverable_total += dropped;
                 commit_kafka_offsets(rk, batch_offsets);
                 for (const auto& [tp, offset] : batch_offsets) {
                     last_offsets[tp] = std::max(last_offsets[tp], offset);
@@ -1593,8 +1604,7 @@ int run_kafka_apply_native_cli(
             met,
             target,
             stale_keys,
-            allow_quiet,
-            &processed_by_table);
+            allow_quiet);
         if (!stop) {
             return false;
         }
@@ -1819,6 +1829,25 @@ int run_kafka_apply_native_cli(
                     offset,
                     pk_by_table[key],
                     db_engine)) {
+                parse_skipped += 1;
+                parse_skipped_by_table[key] += 1;
+                if (parse_skipped <= 10) {
+                    log_write(log_pg, {
+                        .level = LogLevel::Warning,
+                        .component = "cdc_kafka_apply_cpp",
+                        .message = "kafka payload parse skipped",
+                        .batch_id = batch_id,
+                        .conn_id = conn_id,
+                        .source_schema = schema_name,
+                        .source_table = table_name,
+                        .context = {
+                            {"topic", topic},
+                            {"partition", partition},
+                            {"offset", offset},
+                            {"parse_skipped_count", parse_skipped},
+                        },
+                    });
+                }
                 continue;
             }
             event.catalog_id = meta_by_key[key].catalog_id;
@@ -1843,7 +1872,6 @@ int run_kafka_apply_native_cli(
             }
 
             seen_by_table[key] = seen_by_table[key] + 1;
-            processed_by_table[key] = processed_by_table[key] + 1;
 
             if (target > 0) {
                 const int applied_n = applied_by_table.count(key) ? applied_by_table.at(key) : 0;
@@ -1973,7 +2001,9 @@ int run_kafka_apply_native_cli(
             events_seen,
             events_applied,
             duration_ms,
-            static_cast<int>(wanted.size()));
+            static_cast<int>(wanted.size()),
+            parse_skipped,
+            dropped_unrecoverable_total);
 
         stats["events_seen"] = events_seen;
         stats["events_applied"] = events_applied;

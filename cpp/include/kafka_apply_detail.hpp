@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -50,6 +51,8 @@ struct ApplyBatchOptions {
     std::vector<ApplyEvent>* failed_events_out{nullptr};
     /** Optional: per-table apply failures in this batch. */
     int* table_errors_out{nullptr};
+    /** Optional: per-table parse_skipped count from main loop. */
+    const std::map<std::pair<std::string, std::string>, int>* parse_skipped_by_table{nullptr};
 };
 
 struct QuietTableRef {

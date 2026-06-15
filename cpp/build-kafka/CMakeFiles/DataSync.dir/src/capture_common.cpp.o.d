@@ -321,7 +321,8 @@ CMakeFiles/DataSync.dir/src/capture_common.cpp.o: \
  /usr/include/nlohmann/ordered_map.hpp /usr/include/c++/15.2.1/any \
  /usr/include/nlohmann/detail/macro_unscope.hpp \
  /usr/include/nlohmann/thirdparty/hedley/hedley_undef.hpp \
- /usr/include/c++/15.2.1/set /usr/include/c++/15.2.1/bits/stl_set.h \
+ /usr/include/c++/15.2.1/atomic /usr/include/c++/15.2.1/set \
+ /usr/include/c++/15.2.1/bits/stl_set.h \
  /usr/include/c++/15.2.1/bits/stl_multiset.h \
  /home/iks/Projects/DataSync/cpp/include/mssql_kafka_capture.hpp \
  /home/iks/Projects/DataSync/cpp/include/mssql_conn.hpp \
@@ -452,7 +453,7 @@ CMakeFiles/DataSync.dir/src/capture_common.cpp.o: \
  /usr/include/c++/15.2.1/x86_64-pc-linux-gnu/bits/basic_file.h \
  /usr/include/c++/15.2.1/x86_64-pc-linux-gnu/bits/c++io.h \
  /usr/include/c++/15.2.1/bits/fstream.tcc /usr/include/c++/15.2.1/thread \
- /usr/include/c++/15.2.1/stop_token /usr/include/c++/15.2.1/atomic \
+ /usr/include/c++/15.2.1/stop_token \
  /usr/include/c++/15.2.1/bits/std_thread.h \
  /usr/include/c++/15.2.1/semaphore \
  /usr/include/c++/15.2.1/bits/semaphore_base.h \

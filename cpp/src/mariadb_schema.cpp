@@ -415,12 +415,12 @@ void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const
     PQclear(res);
 }
 
-std::string mysql_escape_literal(const std::string& value) {
-    std::string out = "'";
-    for (char c : value) {
-        out += (c == '\'') ? "''" : std::string(1, c);
-    }
-    out += "'";
+std::string mysql_escape_literal(MYSQL* mysql, const std::string& value) {
+    std::string out(value.size() * 2 + 3, '\'');
+    const unsigned long len = mysql_real_escape_string(mysql, out.data() + 1, value.c_str(), static_cast<unsigned long>(value.size()));
+    out.resize(len + 2);
+    out[0] = '\'';
+    out[len + 1] = '\'';
     return out;
 }
 
@@ -428,7 +428,7 @@ std::vector<MariaDbColumn> fetch_mariadb_columns(MYSQL* mysql, const std::string
     const std::string sql =
         "SELECT column_name, column_type, column_key, is_nullable FROM information_schema.columns "
         "WHERE table_schema=" +
-        mysql_escape_literal(schema) + " AND table_name=" + mysql_escape_literal(table) +
+        mysql_escape_literal(mysql, schema) + " AND table_name=" + mysql_escape_literal(mysql, table) +
         " ORDER BY ordinal_position";
 
     if (mysql_query(mysql, sql.c_str()) != 0) {
@@ -628,7 +628,7 @@ void migrate_lake_table_schema(
                 pg_exec(pg, alter_sql);
             } catch (const std::exception& ex) {
                 try {
-                    pg_exec(pg, "DROP TABLE IF EXISTS " + fq + " CASCADE");
+                    pg_exec(pg, "DROP TABLE IF EXISTS " + fq);
                 } catch (...) {
                 }
                 throw std::runtime_error(

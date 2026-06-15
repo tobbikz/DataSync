@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstring>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -24,7 +25,6 @@ namespace {
 
 AppConfig snapshot_app_config(const AppConfig& cfg);
 
-std::atomic<bool> g_shutdown{false};
 std::atomic<int> g_catalog_sync_round{0};
 std::vector<std::thread> g_background_threads;
 std::mutex g_background_threads_mu;
@@ -42,8 +42,8 @@ void join_background_threads() {
     }
 }
 
-void on_signal(int) {
-    g_shutdown.store(true);
+extern "C" void on_signal(int) {
+    g_shutdown.store(true, std::memory_order_relaxed);
 }
 
 void sleep_interruptible(int seconds) {
@@ -520,8 +520,13 @@ int run_cdc_daemon(
     AppConfig& cfg,
     PGconn* log_pg,
     bool once) {
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
     RuntimeConfig runtime;
     runtime.reload(log_pg);

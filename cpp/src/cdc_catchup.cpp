@@ -117,11 +117,11 @@ ApplyPositionRow fetch_apply_position(
         }
         throw std::runtime_error("no apply_position for " + schema + "." + table);
     }
-    out.catalog_id = std::atoll(PQgetvalue(res, 0, 0));
-    out.kafka_topic = PQgetvalue(res, 0, 1);
-    out.kafka_partition = std::stoi(PQgetvalue(res, 0, 2));
-    out.service_tier = PQgetvalue(res, 0, 3);
-    out.source_database = PQgetvalue(res, 0, 4);
+    out.catalog_id = PQgetisnull(res, 0, 0) ? 0 : std::atoll(PQgetvalue(res, 0, 0));
+    out.kafka_topic = PQgetvalue(res, 0, 1) ? PQgetvalue(res, 0, 1) : "";
+    out.kafka_partition = PQgetisnull(res, 0, 2) ? 0 : std::stoi(PQgetvalue(res, 0, 2));
+    out.service_tier = PQgetvalue(res, 0, 3) ? PQgetvalue(res, 0, 3) : "";
+    out.source_database = PQgetvalue(res, 0, 4) ? PQgetvalue(res, 0, 4) : "";
     const char* meta = PQgetvalue(res, 0, 5);
     if (meta && *meta) {
         out.engine_meta = nlohmann::json::parse(meta, nullptr, false);
@@ -333,13 +333,14 @@ std::vector<CatchupCandidate> find_catchup_candidates(
         if (status && std::string(status) == "quarantined") {
             continue;
         }
-        const std::string schema = PQgetvalue(res, i, 0);
-        const std::string table = PQgetvalue(res, i, 1);
+        const std::string schema = PQgetvalue(res, i, 0) ? PQgetvalue(res, i, 0) : "";
+        const std::string table = PQgetvalue(res, i, 1) ? PQgetvalue(res, i, 1) : "";
         const int lag_col = PQgetisnull(res, i, 3) ? -1 : std::stoi(PQgetvalue(res, i, 3));
-        const int lag_s = table_lag_seconds(log_pg, PQgetvalue(res, i, 2), lag_col, default_stale);
-        const std::string topic = PQgetvalue(res, i, 5);
-        const int partition = std::stoi(PQgetvalue(res, i, 6));
-        const std::string table_tier = PQgetvalue(res, i, 7);
+        const std::string conn_name = PQgetvalue(res, i, 2) ? PQgetvalue(res, i, 2) : "";
+        const int lag_s = table_lag_seconds(log_pg, conn_name.c_str(), lag_col, default_stale);
+        const std::string topic = PQgetvalue(res, i, 5) ? PQgetvalue(res, i, 5) : "";
+        const int partition = PQgetisnull(res, i, 6) ? 0 : std::stoi(PQgetvalue(res, i, 6));
+        const std::string table_tier = PQgetvalue(res, i, 7) ? PQgetvalue(res, i, 7) : "";
         const std::string consumer_group = kafka_apply_consumer_group(runtime, log_pg, conn_id, table_tier);
 
 #ifdef HAVE_RDKAFKA

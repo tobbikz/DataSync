@@ -84,7 +84,8 @@ struct PgTxn {
             ok = false;
             throw std::runtime_error("count query failed");
         }
-        const int n = std::atoi(PQgetvalue(res, 0, 0));
+        const char* val = PQgetvalue(res, 0, 0);
+        const int n = val ? std::atoi(val) : 0;
         PQclear(res);
         return n;
     }
@@ -98,7 +99,8 @@ struct PgTxn {
             ok = false;
             throw std::runtime_error("params count query failed");
         }
-        const int n = std::atoi(PQgetvalue(res, 0, 0));
+        const char* val = PQgetvalue(res, 0, 0);
+        const int n = val ? std::atoi(val) : 0;
         PQclear(res);
         return n;
     }

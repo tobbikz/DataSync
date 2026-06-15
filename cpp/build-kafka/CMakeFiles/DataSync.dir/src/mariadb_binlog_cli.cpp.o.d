@@ -208,12 +208,13 @@ CMakeFiles/DataSync.dir/src/mariadb_binlog_cli.cpp.o: \
  /usr/include/c++/15.2.1/bits/formatfwd.h \
  /usr/include/c++/15.2.1/bits/ranges_algobase.h \
  /usr/include/c++/15.2.1/bits/unicode.h \
- /usr/include/c++/15.2.1/bits/unicode-data.h /usr/include/fcntl.h \
- /usr/include/bits/fcntl.h /usr/include/bits/fcntl-linux.h \
- /usr/include/bits/types/struct_iovec.h /usr/include/linux/falloc.h \
- /usr/include/linux/openat2.h /usr/include/bits/openat2.h \
- /usr/include/bits/stat.h /usr/include/bits/struct_stat.h \
- /usr/include/c++/15.2.1/fstream \
+ /usr/include/c++/15.2.1/bits/unicode-data.h \
+ /usr/include/c++/15.2.1/cstring /usr/include/string.h \
+ /usr/include/strings.h /usr/include/fcntl.h /usr/include/bits/fcntl.h \
+ /usr/include/bits/fcntl-linux.h /usr/include/bits/types/struct_iovec.h \
+ /usr/include/linux/falloc.h /usr/include/linux/openat2.h \
+ /usr/include/bits/openat2.h /usr/include/bits/stat.h \
+ /usr/include/bits/struct_stat.h /usr/include/c++/15.2.1/fstream \
  /usr/include/c++/15.2.1/x86_64-pc-linux-gnu/bits/basic_file.h \
  /usr/include/c++/15.2.1/x86_64-pc-linux-gnu/bits/c++io.h \
  /usr/include/c++/15.2.1/bits/fstream.tcc /usr/include/c++/15.2.1/map \

@@ -322,12 +322,12 @@ CMakeFiles/DataSync.dir/src/cdc_daemon.cpp.o: \
  /usr/include/nlohmann/ordered_map.hpp /usr/include/c++/15.2.1/any \
  /usr/include/nlohmann/detail/macro_unscope.hpp \
  /usr/include/nlohmann/thirdparty/hedley/hedley_undef.hpp \
- /usr/include/c++/15.2.1/set /usr/include/c++/15.2.1/bits/stl_set.h \
+ /usr/include/c++/15.2.1/atomic /usr/include/c++/15.2.1/set \
+ /usr/include/c++/15.2.1/bits/stl_set.h \
  /usr/include/c++/15.2.1/bits/stl_multiset.h \
  /home/iks/Projects/DataSync/cpp/include/catalog_sync.hpp \
  /home/iks/Projects/DataSync/cpp/include/cdc_pre_apply.hpp \
  /home/iks/Projects/DataSync/cpp/include/cdc_reconcile.hpp \
- /usr/include/c++/15.2.1/atomic \
  /home/iks/Projects/DataSync/cpp/include/connections.hpp \
  /usr/include/c++/15.2.1/mutex /usr/include/c++/15.2.1/bits/unique_lock.h \
  /home/iks/Projects/DataSync/cpp/include/daemon_full_load.hpp \

@@ -65,6 +65,8 @@ struct BatchStatsMetrics {
     bool catchup_triggered{false};
     int fk_deferred_retries{0};
     int dedup_skipped{0};
+    int parse_skipped{0};
+    int dropped_unrecoverable{0};
     const HostMetricsSampler* host_sampler{nullptr};
 };
 
@@ -169,17 +171,22 @@ TableHealthSnapshot fetch_table_health_by_catalog_id(
     }
     const char* status = PQgetvalue(res, 0, 0);
     out.apply_status = status ? status : "";
-    out.apply_lag_seconds = std::atoi(PQgetvalue(res, 0, 1));
+    const char* lag_val = PQgetvalue(res, 0, 1);
+    out.apply_lag_seconds = lag_val ? std::atoi(lag_val) : 0;
     if (PQgetvalue(res, 0, 2) && PQgetvalue(res, 0, 2)[0]) {
         out.seconds_since_last_apply = std::atoi(PQgetvalue(res, 0, 2));
     }
-    out.catalog_active = PQgetvalue(res, 0, 3)[0] == 't';
-    out.cdc_enabled = PQgetvalue(res, 0, 4)[0] == 't';
-    out.reconciliation_rag = reconciliation_status_to_rag(PQgetvalue(res, 0, 5));
+    const char* active_val = PQgetvalue(res, 0, 3);
+    out.catalog_active = active_val && active_val[0] == 't';
+    const char* cdc_val = PQgetvalue(res, 0, 4);
+    out.cdc_enabled = cdc_val && cdc_val[0] == 't';
+    const char* rag_val = PQgetvalue(res, 0, 5);
+    out.reconciliation_rag = reconciliation_status_to_rag(rag_val ? rag_val : "");
     if (PQgetvalue(res, 0, 6) && PQgetvalue(res, 0, 6)[0]) {
         out.reconcile_row_delta = std::atoll(PQgetvalue(res, 0, 6));
     }
-    out.capture_lag_seconds = std::atoi(PQgetvalue(res, 0, 7));
+    const char* capt_val = PQgetvalue(res, 0, 7);
+    out.capture_lag_seconds = capt_val ? std::atoi(capt_val) : 0;
     out.is_quarantined = out.apply_status == "quarantined";
     if (out.apply_status == "stale" || out.apply_status == "lagging" || out.apply_status == "gap_detected") {
         out.is_stale = true;
@@ -631,13 +638,26 @@ void copy_csv_lines(PGconn* pg, const std::string& copy_sql, const std::vector<s
         throw std::runtime_error("COPY start failed: " + err);
     }
     PQclear(res);
+    bool copy_ok = true;
     for (const auto& line : lines) {
         if (PQputCopyData(pg, line.data(), static_cast<int>(line.size())) != 1 ||
             PQputCopyData(pg, "\n", 1) != 1) {
-            throw std::runtime_error(std::string("PQputCopyData failed: ") + PQerrorMessage(pg));
+            copy_ok = false;
+            break;
         }
     }
+    if (!copy_ok) {
+        PQputCopyEnd(pg, "abort");
+        while (PGresult* r = PQgetResult(pg)) {
+            PQclear(r);
+        }
+        throw std::runtime_error(std::string("PQputCopyData failed: ") + PQerrorMessage(pg));
+    }
     if (PQputCopyEnd(pg, nullptr) != 1) {
+        PQputCopyEnd(pg, "abort");
+        while (PGresult* r = PQgetResult(pg)) {
+            PQclear(r);
+        }
         throw std::runtime_error(std::string("PQputCopyEnd failed: ") + PQerrorMessage(pg));
     }
     PGresult* end_res = PQgetResult(pg);
@@ -645,6 +665,9 @@ void copy_csv_lines(PGconn* pg, const std::string& copy_sql, const std::vector<s
         if (PQresultStatus(end_res) != PGRES_COMMAND_OK) {
             std::string err = PQerrorMessage(pg);
             PQclear(end_res);
+            while (PGresult* r = PQgetResult(pg)) {
+                PQclear(r);
+            }
             throw std::runtime_error("COPY failed: " + err);
         }
         PQclear(end_res);
@@ -857,6 +880,8 @@ void insert_apply_batch_stats(
     const std::string catchup = metrics.catchup_triggered ? "true" : "false";
     const std::string fk_retries = std::to_string(metrics.fk_deferred_retries);
     const std::string dedup_skip = std::to_string(metrics.dedup_skipped);
+    const std::string parse_skip = std::to_string(metrics.parse_skipped);
+    const std::string dropped = std::to_string(metrics.dropped_unrecoverable);
     HostMetricsSlice host{};
     if (metrics.host_sampler) {
         host = metrics.host_sampler->current_snapshot();
@@ -906,6 +931,8 @@ void insert_apply_batch_stats(
         catchup.c_str(),
         fk_retries.c_str(),
         dedup_skip.c_str(),
+        parse_skip.c_str(),
+        dropped.c_str(),
         cpu_pct.empty() ? nullptr : cpu_pct.c_str(),
         mem_mb.empty() ? nullptr : mem_mb.c_str(),
         mem_pct.empty() ? nullptr : mem_pct.c_str(),
@@ -925,6 +952,7 @@ void insert_apply_batch_stats(
             catalog_active, cdc_enabled,
             capture_lag_seconds, kafka_consumer_lag, reconcile_row_delta,
             catchup_triggered, fk_deferred_retries, dedup_skipped,
+            parse_skipped, dropped_unrecoverable,
             host_cpu_percent, host_mem_used_mb, host_mem_percent,
             host_net_rx_mb, host_net_tx_mb, process_rss_mb,
             context
@@ -936,12 +964,13 @@ void insert_apply_batch_stats(
             $21::integer, $22, $23::integer, $24::boolean, $25::boolean,
             $26::integer, $27::bigint, $28::bigint,
             $29::boolean, $30::integer, $31::integer,
-            NULLIF($32, '')::double precision, NULLIF($33, '')::bigint, NULLIF($34, '')::integer,
-            NULLIF($35, '')::bigint, NULLIF($36, '')::bigint, NULLIF($37, '')::bigint,
-            $38::jsonb
+            $32::bigint, $33::bigint,
+            NULLIF($34, '')::double precision, NULLIF($35, '')::bigint, NULLIF($36, '')::integer,
+            NULLIF($37, '')::bigint, NULLIF($38, '')::bigint, NULLIF($39, '')::bigint,
+            $40::jsonb
         )
         )",
-        38,
+        40,
         vals);
 }
 
@@ -1087,6 +1116,7 @@ long long apply_table_batch(
         }
     }
 
+    int skipped_missing_pk_deletes = 0;
     if (!deletes.empty() && !delete_pk_cols.empty()) {
         const std::string del_stg = "cdc_stg_del_" + std::to_string(staging_id);
         const std::string del_fq_stg = pg_ident(del_stg);
@@ -1119,7 +1149,10 @@ long long apply_table_batch(
                     break;
                 }
             }
-            if (missing_pk) continue;
+            if (missing_pk) {
+                skipped_missing_pk_deletes += 1;
+                continue;
+            }
             std::ostringstream line;
             for (std::size_t i = 0; i < delete_pk_cols.size(); ++i) {
                 if (i) line << ',';
@@ -1135,10 +1168,14 @@ long long apply_table_batch(
             copy_csv_lines(pg, "COPY " + del_fq_stg + " (" + del_col_list + ") FROM STDIN WITH (FORMAT csv)", del_lines);
             delete_target_by_staging_pk(pg, fq, del_fq_stg, delete_pk_cols);
         }
+    } else if (!deletes.empty()) {
+        skipped_missing_pk_deletes = static_cast<int>(deletes.size());
     }
 
+    const long long applied_deletes = static_cast<long long>(deletes.size()) - skipped_missing_pk_deletes;
+
     if (upserts.empty()) {
-        return static_cast<long long>(deletes.size());
+        return applied_deletes;
     }
 
     std::vector<std::string> data_cols = meta.data_cols;
@@ -1217,7 +1254,7 @@ long long apply_table_batch(
     }
     if (lines.empty()) {
         (void)skipped_missing_pk;
-        return static_cast<long long>(deletes.size() + upserts.size() - skipped_missing_pk);
+        return applied_deletes + static_cast<long long>(upserts.size() - skipped_missing_pk);
     }
 
     const bool all_inserts =
@@ -1263,7 +1300,7 @@ long long apply_table_batch(
         copy_csv_lines(pg, "COPY " + fq + " (" + col_list_str + ") FROM STDIN WITH (FORMAT csv)", lines);
     }
 
-    return static_cast<long long>(deletes.size() + upserts.size() - skipped_missing_pk);
+    return applied_deletes + static_cast<long long>(upserts.size() - skipped_missing_pk);
 }
 
 json apply_events_batch(
@@ -1348,8 +1385,10 @@ json apply_events_batch(
                         lk_schema = mongo_pg_schema_name(db);
                         lk_table = mongo_pg_table_name(tbl);
                     }
+                    const char* cid_str = PQgetvalue(cr, i, 0);
+                    const char* pk_str = PQgetvalue(cr, i, 1);
                     engine_catalog_map[lk_schema + "|" + lk_table] = {
-                        std::atoll(PQgetvalue(cr, i, 0)), PQgetvalue(cr, i, 1)};
+                        cid_str ? std::atoll(cid_str) : 0, pk_str ? pk_str : ""};
                 }
             }
             if (cr) {
@@ -1406,8 +1445,10 @@ json apply_events_batch(
                     " WHERE conn_id=$1 AND db_engine='mariadb' AND source_schema=$2 AND source_table=$3",
                     3, nullptr, vals, nullptr, nullptr, 0);
                 if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-                    meta.catalog_id = std::atoll(PQgetvalue(res, 0, 0));
-                    meta.pk_columns = PQgetvalue(res, 0, 1);
+                    const char* cid_str = PQgetvalue(res, 0, 0);
+                    const char* pk_str = PQgetvalue(res, 0, 1);
+                    meta.catalog_id = cid_str ? std::atoll(cid_str) : 0;
+                    meta.pk_columns = pk_str ? pk_str : "";
                     meta.catalog_source_schema = meta.schema_name;
                     meta.catalog_source_table = meta.table_name;
                 }
@@ -1493,6 +1534,7 @@ json apply_events_batch(
         }
 
         int skipped_missing_pk = 0;
+        int skipped_missing_pk_deletes = 0;
         if (!meta.lake_pk.empty()) {
             std::vector<ApplyEvent> valid_upserts;
             valid_upserts.reserve(upserts.size());
@@ -1512,8 +1554,27 @@ json apply_events_batch(
                 }
             }
             upserts = std::move(valid_upserts);
+            std::vector<ApplyEvent> valid_deletes;
+            valid_deletes.reserve(deletes.size());
+            for (auto& e : deletes) {
+                bool missing_pk = false;
+                for (const auto& pk_col : meta.lake_pk) {
+                    const json* pk_val = e.row.contains(pk_col) ? &e.row[pk_col] : nullptr;
+                    if (!pk_val || pk_val->is_null()) {
+                        missing_pk = true;
+                        break;
+                    }
+                }
+                if (missing_pk) {
+                    skipped_missing_pk_deletes += 1;
+                } else {
+                    valid_deletes.push_back(std::move(e));
+                }
+            }
+            deletes = std::move(valid_deletes);
         }
-        if (skipped_missing_pk > 0) {
+        const int total_skipped = skipped_missing_pk + skipped_missing_pk_deletes;
+        if (total_skipped > 0) {
             log_write(app_pg, {
                 .level = LogLevel::Warning,
                 .component = "cdc_kafka_apply_cpp",
@@ -1524,7 +1585,9 @@ json apply_events_batch(
                 .source_table = meta.catalog_source_table,
                 .context = {
                     {"skipped_missing_pk", skipped_missing_pk},
+                    {"skipped_missing_pk_deletes", skipped_missing_pk_deletes},
                     {"total_upserts", skipped_missing_pk + static_cast<int>(upserts.size())},
+                    {"total_deletes", skipped_missing_pk_deletes + static_cast<int>(deletes.size())},
                 },
             });
         }
@@ -1550,7 +1613,7 @@ json apply_events_batch(
                 options.source_system,
                 &fk_retries);
         } catch (const std::exception& ex) {
-            PQexec(lake_pg, "ROLLBACK");
+            { PGresult* r = PQexec(lake_pg, "ROLLBACK"); if (r) PQclear(r); }
             (*table_errors_acc) += 1;
             if (options.failed_events_out) {
                 for (auto& e : deletes) {
@@ -1642,6 +1705,13 @@ json apply_events_batch(
                 }
                 metrics.fk_deferred_retries = fk_retries;
                 metrics.host_sampler = options.host_sampler;
+                if (options.parse_skipped_by_table) {
+                    const TableKey pk{meta.catalog_source_schema, meta.catalog_source_table};
+                    const auto ps_it = options.parse_skipped_by_table->find(pk);
+                    if (ps_it != options.parse_skipped_by_table->end()) {
+                        metrics.parse_skipped = ps_it->second;
+                    }
+                }
                 update_apply_position(
                     app_pg,
                     meta.catalog_id,
@@ -1712,8 +1782,8 @@ json apply_events_batch(
                 if (lake_commit) {
                     PQclear(lake_commit);
                 }
-                PQexec(app_pg, "ROLLBACK");
-                PQexec(lake_pg, "ROLLBACK");
+                { PGresult* r = PQexec(app_pg, "ROLLBACK"); if (r) PQclear(r); }
+                { PGresult* r = PQexec(lake_pg, "ROLLBACK"); if (r) PQclear(r); }
                 (*table_errors_acc) += 1;
                 if (options.failed_events_out) {
                     for (auto& e : audit) {
@@ -1791,10 +1861,10 @@ json apply_events_batch(
                 offsets[kafka_offset_out->first] = kafka_offset_out->second;
             }
         } catch (const std::exception& ex) {
-            PQexec(app_pg, "ROLLBACK");
-            PQexec(lake_pg, "ROLLBACK TO SAVEPOINT sp_lake_apply");
-            PQexec(lake_pg, "RELEASE SAVEPOINT sp_lake_apply");
-            PQexec(lake_pg, "ROLLBACK");
+            { PGresult* r = PQexec(app_pg, "ROLLBACK"); if (r) PQclear(r); }
+            { PGresult* r = PQexec(lake_pg, "ROLLBACK TO SAVEPOINT sp_lake_apply"); if (r) PQclear(r); }
+            { PGresult* r = PQexec(lake_pg, "RELEASE SAVEPOINT sp_lake_apply"); if (r) PQclear(r); }
+            { PGresult* r = PQexec(lake_pg, "ROLLBACK"); if (r) PQclear(r); }
             (*table_errors_acc) += 1;
             if (options.failed_events_out) {
                 for (auto& e : audit) {
@@ -1823,7 +1893,7 @@ json apply_events_batch(
         }
     }
 
-    return json{{"applied", applied}, {"offsets", offsets}, {"errors", *table_errors_acc}};
+    return json{{"applied", applied}, {"offsets", offsets}, {"errors", *table_errors_acc}, {"dropped_unrecoverable", dropped_unrecoverable}};
 }
 
 std::unordered_set<std::string> filter_new_event_ids(PGconn* pg, const std::vector<std::string>& event_ids) {

@@ -343,7 +343,8 @@ std::string resolve_reconcile_mode(
         0);
     long long age_seconds = -1;
     if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-        age_seconds = std::atoll(PQgetvalue(res, 0, 0));
+        const char* age_str = PQgetvalue(res, 0, 0);
+        age_seconds = age_str ? std::atoll(age_str) : -1;
     }
     if (res) {
         PQclear(res);
@@ -397,14 +398,14 @@ std::vector<CatalogReconcileRow> fetch_reconcile_catalog(
 
     for (int i = 0; i < PQntuples(res); ++i) {
         CatalogReconcileRow row;
-        row.catalog_id = std::atoll(PQgetvalue(res, i, 0));
-        row.conn_id = PQgetvalue(res, i, 1);
-        row.db_engine = PQgetvalue(res, i, 2);
-        row.source_database = PQgetvalue(res, i, 3);
-        row.source_schema = PQgetvalue(res, i, 4);
-        row.source_table = PQgetvalue(res, i, 5);
-        row.pk_columns = PQgetvalue(res, i, 6);
-        row.service_tier = PQgetvalue(res, i, 7);
+        row.catalog_id = PQgetisnull(res, i, 0) ? 0 : std::atoll(PQgetvalue(res, i, 0));
+        row.conn_id = PQgetvalue(res, i, 1) ? PQgetvalue(res, i, 1) : "";
+        row.db_engine = PQgetvalue(res, i, 2) ? PQgetvalue(res, i, 2) : "";
+        row.source_database = PQgetvalue(res, i, 3) ? PQgetvalue(res, i, 3) : "";
+        row.source_schema = PQgetvalue(res, i, 4) ? PQgetvalue(res, i, 4) : "";
+        row.source_table = PQgetvalue(res, i, 5) ? PQgetvalue(res, i, 5) : "";
+        row.pk_columns = PQgetvalue(res, i, 6) ? PQgetvalue(res, i, 6) : "";
+        row.service_tier = PQgetvalue(res, i, 7) ? PQgetvalue(res, i, 7) : "";
         if (row.db_engine == "mongodb") {
             row.source_schema = mongo_catalog_source_schema(row.source_database, row.source_schema);
         }
@@ -445,7 +446,8 @@ long long pg_table_count(PGconn* pg, const std::string& schema, const std::strin
         }
         return -1;
     }
-    const long long exists = std::atoll(PQgetvalue(res, 0, 0));
+    const char* exists_str = PQgetvalue(res, 0, 0);
+    const long long exists = exists_str ? std::atoll(exists_str) : -1;
     PQclear(res);
     if (exists <= 0) {
         return 0;
@@ -459,7 +461,8 @@ long long pg_table_count(PGconn* pg, const std::string& schema, const std::strin
         }
         return -1;
     }
-    const long long n = std::atoll(PQgetvalue(cnt, 0, 0));
+    const char* n_str = PQgetvalue(cnt, 0, 0);
+    const long long n = n_str ? std::atoll(n_str) : -1;
     PQclear(cnt);
     return n;
 }
@@ -566,8 +569,8 @@ ApplyMeta fetch_apply_meta(PGconn* pg, long long catalog_id) {
         }
         return out;
     }
-    out.apply_lag_seconds = std::atoi(PQgetvalue(res, 0, 0));
-    out.apply_status = PQgetvalue(res, 0, 1);
+    out.apply_lag_seconds = PQgetisnull(res, 0, 0) ? -1 : std::atoi(PQgetvalue(res, 0, 0));
+    out.apply_status = PQgetvalue(res, 0, 1) ? PQgetvalue(res, 0, 1) : "";
     if (PQgetvalue(res, 0, 2) && PQgetvalue(res, 0, 2)[0]) {
         out.kafka_topic = PQgetvalue(res, 0, 2);
     }
@@ -683,17 +686,18 @@ long long insert_reconcile_run(
     const std::string& batch_id,
     const std::string& conn_id,
     const std::string& tier,
+    const std::string& reconcile_mode,
     const nlohmann::json& context) {
     const std::string context_json = context.dump();
-    const char* vals[] = {batch_id.c_str(), conn_id.c_str(), tier.c_str(), context_json.c_str()};
+    const char* vals[] = {batch_id.c_str(), conn_id.c_str(), tier.c_str(), reconcile_mode.c_str(), context_json.c_str()};
     PGresult* res = PQexecParams(
         pg,
         R"(
-        INSERT INTO cdc_catalog.reconciliation_run (batch_id, conn_id, service_tier, status, context)
-        VALUES ($1, $2, $3, 'running', $4::jsonb)
+        INSERT INTO cdc_catalog.reconciliation_run (batch_id, conn_id, service_tier, status, reconcile_mode, context)
+        VALUES ($1, $2, $3, 'running', $4, $5::jsonb)
         RETURNING run_id
         )",
-        4,
+        5,
         nullptr,
         vals,
         nullptr,
@@ -1141,6 +1145,7 @@ int run_reconcile_cli(
         batch_id,
         conn_id,
         tier,
+        reconcile_mode,
         {{"db_engine", db_engine},
          {"mode", reconcile_mode},
          {"tables_planned", static_cast<int>(tables.size())},

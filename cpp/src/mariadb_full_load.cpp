@@ -262,7 +262,7 @@ PkRange pk_range_for_keyset(const PkRange& bounds) {
     }
     try {
         const long long max_v = std::stoll(range.upper_exclusive);
-        range.upper_exclusive = std::to_string(max_v + 1);
+        range.upper_exclusive = (max_v < LLONG_MAX) ? std::to_string(max_v + 1) : range.upper_exclusive;
     } catch (...) {
     }
     return range;
@@ -335,6 +335,9 @@ long long copy_rows_keyset(
     std::vector<std::string> last_pk_values;
 
     while (true) {
+        if (g_shutdown.load()) {
+            break;
+        }
         std::ostringstream query;
         query << "SELECT " << select_cols.str() << " FROM `" << target.source_schema << "`.`" << target.source_table
               << "` WHERE 1=1";
@@ -419,13 +422,26 @@ long long copy_rows_keyset(
         }
         PQclear(copy_res);
 
+        bool copy_ok = true;
         for (const auto& line : batch_lines) {
             if (PQputCopyData(pg, line.data(), static_cast<int>(line.size())) != 1 ||
                 PQputCopyData(pg, "\n", 1) != 1) {
-                throw std::runtime_error(std::string("PQputCopyData failed: ") + PQerrorMessage(pg));
+                copy_ok = false;
+                break;
             }
         }
+        if (!copy_ok) {
+            PQputCopyEnd(pg, "abort");
+            while (PGresult* r = PQgetResult(pg)) {
+                PQclear(r);
+            }
+            throw std::runtime_error(std::string("PQputCopyData failed: ") + PQerrorMessage(pg));
+        }
         if (PQputCopyEnd(pg, nullptr) != 1) {
+            PQputCopyEnd(pg, "abort");
+            while (PGresult* r = PQgetResult(pg)) {
+                PQclear(r);
+            }
             throw std::runtime_error(std::string("PQputCopyEnd failed: ") + PQerrorMessage(pg));
         }
 
@@ -434,6 +450,9 @@ long long copy_rows_keyset(
             if (PQresultStatus(end_res) != PGRES_COMMAND_OK) {
                 const std::string err = PQerrorMessage(pg);
                 PQclear(end_res);
+                while (PGresult* r = PQgetResult(pg)) {
+                    PQclear(r);
+                }
                 throw std::runtime_error(std::string("COPY failed: ") + err);
             }
             PQclear(end_res);
@@ -566,7 +585,7 @@ long long copy_rows_parallel(
             skip_stats);
     }
 
-    const long long total = max_v - min_v + 1;
+    const unsigned long long total = static_cast<unsigned long long>(max_v) - static_cast<unsigned long long>(min_v) + 1ULL;
     const long long span = (total + workers - 1) / workers;
 
     log_fl(
@@ -592,9 +611,9 @@ long long copy_rows_parallel(
                 PkRange slice;
                 slice.active = true;
                 slice.numeric = true;
-                const long long lo = min_v + static_cast<long long>(w) * span;
-                const long long hi_ex =
-                    (w == workers - 1) ? max_v + 1 : min_v + static_cast<long long>(w + 1) * span;
+                const unsigned long long lo = static_cast<unsigned long long>(min_v) + static_cast<unsigned long long>(w) * static_cast<unsigned long long>(span);
+                const unsigned long long hi_ex =
+                    (w == workers - 1) ? (max_v < LLONG_MAX ? static_cast<unsigned long long>(max_v) + 1ULL : static_cast<unsigned long long>(max_v)) : static_cast<unsigned long long>(min_v) + static_cast<unsigned long long>(w + 1) * static_cast<unsigned long long>(span);
                 slice.lower_inclusive = std::to_string(lo);
                 slice.upper_exclusive = std::to_string(hi_ex);
 
@@ -807,8 +826,12 @@ void agent_debug_log_full_load(
     const char* hypothesis_id,
     long long catalog_id,
     const nlohmann::json& data) {
+    const char* log_path = std::getenv("DATASYNC_DEBUG_LOG");
+    if (!log_path || !log_path[0]) {
+        return;
+    }
     try {
-        std::ofstream f("/home/iks/Projects/DataSync/.cursor/debug-e0d3ad.log", std::ios::app);
+        std::ofstream f(log_path, std::ios::app);
         if (!f) {
             return;
         }

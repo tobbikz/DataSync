@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <map>
@@ -141,7 +142,11 @@ BinlogCliStats read_remote_binlog_cli(
         return stats;
     }
 
-    char err_path_template[] = "/tmp/datasync_binlog_err_XXXXXX";
+    const char* tmpdir = std::getenv("TMPDIR");
+    const std::string tmp_prefix = tmpdir ? (std::string(tmpdir) + "/datasync_binlog_err_XXXXXX") : "/tmp/datasync_binlog_err_XXXXXX";
+    char err_path_template[1024];
+    std::strncpy(err_path_template, tmp_prefix.c_str(), sizeof(err_path_template) - 1);
+    err_path_template[sizeof(err_path_template) - 1] = '\0';
     const int err_fd = mkstemp(err_path_template);
     if (err_fd == -1) {
         throw std::runtime_error("failed to create temp file for binlog stderr");
@@ -233,7 +238,7 @@ BinlogCliStats read_remote_binlog_cli(
             before_values = &before_vec;
         }
 
-        on_row(pending_schema, pending_table, pending_op, values, before_values);
+        on_row(pending_schema, pending_table, pending_op, values, before_values, stats.last_position);
         stats.events += 1;
         if (pending_op == "DELETE") {
             stats.deletes += 1;

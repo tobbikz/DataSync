@@ -92,9 +92,8 @@ bool pg_table_is_partitioned(PGconn* pg, const std::string& schema, const std::s
         nullptr,
         nullptr,
         0);
-    const bool ok =
-        res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 &&
-        PQgetvalue(res, 0, 0)[0] == 't';
+    const char* val = res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 ? PQgetvalue(res, 0, 0) : nullptr;
+    const bool ok = val && val[0] == 't';
     if (res) {
         PQclear(res);
     }

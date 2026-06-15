@@ -369,11 +369,16 @@ bool resolve_event_lake_key_from_catalog(
         }
         return false;
     }
-    const std::string row_conn = PQgetvalue(res, 0, 0);
-    const std::string src_db = PQgetvalue(res, 0, 1);
-    const std::string src_schema = PQgetvalue(res, 0, 2);
-    const std::string src_table = PQgetvalue(res, 0, 3);
-    const std::string eng = PQgetvalue(res, 0, 4);
+    const char* rconn = PQgetvalue(res, 0, 0);
+    const char* sdb = PQgetvalue(res, 0, 1);
+    const char* ssch = PQgetvalue(res, 0, 2);
+    const char* stbl = PQgetvalue(res, 0, 3);
+    const char* engc = PQgetvalue(res, 0, 4);
+    const std::string row_conn = rconn ? rconn : "";
+    const std::string src_db = sdb ? sdb : "";
+    const std::string src_schema = ssch ? ssch : "";
+    const std::string src_table = stbl ? stbl : "";
+    const std::string eng = engc ? engc : "";
     PQclear(res);
     if (row_conn != conn_id || src_table.empty()) {
         return false;

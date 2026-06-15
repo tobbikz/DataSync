@@ -297,6 +297,9 @@ long long copy_collection_batches(
     };
 
     while (true) {
+        if (g_shutdown.load()) {
+            break;
+        }
         bson_t query = BSON_INITIALIZER;
         if (last_id_value) {
             bson_t id_wrap;
@@ -323,12 +326,15 @@ long long copy_collection_batches(
             while (mongoc_cursor_next(cursor, &doc)) {
                 bson_iter_t iter;
                 if (bson_iter_init_find(&iter, doc, "_id")) {
-                    if (last_id_value) {
-                        bson_value_destroy(last_id_value);
-                        delete last_id_value;
+                    const bson_value_t* iter_val = bson_iter_value(&iter);
+                    if (iter_val) {
+                        if (last_id_value) {
+                            bson_value_destroy(last_id_value);
+                            delete last_id_value;
+                        }
+                        last_id_value = new bson_value_t();
+                        bson_value_copy(iter_val, last_id_value);
                     }
-                    last_id_value = new bson_value_t();
-                    bson_value_copy(bson_iter_value(&iter), last_id_value);
                 }
 
                 const auto j = bson_to_json(doc);

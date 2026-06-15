@@ -28,7 +28,8 @@ using BinlogRowHandler = std::function<void(
     const std::string& table,
     const std::string& op,
     const std::vector<std::string>& col_values,
-    const std::vector<std::string>* before_col_values)>;
+    const std::vector<std::string>* before_col_values,
+    long long event_position)>;
 
 BinlogCliStats read_remote_binlog_cli(
     const MariaDbSource& source,

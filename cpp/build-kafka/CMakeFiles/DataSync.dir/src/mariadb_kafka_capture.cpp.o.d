@@ -320,8 +320,8 @@ CMakeFiles/DataSync.dir/src/mariadb_kafka_capture.cpp.o: \
  /usr/include/nlohmann/thirdparty/hedley/hedley_undef.hpp \
  /home/iks/Projects/DataSync/cpp/include/capture_common.hpp \
  /home/iks/Projects/DataSync/cpp/include/runtime_config.hpp \
- /usr/include/c++/15.2.1/shared_mutex /usr/include/c++/15.2.1/set \
- /usr/include/c++/15.2.1/bits/stl_set.h \
+ /usr/include/c++/15.2.1/shared_mutex /usr/include/c++/15.2.1/atomic \
+ /usr/include/c++/15.2.1/set /usr/include/c++/15.2.1/bits/stl_set.h \
  /usr/include/c++/15.2.1/bits/stl_multiset.h \
  /home/iks/Projects/DataSync/cpp/include/cdc_envelope.hpp \
  /home/iks/Projects/DataSync/cpp/include/kafka_producer.hpp \
@@ -342,7 +342,7 @@ CMakeFiles/DataSync.dir/src/mariadb_kafka_capture.cpp.o: \
  /usr/include/c++/15.2.1/bits/unicode-data.h \
  /usr/include/c++/15.2.1/mutex /usr/include/c++/15.2.1/bits/unique_lock.h \
  /usr/include/c++/15.2.1/thread /usr/include/c++/15.2.1/stop_token \
- /usr/include/c++/15.2.1/atomic /usr/include/c++/15.2.1/bits/std_thread.h \
+ /usr/include/c++/15.2.1/bits/std_thread.h \
  /usr/include/c++/15.2.1/semaphore \
  /usr/include/c++/15.2.1/bits/semaphore_base.h \
  /usr/include/c++/15.2.1/bits/atomic_timed_wait.h \

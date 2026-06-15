@@ -6,10 +6,13 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <optional>
 #include <set>
 #include <string>
 #include <vector>
+
+extern std::atomic<bool> g_shutdown;
 
 struct st_mysql;
 typedef struct st_mysql MYSQL;

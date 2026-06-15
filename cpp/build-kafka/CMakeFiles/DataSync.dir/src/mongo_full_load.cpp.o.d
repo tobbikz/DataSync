@@ -323,7 +323,8 @@ CMakeFiles/DataSync.dir/src/mongo_full_load.cpp.o: \
  /usr/include/nlohmann/ordered_map.hpp /usr/include/c++/15.2.1/any \
  /usr/include/nlohmann/detail/macro_unscope.hpp \
  /usr/include/nlohmann/thirdparty/hedley/hedley_undef.hpp \
- /usr/include/c++/15.2.1/set /usr/include/c++/15.2.1/bits/stl_set.h \
+ /usr/include/c++/15.2.1/atomic /usr/include/c++/15.2.1/set \
+ /usr/include/c++/15.2.1/bits/stl_set.h \
  /usr/include/c++/15.2.1/bits/stl_multiset.h \
  /home/iks/Projects/DataSync/cpp/include/mongo_conn.hpp \
  /usr/include/libmongoc-1.0/mongoc/mongoc.h \
@@ -445,7 +446,7 @@ CMakeFiles/DataSync.dir/src/mongo_full_load.cpp.o: \
  /usr/include/c++/15.2.1/bits/unicode-data.h \
  /usr/include/c++/15.2.1/mutex /usr/include/c++/15.2.1/bits/unique_lock.h \
  /usr/include/c++/15.2.1/thread /usr/include/c++/15.2.1/stop_token \
- /usr/include/c++/15.2.1/atomic /usr/include/c++/15.2.1/bits/std_thread.h \
+ /usr/include/c++/15.2.1/bits/std_thread.h \
  /usr/include/c++/15.2.1/semaphore \
  /usr/include/c++/15.2.1/bits/semaphore_base.h \
  /usr/include/c++/15.2.1/bits/atomic_timed_wait.h \

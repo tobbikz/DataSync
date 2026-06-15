@@ -30,7 +30,11 @@ rd_kafka_t* make_admin_client(const std::string& bootstrap, char* errstr, std::s
         rd_kafka_conf_destroy(conf);
         return nullptr;
     }
-    return rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, errstr_size);
+    rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, errstr_size);
+    if (!rk) {
+        rd_kafka_conf_destroy(conf);
+    }
+    return rk;
 }
 
 const rd_kafka_topic_partition_list_t* fetch_committed_partitions(

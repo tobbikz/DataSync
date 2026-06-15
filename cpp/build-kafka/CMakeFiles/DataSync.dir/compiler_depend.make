@@ -1292,6 +1292,7 @@ CMakeFiles/DataSync.dir/src/cdc_catchup.cpp.o: /home/iks/Projects/DataSync/cpp/s
   /usr/include/c++/15.2.1/algorithm \
   /usr/include/c++/15.2.1/any \
   /usr/include/c++/15.2.1/array \
+  /usr/include/c++/15.2.1/atomic \
   /usr/include/c++/15.2.1/backward/auto_ptr.h \
   /usr/include/c++/15.2.1/backward/binders.h \
   /usr/include/c++/15.2.1/bit \
@@ -4791,6 +4792,7 @@ CMakeFiles/DataSync.dir/src/daemon_full_load.cpp.o: /home/iks/Projects/DataSync/
   /usr/include/c++/15.2.1/algorithm \
   /usr/include/c++/15.2.1/any \
   /usr/include/c++/15.2.1/array \
+  /usr/include/c++/15.2.1/atomic \
   /usr/include/c++/15.2.1/backward/auto_ptr.h \
   /usr/include/c++/15.2.1/backward/binders.h \
   /usr/include/c++/15.2.1/bit \
@@ -9202,6 +9204,7 @@ CMakeFiles/DataSync.dir/src/mariadb_binlog_cli.cpp.o: /home/iks/Projects/DataSyn
   /usr/include/c++/15.2.1/cstdint \
   /usr/include/c++/15.2.1/cstdio \
   /usr/include/c++/15.2.1/cstdlib \
+  /usr/include/c++/15.2.1/cstring \
   /usr/include/c++/15.2.1/ctime \
   /usr/include/c++/15.2.1/cwchar \
   /usr/include/c++/15.2.1/cwctype \
@@ -9295,6 +9298,8 @@ CMakeFiles/DataSync.dir/src/mariadb_binlog_cli.cpp.o: /home/iks/Projects/DataSyn
   /usr/include/stdint.h \
   /usr/include/stdio.h \
   /usr/include/stdlib.h \
+  /usr/include/string.h \
+  /usr/include/strings.h \
   /usr/include/sys/cdefs.h \
   /usr/include/sys/select.h \
   /usr/include/sys/single_threaded.h \
@@ -9422,6 +9427,7 @@ CMakeFiles/DataSync.dir/src/mariadb_cdc.cpp.o: /home/iks/Projects/DataSync/cpp/s
   /usr/include/c++/15.2.1/algorithm \
   /usr/include/c++/15.2.1/any \
   /usr/include/c++/15.2.1/array \
+  /usr/include/c++/15.2.1/atomic \
   /usr/include/c++/15.2.1/backward/auto_ptr.h \
   /usr/include/c++/15.2.1/backward/binders.h \
   /usr/include/c++/15.2.1/bit \
@@ -15305,6 +15311,7 @@ CMakeFiles/DataSync.dir/src/mssql_ddl_sync.cpp.o: /home/iks/Projects/DataSync/cp
   /usr/include/c++/15.2.1/algorithm \
   /usr/include/c++/15.2.1/any \
   /usr/include/c++/15.2.1/array \
+  /usr/include/c++/15.2.1/atomic \
   /usr/include/c++/15.2.1/backward/auto_ptr.h \
   /usr/include/c++/15.2.1/backward/binders.h \
   /usr/include/c++/15.2.1/bit \
@@ -16832,6 +16839,7 @@ CMakeFiles/DataSync.dir/src/mssql_schema.cpp.o: /home/iks/Projects/DataSync/cpp/
   /usr/include/c++/15.2.1/algorithm \
   /usr/include/c++/15.2.1/any \
   /usr/include/c++/15.2.1/array \
+  /usr/include/c++/15.2.1/atomic \
   /usr/include/c++/15.2.1/backward/auto_ptr.h \
   /usr/include/c++/15.2.1/backward/binders.h \
   /usr/include/c++/15.2.1/bit \

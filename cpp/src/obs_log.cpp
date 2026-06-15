@@ -99,7 +99,7 @@ long long purge_logs(PGconn* pg, int retention_days) {
         return -1;
     }
 
-    const long long deleted = std::atoll(PQgetvalue(res, 0, 0));
+    const long long deleted = PQgetisnull(res, 0, 0) ? 0 : std::atoll(PQgetvalue(res, 0, 0));
     PQclear(res);
     return deleted;
 }

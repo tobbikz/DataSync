@@ -238,6 +238,8 @@ CREATE TABLE cdc_catalog.apply_batch_stats (
     catchup_triggered boolean DEFAULT false NOT NULL,
     fk_deferred_retries integer DEFAULT 0 NOT NULL,
     dedup_skipped integer DEFAULT 0 NOT NULL,
+    parse_skipped bigint DEFAULT 0 NOT NULL,
+    dropped_unrecoverable bigint DEFAULT 0 NOT NULL,
     semaphore text GENERATED ALWAYS AS (reconciliation_rag) STORED,
     host_cpu_percent double precision,
     host_mem_used_mb bigint,
@@ -588,6 +590,8 @@ CREATE TABLE cdc_catalog.cdc_run_fairness_metrics (
     oldest_lag_seconds integer DEFAULT 0 NOT NULL,
     events_seen bigint DEFAULT 0 NOT NULL,
     events_applied bigint DEFAULT 0 NOT NULL,
+    parse_skipped bigint DEFAULT 0 NOT NULL,
+    dropped_unrecoverable bigint DEFAULT 0 NOT NULL,
     duration_ms bigint DEFAULT 0 NOT NULL,
     context jsonb DEFAULT '{}'::jsonb NOT NULL,
     logged_at timestamp with time zone DEFAULT now() NOT NULL
@@ -768,16 +772,14 @@ CREATE TABLE cdc_catalog.reconciliation_run (
     tables_warn integer DEFAULT 0 NOT NULL,
     tables_fail integer DEFAULT 0 NOT NULL,
     stale_tables integer DEFAULT 0 NOT NULL,
+    reconcile_mode text DEFAULT 'full'::text NOT NULL,
     context jsonb DEFAULT '{}'::jsonb NOT NULL,
-    CONSTRAINT reconciliation_run_status_check CHECK ((status = ANY (ARRAY['running'::text, 'ok'::text, 'warn'::text, 'fail'::text])))
+    CONSTRAINT reconciliation_run_status_check CHECK ((status = ANY (ARRAY['running'::text, 'ok'::text, 'warn'::text, 'fail'::text]))),
+    CONSTRAINT reconciliation_run_mode_check CHECK ((reconcile_mode = ANY (ARRAY['full'::text, 'light'::text])))
 );
 
 
---
--- Name: TABLE reconciliation_run; Type: COMMENT; Schema: cdc_catalog; Owner: -
---
-
-COMMENT ON TABLE cdc_catalog.reconciliation_run IS 'One row per cdc_kafka reconcile CLI run (independent of capture/apply daemon).';
+COMMENT ON TABLE cdc_catalog.reconciliation_run IS 'One row per cdc_kafka reconcile CLI run (independent of capture/apply daemon). reconcile_mode = full (row count + PK checksum + lag) vs light (row count + lag only).';
 
 
 --
@@ -1558,3 +1560,16 @@ WHERE component IN ('cdc_kafka_capture', 'cdc_kafka_daemon', 'cdc_kafka_apply_cp
   AND created_at > now() - interval '6 hours'
 ORDER BY created_at DESC
 LIMIT 20;
+
+-- Migration 003: Add reconcile_mode column to reconciliation_run for full vs light visibility.
+ALTER TABLE cdc_catalog.reconciliation_run
+    ADD COLUMN IF NOT EXISTS reconcile_mode text NOT NULL DEFAULT 'full';
+
+ALTER TABLE cdc_catalog.reconciliation_run
+    DROP CONSTRAINT IF EXISTS reconciliation_run_mode_check;
+
+ALTER TABLE cdc_catalog.reconciliation_run
+    ADD CONSTRAINT reconciliation_run_mode_check
+        CHECK (reconcile_mode = ANY (ARRAY['full'::text, 'light'::text]));
+
+COMMENT ON TABLE cdc_catalog.reconciliation_run IS 'One row per cdc_kafka reconcile CLI run (independent of capture/apply daemon). reconcile_mode = full (row count + PK checksum + lag) vs light (row count + lag only).';

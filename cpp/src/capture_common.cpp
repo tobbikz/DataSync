@@ -1,6 +1,9 @@
 #include "capture_common.hpp"
 
+#include <atomic>
 #include <cstdlib>
+
+std::atomic<bool> g_shutdown{false};
 
 #ifdef HAVE_FREETDS
 #include "mssql_kafka_capture.hpp"
@@ -505,12 +508,18 @@ bool seed_stream_capture_bookmark_if_needed(
         }
         return false;
     }
-    const std::string tier = PQgetvalue(res, 0, 0);
-    const std::string source_database = PQgetvalue(res, 0, 1);
-    const std::string source_schema = PQgetvalue(res, 0, 2);
-    const std::string source_table = PQgetvalue(res, 0, 3);
-    const bool streaming = std::string(PQgetvalue(res, 0, 4)) == "t";
-    const std::string engine_meta_text = PQgetvalue(res, 0, 5);
+    const char* t = PQgetvalue(res, 0, 0);
+    const char* sd = PQgetvalue(res, 0, 1);
+    const char* ss = PQgetvalue(res, 0, 2);
+    const char* st = PQgetvalue(res, 0, 3);
+    const char* st4 = PQgetvalue(res, 0, 4);
+    const char* emt = PQgetvalue(res, 0, 5);
+    const std::string tier = t ? t : "";
+    const std::string source_database = sd ? sd : "";
+    const std::string source_schema = ss ? ss : "";
+    const std::string source_table = st ? st : "";
+    const bool streaming = st4 ? (std::string(st4) == "t") : false;
+    const std::string engine_meta_text = emt ? emt : "";
     PQclear(res);
     if (!streaming) {
         return false;
@@ -821,7 +830,8 @@ void flag_table_for_full_load(
         nullptr,
         0);
     if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-        const long long catalog_id = std::atoll(PQgetvalue(res, 0, 0));
+        const char* cid_str = PQgetvalue(res, 0, 0);
+        const long long catalog_id = cid_str ? std::atoll(cid_str) : 0;
         PQclear(res);
         res = nullptr;
         RuntimeConfig runtime;
@@ -976,8 +986,12 @@ void agent_debug_log_skip_status(
     long long catalog_id,
     bool needs_full_load,
     const char* hypothesis_id) {
+    const char* log_path = std::getenv("DATASYNC_DEBUG_LOG");
+    if (!log_path || !log_path[0]) {
+        return;
+    }
     try {
-        std::ofstream f("/home/iks/Projects/DataSync/.cursor/debug-e0d3ad.log", std::ios::app);
+        std::ofstream f(log_path, std::ios::app);
         if (!f) {
             return;
         }

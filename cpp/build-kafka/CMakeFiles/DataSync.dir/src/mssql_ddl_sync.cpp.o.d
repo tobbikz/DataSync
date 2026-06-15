@@ -333,7 +333,8 @@ CMakeFiles/DataSync.dir/src/mssql_ddl_sync.cpp.o: \
  /usr/include/nlohmann/ordered_map.hpp /usr/include/c++/15.2.1/any \
  /usr/include/nlohmann/detail/macro_unscope.hpp \
  /usr/include/nlohmann/thirdparty/hedley/hedley_undef.hpp \
- /usr/include/c++/15.2.1/set /usr/include/c++/15.2.1/bits/stl_set.h \
+ /usr/include/c++/15.2.1/atomic /usr/include/c++/15.2.1/set \
+ /usr/include/c++/15.2.1/bits/stl_set.h \
  /usr/include/c++/15.2.1/bits/stl_multiset.h \
  /home/iks/Projects/DataSync/cpp/include/mssql_lake.hpp \
  /home/iks/Projects/DataSync/cpp/include/obs_log.hpp \

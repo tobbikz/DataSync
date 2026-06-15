@@ -52,10 +52,14 @@ void RuntimeConfig::reload(PGconn* pg) {
     }
 
     for (int i = 0; i < PQntuples(res); ++i) {
+        const char* v0 = PQgetvalue(res, i, 0);
+        const char* v1 = PQgetvalue(res, i, 1);
+        const char* v2 = PQgetvalue(res, i, 2);
+        const char* v3 = PQgetvalue(res, i, 3);
         next[make_lookup_key(
-            PQgetvalue(res, i, 0),
-            PQgetvalue(res, i, 1),
-            PQgetvalue(res, i, 2))] = json_scalar_to_string(PQgetvalue(res, i, 3));
+            v0 ? v0 : "",
+            v1 ? v1 : "",
+            v2 ? v2 : "")] = json_scalar_to_string(v3 ? v3 : "");
     }
     PQclear(res);
 
