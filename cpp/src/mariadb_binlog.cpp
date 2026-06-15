@@ -229,11 +229,16 @@ std::vector<BinlogFileEntry> fetch_binary_logs(MYSQL* mysql) {
 
 MasterBinlogStatus fetch_master_binlog_status(MYSQL* mysql) {
     MasterBinlogStatus out;
-    if (!mysql || mysql_query(mysql, "SHOW MASTER STATUS") != 0) {
+    if (!mysql) {
+        return out;
+    }
+    if (mysql_query(mysql, "SHOW MASTER STATUS") != 0) {
+        fprintf(stderr, "[mariadb_binlog] SHOW MASTER STATUS failed: %s\n", mysql_error(mysql));
         return out;
     }
     MYSQL_RES* res = mysql_store_result(mysql);
     if (!res) {
+        fprintf(stderr, "[mariadb_binlog] mysql_store_result failed: %s\n", mysql_error(mysql));
         return out;
     }
     MYSQL_ROW row = mysql_fetch_row(res);

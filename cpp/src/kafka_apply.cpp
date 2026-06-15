@@ -26,6 +26,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -610,6 +611,11 @@ void ensure_partitions(PGconn* pg, const std::string& schema, const std::string&
     PGresult* res = PQexecParams(
         pg, "SELECT lake.ensure_monthly_partitions($1, $2, $3::integer)", 3, nullptr, vals, nullptr, nullptr, 0);
     if (res) {
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            const std::string err = PQerrorMessage(pg);
+            PQclear(res);
+            throw std::runtime_error("ensure_monthly_partitions failed: " + err);
+        }
         PQclear(res);
     }
     ready.insert(key);
@@ -1081,18 +1087,54 @@ long long apply_table_batch(
         }
     }
 
-    for (const auto& e : deletes) {
-        std::ostringstream where;
+    if (!deletes.empty() && !delete_pk_cols.empty()) {
+        const std::string del_stg = "cdc_stg_del_" + std::to_string(staging_id);
+        const std::string del_fq_stg = pg_ident(del_stg);
+
+        std::ostringstream del_col_list_ss;
         for (std::size_t i = 0; i < delete_pk_cols.size(); ++i) {
-            if (i) {
-                where << " AND ";
-            }
-            const json* val = e.row.contains(delete_pk_cols[i]) ? &e.row[delete_pk_cols[i]] : nullptr;
-            const std::string pg_type = meta.col_types.count(delete_pk_cols[i]) ? meta.col_types.at(delete_pk_cols[i]) : "";
-            where << pg_ident(delete_pk_cols[i]) << " IS NOT DISTINCT FROM "
-                  << (val ? json_cell_sql(*val, pg_type) : std::string("NULL"));
+            if (i) del_col_list_ss << ", ";
+            del_col_list_ss << pg_ident(delete_pk_cols[i]);
         }
-        pg_exec(pg, "DELETE FROM " + fq + " WHERE " + where.str());
+        const std::string del_col_list = del_col_list_ss.str();
+
+        std::ostringstream ct;
+        ct << "CREATE TEMP TABLE " << del_fq_stg << " (";
+        for (std::size_t i = 0; i < delete_pk_cols.size(); ++i) {
+            if (i) ct << ", ";
+            ct << pg_ident(delete_pk_cols[i]) << " "
+               << (meta.col_types.count(delete_pk_cols[i]) ? meta.col_types.at(delete_pk_cols[i]) : "TEXT");
+        }
+        ct << ") ON COMMIT DROP";
+        pg_exec(pg, ct.str());
+
+        std::vector<std::string> del_lines;
+        del_lines.reserve(deletes.size());
+        for (const auto& e : deletes) {
+            bool missing_pk = false;
+            for (const auto& pk_col : delete_pk_cols) {
+                const json* pk_val = e.row.contains(pk_col) ? &e.row[pk_col] : nullptr;
+                if (!pk_val || pk_val->is_null()) {
+                    missing_pk = true;
+                    break;
+                }
+            }
+            if (missing_pk) continue;
+            std::ostringstream line;
+            for (std::size_t i = 0; i < delete_pk_cols.size(); ++i) {
+                if (i) line << ',';
+                const json* val = e.row.contains(delete_pk_cols[i]) ? &e.row[delete_pk_cols[i]] : nullptr;
+                if (val) {
+                    const std::string pg_type = meta.col_types.count(delete_pk_cols[i]) ? meta.col_types.at(delete_pk_cols[i]) : "";
+                    line << json_cell_csv(*val, pg_type, false);
+                }
+            }
+            del_lines.push_back(line.str());
+        }
+        if (!del_lines.empty()) {
+            copy_csv_lines(pg, "COPY " + del_fq_stg + " (" + del_col_list + ") FROM STDIN WITH (FORMAT csv)", del_lines);
+            delete_target_by_staging_pk(pg, fq, del_fq_stg, delete_pk_cols);
+        }
     }
 
     if (upserts.empty()) {
@@ -1106,6 +1148,24 @@ long long apply_table_batch(
     if (data_cols.empty()) {
         for (auto it = upserts.front().row.begin(); it != upserts.front().row.end(); ++it) {
             data_cols.push_back(it.key());
+        }
+    }
+
+    for (const auto& e : upserts) {
+        for (auto it = e.row.begin(); it != e.row.end(); ++it) {
+            const std::string& col = it.key();
+            if (col.rfind("_dl_", 0) == 0) continue;
+            if (std::find(data_cols.begin(), data_cols.end(), col) != data_cols.end()) continue;
+            std::string pg_type = "TEXT";
+            const json& val = it.value();
+            if (val.is_boolean())                pg_type = "BOOLEAN";
+            else if (val.is_number_integer())    pg_type = "BIGINT";
+            else if (val.is_number_float())      pg_type = "DOUBLE PRECISION";
+            const std::string fq = pg_ident(meta.schema_name) + "." + pg_ident(meta.table_name);
+            try {
+                pg_exec(pg, "ALTER TABLE " + fq + " ADD COLUMN IF NOT EXISTS " + pg_ident(col) + " " + pg_type + " NULL");
+                data_cols.push_back(col);
+            } catch (...) {}
         }
     }
 
@@ -1217,12 +1277,9 @@ json apply_events_batch(
         ? "mssql"
         : (options.source_system == "MongoDB") ? "mongodb" : "mariadb";
 
-    static std::unordered_map<std::string, std::vector<std::string>> lake_pk_cache;
-    static std::unordered_map<std::string, std::vector<std::string>> lake_data_cols_cache;
-    static std::unordered_map<std::string, std::map<std::string, std::string>> lake_col_types_cache;
-    lake_pk_cache.clear();
-    lake_data_cols_cache.clear();
-    lake_col_types_cache.clear();
+    thread_local std::unordered_map<std::string, std::vector<std::string>> lake_pk_cache;
+    thread_local std::unordered_map<std::string, std::vector<std::string>> lake_data_cols_cache;
+    thread_local std::unordered_map<std::string, std::map<std::string, std::string>> lake_col_types_cache;
 
     std::vector<ApplyEvent> working(events.begin(), events.end());
     std::map<std::pair<std::string, std::string>, std::vector<ApplyEvent>> by_table;
@@ -1684,15 +1741,22 @@ json apply_events_batch(
                 continue;
             }
             PQclear(lake_commit);
-            PGresult* app_commit = PQexec(app_pg, "COMMIT");
-            const bool app_commit_ok =
-                app_commit && PQresultStatus(app_commit) == PGRES_COMMAND_OK;
-            if (!app_commit_ok) {
-                const std::string app_err =
-                    app_commit ? PQresultErrorMessage(app_commit) : PQerrorMessage(app_pg);
+            bool app_commit_ok = false;
+            for (int app_retry = 0; app_retry < 3; ++app_retry) {
+                PGresult* app_commit = PQexec(app_pg, "COMMIT");
+                app_commit_ok = app_commit && PQresultStatus(app_commit) == PGRES_COMMAND_OK;
                 if (app_commit) {
                     PQclear(app_commit);
                 }
+                if (app_commit_ok) {
+                    break;
+                }
+                if (app_retry < 2) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << app_retry)));
+                }
+            }
+            if (!app_commit_ok) {
+                const std::string app_err = PQerrorMessage(app_pg);
                 (*table_errors_acc) += 1;
                 if (options.failed_events_out) {
                     for (auto& e : audit) {
@@ -1719,7 +1783,6 @@ json apply_events_batch(
                 }
                 continue;
             }
-            PQclear(app_commit);
             if (meta.catalog_id > 0) {
                 mark_catalog_cdc_success(app_pg, meta.catalog_id);
             }

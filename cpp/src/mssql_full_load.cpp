@@ -282,12 +282,18 @@ std::vector<std::vector<std::string>> group_mssql_tables_by_fk_level(
         return {tables};
     }
 
+    std::string escaped_schema;
+    escaped_schema.reserve(schema.size());
+    for (char c : schema) {
+        if (c == '\'') escaped_schema += "''";
+        else escaped_schema += c;
+    }
     const std::string sql =
         "SELECT OBJECT_NAME(f.parent_object_id), OBJECT_NAME(f.referenced_object_id) "
         "FROM sys.foreign_keys f "
         "JOIN sys.tables pt ON f.parent_object_id = pt.object_id "
         "JOIN sys.schemas ps ON pt.schema_id = ps.schema_id "
-        "WHERE ps.name = '" + schema + "'";
+        "WHERE ps.name = '" + escaped_schema + "'";
     const auto result = mssql.query(sql);
 
     std::unordered_map<std::string, int> in_degree;

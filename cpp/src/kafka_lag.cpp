@@ -24,6 +24,7 @@ KafkaLagProbe::KafkaLagProbe(const std::string& bootstrap_servers) {
     }
     rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, sizeof(errstr));
     if (!rk) {
+        rd_kafka_conf_destroy(conf);
         throw std::runtime_error(std::string("Kafka lag probe create failed: ") + errstr);
     }
     rd_kafka_poll_set_consumer(rk);

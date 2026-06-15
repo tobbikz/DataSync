@@ -456,14 +456,18 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         auto window = resolve_lsn_window(mssql, tbl.source_database, cap, from_lsn);
         if (!window) {
             if (recover_purged_lsn(log_pg, mssql, conn_id, tbl, cap, from_lsn, batch_id)) {
-                from_lsn = *fetch_min_lsn(mssql, tbl.source_database, cap);
-                lsn_recovered += 1;
-                window = resolve_lsn_window(mssql, tbl.source_database, cap, from_lsn);
+                if (auto recovered = fetch_min_lsn(mssql, tbl.source_database, cap)) {
+                    from_lsn = *recovered;
+                    lsn_recovered += 1;
+                    window = resolve_lsn_window(mssql, tbl.source_database, cap, from_lsn);
+                }
             } else if (rcfg.mssql_replay_on_idle &&
                        recover_idle_at_max_lsn(log_pg, mssql, conn_id, tbl, cap, from_lsn, batch_id)) {
-                from_lsn = *fetch_min_lsn(mssql, tbl.source_database, cap);
-                lsn_recovered += 1;
-                window = resolve_lsn_window(mssql, tbl.source_database, cap, from_lsn);
+                if (auto recovered = fetch_min_lsn(mssql, tbl.source_database, cap)) {
+                    from_lsn = *recovered;
+                    lsn_recovered += 1;
+                    window = resolve_lsn_window(mssql, tbl.source_database, cap, from_lsn);
+                }
             }
         }
         if (!window) {
@@ -555,7 +559,21 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             const nlohmann::json* row_for_key = (op == "d") ? &before : &after;
             const std::string msg_key = kafka_message_key_for_row(
                 tbl.lake_schema, tbl.lake_table, row_for_key, tbl.pk_columns);
-            producer.produce(topic, msg_key, event.to_kafka_dict().dump());
+            try {
+                producer.produce(topic, msg_key, event.to_kafka_dict().dump());
+            } catch (const std::exception& ex) {
+                log_write(log_pg, {
+                    .level = LogLevel::Error,
+                    .component = "cdc_kafka_mssql_capture",
+                    .message = "mssql capture row skipped: kafka produce failed",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = tbl.lake_schema,
+                    .source_table = tbl.lake_table,
+                    .context = {{"error", ex.what()}, {"topic", topic}, {"op", op}},
+                });
+                continue;
+            }
             published += 1;
             last_heartbeat = std::chrono::steady_clock::now();
         }

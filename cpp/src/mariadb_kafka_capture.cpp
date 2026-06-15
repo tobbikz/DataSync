@@ -48,9 +48,15 @@ std::string mariadb_scalar(MYSQL* mysql, const std::string& sql) {
 }
 
 std::vector<std::string> fetch_table_columns(MYSQL* mysql, const std::string& schema, const std::string& table) {
+    auto esc = [mysql](const std::string& val) {
+        std::string out(val.size() * 2 + 1, '\0');
+        const unsigned long len = mysql_real_escape_string(mysql, out.data(), val.c_str(), static_cast<unsigned long>(val.size()));
+        out.resize(len);
+        return out;
+    };
     std::ostringstream sql;
     sql << "SELECT column_name FROM information_schema.columns "
-        << "WHERE table_schema='" << schema << "' AND table_name='" << table
+        << "WHERE table_schema='" << esc(schema) << "' AND table_name='" << esc(table)
         << "' ORDER BY ordinal_position";
     if (mysql_query(mysql, sql.str().c_str()) != 0) {
         throw std::runtime_error(std::string("MariaDB columns query failed: ") + mysql_error(mysql));
@@ -232,9 +238,16 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         },
     });
 
-    // One binlog cursor per conn: serialize capture when daemon runs tiers in parallel.
-    static std::mutex g_mariadb_capture_mu;
-    std::lock_guard<std::mutex> capture_lock(g_mariadb_capture_mu);
+    // One binlog cursor per conn: serialize capture per connection.
+    static std::map<std::string, std::unique_ptr<std::mutex>> g_mariadb_capture_mutexes;
+    static std::mutex g_mariadb_capture_registry_mu;
+    std::unique_lock<std::mutex> registry_lock(g_mariadb_capture_registry_mu);
+    auto& conn_mu_ptr = g_mariadb_capture_mutexes[conn_id];
+    if (!conn_mu_ptr) {
+        conn_mu_ptr = std::make_unique<std::mutex>();
+    }
+    registry_lock.unlock();
+    std::lock_guard<std::mutex> capture_lock(*conn_mu_ptr);
 
     const auto tables =
         fetch_capture_catalog_tables(log_pg, conn_id, service_tier, worker_id, worker_count, "mariadb");
@@ -590,9 +603,13 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             bool advanced = advance_binlog_cursor_to_next_file(mariadb.handle, binlog_start);
             if (!advanced && chunk_stalled && binlog_cursor_is_behind(cursor_pos, master_chunk) &&
                 cursor_pos.file != master_chunk.file) {
-                advanced = advance_binlog_to_next_file(mariadb.handle, binlog_start);
+                const auto master_before_advance = fetch_master_binlog_status(mariadb.handle);
+                if (binlog_cursor_is_behind(cursor_pos, master_before_advance)) {
+                    advanced = advance_binlog_to_next_file(mariadb.handle, binlog_start);
+                }
             }
             if (advanced) {
+                lagging_idle_chunks = 0;
                 read_stats.last_file = binlog_start.file;
                 read_stats.last_position = binlog_start.position;
                 upsert_capture_position(
@@ -601,6 +618,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                     read_stats.last_file,
                     read_stats.last_position,
                     live_uuid);
+                const auto master_after_advance = fetch_master_binlog_status(mariadb.handle);
                 log_write(log_pg, {
                     .level = LogLevel::Info,
                     .component = "cdc_kafka_capture",
@@ -616,8 +634,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                         {"from_position", before_advance.position},
                         {"to_file", binlog_start.file},
                         {"to_position", binlog_start.position},
-                        {"master_file", master_chunk.file},
-                        {"master_position", master_chunk.position},
+                        {"master_file", master_after_advance.file},
+                        {"master_position", master_after_advance.position},
                         {"chunk_stalled", chunk_stalled},
                     },
                 });
@@ -733,7 +751,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         last_heartbeat = std::chrono::steady_clock::now();
     }
 
-    const int queued = producer.flush(120);
+    const int queued = producer.flush(15);
     const KafkaProducerStats pstats = producer.stats();
     if (pstats.errors > 0 || queued > 0 || pstats.pending > 0) {
         const std::string err_detail =

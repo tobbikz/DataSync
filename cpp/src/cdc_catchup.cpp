@@ -141,7 +141,8 @@ void update_apply_position_after_catchup(
     const std::string& schema,
     const std::string& table) {
     const std::string offset_str = std::to_string(new_offset);
-    const char* vals1[] = {offset_str.c_str(), std::to_string(catalog_id).c_str()};
+    const std::string catalog_id_str = std::to_string(catalog_id);
+    const char* vals1[] = {offset_str.c_str(), catalog_id_str.c_str()};
     pg_exec_params_simple(
         pg,
         R"(

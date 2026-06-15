@@ -563,6 +563,7 @@ bool seed_stream_capture_bookmark_if_needed(
             .source_table = source_table,
             .context = {{"error", errstr}, {"topic", topic}},
         });
+        rd_kafka_conf_destroy(conf);
         return false;
     }
 
@@ -821,6 +822,8 @@ void flag_table_for_full_load(
         0);
     if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
         const long long catalog_id = std::atoll(PQgetvalue(res, 0, 0));
+        PQclear(res);
+        res = nullptr;
         RuntimeConfig runtime;
         runtime.reload(pg);
         try {
@@ -872,7 +875,7 @@ void enable_cdc_after_full_load(
           AND db_engine = $2::cdc_catalog.db_engine
           AND active = true
           AND has_pk = true
-          AND status NOT IN ('skipped', 'disabled')
+          AND status NOT IN ('skipped', 'disabled', 'failed')
           AND (NOT cdc_enabled OR needs_full_load = true)
     )";
     std::vector<const char*> vals = {conn_id.c_str(), db_engine.c_str()};
@@ -1564,6 +1567,7 @@ void ensure_apply_positions_for_tier(
             if (ap_st != PGRES_COMMAND_OK && ap_st != PGRES_TUPLES_OK) {
                 const std::string ap_err = PQerrorMessage(pg);
                 PQclear(ap_res);
+                ap_res = nullptr;
                 if (ap_err.find("apply_position_pkey") != std::string::npos) {
                     const char* upd_vals[] = {
                         conn_id.c_str(),
@@ -2017,6 +2021,7 @@ long long kafka_backlog_messages(
 
     rd_kafka_t* consumer = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, sizeof(errstr));
     if (!consumer) {
+        rd_kafka_conf_destroy(conf);
         throw std::runtime_error(std::string("kafka consumer create failed: ") + errstr);
     }
     rd_kafka_poll_set_consumer(consumer);
@@ -2059,6 +2064,7 @@ long long reset_apply_offset_to_end(
 
     rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
     if (!rk) {
+        rd_kafka_conf_destroy(conf);
         throw std::runtime_error(std::string("kafka client create failed: ") + errstr);
     }
 
@@ -2093,11 +2099,12 @@ long long reset_apply_offset_to_end(
 
     rd_kafka_queue_t* queue = rd_kafka_queue_new(rk);
     rd_kafka_AlterConsumerGroupOffsets(rk, &alter, 1, options, queue);
+
+    rd_kafka_event_t* event = rd_kafka_queue_poll(queue, 30000);
+
     rd_kafka_AlterConsumerGroupOffsets_destroy(alter);
     rd_kafka_AdminOptions_destroy(options);
     rd_kafka_topic_partition_list_destroy(parts);
-
-    rd_kafka_event_t* event = rd_kafka_queue_poll(queue, 30000);
     rd_kafka_queue_destroy(queue);
     rd_kafka_destroy(rk);
 
@@ -2142,6 +2149,7 @@ long long reset_apply_consumer_offset(
 
     rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
     if (!rk) {
+        rd_kafka_conf_destroy(conf);
         throw std::runtime_error(std::string("kafka client create failed: ") + errstr);
     }
 
@@ -2164,11 +2172,12 @@ long long reset_apply_consumer_offset(
 
     rd_kafka_queue_t* queue = rd_kafka_queue_new(rk);
     rd_kafka_AlterConsumerGroupOffsets(rk, &alter, 1, options, queue);
+
+    rd_kafka_event_t* event = rd_kafka_queue_poll(queue, 30000);
+
     rd_kafka_AlterConsumerGroupOffsets_destroy(alter);
     rd_kafka_AdminOptions_destroy(options);
     rd_kafka_topic_partition_list_destroy(parts);
-
-    rd_kafka_event_t* event = rd_kafka_queue_poll(queue, 30000);
     rd_kafka_queue_destroy(queue);
     rd_kafka_destroy(rk);
 
@@ -2273,6 +2282,7 @@ void ensure_kafka_topics_exist(
 
     rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
     if (!rk) {
+        rd_kafka_conf_destroy(conf);
         throw std::runtime_error(std::string("kafka ensure topics client failed: ") + errstr);
     }
 

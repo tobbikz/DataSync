@@ -319,19 +319,24 @@ long long copy_collection_batches(
         std::vector<std::string> batch_lines;
         std::vector<std::map<std::string, nlohmann::json>> batch_flats;
         const bson_t* doc = nullptr;
-        while (mongoc_cursor_next(cursor, &doc)) {
-            bson_iter_t iter;
-            if (bson_iter_init_find(&iter, doc, "_id")) {
-                if (last_id_value) {
-                    bson_value_destroy(last_id_value);
-                    delete last_id_value;
+        try {
+            while (mongoc_cursor_next(cursor, &doc)) {
+                bson_iter_t iter;
+                if (bson_iter_init_find(&iter, doc, "_id")) {
+                    if (last_id_value) {
+                        bson_value_destroy(last_id_value);
+                        delete last_id_value;
+                    }
+                    last_id_value = new bson_value_t();
+                    bson_value_copy(bson_iter_value(&iter), last_id_value);
                 }
-                last_id_value = new bson_value_t();
-                bson_value_copy(bson_iter_value(&iter), last_id_value);
-            }
 
-            const auto j = bson_to_json(doc);
-            batch_flats.push_back(flatten_mongo_document(j));
+                const auto j = bson_to_json(doc);
+                batch_flats.push_back(flatten_mongo_document(j));
+            }
+        } catch (...) {
+            mongoc_cursor_destroy(cursor);
+            throw;
         }
         mongoc_cursor_destroy(cursor);
 
@@ -512,6 +517,15 @@ bool load_one_collection(
     }
 
     mongoc_collection_t* coll = mongo.collection(target.source_database, target.source_table);
+    bool coll_destroyed = false;
+    auto destroy_coll = [&]() {
+        if (!coll_destroyed) {
+            mongoc_collection_destroy(coll);
+            coll_destroyed = true;
+        }
+    };
+
+    try {
     const auto sample = sample_flattened_mongo_docs(coll, 1000);
     auto pg_cols = infer_schema_from_flat_rows(sample);
 
@@ -568,7 +582,7 @@ bool load_one_collection(
         source_sleep_ms,
         batch_id);
 
-    mongoc_collection_destroy(coll);
+    destroy_coll();
 
     mark_catalog_success(app_pg.raw, target.catalog_id);
 
@@ -583,6 +597,10 @@ bool load_one_collection(
         target.source_database,
         target.source_table);
     return true;
+    } catch (...) {
+        destroy_coll();
+        throw;
+    }
 }
 
 }  // namespace

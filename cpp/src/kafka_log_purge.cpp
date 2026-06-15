@@ -101,6 +101,10 @@ void delete_records_before(
     }
 
     rd_kafka_AdminOptions_t* options = rd_kafka_AdminOptions_new(rk, RD_KAFKA_ADMIN_OP_DELETERECORDS);
+    if (!options) {
+        rd_kafka_DeleteRecords_destroy(del);
+        throw std::runtime_error("AdminOptions_new failed");
+    }
     rd_kafka_AdminOptions_set_request_timeout(options, 120000, nullptr, 0);
     rd_kafka_AdminOptions_set_operation_timeout(options, 120000, nullptr, 0);
 
@@ -167,6 +171,11 @@ KafkaPurgeConsumedResult purge_kafka_consumed_logs(
     }
 
     rd_kafka_topic_partition_list_t* to_delete = rd_kafka_topic_partition_list_new(committed->cnt);
+    if (!to_delete) {
+        rd_kafka_topic_partition_list_destroy(const_cast<rd_kafka_topic_partition_list_t*>(committed));
+        rd_kafka_destroy(rk);
+        throw std::runtime_error("topic_partition_list_new failed");
+    }
 
     for (int i = 0; i < committed->cnt; ++i) {
         const rd_kafka_topic_partition_t* part = &committed->elems[i];

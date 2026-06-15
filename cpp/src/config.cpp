@@ -202,10 +202,14 @@ AppConfig load_config(const std::string& path) {
     parse_cdc_config(root, cfg.cdc);
 
     if (const char* env = std::getenv("DATASYNC_PG_PASSWORD")) {
-        cfg.datasync.password = env;
+        if (env[0] != '\0') {
+            cfg.datasync.password = env;
+        }
     }
     if (const char* env = std::getenv("DATALAKE_PG_PASSWORD")) {
-        cfg.datalake.password = env;
+        if (env[0] != '\0') {
+            cfg.datalake.password = env;
+        }
     }
     if (const char* env = std::getenv("DATASYNC_PG_SSLMODE")) {
         cfg.datasync.sslmode = env;

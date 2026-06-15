@@ -3,6 +3,7 @@
 #include <libpq-fe.h>
 
 #include <cstddef>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -46,7 +47,7 @@ private:
         const std::string& component,
         const std::string& conn_id);
 
-    const std::string* find_raw(
+    std::optional<std::string> find_raw(
         const std::string& key,
         const std::string& component,
         const std::string& conn_id) const;

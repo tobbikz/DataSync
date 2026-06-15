@@ -171,28 +171,41 @@ void apply_delete_batch(PGconn* pg, const CdcTableMeta& meta, const std::vector<
     }
 
     for (const auto& row : rows) {
-        if (row.pk_only || row.values.size() == meta.pk_cols.size()) {
+        if ((row.pk_only || row.values.size() == meta.pk_cols.size()) && row.values.size() >= meta.pk_cols.size()) {
             std::ostringstream where;
             for (std::size_t i = 0; i < meta.pk_cols.size(); ++i) {
                 if (i) {
                     where << " AND ";
                 }
-                where << pg_ident(meta.pk_cols[i]) << " IS NOT DISTINCT FROM " << row.values[i];
+                std::string val = row.values[i];
+                if (val != "NULL") {
+                    val = normalize_pg_sql_literal(val, "text");
+                }
+                where << pg_ident(meta.pk_cols[i]) << " IS NOT DISTINCT FROM " << val;
             }
             pg_exec(pg, "DELETE FROM " + fq + " WHERE " + where.str());
             continue;
         }
 
         std::ostringstream where;
+        bool all_pk_found = true;
         for (std::size_t i = 0; i < meta.pk_cols.size(); ++i) {
-            if (i) {
-                where << " AND ";
-            }
             const auto it = pk_index.find(meta.pk_cols[i]);
             if (it == pk_index.end()) {
+                all_pk_found = false;
                 continue;
             }
-            where << pg_ident(meta.pk_cols[i]) << " IS NOT DISTINCT FROM " << row.values[it->second];
+            std::string val = row.values[it->second];
+            if (val != "NULL") {
+                val = normalize_pg_sql_literal(val, meta.cols[it->second].pg_type);
+            }
+            if (i > 0 && where.tellp() > 0) {
+                where << " AND ";
+            }
+            where << pg_ident(meta.pk_cols[i]) << " IS NOT DISTINCT FROM " << val;
+        }
+        if (!all_pk_found) {
+            continue;
         }
         pg_exec(pg, "DELETE FROM " + fq + " WHERE " + where.str());
     }
@@ -243,6 +256,16 @@ CdcRunStats run_cdc_for_conn(
     for (auto& meta : table_metas) {
         meta.cols = fetch_mariadb_columns(mariadb.handle, meta.source_schema, meta.source_table);
         const TableKey key{meta.source_schema, meta.source_table};
+        if (meta.cols.empty()) {
+            log_cdc(
+                log_pg,
+                LogLevel::Warning,
+                batch_id,
+                "cdc skip table: no columns",
+                {{"schema", meta.source_schema}, {"table", meta.source_table}},
+                source.conn_id);
+            continue;
+        }
         wanted.insert(key);
         state.meta_by_key[key] = meta;
     }

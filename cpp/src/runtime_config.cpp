@@ -63,25 +63,25 @@ void RuntimeConfig::reload(PGconn* pg) {
     values_ = std::move(next);
 }
 
-const std::string* RuntimeConfig::find_raw(
+std::optional<std::string> RuntimeConfig::find_raw(
     const std::string& key,
     const std::string& component,
     const std::string& conn_id) const {
     std::shared_lock lock(mutex_);
     if (auto it = values_.find(make_lookup_key(key, component, conn_id)); it != values_.end()) {
-        return &it->second;
+        return it->second;
     }
     if (!conn_id.empty()) {
         if (auto it = values_.find(make_lookup_key(key, component, "")); it != values_.end()) {
-            return &it->second;
+            return it->second;
         }
     }
     if (component != "global") {
         if (auto it = values_.find(make_lookup_key(key, "global", "")); it != values_.end()) {
-            return &it->second;
+            return it->second;
         }
     }
-    return nullptr;
+    return std::nullopt;
 }
 
 int RuntimeConfig::get_int(
@@ -89,7 +89,7 @@ int RuntimeConfig::get_int(
     int default_value,
     const std::string& component,
     const std::string& conn_id) const {
-    const std::string* raw = find_raw(key, component, conn_id);
+    const auto raw = find_raw(key, component, conn_id);
     if (!raw) {
         return default_value;
     }
@@ -105,7 +105,7 @@ std::size_t RuntimeConfig::get_size_t(
     std::size_t default_value,
     const std::string& component,
     const std::string& conn_id) const {
-    const std::string* raw = find_raw(key, component, conn_id);
+    const auto raw = find_raw(key, component, conn_id);
     if (!raw) {
         return default_value;
     }
@@ -125,7 +125,7 @@ bool RuntimeConfig::get_bool(
     bool default_value,
     const std::string& component,
     const std::string& conn_id) const {
-    const std::string* raw = find_raw(key, component, conn_id);
+    const auto raw = find_raw(key, component, conn_id);
     if (!raw) {
         return default_value;
     }
@@ -143,6 +143,6 @@ std::string RuntimeConfig::get_string(
     const std::string& default_value,
     const std::string& component,
     const std::string& conn_id) const {
-    const std::string* raw = find_raw(key, component, conn_id);
+    const auto raw = find_raw(key, component, conn_id);
     return raw ? *raw : default_value;
 }

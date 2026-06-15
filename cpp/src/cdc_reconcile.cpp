@@ -126,7 +126,12 @@ struct CatalogReconcileRow {
 };
 
 std::string mssql_brack(const std::string& name) {
-    return "[" + name + "]";
+    std::string out = "[";
+    for (char c : name) {
+        out += (c == ']') ? "]]" : std::string(1, c);
+    }
+    out += "]";
+    return out;
 }
 
 std::string md5_hex(const std::string& payload) {
@@ -461,7 +466,14 @@ long long pg_table_count(PGconn* pg, const std::string& schema, const std::strin
 
 long long mariadb_table_count(MYSQL* mysql, const std::string& schema, const std::string& table) {
     std::ostringstream sql;
-    sql << "SELECT COUNT(*) FROM `" << schema << "`.`" << table << "`";
+    auto esc_id = [](const std::string& id) {
+        std::string out;
+        for (char c : id) {
+            out += (c == '`') ? "``" : std::string(1, c);
+        }
+        return out;
+    };
+    sql << "SELECT COUNT(*) FROM `" << esc_id(schema) << "`.`" << esc_id(table) << "`";
     if (mysql_query(mysql, sql.str().c_str()) != 0) {
         return -1;
     }
@@ -492,8 +504,7 @@ long long mongo_collection_count(MongoConn& mongo, const std::string& database, 
     bson_t reply;
     bson_error_t error;
     bson_init(&reply);
-    const std::string cmd = "{\"count\":\"" + collection + "\"}";
-    bson_t* cmd_bson = bson_new_from_json(reinterpret_cast<const uint8_t*>(cmd.c_str()), cmd.size(), &error);
+    bson_t* cmd_bson = BCON_NEW("count", BCON_UTF8(collection.c_str()));
     if (!cmd_bson) {
         bson_destroy(&reply);
         return -1;
@@ -868,15 +879,22 @@ std::optional<bool> pk_checksum_match_mariadb(
     if (pk_cols.empty()) {
         return std::nullopt;
     }
+    auto esc_id = [](const std::string& id) {
+        std::string out;
+        for (char c : id) {
+            out += (c == '`') ? "``" : std::string(1, c);
+        }
+        return out;
+    };
     std::ostringstream order_by;
     for (std::size_t i = 0; i < pk_cols.size(); ++i) {
         if (i > 0) {
             order_by << ", ";
         }
-        order_by << "`" << pk_cols[i] << "`";
+        order_by << "`" << esc_id(pk_cols[i]) << "`";
     }
     std::ostringstream src_sql;
-    src_sql << "SELECT " << order_by.str() << " FROM `" << row.source_schema << "`.`" << row.source_table
+    src_sql << "SELECT " << order_by.str() << " FROM `" << esc_id(row.source_schema) << "`.`" << esc_id(row.source_table)
             << "` ORDER BY " << order_by.str() << " LIMIT " << sample_size;
     if (mysql_query(mysql, src_sql.str().c_str()) != 0) {
         return std::nullopt;

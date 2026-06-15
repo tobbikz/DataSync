@@ -428,7 +428,21 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
             const nlohmann::json* row_for_key = (op == "d") ? &before : &after;
             const std::string msg_key = kafka_message_key_for_row(
                 coll.lake_schema, coll.lake_table, row_for_key, coll.pk_columns);
-            producer.produce(topic, msg_key, event.to_kafka_dict().dump());
+            try {
+                producer.produce(topic, msg_key, event.to_kafka_dict().dump());
+            } catch (const std::exception& ex) {
+                log_write(log_pg, {
+                    .level = LogLevel::Error,
+                    .component = "cdc_kafka_mongo_capture",
+                    .message = "mongo capture row skipped: kafka produce failed",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = coll.lake_schema,
+                    .source_table = coll.lake_table,
+                    .context = {{"error", ex.what()}, {"topic", topic}, {"op", op}},
+                });
+                continue;
+            }
             published += 1;
         }
 

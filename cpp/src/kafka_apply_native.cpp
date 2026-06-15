@@ -52,6 +52,41 @@ using kafka_apply_detail::filter_new_event_ids;
 using kafka_apply_detail::parse_kafka_payload;
 using kafka_apply_detail::record_quiet_table_batch_stats;
 
+struct KafkaApplyContext {
+    PGconn* log_pg{nullptr};
+    std::string batch_id;
+    std::string conn_id;
+};
+
+void rebalance_cb(rd_kafka_t* rk, rd_kafka_resp_err_t err,
+                  rd_kafka_topic_partition_list_t* partitions, void* opaque) {
+    auto* ctx = static_cast<KafkaApplyContext*>(opaque);
+    if (err == RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS) {
+        rd_kafka_commit(rk, partitions, 0);
+        if (ctx) {
+            log_write(ctx->log_pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_kafka_apply_cpp",
+                .message = "kafka partitions revoked, committed offsets",
+                .batch_id = ctx->batch_id,
+                .conn_id = ctx->conn_id,
+                .context = {{"partition_count", static_cast<int>(partitions->cnt)}},
+            });
+        }
+    } else if (err == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS) {
+        if (ctx) {
+            log_write(ctx->log_pg, {
+                .level = LogLevel::Info,
+                .component = "cdc_kafka_apply_cpp",
+                .message = "kafka partitions assigned",
+                .batch_id = ctx->batch_id,
+                .conn_id = ctx->conn_id,
+                .context = {{"partition_count", static_cast<int>(partitions->cnt)}},
+            });
+        }
+    }
+}
+
 struct CatalogMeta {
     long long catalog_id{0};
     std::string pk_columns;
@@ -920,10 +955,6 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
                 }
                 if (e.schema_name.empty() || e.table_name.empty()) {
                     dropped_unrecoverable += 1;
-                    auto it = batch_offsets.find({e.topic, e.partition});
-                    if (it == batch_offsets.end() || e.offset > it->second) {
-                        batch_offsets[{e.topic, e.partition}] = e.offset;
-                    }
                     continue;
                 }
                 pending.push_back(std::move(e));
@@ -1339,6 +1370,10 @@ int run_kafka_apply_native_cli(
     // After Kafka topic purge, apply may subscribe before capture recreates buckets.
     rd_kafka_conf_set(conf, "allow.auto.create.topics", "true", errstr, sizeof(errstr));
 
+    auto* kafka_ctx = new KafkaApplyContext{log_pg, batch_id, conn_id};
+    rd_kafka_conf_set_opaque(conf, kafka_ctx);
+    rd_kafka_conf_set_rebalance_cb(conf, rebalance_cb);
+
     rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, sizeof(errstr));
     if (!rk) {
         log_write(log_pg, {
@@ -1354,6 +1389,7 @@ int run_kafka_apply_native_cli(
         stats["stop_reason"] = "kafka_init_failed";
         stats["errors"] = 1;
         stats["duration_ms"] = 0;
+        rd_kafka_conf_destroy(conf);
         std::cout << stats.dump() << std::endl;
         return 1;
     }
@@ -1376,6 +1412,7 @@ int run_kafka_apply_native_cli(
             .source_table = std::nullopt,
             .context = {{"error", rd_kafka_err2str(sub_err)}},
         });
+        delete static_cast<KafkaApplyContext*>(rd_kafka_opaque(rk));
         rd_kafka_destroy(rk);
         stats["stop_reason"] = "kafka_subscribe_failed";
         stats["errors"] = 1;
@@ -1431,66 +1468,76 @@ int run_kafka_apply_native_cli(
         if (pending_batch.empty()) {
             return;
         }
-        try {
-            auto batch_offsets = flush_pending_batch(
-                app_pg.raw,
-                lake_pg.raw,
-                conn_id,
-                batch_id,
-                pending_batch,
-                dedup_enabled,
-                append_only,
-                audit_enabled,
-                events_applied,
-                errors,
-                applied_by_table,
-                seen_by_table,
-                meta_by_key,
-                source_system,
-                db_engine,
-                service_tier.value_or(""),
-                staleness,
-                inactive_seconds,
-                rk,
-                &catchup_tables,
-                &host_sampler);
-            commit_kafka_offsets(rk, batch_offsets);
-            for (const auto& [tp, offset] : batch_offsets) {
-                last_offsets[tp] = std::max(last_offsets[tp], offset);
-            }
-        } catch (const std::exception& ex) {
+        for (int retry = 0; retry < 3; ++retry) {
             try {
-                const int cleared =
-                    clear_stale_cdc_in_progress(app_pg.raw, conn_id, service_tier, db_engine);
-                log_write(log_pg, {
-                    .level = LogLevel::Error,
-                    .component = "cdc_kafka_apply_cpp",
-                    .message = "apply batch flush failed",
-                    .batch_id = batch_id,
-                    .conn_id = conn_id,
-                    .source_schema = std::nullopt,
-                    .source_table = std::nullopt,
-                    .context = {
-                        {"error", ex.what()},
-                        {"errors", errors},
-                        {"cdc_in_progress_cleared", cleared},
-                    },
-                });
-            } catch (const std::exception& clear_ex) {
-                log_write(log_pg, {
-                    .level = LogLevel::Error,
-                    .component = "cdc_kafka_apply_cpp",
-                    .message = "apply batch flush failed",
-                    .batch_id = batch_id,
-                    .conn_id = conn_id,
-                    .source_schema = std::nullopt,
-                    .source_table = std::nullopt,
-                    .context = {
-                        {"error", ex.what()},
-                        {"errors", errors},
-                        {"clear_error", clear_ex.what()},
-                    },
-                });
+                auto batch_offsets = flush_pending_batch(
+                    app_pg.raw,
+                    lake_pg.raw,
+                    conn_id,
+                    batch_id,
+                    pending_batch,
+                    dedup_enabled,
+                    append_only,
+                    audit_enabled,
+                    events_applied,
+                    errors,
+                    applied_by_table,
+                    seen_by_table,
+                    meta_by_key,
+                    source_system,
+                    db_engine,
+                    service_tier.value_or(""),
+                    staleness,
+                    inactive_seconds,
+                    rk,
+                    &catchup_tables,
+                    &host_sampler);
+                commit_kafka_offsets(rk, batch_offsets);
+                for (const auto& [tp, offset] : batch_offsets) {
+                    last_offsets[tp] = std::max(last_offsets[tp], offset);
+                }
+                return;
+            } catch (const std::exception& ex) {
+                if (retry >= 2) {
+                    try {
+                        const int cleared =
+                            clear_stale_cdc_in_progress(app_pg.raw, conn_id, service_tier, db_engine);
+                        log_write(log_pg, {
+                            .level = LogLevel::Error,
+                            .component = "cdc_kafka_apply_cpp",
+                            .message = "apply batch flush failed after retries",
+                            .batch_id = batch_id,
+                            .conn_id = conn_id,
+                            .source_schema = std::nullopt,
+                            .source_table = std::nullopt,
+                            .context = {
+                                {"error", ex.what()},
+                                {"errors", errors},
+                                {"retries", retry},
+                                {"pending_batch_size", static_cast<int>(pending_batch.size())},
+                                {"cdc_in_progress_cleared", cleared},
+                            },
+                        });
+                    } catch (const std::exception& clear_ex) {
+                        log_write(log_pg, {
+                            .level = LogLevel::Error,
+                            .component = "cdc_kafka_apply_cpp",
+                            .message = "apply batch flush failed after retries",
+                            .batch_id = batch_id,
+                            .conn_id = conn_id,
+                            .source_schema = std::nullopt,
+                            .source_table = std::nullopt,
+                            .context = {
+                                {"error", ex.what()},
+                                {"errors", errors},
+                                {"retries", retry},
+                                {"clear_error", clear_ex.what()},
+                            },
+                        });
+                    }
+                    throw;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << retry)));
             }
         }
     };
@@ -1680,6 +1727,10 @@ int run_kafka_apply_native_cli(
             }
             if (events_seen - kafka_poll_progress_last >= 100) {
                 kafka_poll_progress_last = events_seen;
+                const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                const double throughput = elapsed_ms > 0
+                    ? static_cast<double>(events_seen) / (elapsed_ms / 1000.0) : 0.0;
                 log_write(log_pg, {
                     .level = LogLevel::Info,
                     .component = "cdc_kafka_apply_cpp",
@@ -1691,8 +1742,12 @@ int run_kafka_apply_native_cli(
                     .context = {
                         {"events_seen", events_seen},
                         {"events_applied", events_applied},
+                        {"parse_skipped", parse_skipped},
+                        {"errors", errors},
+                        {"throughput_eps", throughput},
                         {"pending_batch", static_cast<int>(pending_batch.size())},
                         {"empty_polls", empty_polls},
+                        {"elapsed_ms", elapsed_ms},
                     },
                 });
             }
@@ -1704,6 +1759,25 @@ int run_kafka_apply_native_cli(
                 auto sit = skipped_parse_offsets.find(tp);
                 if (sit == skipped_parse_offsets.end() || offset > sit->second) {
                     skipped_parse_offsets[tp] = offset;
+                }
+                if (parse_skipped <= 10) {
+                    log_write(log_pg, {
+                        .level = LogLevel::Warning,
+                        .component = "cdc_kafka_apply_cpp",
+                        .message = "kafka message parse skipped",
+                        .batch_id = batch_id,
+                        .conn_id = conn_id,
+                        .source_schema = std::nullopt,
+                        .source_table = std::nullopt,
+                        .context = {
+                            {"topic", topic},
+                            {"partition", partition},
+                            {"offset", offset},
+                            {"payload_bytes", static_cast<int>(payload.size())},
+                            {"payload_preview", payload.substr(0, 200)},
+                            {"parse_skipped_count", parse_skipped},
+                        },
+                    });
                 }
                 continue;
             }
@@ -1955,6 +2029,7 @@ int run_kafka_apply_native_cli(
         } catch (...) {
         }
         rd_kafka_consumer_close(rk);
+        delete static_cast<KafkaApplyContext*>(rd_kafka_opaque(rk));
         rd_kafka_destroy(rk);
         return 1;
     }
@@ -1980,6 +2055,7 @@ int run_kafka_apply_native_cli(
         log_pg, runtime, conn_id, service_tier, batch_id, bootstrap);
 
     rd_kafka_consumer_close(rk);
+    delete static_cast<KafkaApplyContext*>(rd_kafka_opaque(rk));
     rd_kafka_destroy(rk);
     std::cout << stats.dump() << std::endl;
     return errors > 0 ? 1 : 0;

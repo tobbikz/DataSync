@@ -799,7 +799,7 @@ void mark_catalog_failed(
         vals);
 }
 
-enum class TableLoadOutcome { Success, Skipped };
+enum class TableLoadOutcome { Success, Skipped, Failed };
 
 // #region agent log
 void agent_debug_log_full_load(
@@ -924,6 +924,18 @@ TableLoadOutcome load_one_table(
     ensure_lake_table_base(lake_pg.raw, target.source_schema, target.source_table, cols, partition_months);
 
     acquire_full_load_table_lock(lake_pg.raw, target.catalog_id);
+    bool lock_released = false;
+    auto release_lock = [&]() {
+        if (!lock_released) {
+            try {
+                release_full_load_table_lock(lake_pg.raw, target.catalog_id);
+            } catch (...) {
+            }
+            lock_released = true;
+        }
+    };
+
+    try {
     const long long rows_before_truncate =
         lake_table_row_count(lake_pg.raw, target.source_schema, target.source_table);
     // #region agent log
@@ -936,7 +948,23 @@ TableLoadOutcome load_one_table(
          {"table", target.source_table}});
     // #endregion
 
-    truncate_lake_table(lake_pg.raw, target.source_schema, target.source_table);
+    try {
+        truncate_lake_table(lake_pg.raw, target.source_schema, target.source_table);
+    } catch (const std::exception& ex) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Error,
+            batch_id,
+            "lake table truncate failed, aborting full load",
+            {{"error", ex.what()}},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
+        release_lock();
+        mark_catalog_failed(app_pg.raw, target.catalog_id, target.conn_id, "truncate failed: " + std::string(ex.what()));
+        return TableLoadOutcome::Failed;
+    }
 
     const long long rows_after_truncate =
         lake_table_row_count(lake_pg.raw, target.source_schema, target.source_table);
@@ -1048,8 +1076,12 @@ TableLoadOutcome load_one_table(
         target.conn_id,
         target.source_schema,
         target.source_table);
-    release_full_load_table_lock(lake_pg.raw, target.catalog_id);
+    release_lock();
     return TableLoadOutcome::Success;
+    } catch (...) {
+        release_lock();
+        throw;
+    }
 }
 
 }  // namespace

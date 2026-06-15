@@ -3,18 +3,19 @@
 #include "lake_columns.hpp"
 #include "mariadb_schema.hpp"
 
+#include <functional>
 #include <map>
 #include <optional>
 #include <sstream>
 
 namespace {
 
-std::string mysql_escape_literal(const std::string& value) {
-    std::string out = "'";
-    for (char c : value) {
-        out += (c == '\'') ? "''" : std::string(1, c);
-    }
-    out += "'";
+std::string mysql_escape_literal(MYSQL* mysql, const std::string& value) {
+    std::string out(value.size() * 2 + 3, '\'');
+    const unsigned long len = mysql_real_escape_string(mysql, out.data() + 1, value.c_str(), static_cast<unsigned long>(value.size()));
+    out.resize(len + 2);
+    out[0] = '\'';
+    out[len + 1] = '\'';
     return out;
 }
 
@@ -149,7 +150,12 @@ std::string mirror_unique_index_name(
         name += "_" + col;
     }
     if (name.size() > 63) {
-        name.resize(63);
+        const auto hash = std::hash<std::string>{}(name);
+        std::ostringstream suffix;
+        suffix << std::hex << (hash & 0xFFFFFFFF);
+        const std::string suffix_str = suffix.str();
+        name.resize(63 - suffix_str.size() - 1);
+        name += "_" + suffix_str;
     }
     return name;
 }
@@ -319,7 +325,7 @@ std::vector<IndexDef> fetch_mariadb_indexes(MYSQL* mysql, const std::string& sch
     const std::string sql =
         "SELECT index_name, non_unique, column_name, seq_in_index FROM information_schema.statistics "
         "WHERE table_schema=" +
-        mysql_escape_literal(schema) + " AND table_name=" + mysql_escape_literal(table) +
+        mysql_escape_literal(mysql, schema) + " AND table_name=" + mysql_escape_literal(mysql, table) +
         " ORDER BY index_name, seq_in_index";
 
     if (mysql_query(mysql, sql.c_str()) != 0) {
@@ -333,18 +339,23 @@ std::vector<IndexDef> fetch_mariadb_indexes(MYSQL* mysql, const std::string& sch
 
     std::map<std::string, IndexDef> indexes;
     MYSQL_ROW row;
-    while ((row = mysql_fetch_row(res)) != nullptr) {
-        if (!row[0] || !row[2]) {
-            continue;
+    try {
+        while ((row = mysql_fetch_row(res)) != nullptr) {
+            if (!row[0] || !row[2]) {
+                continue;
+            }
+            const std::string name = row[0];
+            if (name == "PRIMARY") {
+                continue;
+            }
+            auto& idx = indexes[name];
+            idx.name = name;
+            idx.unique = row[1] && std::string(row[1]) == "0";
+            idx.columns.push_back(row[2]);
         }
-        const std::string name = row[0];
-        if (name == "PRIMARY") {
-            continue;
-        }
-        auto& idx = indexes[name];
-        idx.name = name;
-        idx.unique = row[1] && std::string(row[1]) == "0";
-        idx.columns.push_back(row[2]);
+    } catch (...) {
+        mysql_free_result(res);
+        throw;
     }
     mysql_free_result(res);
 
@@ -402,7 +413,7 @@ std::vector<ForeignKeyDef> fetch_mariadb_foreign_keys_once(MYSQL* mysql, const s
         "referenced_column_name, ordinal_position "
         "FROM information_schema.key_column_usage "
         "WHERE table_schema=" +
-        mysql_escape_literal(schema) + " AND table_name=" + mysql_escape_literal(table) +
+        mysql_escape_literal(mysql, schema) + " AND table_name=" + mysql_escape_literal(mysql, table) +
         " AND referenced_table_name IS NOT NULL "
         "ORDER BY constraint_name, ordinal_position";
 
@@ -417,16 +428,21 @@ std::vector<ForeignKeyDef> fetch_mariadb_foreign_keys_once(MYSQL* mysql, const s
 
     std::map<std::string, ForeignKeyDef> fks;
     MYSQL_ROW row;
-    while ((row = mysql_fetch_row(res)) != nullptr) {
-        if (!row[0] || !row[1] || !row[3] || !row[4]) {
-            continue;
+    try {
+        while ((row = mysql_fetch_row(res)) != nullptr) {
+            if (!row[0] || !row[1] || !row[3] || !row[4]) {
+                continue;
+            }
+            auto& fk = fks[row[0]];
+            fk.constraint_name = row[0];
+            fk.columns.push_back(row[1]);
+            fk.ref_schema = row[2] ? row[2] : schema;
+            fk.ref_table = row[3];
+            fk.ref_columns.push_back(row[4]);
         }
-        auto& fk = fks[row[0]];
-        fk.constraint_name = row[0];
-        fk.columns.push_back(row[1]);
-        fk.ref_schema = row[2] ? row[2] : schema;
-        fk.ref_table = row[3];
-        fk.ref_columns.push_back(row[4]);
+    } catch (...) {
+        mysql_free_result(res);
+        throw;
     }
     mysql_free_result(res);
 

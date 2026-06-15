@@ -131,6 +131,7 @@ bool mariadb_should_retry(unsigned int err_no, const std::string& err, int attem
 }
 
 void mariadb_mysql_query_retry(MariaDbConn& conn, const std::string& sql, const MariaDbRetryOptions& opts) {
+    if (!conn.handle) throw std::runtime_error("MariaDB handle is null");
     const int attempts = mariadb_retry_attempt_limit(opts.max_attempts);
     for (int attempt = 0; attempt < attempts; ++attempt) {
         if (mysql_query(conn.handle, sql.c_str()) == 0) {
@@ -147,6 +148,7 @@ void mariadb_mysql_query_retry(MariaDbConn& conn, const std::string& sql, const 
 }
 
 MYSQL_RES* mariadb_mysql_query_store_retry(MariaDbConn& conn, const std::string& sql, const MariaDbRetryOptions& opts) {
+    if (!conn.handle) throw std::runtime_error("MariaDB handle is null");
     const int attempts = mariadb_retry_attempt_limit(opts.max_attempts);
     for (int attempt = 0; attempt < attempts; ++attempt) {
         if (mysql_query(conn.handle, sql.c_str()) != 0) {

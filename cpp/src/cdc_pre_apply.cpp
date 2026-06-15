@@ -62,6 +62,7 @@ int sync_mssql_columns_for_tier(
         }
         return 0;
     }
+    const bool has_res = true;
 
     int synced = 0;
     try {
@@ -90,7 +91,9 @@ int sync_mssql_columns_for_tier(
                 });
             }
         }
+        PQclear(res);
     } catch (const std::exception& ex) {
+        if (has_res) PQclear(res);
         log_write(log_pg, {
             .level = LogLevel::Error,
             .component = "cdc_kafka_mssql_ddl",
@@ -102,7 +105,6 @@ int sync_mssql_columns_for_tier(
             .context = {{"tier", tier}, {"error", ex.what()}},
         });
     }
-    PQclear(res);
     return synced;
 }
 #endif
@@ -147,44 +149,50 @@ int sync_mongo_columns_for_tier(
 
     const std::size_t sample_limit =
         runtime.get_size_t("ddl_sync_sample_size", 1000, "mongo_load", conn_id);
-    MongoConn mongo(*source);
-    PgConn lake_pg(cfg.datalake.conn_string());
-    if (!lake_pg.raw) {
-        PQclear(res);
-        return 0;
-    }
 
     int synced = 0;
-    for (int i = 0; i < PQntuples(res); ++i) {
-        const std::string db = PQgetvalue(res, i, 0);
-        const std::string schema = mongo_catalog_source_schema(db, PQgetvalue(res, i, 1));
-        const std::string coll = PQgetvalue(res, i, 2);
-        const std::string pg_schema = mongo_pg_schema_name(db);
-        const std::string pg_table = mongo_pg_table_name(coll);
-
-        mongoc_collection_t* collection = mongo.collection(db, coll);
-        const auto ddl = sync_mongo_lake_columns_from_collection(
-            lake_pg.raw, collection, pg_schema, pg_table, sample_limit);
-        mongoc_collection_destroy(collection);
-
-        if (ddl.columns_added > 0 || ddl.columns_widened > 0) {
-            synced += 1;
-            log_write(log_pg, {
-                .level = LogLevel::Info,
-                .component = "cdc_kafka_mongo_ddl",
-                .message = "mongo ddl sync columns updated",
-                .batch_id = batch_id,
-                .conn_id = conn_id,
-                .source_schema = schema,
-                .source_table = coll,
-                .context = {
-                    {"columns_added", ddl.columns_added},
-                    {"columns_widened", ddl.columns_widened},
-                },
-            });
+    try {
+        MongoConn mongo(*source);
+        PgConn lake_pg(cfg.datalake.conn_string());
+        if (!lake_pg.raw) {
+            PQclear(res);
+            return 0;
         }
+
+        for (int i = 0; i < PQntuples(res); ++i) {
+            const std::string db = PQgetvalue(res, i, 0);
+            const std::string schema = mongo_catalog_source_schema(db, PQgetvalue(res, i, 1));
+            const std::string coll = PQgetvalue(res, i, 2);
+            const std::string pg_schema = mongo_pg_schema_name(db);
+            const std::string pg_table = mongo_pg_table_name(coll);
+
+            mongoc_collection_t* collection = mongo.collection(db, coll);
+            const auto ddl = sync_mongo_lake_columns_from_collection(
+                lake_pg.raw, collection, pg_schema, pg_table, sample_limit);
+            mongoc_collection_destroy(collection);
+
+            if (ddl.columns_added > 0 || ddl.columns_widened > 0) {
+                synced += 1;
+                log_write(log_pg, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_kafka_mongo_ddl",
+                    .message = "mongo ddl sync columns updated",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = schema,
+                    .source_table = coll,
+                    .context = {
+                        {"columns_added", ddl.columns_added},
+                        {"columns_widened", ddl.columns_widened},
+                    },
+                });
+            }
+        }
+        PQclear(res);
+    } catch (...) {
+        PQclear(res);
+        throw;
     }
-    PQclear(res);
     return synced;
 }
 #endif

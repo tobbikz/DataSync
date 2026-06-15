@@ -26,6 +26,21 @@ AppConfig snapshot_app_config(const AppConfig& cfg);
 
 std::atomic<bool> g_shutdown{false};
 std::atomic<int> g_catalog_sync_round{0};
+std::vector<std::thread> g_background_threads;
+std::mutex g_background_threads_mu;
+
+void join_background_threads() {
+    std::vector<std::thread> threads;
+    {
+        std::lock_guard<std::mutex> lock(g_background_threads_mu);
+        threads.swap(g_background_threads);
+    }
+    for (auto& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+}
 
 void on_signal(int) {
     g_shutdown.store(true);
@@ -91,14 +106,14 @@ int run_apply_workers(
     return failures.load() > 0 ? 1 : 0;
 }
 
-void spawn_daemon_full_load_detached(
+void spawn_daemon_full_load_background(
     AppConfig cfg,
     std::string conn_id,
     std::string tier_code,
     std::string batch_id,
     int pending_before,
     std::string db_engine) {
-    std::thread(
+    std::thread t(
         [cfg = std::move(cfg),
          conn_id = std::move(conn_id),
          tier_code = std::move(tier_code),
@@ -167,8 +182,9 @@ void spawn_daemon_full_load_detached(
                 } catch (...) {
                 }
             }
-        })
-        .detach();
+        });
+    std::lock_guard<std::mutex> lock(g_background_threads_mu);
+    g_background_threads.push_back(std::move(t));
 }
 
 int run_one_cycle(
@@ -212,7 +228,7 @@ int run_one_cycle(
                 {"non_blocking", true},
             },
         });
-        spawn_daemon_full_load_detached(
+        spawn_daemon_full_load_background(
             snapshot_app_config(cfg),
             conn_id,
             tier.tier_code,
@@ -306,10 +322,8 @@ int run_parallel_daemon_round(
         }
     }
 
-    std::vector<std::thread> capture_threads;
-    capture_threads.reserve(conn_ids.size());
-    for (const auto& conn_id : conn_ids) {
-        capture_threads.emplace_back([&, conn_id]() {
+    auto make_capture_fn = [&](const std::string& conn_id) {
+        return [&, conn_id]() {
             PgConn capture_pg(cfg.datasync.conn_string());
             if (!capture_pg.raw) {
                 failures.fetch_add(1);
@@ -347,7 +361,18 @@ int run_parallel_daemon_round(
                     .context = {{"error", ex.what()}},
                 });
             }
-        });
+        };
+    };
+
+    std::vector<std::thread> capture_threads;
+    capture_threads.reserve(conn_ids.size());
+    for (const auto& conn_id : conn_ids) {
+        try {
+            capture_threads.emplace_back(make_capture_fn(conn_id));
+        } catch (...) {
+            for (auto& t : capture_threads) if (t.joinable()) t.join();
+            throw;
+        }
     }
 
     std::vector<std::thread> threads;
@@ -355,7 +380,8 @@ int run_parallel_daemon_round(
 
     for (const auto& tier : tiers) {
         for (const auto& conn_id : conn_ids) {
-            threads.emplace_back([&, tier, conn_id]() {
+            try {
+                threads.emplace_back([&, tier, conn_id]() {
                 PgConn pg(cfg.datasync.conn_string());
                 if (!pg.raw) {
                     failures.fetch_add(1);
@@ -379,6 +405,10 @@ int run_parallel_daemon_round(
                     });
                 }
             });
+            } catch (...) {
+                for (auto& t : threads) if (t.joinable()) t.join();
+                throw;
+            }
         }
     }
 
@@ -572,7 +602,19 @@ int run_cdc_daemon(
             }
             int sweep_exit = 0;
             run_startup_full_load_sweep(startup_cfg, pg.raw, conn_ids_initial, tiers, sweep_exit);
-        } catch (const std::exception&) {
+        } catch (const std::exception& ex) {
+            try {
+                PgConn pg(startup_cfg.datasync.conn_string());
+                if (pg.raw) {
+                    log_write(pg.raw, {
+                        .level = LogLevel::Error,
+                        .component = "cdc_daemon",
+                        .message = "startup full-load sweep failed",
+                        .context = {{"error", ex.what()}},
+                    });
+                }
+            } catch (...) {
+            }
         }
     });
 
@@ -645,6 +687,7 @@ int run_cdc_daemon(
     if (reconcile_thread.joinable()) {
         reconcile_thread.join();
     }
+    join_background_threads();
 
     log_write(log_pg, {
         .level = LogLevel::Info,

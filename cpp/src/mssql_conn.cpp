@@ -192,7 +192,10 @@ void MssqlConn::use_database(const std::string& database) {
 
 void MssqlConn::exec(const std::string& sql) {
     run_dbsql(handle, sql);
-    while (dbresults(handle) != NO_MORE_RESULTS) {
+    while (true) {
+        const int r = dbresults(handle);
+        if (r == NO_MORE_RESULTS) break;
+        if (r == FAIL) throw std::runtime_error("MSSQL exec drain failed: " + format_dberror(handle));
     }
 }
 
@@ -244,7 +247,10 @@ MssqlQueryResult MssqlConn::query(const std::string& sql) {
         }
         out.rows.push_back(std::move(row));
     }
-    while (dbresults(handle) != NO_MORE_RESULTS) {
+    while (true) {
+        const int r = dbresults(handle);
+        if (r == NO_MORE_RESULTS) break;
+        if (r == FAIL) throw std::runtime_error("MSSQL query drain failed: " + format_dberror(handle));
     }
     return out;
 }

@@ -65,6 +65,7 @@ KafkaProducer::KafkaProducer(
     rd_kafka_conf_t* conf = rd_kafka_conf_new();
     rd_kafka_conf_set(conf, "bootstrap.servers", bootstrap.c_str(), errstr, sizeof(errstr));
     rd_kafka_conf_set(conf, "acks", "all", errstr, sizeof(errstr));
+    rd_kafka_conf_set(conf, "compression.type", "zstd", errstr, sizeof(errstr));
     rd_kafka_conf_set(conf, "linger.ms", std::to_string(linger_ms).c_str(), errstr, sizeof(errstr));
     rd_kafka_conf_set(conf, "batch.num.messages", std::to_string(batch_size).c_str(), errstr, sizeof(errstr));
     if (queue_max_messages > 0) {
@@ -80,6 +81,7 @@ KafkaProducer::KafkaProducer(
 
     impl_->body.producer = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
     if (!impl_->body.producer) {
+        rd_kafka_conf_destroy(conf);
         impl_->body.first_error = errstr;
         impl_->body.available = false;
         return;
@@ -158,7 +160,8 @@ void KafkaProducer::produce(const std::string& topic, const std::string& key, co
         std::this_thread::sleep_for(std::chrono::milliseconds(5 + attempt / 4));
     }
     impl_->body.errors.fetch_add(1);
-    throw std::runtime_error(std::string("kafka produce failed: ") + rd_kafka_err2str(err));
+    impl_->body.first_error = std::string("kafka produce failed after 200 retries (QUEUE_FULL): ") + rd_kafka_err2str(err);
+    throw std::runtime_error(impl_->body.first_error);
 #endif
 }
 

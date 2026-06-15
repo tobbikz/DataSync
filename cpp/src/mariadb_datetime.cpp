@@ -18,8 +18,8 @@ std::string epoch_to_timestamptz(long long secs) {
 }
 
 std::string epoch_ms_to_timestamptz(long long ms) {
-    const long long sec = ms / 1000;
-    const int milli = static_cast<int>(ms >= 0 ? ms % 1000 : -ms % 1000);
+    const long long sec = ms >= 0 ? ms / 1000 : (ms - 999) / 1000;
+    const int milli = static_cast<int>(ms - sec * 1000);
     const std::string base = epoch_to_timestamptz(sec);
     const auto plus = base.rfind('+');
     if (plus == std::string::npos) {

@@ -618,7 +618,24 @@ void migrate_lake_table_schema(
             desired = "double precision";
         }
         if (existing != desired) {
-            (void)pg_exec(pg, "DROP TABLE IF EXISTS " + pg_ident(schema) + "." + pg_ident(table) + " CASCADE");
+            const std::string fq = pg_ident(schema) + "." + pg_ident(table);
+            const std::string alter_sql =
+                "ALTER TABLE " + fq +
+                " ALTER COLUMN " + pg_ident(col.name) +
+                " TYPE " + desired +
+                " USING " + pg_ident(col.name) + "::" + desired;
+            try {
+                pg_exec(pg, alter_sql);
+            } catch (const std::exception& ex) {
+                try {
+                    pg_exec(pg, "DROP TABLE IF EXISTS " + fq + " CASCADE");
+                } catch (...) {
+                }
+                throw std::runtime_error(
+                    "column type migration failed for " + col.name +
+                    " (" + existing + " -> " + desired + "): " + ex.what() +
+                    "; table dropped for safety");
+            }
             return;
         }
     }

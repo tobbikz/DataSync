@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <fstream>
 #include <map>
 #include <regex>
@@ -140,8 +141,13 @@ BinlogCliStats read_remote_binlog_cli(
         return stats;
     }
 
-    const std::string err_path =
-        std::string("/tmp/datasync_binlog_err_") + std::to_string(getpid()) + ".log";
+    char err_path_template[] = "/tmp/datasync_binlog_err_XXXXXX";
+    const int err_fd = mkstemp(err_path_template);
+    if (err_fd == -1) {
+        throw std::runtime_error("failed to create temp file for binlog stderr");
+    }
+    close(err_fd);
+    const std::string err_path(err_path_template);
 
     const bool binlog_ssl =
         std::getenv("MARIADB_BINLOG_SSL") != nullptr && std::getenv("MARIADB_BINLOG_SSL")[0] == '1';
@@ -159,9 +165,11 @@ BinlogCliStats read_remote_binlog_cli(
 
     FILE* pipe = popen(cmd.str().c_str(), "r");
     if (!pipe) {
+        unlink(err_path.c_str());
         throw std::runtime_error("failed to start mariadb-binlog");
     }
 
+    try {
     const auto run_start = std::chrono::steady_clock::now();
     char buffer[8192];
     std::string pending_schema;
@@ -324,11 +332,16 @@ BinlogCliStats read_remote_binlog_cli(
     }
 
     flush_row();
-    const int status = pclose(pipe);
-    if (WIFEXITED(status)) {
-        stats.exit_code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        stats.exit_code = 128 + WTERMSIG(status);
+    } catch (...) {
+        pclose(pipe);
+        unlink(err_path.c_str());
+        throw;
+    }
+    const int pipe_rc = pclose(pipe);
+    if (WIFEXITED(pipe_rc)) {
+        stats.exit_code = WEXITSTATUS(pipe_rc);
+    } else if (WIFSIGNALED(pipe_rc)) {
+        stats.exit_code = 128 + WTERMSIG(pipe_rc);
     }
     stats.stderr_tail = read_file_tail(err_path, 1500);
     (void)unlink(err_path.c_str());

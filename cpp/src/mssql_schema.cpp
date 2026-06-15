@@ -180,8 +180,10 @@ std::vector<MssqlColumn> fetch_mssql_columns(
         }
     }
 
-    while (dbresults(db) != NO_MORE_RESULTS) {
-        // drain
+    while (true) {
+        const int r = dbresults(db);
+        if (r == NO_MORE_RESULTS) break;
+        if (r == FAIL) throw std::runtime_error("MSSQL schema drain failed");
     }
 
     if (cols.empty()) {
