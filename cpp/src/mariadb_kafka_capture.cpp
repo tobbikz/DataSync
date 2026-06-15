@@ -23,6 +23,58 @@
 
 namespace {
 
+using TableKey = std::pair<std::string, std::string>;
+
+std::string to_lower_copy(std::string value) {
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+
+/** Map binlog schema.table → canonical catalog source_schema/source_table. */
+struct CaptureBinlogResolver {
+    std::set<TableKey> catalog_keys;
+    std::map<TableKey, TableKey> lower_to_catalog;
+    std::map<std::string, std::vector<TableKey>> catalog_keys_by_lower_table;
+
+    void add(const TableKey& catalog_key) {
+        catalog_keys.insert(catalog_key);
+        const TableKey lower_key{to_lower_copy(catalog_key.first), to_lower_copy(catalog_key.second)};
+        lower_to_catalog[lower_key] = catalog_key;
+        catalog_keys_by_lower_table[lower_key.second].push_back(catalog_key);
+    }
+
+    enum class ResolveKind { Exact, CaseFold, NoMatch, SchemaMismatch };
+
+    struct ResolveResult {
+        ResolveKind kind{ResolveKind::NoMatch};
+        TableKey catalog_key;
+    };
+
+    ResolveResult resolve(const std::string& binlog_schema, const std::string& binlog_table) const {
+        const TableKey binlog_key{binlog_schema, binlog_table};
+        if (catalog_keys.count(binlog_key) > 0) {
+            return {ResolveKind::Exact, binlog_key};
+        }
+        const TableKey lower_key{to_lower_copy(binlog_schema), to_lower_copy(binlog_table)};
+        if (const auto it = lower_to_catalog.find(lower_key); it != lower_to_catalog.end()) {
+            return {ResolveKind::CaseFold, it->second};
+        }
+        if (const auto tit = catalog_keys_by_lower_table.find(lower_key.second);
+            tit != catalog_keys_by_lower_table.end()) {
+            for (const auto& catalog_key : tit->second) {
+                if (to_lower_copy(catalog_key.first) != lower_key.first) {
+                    return {ResolveKind::SchemaMismatch, catalog_key};
+                }
+            }
+        }
+        return {ResolveKind::NoMatch, {}};
+    }
+};
+
 struct CapturePosition {
     std::string binlog_file;
     long long binlog_position{0};
@@ -268,6 +320,20 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         return stats;
     }
 
+    std::set<TableKey> wanted;
+    CaptureBinlogResolver binlog_resolver;
+    std::map<TableKey, std::string> pk_by_table;
+    std::map<TableKey, long long> catalog_id_by_table;
+    nlohmann::json catalog_tables_json = nlohmann::json::array();
+    for (const auto& tbl : tables) {
+        const TableKey key{tbl.source_schema, tbl.source_table};
+        wanted.insert(key);
+        binlog_resolver.add(key);
+        pk_by_table[key] = tbl.pk_columns;
+        catalog_id_by_table[key] = tbl.catalog_id;
+        catalog_tables_json.push_back(tbl.source_schema + "." + tbl.source_table);
+    }
+
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_kafka_capture",
@@ -276,18 +342,12 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         .conn_id = conn_id,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"table_count", static_cast<int>(tables.size())}},
+        .context = {
+            {"table_count", static_cast<int>(tables.size())},
+            {"catalog_tables", catalog_tables_json},
+        },
     });
 
-    std::set<std::pair<std::string, std::string>> wanted;
-    std::map<std::pair<std::string, std::string>, std::string> pk_by_table;
-    std::map<std::pair<std::string, std::string>, long long> catalog_id_by_table;
-    for (const auto& tbl : tables) {
-        const auto key = std::make_pair(tbl.source_schema, tbl.source_table);
-        wanted.insert(key);
-        pk_by_table[key] = tbl.pk_columns;
-        catalog_id_by_table[key] = tbl.catalog_id;
-    }
     std::set<long long> cdc_active_catalog_ids;
 
     try {
@@ -428,6 +488,12 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
 
     BinlogPosition binlog_start{start_pos.binlog_file, start_pos.binlog_position};
     bool first_kafka_publish_logged = false;
+    int watched_binlog_events = 0;
+    int unwatched_binlog_events = 0;
+    int schema_mismatch_events = 0;
+    int case_fold_resolved_events = 0;
+    int schema_mismatch_logs = 0;
+    std::set<TableKey> schema_mismatch_samples;
     const auto publish_row = [&](
                                const std::string& schema,
                                const std::string& table,
@@ -435,12 +501,76 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                                const std::vector<std::string>& col_values,
                                const std::vector<std::string>* before_col_values,
                                long long event_position) {
-        const auto key = std::make_pair(schema, table);
-        if (!wanted.count(key)) {
+        const CaptureBinlogResolver::ResolveResult resolved = binlog_resolver.resolve(schema, table);
+        if (resolved.kind == CaptureBinlogResolver::ResolveKind::NoMatch) {
+            unwatched_binlog_events += 1;
             return;
         }
+        if (resolved.kind == CaptureBinlogResolver::ResolveKind::SchemaMismatch) {
+            schema_mismatch_events += 1;
+            const TableKey sample_key{schema, table};
+            if (schema_mismatch_samples.size() < 8) {
+                schema_mismatch_samples.insert(sample_key);
+            }
+            if (schema_mismatch_logs < 5) {
+                schema_mismatch_logs += 1;
+                log_write(log_pg, {
+                    .level = LogLevel::Warning,
+                    .component = "cdc_kafka_capture",
+                    .message = "capture binlog schema mismatch for catalog table",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = resolved.catalog_key.first,
+                    .source_table = resolved.catalog_key.second,
+                    .context = {
+                        {"binlog_schema", schema},
+                        {"binlog_table", table},
+                        {"catalog_schema", resolved.catalog_key.first},
+                        {"catalog_table", resolved.catalog_key.second},
+                        {"op", op},
+                    },
+                });
+            }
+            return;
+        }
+        if (resolved.kind == CaptureBinlogResolver::ResolveKind::CaseFold) {
+            case_fold_resolved_events += 1;
+            if (case_fold_resolved_events <= 3) {
+                log_write(log_pg, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_kafka_capture",
+                    .message = "capture binlog table resolved via case fold",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = resolved.catalog_key.first,
+                    .source_table = resolved.catalog_key.second,
+                    .context = {
+                        {"binlog_schema", schema},
+                        {"binlog_table", table},
+                        {"catalog_schema", resolved.catalog_key.first},
+                        {"catalog_table", resolved.catalog_key.second},
+                    },
+                });
+            }
+        }
+
+        const TableKey& key = resolved.catalog_key;
+        watched_binlog_events += 1;
         const auto cols_it = col_cache.find(key);
         if (cols_it == col_cache.end()) {
+            log_write(log_pg, {
+                .level = LogLevel::Error,
+                .component = "cdc_kafka_capture",
+                .message = "capture column cache missing for catalog table",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = key.first,
+                .source_table = key.second,
+                .context = {
+                    {"binlog_schema", schema},
+                    {"binlog_table", table},
+                },
+            });
             return;
         }
         const std::string op_char = op_char_from_mysql(op);
@@ -465,8 +595,9 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         CdcEvent event;
         event.op = op_char;
         event.conn_id = conn_id;
-        event.schema_name = schema;
-        event.table_name = table;
+        // Always publish canonical catalog names (apply matches on source_schema/source_table).
+        event.schema_name = key.first;
+        event.table_name = key.second;
         event.before = before;
         event.after = after;
         event.binlog_file = binlog_start.file;
@@ -475,10 +606,10 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         event.ingestion_ts = utc_iso_timestamp_now();
 
         const std::string topic = topic_for_catalog(
-            rcfg.topic_prefix, schema, table, rcfg.topic_mode, rcfg.topic_buckets);
+            rcfg.topic_prefix, key.first, key.second, rcfg.topic_mode, rcfg.topic_buckets);
         const nlohmann::json* row_for_key = (op_char == "d") ? &before : &after;
         const std::string msg_key = kafka_message_key_for_row(
-            schema, table, row_for_key, pk_by_table[key]);
+            key.first, key.second, row_for_key, pk_by_table[key]);
         try {
             producer.produce(topic, msg_key, event.to_kafka_dict().dump());
         } catch (const std::exception& ex) {
@@ -488,9 +619,14 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 .message = "capture row skipped: kafka publish failed",
                 .batch_id = batch_id,
                 .conn_id = conn_id,
-                .source_schema = schema,
-                .source_table = table,
-                .context = {{"error", ex.what()}, {"topic", topic}},
+                .source_schema = key.first,
+                .source_table = key.second,
+                .context = {
+                    {"error", ex.what()},
+                    {"topic", topic},
+                    {"binlog_schema", schema},
+                    {"binlog_table", table},
+                },
             });
             return;
         }
@@ -502,8 +638,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 .message = "capture kafka first event published",
                 .batch_id = batch_id,
                 .conn_id = conn_id,
-                .source_schema = schema,
-                .source_table = table,
+                .source_schema = key.first,
+                .source_table = key.second,
                 .context = {
                     {"topic", topic},
                     {"op", op_char},
@@ -804,20 +940,47 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                             std::chrono::steady_clock::now() - start)
                             .count();
 
-    if (read_stats.events > 0 && pstats.events_published == 0) {
+    if (watched_binlog_events > 0 && pstats.events_published == 0) {
         log_write(log_pg, {
             .level = LogLevel::Warning,
             .component = "cdc_kafka_capture",
-            .message = "capture binlog events read but none published to kafka",
+            .message = "capture watched-table binlog events read but none published to kafka",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"watched_binlog_events", watched_binlog_events},
+                {"binlog_events_read", read_stats.events},
+                {"events_published", pstats.events_published},
+                {"schema_mismatch_events", schema_mismatch_events},
+                {"catalog_tables", catalog_tables_json},
+                {"kafka_bootstrap", rcfg.bootstrap},
+            },
+        });
+    } else if (read_stats.events > 0 && watched_binlog_events == 0 && pstats.events_published == 0) {
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_kafka_capture",
+            .message = "capture binlog activity on unwatched tables only",
             .batch_id = batch_id,
             .conn_id = conn_id,
             .source_schema = std::nullopt,
             .source_table = std::nullopt,
             .context = {
                 {"binlog_events_read", read_stats.events},
-                {"events_published", pstats.events_published},
-                {"kafka_bootstrap", rcfg.bootstrap},
+                {"unwatched_binlog_events", unwatched_binlog_events},
+                {"schema_mismatch_events", schema_mismatch_events},
+                {"catalog_tables", catalog_tables_json},
             },
+        });
+    }
+
+    nlohmann::json mismatch_samples = nlohmann::json::array();
+    for (const auto& [binlog_schema, binlog_table] : schema_mismatch_samples) {
+        mismatch_samples.push_back({
+            {"binlog_schema", binlog_schema},
+            {"binlog_table", binlog_table},
         });
     }
 
@@ -832,6 +995,12 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         .context = {
             {"events_published", stats.events_published},
             {"binlog_events_read", read_stats.events},
+            {"watched_binlog_events", watched_binlog_events},
+            {"unwatched_binlog_events", unwatched_binlog_events},
+            {"schema_mismatch_events", schema_mismatch_events},
+            {"case_fold_resolved_events", case_fold_resolved_events},
+            {"schema_mismatch_samples", mismatch_samples},
+            {"catalog_tables", catalog_tables_json},
             {"ddl_recorded", stats.ddl_recorded},
             {"binlog_file", stats.binlog_file},
             {"binlog_position", stats.binlog_position},
