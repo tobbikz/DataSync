@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host:      ./install.sh | ./install.sh start  → build + Kafka + daemon + discover
+# Host:      ./install.sh | ./install.sh start  → build + migrate + Kafka + daemon + discover
 #             ./install.sh kafka-retention [TOPIC_PREFIX=…]  → alter existing topic retention
 # Systemd:   ExecStart=$ROOT/install.sh start  ExecStop=$ROOT/install.sh stop
 #            sudo ./install.sh systemd-install  (once — installs DataSync.service)
@@ -359,22 +359,42 @@ apply_catalog_incremental() {
   "$BIN" migrate --config "$CONFIG"
 }
 
-post_schema_bootstrap() {
-  [[ "${DATASYNC_RUN_MIGRATIONS:-0}" == "1" ]] || return 0
+apply_catalog_incremental_if_ready() {
   [[ -f "$CONFIG" ]] || return 0
 
   if ! mapfile -t pg < <(read_pg_cfg); then
-    fail "post-schema bootstrap: config unreadable"
+    warn "migrate skipped: config unreadable"
+    return 0
   fi
   export PGPASSWORD="${pg[4]}"
   apply_pg_sslmode "${pg[5]:-}"
 
   if ! catalog_schema_exists "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"; then
-    fail "cdc_catalog schema missing after apply — check PostgreSQL logs"
+    [[ "$QUIET" == "1" ]] || log "migrate skipped: cdc_catalog missing (first install: DATASYNC_RUN_MIGRATIONS=1)"
+    return 0
   fi
 
-  verify_catalog_integrity "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"
   apply_catalog_incremental
+}
+
+post_schema_bootstrap() {
+  [[ -f "$CONFIG" ]] || return 0
+
+  if [[ "${DATASYNC_RUN_MIGRATIONS:-0}" == "1" ]]; then
+    if ! mapfile -t pg < <(read_pg_cfg); then
+      fail "post-schema bootstrap: config unreadable"
+    fi
+    export PGPASSWORD="${pg[4]}"
+    apply_pg_sslmode "${pg[5]:-}"
+
+    if ! catalog_schema_exists "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"; then
+      fail "cdc_catalog schema missing after apply — check PostgreSQL logs"
+    fi
+
+    verify_catalog_integrity "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"
+  fi
+
+  apply_catalog_incremental_if_ready
 }
 
 lake_schema_ok() {
@@ -559,10 +579,17 @@ host_build_datasync() {
   docker_compose build datasync
 }
 
+run_host_migrate() {
+  [[ -f "$CONFIG" ]] || return 0
+  log "Running DataSync migrate (incremental)"
+  docker_compose run --rm --no-deps datasync migrate || fail "DataSync migrate failed"
+}
+
 host_stack_start() {
   ensure_container_runtime || exit 1
   cd "$ROOT"
   host_build_datasync
+  run_host_migrate
   docker_compose up -d kafka
   wait_kafka_compose || exit 1
   docker_compose up -d --force-recreate --remove-orphans datasync

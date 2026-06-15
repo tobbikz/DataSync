@@ -100,5 +100,6 @@ Build: `cpp/build-kafka` OK.
 | Variable | Default | Use |
 |----------|---------|-----|
 | `DATASYNC_CONFIG` | `/app/config.json` | PG credentials |
-| `DATASYNC_RUN_MIGRATIONS` | `0` | `1` = apply catalog DDL on start |
+| `DATASYNC_RUN_MIGRATIONS` | `0` | `1` = baseline + lake DDL on first install only |
+| Incremental migrate | always | `./install.sh start` and container entrypoint run `DataSync migrate` when `cdc_catalog` exists |
 | `KAFKA_BOOTSTRAP` | `127.0.0.1:9092` | Kafka bootstrap (env only; C++ reads via `resolve_kafka_bootstrap`) |
