@@ -62,6 +62,7 @@ void rebalance_cb(rd_kafka_t* rk, rd_kafka_resp_err_t err,
         if (partitions) {
             rd_kafka_commit(rk, partitions, 0);
         }
+        rd_kafka_assign(rk, nullptr);
         if (ctx) {
             log_write(ctx->log_pg, {
                 .level = LogLevel::Warning,
@@ -73,6 +74,7 @@ void rebalance_cb(rd_kafka_t* rk, rd_kafka_resp_err_t err,
             });
         }
     } else if (err == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS) {
+        rd_kafka_assign(rk, partitions);
         if (ctx) {
             log_write(ctx->log_pg, {
                 .level = LogLevel::Info,
