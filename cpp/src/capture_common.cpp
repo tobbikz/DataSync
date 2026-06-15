@@ -101,16 +101,29 @@ KafkaBootstrapResolved resolve_kafka_bootstrap(RuntimeConfig& runtime, const std
     return out;
 }
 
+int catalog_apply_worker_id(long long catalog_id, int worker_count) {
+    if (worker_count <= 1) {
+        return 0;
+    }
+    return static_cast<int>(catalog_id % worker_count);
+}
+
 std::string kafka_apply_consumer_group(
     RuntimeConfig& runtime,
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& tier) {
+    const std::string& tier,
+    int worker_id,
+    int worker_count) {
     runtime.reload(pg);
     std::string group = runtime.get_string("kafka_consumer_group", "datalake-cdc-apply", "cdc_kafka_apply", conn_id);
     if (!tier.empty()) {
         group += '-';
         group += tier;
+    }
+    if (worker_count > 1) {
+        group += "-w";
+        group += std::to_string(worker_id);
     }
     return group;
 }
@@ -1633,7 +1646,10 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
     runtime.reload(pg);
     const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
     const std::string bootstrap = kafka.bootstrap;
-    const std::string consumer_group = kafka_apply_consumer_group(runtime, pg, conn_id, tier);
+    int apply_workers = runtime.get_int("apply_worker_count", 1, "cdc_kafka_apply", conn_id);
+    if (apply_workers <= 0) {
+        apply_workers = 1;
+    }
     ensure_apply_positions_for_tier(pg, runtime, conn_id, tier, db_engine);
 
     const char* vals[] = {conn_id.c_str(), tier.c_str(), db_engine.c_str()};
@@ -1789,15 +1805,19 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
         bool reset_ok = false;
         for (int attempt = 0; attempt < 3; ++attempt) {
             try {
-                const long long stored_offset =
-                    use_bookmark
-                        ? reset_apply_consumer_offset(
-                              bootstrap, consumer_group, topic, partition, bookmark_it->second)
-                        : reset_apply_offset_to_end(bootstrap, consumer_group, topic, partition);
-                if (stored_offset >= 0) {
-                    topic_offsets.emplace(topic_key, stored_offset);
-                    stats.topics_reset += 1;
+                for (int w = 0; w < apply_workers; ++w) {
+                    const std::string consumer_group =
+                        kafka_apply_consumer_group(runtime, pg, conn_id, tier, w, apply_workers);
+                    const long long stored_offset =
+                        use_bookmark
+                            ? reset_apply_consumer_offset(
+                                  bootstrap, consumer_group, topic, partition, bookmark_it->second)
+                            : reset_apply_offset_to_end(bootstrap, consumer_group, topic, partition);
+                    if (w == 0 && stored_offset >= 0) {
+                        topic_offsets.emplace(topic_key, stored_offset);
+                    }
                 }
+                stats.topics_reset += 1;
                 reset_ok = true;
                 break;
             } catch (const std::exception& ex) {

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -52,6 +53,48 @@ using kafka_apply_detail::filter_new_event_ids;
 using kafka_apply_detail::parse_kafka_payload;
 using kafka_apply_detail::record_dropped_unrecoverable;
 using kafka_apply_detail::record_quiet_table_batch_stats;
+
+// #region agent log
+void agent_debug_log_wrong_worker_skip(
+    int worker_id,
+    int worker_count,
+    const std::string& schema,
+    const std::string& table,
+    const std::string& topic,
+    int partition,
+    long long offset) {
+    const char* log_path = std::getenv("DATASYNC_DEBUG_LOG");
+    if (!log_path || !log_path[0]) {
+        log_path = "/home/iks/Projects/DataSync/.cursor/debug-e0d3ad.log";
+    }
+    try {
+        std::ofstream f(log_path, std::ios::app);
+        if (!f) {
+            return;
+        }
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        const json line = {
+            {"sessionId", "e0d3ad"},
+            {"hypothesisId", "H6"},
+            {"location", "kafka_apply_native.cpp:wrong_worker_skip"},
+            {"message", "kafka message skipped: table not in worker wanted set"},
+            {"data",
+             {{"worker_id", worker_id},
+              {"worker_count", worker_count},
+              {"source_schema", schema},
+              {"source_table", table},
+              {"topic", topic},
+              {"partition", partition},
+              {"offset", offset}}},
+            {"timestamp", now_ms},
+        };
+        f << line.dump() << '\n';
+    } catch (...) {
+    }
+}
+// #endregion
 
 struct KafkaApplyContext {
     PGconn* log_pg{nullptr};
@@ -1066,7 +1109,9 @@ void maybe_purge_kafka_consumed_logs(
     const std::string& conn_id,
     const std::optional<std::string>& service_tier,
     const std::string& batch_id,
-    const std::string& bootstrap) {
+    const std::string& bootstrap,
+    int worker_id,
+    int worker_count) {
     runtime.reload(log_pg);
     if (!runtime.get_bool("kafka_purge_consumed_enabled", true, "cdc_kafka_apply", conn_id)) {
         return;
@@ -1079,7 +1124,7 @@ void maybe_purge_kafka_consumed_logs(
         "kafka_purge_consumed_min_deletable_offsets", 1000, "cdc_kafka_apply", conn_id));
 
     const std::string tier = service_tier.value_or("");
-    const std::string throttle_key = conn_id + "|" + tier;
+    const std::string throttle_key = conn_id + "|" + tier + "|w" + std::to_string(worker_id);
     const auto now = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(g_kafka_purge_mu);
@@ -1093,7 +1138,8 @@ void maybe_purge_kafka_consumed_logs(
         g_kafka_purge_last[throttle_key] = now;
     }
 
-    const std::string consumer_group = kafka_apply_consumer_group(runtime, log_pg, conn_id, tier);
+    const std::string consumer_group =
+        kafka_apply_consumer_group(runtime, log_pg, conn_id, tier, worker_id, worker_count);
     const std::string topic_prefix = topic_prefix_for_conn(conn_id);
     try {
         const KafkaPurgeConsumedResult purged = purge_kafka_consumed_logs(
@@ -1188,8 +1234,14 @@ int run_kafka_apply_native_cli(
 
     const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
     const std::string bootstrap = kafka.bootstrap;
+    if (worker_count <= 0) {
+        worker_count = runtime.get_int("apply_worker_count", 1, "cdc_kafka_apply", conn_id);
+    }
+    if (worker_count <= 0) {
+        worker_count = 1;
+    }
     const std::string consumer_group =
-        kafka_apply_consumer_group(runtime, log_pg, conn_id, service_tier.value_or(""));
+        kafka_apply_consumer_group(runtime, log_pg, conn_id, service_tier.value_or(""), worker_id, worker_count);
     const std::string topic_prefix = topic_prefix_for_conn(conn_id);
     const std::string topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_apply", conn_id);
     const int topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_apply", conn_id);
@@ -1239,13 +1291,6 @@ int run_kafka_apply_native_cli(
             ? runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mongo_capture", conn_id)
             : runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_capture", conn_id);
 
-    if (worker_count <= 0) {
-        worker_count = runtime.get_int("apply_worker_count", 1, "cdc_kafka_apply", conn_id);
-    }
-    if (worker_count <= 0) {
-        worker_count = 1;
-    }
-
     std::map<TableKey, CatalogMeta> meta_by_key;
     fetch_catalog_tables(app_pg.raw, conn_id, service_tier, worker_id, worker_count, meta_by_key, db_engine);
     if (meta_by_key.empty()) {
@@ -1274,6 +1319,8 @@ int run_kafka_apply_native_cli(
             {"tier", service_tier.value_or("")},
             {"db_engine", db_engine},
             {"table_count", static_cast<int>(meta_by_key.size())},
+            {"worker_id", worker_id},
+            {"worker_count", worker_count},
             {"kafka_bootstrap", bootstrap},
             {"kafka_bootstrap_source", kafka.source},
             {"consumer_group", consumer_group},
@@ -1466,6 +1513,7 @@ int run_kafka_apply_native_cli(
     bool memory_backpressure_logged = false;
     bool first_kafka_message_logged = false;
     long long kafka_poll_progress_last = 0;
+    int wrong_worker_skip_logs = 0;
     std::map<std::pair<std::string, int>, long long> skipped_parse_offsets;
     std::vector<ApplyEvent> pending_batch;
     HostMetricsSampler host_sampler;
@@ -1823,7 +1871,17 @@ int run_kafka_apply_native_cli(
                 }
             }
             const TableKey key{schema_name, table_name};
-            if (!wanted.count(key) || quarantined.count(key)) {
+            if (!wanted.count(key)) {
+                if (!schema_name.empty() && !table_name.empty() && wrong_worker_skip_logs < 20) {
+                    // #region agent log
+                    agent_debug_log_wrong_worker_skip(
+                        worker_id, worker_count, schema_name, table_name, topic, partition, offset);
+                    // #endregion
+                    wrong_worker_skip_logs += 1;
+                }
+                continue;
+            }
+            if (quarantined.count(key)) {
                 continue;
             }
             ApplyEvent event;
@@ -2088,7 +2146,7 @@ int run_kafka_apply_native_cli(
     }
 
     maybe_purge_kafka_consumed_logs(
-        log_pg, runtime, conn_id, service_tier, batch_id, bootstrap);
+        log_pg, runtime, conn_id, service_tier, batch_id, bootstrap, worker_id, worker_count);
 
     rd_kafka_consumer_close(rk);
     delete static_cast<KafkaApplyContext*>(rd_kafka_opaque(rk));

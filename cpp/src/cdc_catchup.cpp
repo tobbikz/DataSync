@@ -198,7 +198,11 @@ CatchupResult run_table_catchup(
     if (!tier_lock || !tier_lock->holds()) {
         throw std::runtime_error("catchup skipped: tier full-load lock held");
     }
-    const std::string consumer_group = kafka_apply_consumer_group(runtime, log_pg, conn_id, svc_tier);
+    const int apply_worker_count = runtime.get_int("apply_worker_count", 1, "cdc_kafka_apply", conn_id);
+    const int effective_workers = apply_worker_count > 0 ? apply_worker_count : 1;
+    const int table_worker = catalog_apply_worker_id(pos.catalog_id, effective_workers);
+    const std::string consumer_group = kafka_apply_consumer_group(
+        runtime, log_pg, conn_id, svc_tier, table_worker, effective_workers);
     const std::optional<std::string> conn_filter = conn_id;
 
 #ifdef HAVE_RDKAFKA
@@ -303,7 +307,7 @@ std::vector<CatchupCandidate> find_catchup_candidates(
         R"(
         SELECT c.source_schema, c.source_table, ap.last_applied_at::text,
                ap.apply_lag_seconds, ap.status::text, ap.kafka_topic, ap.kafka_partition,
-               c.service_tier::text
+               c.service_tier::text, c.catalog_id
         FROM cdc_catalog.catalog c
         JOIN cdc_catalog.apply_position ap ON ap.catalog_id = c.catalog_id
         WHERE c.conn_id = $1
@@ -328,6 +332,9 @@ std::vector<CatchupCandidate> find_catchup_candidates(
         return candidates;
     }
 
+    const int apply_worker_count = runtime.get_int("apply_worker_count", 1, "cdc_kafka_apply", conn_id);
+    const int effective_workers = apply_worker_count > 0 ? apply_worker_count : 1;
+
     for (int i = 0; i < PQntuples(res); ++i) {
         const char* status = PQgetvalue(res, i, 4);
         if (status && std::string(status) == "quarantined") {
@@ -341,7 +348,11 @@ std::vector<CatchupCandidate> find_catchup_candidates(
         const std::string topic = PQgetvalue(res, i, 5) ? PQgetvalue(res, i, 5) : "";
         const int partition = PQgetisnull(res, i, 6) ? 0 : std::stoi(PQgetvalue(res, i, 6));
         const std::string table_tier = PQgetvalue(res, i, 7) ? PQgetvalue(res, i, 7) : "";
-        const std::string consumer_group = kafka_apply_consumer_group(runtime, log_pg, conn_id, table_tier);
+        const long long catalog_id = PQgetisnull(res, i, 8) ? 0 : std::atoll(PQgetvalue(res, i, 8));
+        const int table_worker =
+            catalog_apply_worker_id(catalog_id, effective_workers);
+        const std::string consumer_group = kafka_apply_consumer_group(
+            runtime, log_pg, conn_id, table_tier, table_worker, effective_workers);
 
 #ifdef HAVE_RDKAFKA
         long long kafka_lag = 0;

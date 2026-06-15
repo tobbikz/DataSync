@@ -113,11 +113,16 @@ void log_cdc_skip_no_tables(
     const std::string& db_engine);
 
 // Per-tier suffix avoids Kafka consumer group rebalance when daemon runs tiers in parallel.
+// When apply_worker_count > 1, append -w{N} so each worker owns independent Kafka offsets.
 std::string kafka_apply_consumer_group(
     RuntimeConfig& runtime,
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& tier);
+    const std::string& tier,
+    int worker_id = 0,
+    int worker_count = 1);
+
+int catalog_apply_worker_id(long long catalog_id, int worker_count);
 
 std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
     PGconn* pg,
