@@ -50,6 +50,7 @@ using kafka_apply_detail::fill_table_key_from_event_id;
 using kafka_apply_detail::resolve_event_lake_key_from_catalog;
 using kafka_apply_detail::filter_new_event_ids;
 using kafka_apply_detail::parse_kafka_payload;
+using kafka_apply_detail::record_dropped_unrecoverable;
 using kafka_apply_detail::record_quiet_table_batch_stats;
 
 struct KafkaApplyContext {
@@ -802,6 +803,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
     std::map<TableKey, int>& applied_by_table,
     const std::map<TableKey, int>& seen_by_table,
     const std::map<TableKey, int>& parse_skipped_by_table,
+    std::map<TableKey, int>* dropped_unrecoverable_by_table,
     const std::map<TableKey, CatalogMeta>& meta_by_key,
     const std::string& source_system = "MariaDB",
     const std::string& db_engine = "mariadb",
@@ -906,6 +908,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
             options.slice_table_state[state_key].dedup_skipped += skipped;
         }
         options.parse_skipped_by_table = &parse_skipped_by_table;
+        options.dropped_unrecoverable_by_table = dropped_unrecoverable_by_table;
         std::map<std::string, std::tuple<std::string, int, long long>> last_kafka_by_state;
         for (const auto& e : to_apply) {
             const TableKey lake_key{e.schema_name, e.table_name};
@@ -961,6 +964,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
                 }
                 if (e.schema_name.empty() || e.table_name.empty()) {
                     dropped_unrecoverable += 1;
+                    record_dropped_unrecoverable(app_pg, e, dropped_unrecoverable_by_table);
                     continue;
                 }
                 pending.push_back(std::move(e));
@@ -1446,6 +1450,7 @@ int run_kafka_apply_native_cli(
     std::map<TableKey, int> seen_by_table;
     std::map<TableKey, int> applied_by_table;
     std::map<TableKey, int> parse_skipped_by_table;
+    std::map<TableKey, int> dropped_unrecoverable_by_table;
     std::map<TableKey, bool> met;
     std::map<std::pair<std::string, int>, long long> last_offsets;
 
@@ -1493,6 +1498,7 @@ int run_kafka_apply_native_cli(
                     applied_by_table,
                     seen_by_table,
                     parse_skipped_by_table,
+                    &dropped_unrecoverable_by_table,
                     meta_by_key,
                     source_system,
                     db_engine,

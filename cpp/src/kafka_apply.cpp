@@ -34,6 +34,7 @@
 namespace kafka_apply_detail {
 
 using json = nlohmann::json;
+using TableKey = std::pair<std::string, std::string>;
 
 struct TableBatchMeta {
     long long catalog_id{0};
@@ -1330,6 +1331,7 @@ json apply_events_batch(
         }
         if (e.schema_name.empty() || e.table_name.empty()) {
             dropped_unrecoverable += 1;
+            record_dropped_unrecoverable(app_pg, e, options.dropped_unrecoverable_by_table);
             continue;
         }
         by_table[{e.schema_name, e.table_name}].push_back(std::move(e));
@@ -1710,6 +1712,13 @@ json apply_events_batch(
                     const auto ps_it = options.parse_skipped_by_table->find(pk);
                     if (ps_it != options.parse_skipped_by_table->end()) {
                         metrics.parse_skipped = ps_it->second;
+                    }
+                }
+                if (options.dropped_unrecoverable_by_table) {
+                    const TableKey pk{meta.catalog_source_schema, meta.catalog_source_table};
+                    const auto dr_it = options.dropped_unrecoverable_by_table->find(pk);
+                    if (dr_it != options.dropped_unrecoverable_by_table->end()) {
+                        metrics.dropped_unrecoverable = dr_it->second;
                     }
                 }
                 update_apply_position(

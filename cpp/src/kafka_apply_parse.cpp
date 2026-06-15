@@ -399,4 +399,61 @@ bool resolve_event_lake_key_from_catalog(
     return !event.schema_name.empty() && !event.table_name.empty();
 }
 
+void record_dropped_unrecoverable(
+    PGconn* pg,
+    const ApplyEvent& event,
+    std::map<std::pair<std::string, std::string>, int>* by_table) {
+    if (!by_table) {
+        return;
+    }
+    std::string source_schema;
+    std::string source_table;
+    if (event.catalog_id > 0 && pg) {
+        const std::string cid = std::to_string(event.catalog_id);
+        const char* vals[] = {cid.c_str()};
+        PGresult* res = PQexecParams(
+            pg,
+            "SELECT source_schema, source_table FROM cdc_catalog.catalog WHERE catalog_id = $1::bigint",
+            1,
+            nullptr,
+            vals,
+            nullptr,
+            nullptr,
+            0);
+        if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+            const char* ss = PQgetvalue(res, 0, 0);
+            const char* st = PQgetvalue(res, 0, 1);
+            source_schema = ss ? ss : "";
+            source_table = st ? st : "";
+        }
+        if (res) {
+            PQclear(res);
+        }
+    }
+    if (source_schema.empty() || source_table.empty()) {
+        if (event.event_id.empty()) {
+            return;
+        }
+        const std::size_t first = event.event_id.find('|');
+        if (first == std::string::npos) {
+            return;
+        }
+        const std::size_t second = event.event_id.find('|', first + 1);
+        if (second == std::string::npos || second <= first + 1) {
+            return;
+        }
+        const std::string dotted = event.event_id.substr(first + 1, second - first - 1);
+        const std::size_t dot = dotted.find('.');
+        if (dot == std::string::npos || dot == 0 || dot + 1 >= dotted.size()) {
+            return;
+        }
+        source_schema = dotted.substr(0, dot);
+        source_table = dotted.substr(dot + 1);
+    }
+    if (source_schema.empty() || source_table.empty()) {
+        return;
+    }
+    (*by_table)[{source_schema, source_table}] += 1;
+}
+
 }  // namespace kafka_apply_detail

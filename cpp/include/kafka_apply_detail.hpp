@@ -53,6 +53,8 @@ struct ApplyBatchOptions {
     int* table_errors_out{nullptr};
     /** Optional: per-table parse_skipped count from main loop. */
     const std::map<std::pair<std::string, std::string>, int>* parse_skipped_by_table{nullptr};
+    /** Optional: per-table dropped_unrecoverable (mutated by apply_events_batch). */
+    std::map<std::pair<std::string, std::string>, int>* dropped_unrecoverable_by_table{nullptr};
 };
 
 struct QuietTableRef {
@@ -90,6 +92,12 @@ bool resolve_event_lake_key_from_catalog(
     PGconn* pg,
     const std::string& conn_id,
     ApplyEvent& event);
+
+/** Attribute unrecoverable drop to catalog source_schema/source_table when possible. */
+void record_dropped_unrecoverable(
+    PGconn* pg,
+    const ApplyEvent& event,
+    std::map<std::pair<std::string, std::string>, int>* by_table);
 
 std::unordered_set<std::string> filter_new_event_ids(PGconn* pg, const std::vector<std::string>& event_ids);
 

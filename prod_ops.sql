@@ -1573,3 +1573,28 @@ ALTER TABLE cdc_catalog.reconciliation_run
         CHECK (reconcile_mode = ANY (ARRAY['full'::text, 'light'::text]));
 
 COMMENT ON TABLE cdc_catalog.reconciliation_run IS 'One row per cdc_kafka reconcile CLI run (independent of capture/apply daemon). reconcile_mode = full (row count + PK checksum + lag) vs light (row count + lag only).';
+
+-- Migration 004: apply observability columns on existing deployments.
+ALTER TABLE cdc_catalog.apply_batch_stats
+    ADD COLUMN IF NOT EXISTS parse_skipped bigint NOT NULL DEFAULT 0;
+
+ALTER TABLE cdc_catalog.apply_batch_stats
+    ADD COLUMN IF NOT EXISTS dropped_unrecoverable bigint NOT NULL DEFAULT 0;
+
+ALTER TABLE cdc_catalog.cdc_run_fairness_metrics
+    ADD COLUMN IF NOT EXISTS parse_skipped bigint NOT NULL DEFAULT 0;
+
+ALTER TABLE cdc_catalog.cdc_run_fairness_metrics
+    ADD COLUMN IF NOT EXISTS dropped_unrecoverable bigint NOT NULL DEFAULT 0;
+
+COMMENT ON COLUMN cdc_catalog.apply_batch_stats.parse_skipped IS
+    'Kafka messages skipped due to JSON/payload parse failure in apply slice (per table batch)';
+
+COMMENT ON COLUMN cdc_catalog.apply_batch_stats.dropped_unrecoverable IS
+    'Events dropped because lake schema/table could not be resolved (per table batch)';
+
+COMMENT ON COLUMN cdc_catalog.cdc_run_fairness_metrics.parse_skipped IS
+    'Total Kafka messages skipped due to parse failure in apply slice';
+
+COMMENT ON COLUMN cdc_catalog.cdc_run_fairness_metrics.dropped_unrecoverable IS
+    'Total events dropped as unrecoverable in apply slice';
