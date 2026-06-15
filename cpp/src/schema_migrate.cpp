@@ -231,7 +231,16 @@ int run_schema_migrate(PGconn* log_pg, PGconn* lake_pg, const SchemaMigrateOptio
             .message = "migrate applying incremental",
         });
         exec_sql_section(log_pg, prod_ops_embedded::datasync_incremental(), "datasync_incremental");
-        exec_sql_section(log_pg, prod_ops_embedded::monitoring_views(), "monitoring_views");
+        try {
+            exec_sql_section(log_pg, prod_ops_embedded::monitoring_views(), "monitoring_views");
+        } catch (const std::exception& ex) {
+            log_write(log_pg, {
+                .level = LogLevel::Warning,
+                .component = "catalog",
+                .message = "monitoring_views failed (non-fatal)",
+                .context = {{"error", ex.what()}},
+            });
+        }
         steps += 1;
         log_write(log_pg, {
             .level = LogLevel::Info,

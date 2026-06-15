@@ -1551,7 +1551,13 @@ END $$;
     }
     inline std::string_view monitoring_views() {
         return R"PO_monitoring_v(
-CREATE OR REPLACE VIEW cdc_catalog.v_apply_latest AS
+-- Drop dependent views first (CREATE OR REPLACE cannot rename columns e.g. service_tier -> events_total).
+DROP VIEW IF EXISTS cdc_catalog.v_kafka_consumer;
+DROP VIEW IF EXISTS cdc_catalog.v_apply_latest;
+DROP VIEW IF EXISTS cdc_catalog.v_apply_stale;
+DROP VIEW IF EXISTS cdc_catalog.v_cdc_pipeline_summary;
+
+CREATE VIEW cdc_catalog.v_apply_latest AS
 SELECT DISTINCT ON (conn_id, source_schema, source_table)
     stat_id,
     batch_id,
@@ -1580,7 +1586,7 @@ SELECT DISTINCT ON (conn_id, source_schema, source_table)
 FROM cdc_catalog.apply_batch_stats
 ORDER BY conn_id, source_schema, source_table, logged_at DESC;
 
-CREATE OR REPLACE VIEW cdc_catalog.v_kafka_consumer AS
+CREATE VIEW cdc_catalog.v_kafka_consumer AS
 SELECT
     ap.conn_id,
     ap.source_schema,
