@@ -20,6 +20,8 @@
 #include <thread>
 #include <vector>
 
+#include "schema_migrate.hpp"
+
 namespace {
 
 AppConfig snapshot_app_config(const AppConfig& cfg);
@@ -480,6 +482,25 @@ std::vector<std::string> wait_for_daemon_connections(PGconn* log_pg, AppConfig& 
     return conn_ids;
 }
 
+void run_daemon_incremental_migrate(PGconn* log_pg) {
+    if (!catalog_schema_exists(log_pg)) {
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_daemon",
+            .message = "daemon schema migrate skipped: cdc_catalog missing",
+        });
+        return;
+    }
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_daemon",
+        .message = "daemon schema migrate started",
+    });
+    SchemaMigrateOptions opts;
+    opts.incremental = true;
+    (void)run_schema_migrate(log_pg, nullptr, opts);
+}
+
 }  // namespace
 
 int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
@@ -490,6 +511,18 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+
+    try {
+        run_daemon_incremental_migrate(log_pg);
+    } catch (const std::exception& ex) {
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_daemon",
+            .message = "daemon schema migrate failed",
+            .context = {{"error", ex.what()}},
+        });
+        return 1;
+    }
 
     RuntimeConfig runtime;
     runtime.reload(log_pg);
