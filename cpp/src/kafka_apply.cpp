@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -473,6 +474,66 @@ std::vector<std::string> split_pk(const std::string& pk_columns) {
     }
     return out;
 }
+
+/** Source/business PK from catalog — excludes lake-only _dl_* columns (e.g. _dl_load_timestamp). */
+std::vector<std::string> business_pk_cols(const TableBatchMeta& meta) {
+    auto cols = split_pk(meta.pk_columns);
+    if (!cols.empty()) {
+        return cols;
+    }
+    for (const auto& col : meta.lake_pk) {
+        if (col.rfind("_dl_", 0) != 0) {
+            cols.push_back(col);
+        }
+    }
+    return cols;
+}
+
+// #region agent log
+void agent_debug_log_apply_pk(
+    const char* location,
+    const char* hypothesis_id,
+    long long catalog_id,
+    const std::vector<std::string>& check_pk,
+    const std::vector<std::string>& lake_pk,
+    const nlohmann::json& row_sample) {
+    const char* log_path = std::getenv("DATASYNC_DEBUG_LOG");
+    if (!log_path || !log_path[0]) {
+        log_path = "/home/iks/Projects/DataSync/.cursor/debug-e0d3ad.log";
+    }
+    try {
+        std::ofstream f(log_path, std::ios::app);
+        if (!f) {
+            return;
+        }
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        nlohmann::json check_arr = nlohmann::json::array();
+        for (const auto& c : check_pk) {
+            check_arr.push_back(c);
+        }
+        nlohmann::json lake_arr = nlohmann::json::array();
+        for (const auto& c : lake_pk) {
+            lake_arr.push_back(c);
+        }
+        const nlohmann::json line = {
+            {"sessionId", "e0d3ad"},
+            {"hypothesisId", hypothesis_id},
+            {"location", location},
+            {"message", "apply pk validation"},
+            {"catalog_id", catalog_id},
+            {"data",
+             {{"business_pk", check_arr},
+              {"lake_pk", lake_arr},
+              {"row_keys_sample", row_sample}}},
+            {"timestamp", now_ms},
+        };
+        f << line.dump() << '\n';
+    } catch (...) {
+    }
+}
+// #endregion
 
 std::vector<std::string> fetch_lake_pk(PGconn* pg, const std::string& schema, const std::string& table) {
     const char* vals[] = {schema.c_str(), table.c_str()};
@@ -1108,14 +1169,8 @@ long long apply_table_batch(
     const std::string fq = pg_ident(meta.schema_name) + "." + pg_ident(meta.table_name);
     ensure_partitions(pg, meta.schema_name, meta.table_name);
     const auto lake_pk_cols = meta.lake_pk.empty() ? split_pk(meta.pk_columns) : meta.lake_pk;
-    auto delete_pk_cols = split_pk(meta.pk_columns);
-    if (delete_pk_cols.empty()) {
-        for (const auto& col : lake_pk_cols) {
-            if (col.rfind("_dl_", 0) != 0) {
-                delete_pk_cols.push_back(col);
-            }
-        }
-    }
+    const auto business_pk = business_pk_cols(meta);
+    auto delete_pk_cols = business_pk;
 
     int skipped_missing_pk_deletes = 0;
     if (!deletes.empty() && !delete_pk_cols.empty()) {
@@ -1227,7 +1282,7 @@ long long apply_table_batch(
     int skipped_missing_pk = 0;
     for (const auto& e : upserts) {
         bool missing_pk = false;
-        for (const auto& pk_col : lake_pk_cols) {
+        for (const auto& pk_col : business_pk) {
             const json* pk_val = e.row.contains(pk_col) ? &e.row[pk_col] : nullptr;
             if (!pk_val || pk_val->is_null()) {
                 missing_pk = true;
@@ -1236,6 +1291,19 @@ long long apply_table_batch(
         }
         if (missing_pk) {
             skipped_missing_pk += 1;
+            if (skipped_missing_pk <= 3) {
+                nlohmann::json row_keys = nlohmann::json::array();
+                for (auto it = e.row.begin(); it != e.row.end(); ++it) {
+                    row_keys.push_back(it.key());
+                }
+                agent_debug_log_apply_pk(
+                    "apply_table_batch:upsert_skip",
+                    "H1",
+                    meta.catalog_id,
+                    business_pk,
+                    lake_pk_cols,
+                    row_keys);
+            }
             continue;
         }
         const std::string row_ts = unique_load_timestamptz(e.ts_ms, row_index++);
@@ -1521,9 +1589,7 @@ json apply_events_batch(
             continue;
         }
 
-        if (meta.lake_pk.empty()) {
-            meta.lake_pk = split_pk(meta.pk_columns);
-        }
+        const auto business_pk = business_pk_cols(meta);
 
         std::vector<ApplyEvent> upserts;
         std::vector<ApplyEvent> deletes;
@@ -1537,12 +1603,12 @@ json apply_events_batch(
 
         int skipped_missing_pk = 0;
         int skipped_missing_pk_deletes = 0;
-        if (!meta.lake_pk.empty()) {
+        if (!business_pk.empty()) {
             std::vector<ApplyEvent> valid_upserts;
             valid_upserts.reserve(upserts.size());
             for (auto& e : upserts) {
                 bool missing_pk = false;
-                for (const auto& pk_col : meta.lake_pk) {
+                for (const auto& pk_col : business_pk) {
                     const json* pk_val = e.row.contains(pk_col) ? &e.row[pk_col] : nullptr;
                     if (!pk_val || pk_val->is_null()) {
                         missing_pk = true;
@@ -1551,6 +1617,19 @@ json apply_events_batch(
                 }
                 if (missing_pk) {
                     skipped_missing_pk += 1;
+                    if (skipped_missing_pk <= 3) {
+                        nlohmann::json row_keys = nlohmann::json::array();
+                        for (auto it = e.row.begin(); it != e.row.end(); ++it) {
+                            row_keys.push_back(it.key());
+                        }
+                        agent_debug_log_apply_pk(
+                            "apply_events_batch:upsert_skip",
+                            "H1",
+                            meta.catalog_id,
+                            business_pk,
+                            meta.lake_pk,
+                            row_keys);
+                    }
                 } else {
                     valid_upserts.push_back(std::move(e));
                 }
@@ -1560,7 +1639,7 @@ json apply_events_batch(
             valid_deletes.reserve(deletes.size());
             for (auto& e : deletes) {
                 bool missing_pk = false;
-                for (const auto& pk_col : meta.lake_pk) {
+                for (const auto& pk_col : business_pk) {
                     const json* pk_val = e.row.contains(pk_col) ? &e.row[pk_col] : nullptr;
                     if (!pk_val || pk_val->is_null()) {
                         missing_pk = true;
