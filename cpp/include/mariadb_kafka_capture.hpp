@@ -22,7 +22,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::string& batch_id,
     int worker_id = 0,
     int worker_count = 1);

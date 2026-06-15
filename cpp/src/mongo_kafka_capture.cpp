@@ -180,7 +180,6 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::string& batch_id,
     int worker_id,
     int worker_count) {
@@ -190,6 +189,16 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
 
     const MongoSource* source = find_mongo_source(cfg, conn_id);
     if (!source) {
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_kafka_mongo_capture",
+            .message = "mongodb connect failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"reason", "source not found in config"}},
+        });
         throw std::runtime_error("MongoDB source not found: " + conn_id);
     }
 
@@ -197,7 +206,7 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
     runtime.reload(log_pg);
     const CaptureRuntimeConfig rcfg =
         load_mongo_capture_runtime(runtime, log_pg, conn_id, &cfg.cdc);
-    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_kafka_mongo_capture",
@@ -207,18 +216,17 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
         .context = {
-            {"tier", service_tier.value_or("all")},
             {"kafka_bootstrap", kafka.bootstrap},
             {"kafka_bootstrap_source", kafka.source},
             {"topic_prefix", rcfg.topic_prefix},
         },
     });
     const auto collections =
-        fetch_capture_catalog_tables(log_pg, conn_id, service_tier, worker_id, worker_count, "mongodb");
-    clear_stale_cdc_in_progress(log_pg, conn_id, service_tier, "mongodb");
+        fetch_capture_catalog_tables(log_pg, conn_id, worker_id, worker_count, "mongodb");
+    clear_stale_cdc_in_progress(log_pg, conn_id, "mongodb");
     if (collections.empty()) {
         log_cdc_skip_no_tables(
-            log_pg, "cdc_kafka_mongo_capture", "capture", batch_id, conn_id, service_tier, "mongodb");
+            log_pg, "cdc_kafka_mongo_capture", "capture", batch_id, conn_id, "mongodb");
         return stats;
     }
 
@@ -536,7 +544,6 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
             {"changes_read", changes_read},
             {"collections", stats.collections},
             {"duration_ms", stats.duration_ms},
-            {"tier", service_tier.value_or("all")},
         },
     });
 
@@ -584,7 +591,6 @@ int seed_mongo_cdc_resume_for_conn(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::string& batch_id) {
     const MongoSource* source = find_mongo_source(cfg, conn_id);
     if (!source) {
@@ -600,12 +606,6 @@ int seed_mongo_cdc_resume_for_conn(
           AND cdc_enabled = true
     )";
     std::vector<const char*> vals = {conn_id.c_str()};
-    std::string tier_val;
-    if (service_tier && !service_tier->empty()) {
-        sql += " AND service_tier::text = lower($2)";
-        tier_val = *service_tier;
-        vals.push_back(tier_val.c_str());
-    }
 
     PGresult* res = PQexecParams(
         log_pg,

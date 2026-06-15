@@ -13,6 +13,7 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
+#include "pipeline_defaults.hpp"
 
 #ifdef HAVE_FREETDS
 #include "mssql_conn.hpp"
@@ -46,18 +47,6 @@ void on_reconcile_signal(int) {
     g_reconcile_shutdown.store(true);
 }
 
-double runtime_double(RuntimeConfig& runtime, const char* key, double default_value, const std::string& conn_id) {
-    const std::string raw = runtime.get_string(key, "", "cdc_kafka_reconcile", conn_id);
-    if (raw.empty()) {
-        return default_value;
-    }
-    try {
-        return std::stod(raw);
-    } catch (...) {
-        return default_value;
-    }
-}
-
 struct ReconcileRuntime {
     int row_abs_tolerance{50};
     double row_pct_tolerance{0.01};
@@ -71,8 +60,6 @@ struct ReconcileRuntime {
     int max_tables{0};
     bool enabled{true};
     int interval_hours{4};
-    std::string mode{"auto"};
-    int full_interval_hours{24};
     long long kafka_lag_warn{100};
     long long kafka_lag_fail{10000};
     int capture_lag_warn_seconds{300};
@@ -83,32 +70,27 @@ struct ReconcileRuntime {
 ReconcileRuntime load_reconcile_runtime(RuntimeConfig& runtime, PGconn* pg, const std::string& conn_id) {
     runtime.reload(pg);
     ReconcileRuntime cfg;
-    cfg.row_abs_tolerance = runtime.get_int("reconcile_row_abs_tolerance", 50, "cdc_kafka_reconcile", conn_id);
-    cfg.row_pct_tolerance = runtime_double(runtime, "reconcile_row_pct_tolerance", 0.01, conn_id);
-    cfg.row_warn_abs_tolerance = runtime.get_int("reconcile_row_warn_abs_tolerance", 10, "cdc_kafka_reconcile", conn_id);
-    cfg.row_warn_pct_tolerance = runtime_double(runtime, "reconcile_row_warn_pct_tolerance", 0.005, conn_id);
-    cfg.large_table_min_rows =
-        runtime.get_int("reconcile_large_table_min_rows", 100000, "cdc_kafka_reconcile", conn_id);
-    cfg.large_table_abs_cap = runtime.get_int("reconcile_large_table_abs_cap", 5000, "cdc_kafka_reconcile", conn_id);
-    cfg.apply_lag_warn_seconds =
-        runtime.get_int("reconcile_apply_lag_warn_seconds", 600, "cdc_kafka_reconcile", conn_id);
-    cfg.apply_lag_fail_seconds =
-        runtime.get_int("reconcile_apply_lag_fail_seconds", 1800, "cdc_kafka_reconcile", conn_id);
-    cfg.pk_sample_size = runtime.get_int("reconcile_pk_sample_size", 100, "cdc_kafka_reconcile", conn_id);
-    cfg.max_tables = runtime.get_int("reconcile_max_tables", 0, "cdc_kafka_reconcile", conn_id);
-    cfg.enabled = runtime.get_bool("reconcile_enabled", true, "cdc_kafka_reconcile", conn_id);
-    cfg.interval_hours = runtime.get_int("reconcile_interval_hours", 4, "cdc_kafka_reconcile", conn_id);
-    cfg.mode = runtime.get_string("reconcile_mode", "auto", "cdc_kafka_reconcile", conn_id);
-    cfg.full_interval_hours =
-        runtime.get_int("reconcile_full_interval_hours", 4, "cdc_kafka_reconcile", conn_id);
-    cfg.kafka_lag_warn = runtime.get_int("reconcile_kafka_lag_warn", 100, "cdc_kafka_reconcile", conn_id);
-    cfg.kafka_lag_fail = runtime.get_int("reconcile_kafka_lag_fail", 10000, "cdc_kafka_reconcile", conn_id);
-    cfg.capture_lag_warn_seconds =
-        runtime.get_int("reconcile_capture_lag_warn_seconds", 300, "cdc_kafka_reconcile", conn_id);
-    cfg.capture_lag_fail_seconds =
-        runtime.get_int("reconcile_capture_lag_fail_seconds", 900, "cdc_kafka_reconcile", conn_id);
-    cfg.apply_inactive_seconds =
-        runtime.get_int("apply_inactive_seconds", 3600, "cdc_kafka_apply", conn_id);
+    cfg.row_abs_tolerance = pipeline_defaults::kReconcileRowAbsTolerance;
+    cfg.row_pct_tolerance = pipeline_defaults::kReconcileRowPctTolerance;
+    cfg.row_warn_abs_tolerance = pipeline_defaults::kReconcileRowWarnAbsTolerance;
+    cfg.row_warn_pct_tolerance = pipeline_defaults::kReconcileRowWarnPctTolerance;
+    cfg.large_table_min_rows = pipeline_defaults::kReconcileLargeTableMinRows;
+    cfg.large_table_abs_cap = pipeline_defaults::kReconcileLargeTableAbsCap;
+    cfg.apply_lag_warn_seconds = pipeline_defaults::kReconcileApplyLagWarnSeconds;
+    cfg.apply_lag_fail_seconds = pipeline_defaults::kReconcileApplyLagFailSeconds;
+    cfg.pk_sample_size = pipeline_defaults::kReconcilePkSampleSize;
+    cfg.max_tables = pipeline_defaults::kReconcileMaxTables;
+    cfg.enabled = pipeline_defaults::kReconcileEnabled;
+    cfg.interval_hours = runtime.get_int(
+        "reconcile_interval_hours",
+        pipeline_defaults::kReconcileIntervalHoursDefault,
+        "cdc_kafka_reconcile",
+        conn_id);
+    cfg.kafka_lag_warn = pipeline_defaults::kReconcileKafkaLagWarn;
+    cfg.kafka_lag_fail = pipeline_defaults::kReconcileKafkaLagFail;
+    cfg.capture_lag_warn_seconds = pipeline_defaults::kReconcileCaptureLagWarnSeconds;
+    cfg.capture_lag_fail_seconds = pipeline_defaults::kReconcileCaptureLagFailSeconds;
+    cfg.apply_inactive_seconds = pipeline_defaults::kApplyInactiveSeconds;
     return cfg;
 }
 
@@ -122,7 +104,6 @@ struct CatalogReconcileRow {
     std::string lake_schema;
     std::string lake_table;
     std::string pk_columns;
-    std::string service_tier;
 };
 
 std::string mssql_brack(const std::string& name) {
@@ -305,68 +286,16 @@ std::string eval_capture_lag_status(int capture_lag_seconds, const ReconcileRunt
     return "ok";
 }
 
-bool is_full_reconcile_mode(const std::string& mode) {
-    return mode == "full";
-}
-
-std::string resolve_reconcile_mode(
-    RuntimeConfig& runtime,
-    PGconn* pg,
-    const std::string& conn_id,
-    const std::string& tier,
-    const ReconcileRuntime& cfg) {
-    (void)runtime;
-    if (cfg.mode == "full" || cfg.mode == "light") {
-        return cfg.mode;
-    }
-    if (cfg.full_interval_hours <= 0) {
-        return "light";
-    }
-    const char* vals[] = {conn_id.c_str(), tier.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        SELECT extract(epoch FROM (now() - started_at))::bigint AS age_seconds
-        FROM cdc_catalog.reconciliation_run
-        WHERE conn_id = $1
-          AND service_tier = lower($2)
-          AND finished_at IS NOT NULL
-          AND COALESCE(context->>'mode', 'full') = 'full'
-        ORDER BY started_at DESC
-        LIMIT 1
-        )",
-        2,
-        nullptr,
-        vals,
-        nullptr,
-        nullptr,
-        0);
-    long long age_seconds = -1;
-    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-        const char* age_str = PQgetvalue(res, 0, 0);
-        age_seconds = age_str ? std::atoll(age_str) : -1;
-    }
-    if (res) {
-        PQclear(res);
-    }
-    if (age_seconds < 0) {
-        return "full";
-    }
-    return age_seconds >= static_cast<long long>(cfg.full_interval_hours) * 3600LL ? "full" : "light";
-}
-
 std::vector<CatalogReconcileRow> fetch_reconcile_catalog(
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& tier,
     int max_tables) {
     std::ostringstream sql;
     sql << R"(
         SELECT catalog_id, conn_id, db_engine::text, source_database, source_schema, source_table,
-               pk_columns, service_tier::text
+               pk_columns
         FROM cdc_catalog.catalog
         WHERE conn_id = $1
-          AND service_tier::text = lower($2)
           AND active = true
           AND cdc_enabled = true
           AND needs_full_load = false
@@ -378,11 +307,11 @@ std::vector<CatalogReconcileRow> fetch_reconcile_catalog(
         sql << " LIMIT " << max_tables;
     }
 
-    const char* vals[] = {conn_id.c_str(), tier.c_str()};
+    const char* vals[] = {conn_id.c_str()};
     PGresult* res = PQexecParams(
         pg,
         sql.str().c_str(),
-        2,
+        1,
         nullptr,
         vals,
         nullptr,
@@ -405,7 +334,6 @@ std::vector<CatalogReconcileRow> fetch_reconcile_catalog(
         row.source_schema = PQgetvalue(res, i, 4) ? PQgetvalue(res, i, 4) : "";
         row.source_table = PQgetvalue(res, i, 5) ? PQgetvalue(res, i, 5) : "";
         row.pk_columns = PQgetvalue(res, i, 6) ? PQgetvalue(res, i, 6) : "";
-        row.service_tier = PQgetvalue(res, i, 7) ? PQgetvalue(res, i, 7) : "";
         if (row.db_engine == "mongodb") {
             row.source_schema = mongo_catalog_source_schema(row.source_database, row.source_schema);
         }
@@ -685,19 +613,18 @@ long long insert_reconcile_run(
     PGconn* pg,
     const std::string& batch_id,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& reconcile_mode,
     const nlohmann::json& context) {
     const std::string context_json = context.dump();
-    const char* vals[] = {batch_id.c_str(), conn_id.c_str(), tier.c_str(), reconcile_mode.c_str(), context_json.c_str()};
+    const char* vals[] = {batch_id.c_str(), conn_id.c_str(), reconcile_mode.c_str(), context_json.c_str()};
     PGresult* res = PQexecParams(
         pg,
         R"(
-        INSERT INTO cdc_catalog.reconciliation_run (batch_id, conn_id, service_tier, status, reconcile_mode, context)
-        VALUES ($1, $2, $3, 'running', $4, $5::jsonb)
+        INSERT INTO cdc_catalog.reconciliation_run (batch_id, conn_id, status, reconcile_mode, context)
+        VALUES ($1, $2, 'running', $3, $4::jsonb)
         RETURNING run_id
         )",
-        5,
+        4,
         nullptr,
         vals,
         nullptr,
@@ -802,7 +729,6 @@ void insert_reconcile_result(
         row.conn_id.c_str(),
         row.source_schema.c_str(),
         row.source_table.c_str(),
-        row.service_tier.c_str(),
         source_str.empty() ? nullptr : source_str.c_str(),
         lake_str.empty() ? nullptr : lake_str.c_str(),
         delta_str.empty() ? nullptr : delta_str.c_str(),
@@ -815,13 +741,13 @@ void insert_reconcile_result(
         pg,
         R"(
         INSERT INTO cdc_catalog.reconciliation_result (
-            run_id, catalog_id, conn_id, source_schema, source_table, service_tier,
+            run_id, catalog_id, conn_id, source_schema, source_table,
             source_row_count, lake_row_count, row_count_delta, row_count_status,
             apply_lag_seconds, apply_status, status, checks
         ) VALUES (
-            $1::bigint, $2::bigint, $3, $4, $5, $6,
-            NULLIF($7, '')::bigint, NULLIF($8, '')::bigint, NULLIF($9, '')::bigint, $10,
-            NULLIF($11, '')::int, $12, $13, $14::jsonb
+            $1::bigint, $2::bigint, $3, $4, $5,
+            NULLIF($6, '')::bigint, NULLIF($7, '')::bigint, NULLIF($8, '')::bigint, $9,
+            NULLIF($10, '')::int, $11, $12, $13::jsonb
         )
         ON CONFLICT (run_id, source_schema, source_table) DO UPDATE SET
             source_row_count = EXCLUDED.source_row_count,
@@ -833,7 +759,7 @@ void insert_reconcile_result(
             status = EXCLUDED.status,
             checks = EXCLUDED.checks
         )",
-        14,
+        13,
         nullptr,
         vals,
         nullptr,
@@ -844,8 +770,8 @@ void insert_reconcile_result(
     }
 }
 
-int count_stale_tables(PGconn* pg, const std::string& conn_id, const std::string& tier) {
-    const char* vals[] = {conn_id.c_str(), tier.c_str()};
+int count_stale_tables(PGconn* pg, const std::string& conn_id) {
+    const char* vals[] = {conn_id.c_str()};
     PGresult* res = PQexecParams(
         pg,
         R"(
@@ -853,9 +779,8 @@ int count_stale_tables(PGconn* pg, const std::string& conn_id, const std::string
         FROM cdc_catalog.v_apply_stale v
         JOIN cdc_catalog.catalog c ON c.catalog_id = v.catalog_id
         WHERE v.conn_id = $1
-          AND c.service_tier::text = lower($2)
         )",
-        2,
+        1,
         nullptr,
         vals,
         nullptr,
@@ -1101,8 +1026,7 @@ std::optional<bool> pk_checksum_match_mongo(
 int run_reconcile_cli(
     const AppConfig& cfg,
     PGconn* log_pg,
-    const std::string& conn_id,
-    const std::string& tier) {
+    const std::string& conn_id) {
     const std::string batch_id = make_batch_id();
     const std::string db_engine = conn_engine(cfg, conn_id);
 
@@ -1117,7 +1041,7 @@ int run_reconcile_cli(
         .conn_id = conn_id,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"tier", tier}, {"db_engine", db_engine}, {"enabled", rcfg.enabled}, {"mode_config", rcfg.mode}},
+        .context = {{"db_engine", db_engine}, {"enabled", rcfg.enabled}},
     });
 
     if (!rcfg.enabled) {
@@ -1129,25 +1053,23 @@ int run_reconcile_cli(
             .conn_id = conn_id,
             .source_schema = std::nullopt,
             .source_table = std::nullopt,
-            .context = {{"tier", tier}},
         });
         return 0;
     }
 
     const int max_tables = rcfg.max_tables > 0 ? rcfg.max_tables : 0;
-    const auto tables = fetch_reconcile_catalog(log_pg, conn_id, tier, max_tables);
-    const int stale_tables = count_stale_tables(log_pg, conn_id, tier);
-    const std::string reconcile_mode = resolve_reconcile_mode(runtime, log_pg, conn_id, tier, rcfg);
-    const bool full_mode = is_full_reconcile_mode(reconcile_mode);
+    const auto tables = fetch_reconcile_catalog(log_pg, conn_id, max_tables);
+    const int stale_tables = count_stale_tables(log_pg, conn_id);
+    constexpr const char* kReconcileMode = "full";
+    const bool pk_sample = rcfg.pk_sample_size > 0;
 
     const long long run_id = insert_reconcile_run(
         log_pg,
         batch_id,
         conn_id,
-        tier,
-        reconcile_mode,
+        kReconcileMode,
         {{"db_engine", db_engine},
-         {"mode", reconcile_mode},
+         {"mode", kReconcileMode},
          {"tables_planned", static_cast<int>(tables.size())},
          {"stale_tables", stale_tables}});
 
@@ -1155,7 +1077,7 @@ int run_reconcile_cli(
 
 #ifdef HAVE_RDKAFKA
     std::unique_ptr<KafkaLagProbe> kafka_probe;
-    const std::string kafka_bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
+    const std::string kafka_bootstrap = resolve_kafka_bootstrap().bootstrap;
     try {
         kafka_probe = std::make_unique<KafkaLagProbe>(kafka_bootstrap);
     } catch (...) {
@@ -1198,7 +1120,6 @@ int run_reconcile_cli(
     int tables_warn = 0;
     int tables_fail = 0;
     int table_errors = 0;
-    const bool pk_sample = full_mode && rcfg.pk_sample_size > 0;
 
     for (const auto& row : tables) {
         runtime.reload(log_pg);
@@ -1227,7 +1148,7 @@ int run_reconcile_cli(
             std::string overall = status_rank(status_rank(row_status, lag_status), capture_status);
 
             nlohmann::json checks = nlohmann::json::object();
-            checks["reconcile_mode"] = reconcile_mode;
+            checks["reconcile_mode"] = kReconcileMode;
             checks["capture_lag_seconds"] = capture_lag_seconds;
             checks["capture_lag_status"] = capture_status;
             checks["row_count_status"] = row_status;
@@ -1359,7 +1280,7 @@ int run_reconcile_cli(
                     {"apply_lag_status", lag_status},
                     {"capture_lag_seconds", capture_lag_seconds},
                     {"capture_lag_status", capture_status},
-                    {"reconcile_mode", reconcile_mode},
+                    {"reconcile_mode", kReconcileMode},
                     {"kafka_consumer_lag", checks.value("kafka_consumer_lag", nlohmann::json())},
                     {"kafka_lag_status", checks.value("kafka_lag_status", nlohmann::json("skip"))},
                 },
@@ -1395,7 +1316,7 @@ int run_reconcile_cli(
         tables_warn,
         tables_fail,
         stale_tables,
-        {{"table_errors", table_errors}, {"db_engine", db_engine}, {"mode", reconcile_mode}});
+        {{"table_errors", table_errors}, {"db_engine", db_engine}, {"mode", kReconcileMode}});
 
     log_write(log_pg, {
         .level = run_status == "fail" ? LogLevel::Warning : LogLevel::Info,
@@ -1406,9 +1327,8 @@ int run_reconcile_cli(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
         .context = {
-            {"tier", tier},
             {"run_id", run_id},
-            {"mode", reconcile_mode},
+            {"mode", kReconcileMode},
             {"status", run_status},
             {"tables_checked", static_cast<int>(tables.size())},
             {"tables_ok", tables_ok},
@@ -1425,7 +1345,6 @@ int run_reconcile_cli(
 int run_reconcile_loop(
     const AppConfig& cfg,
     PGconn* log_pg,
-    const std::optional<std::string>& tier_filter,
     bool once,
     std::atomic<bool>* external_shutdown) {
     std::atomic<bool>* shutdown = external_shutdown ? external_shutdown : &g_reconcile_shutdown;
@@ -1436,7 +1355,8 @@ int run_reconcile_loop(
 
     RuntimeConfig runtime;
     runtime.reload(log_pg);
-    const int retention_days = runtime.get_int("logs_retention_days", 7, "global");
+    const int retention_days =
+        runtime.get_int("logs_retention_days", pipeline_defaults::kLogsRetentionDaysDefault, "global");
     purge_logs(log_pg, retention_days);
 
     std::vector<std::string> conn_ids;
@@ -1467,62 +1387,19 @@ int run_reconcile_loop(
             if (shutdown->load()) {
                 break;
             }
-            std::string tier = tier_filter.value_or("");
-            if (tier.empty()) {
-                const char* vals[] = {conn_id.c_str()};
-                PGresult* res = PQexecParams(
-                    log_pg,
-                    R"(
-                    SELECT DISTINCT service_tier::text
-                    FROM cdc_catalog.catalog
-                    WHERE conn_id = $1 AND active = true AND cdc_enabled = true
-                    ORDER BY 1
-                    )",
-                    1,
-                    nullptr,
-                    vals,
-                    nullptr,
-                    nullptr,
-                    0);
-                if (res && PQresultStatus(res) == PGRES_TUPLES_OK) {
-                    for (int i = 0; i < PQntuples(res); ++i) {
-                        if (shutdown->load()) {
-                            break;
-                        }
-                        try {
-                            run_reconcile_cli(cfg, log_pg, conn_id, PQgetvalue(res, i, 0));
-                        } catch (const std::exception& ex) {
-                            log_write(log_pg, {
-                                .level = LogLevel::Error,
-                                .component = "reconcile",
-                                .message = "reconcile-loop conn failed",
-                                .batch_id = make_batch_id(),
-                                .conn_id = conn_id,
-                                .source_schema = std::nullopt,
-                                .source_table = std::nullopt,
-                                .context = {{"tier", PQgetvalue(res, i, 0)}, {"error", ex.what()}},
-                            });
-                        }
-                    }
-                }
-                if (res) {
-                    PQclear(res);
-                }
-            } else {
-                try {
-                    run_reconcile_cli(cfg, log_pg, conn_id, tier);
-                } catch (const std::exception& ex) {
-                    log_write(log_pg, {
-                        .level = LogLevel::Error,
-                        .component = "reconcile",
-                        .message = "reconcile-loop conn failed",
-                        .batch_id = make_batch_id(),
-                        .conn_id = conn_id,
-                        .source_schema = std::nullopt,
-                        .source_table = std::nullopt,
-                        .context = {{"tier", tier}, {"error", ex.what()}},
-                    });
-                }
+            try {
+                run_reconcile_cli(cfg, log_pg, conn_id);
+            } catch (const std::exception& ex) {
+                log_write(log_pg, {
+                    .level = LogLevel::Error,
+                    .component = "reconcile",
+                    .message = "reconcile-loop conn failed",
+                    .batch_id = make_batch_id(),
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {{"error", ex.what()}},
+                });
             }
         }
 
@@ -1530,7 +1407,11 @@ int run_reconcile_loop(
             break;
         }
         const int interval_hours =
-            runtime.get_int("reconcile_interval_hours", 4, "cdc_kafka_reconcile", "");
+            runtime.get_int(
+                "reconcile_interval_hours",
+                pipeline_defaults::kReconcileIntervalHoursDefault,
+                "cdc_kafka_reconcile",
+                "");
         const int sleep_sec = std::max(60, interval_hours * 3600);
         for (int i = 0; i < sleep_sec && !shutdown->load(); ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));

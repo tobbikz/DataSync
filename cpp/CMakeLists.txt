@@ -14,7 +14,6 @@ set(DATASYNC_SOURCES
     src/main.cpp
     src/config.cpp
     src/connections.cpp
-    src/service_tiers.cpp
     src/catalog_sync.cpp
     src/mariadb_conn.cpp
     src/mariadb_preflight.cpp
@@ -23,17 +22,15 @@ set(DATASYNC_SOURCES
     src/mariadb_copy_format.cpp
     src/mariadb_ddl_sync.cpp
     src/mariadb_ddl_sync_run.cpp
+    src/full_load_common.cpp
     src/mariadb_full_load.cpp
     src/mariadb_binlog.cpp
     src/mariadb_binlog_cli.cpp
-    src/mariadb_cdc.cpp
     src/kafka_apply.cpp
     src/kafka_apply_parse.cpp
     src/kafka_topics.cpp
     src/kafka_apply_native.cpp
     src/kafka_lag.cpp
-    src/kafka_log_purge.cpp
-    src/host_metrics.cpp
     src/kafka_producer.cpp
     src/cdc_envelope.cpp
     src/capture_common.cpp
@@ -41,7 +38,6 @@ set(DATASYNC_SOURCES
     src/mssql_kafka_capture.cpp
     src/mongo_kafka_capture.cpp
     src/cdc_pre_apply.cpp
-    src/cdc_catchup.cpp
     src/cdc_reconcile.cpp
     src/cdc_daemon.cpp
     src/daemon_full_load.cpp
@@ -50,6 +46,7 @@ set(DATASYNC_SOURCES
     src/mssql_full_load.cpp
     src/mongo_full_load.cpp
     src/runtime_config.cpp
+    src/schema_migrate.cpp
     src/obs_log.cpp
 )
 

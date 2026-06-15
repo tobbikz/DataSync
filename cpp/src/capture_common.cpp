@@ -1,5 +1,7 @@
 #include "capture_common.hpp"
 
+#include "pipeline_defaults.hpp"
+
 #include <atomic>
 #include <cstdlib>
 
@@ -79,7 +81,7 @@ rd_kafka_resp_err_t query_kafka_watermark_offsets_retry(
 
 #endif
 
-KafkaBootstrapResolved resolve_kafka_bootstrap(RuntimeConfig& runtime, const std::string& conn_id) {
+KafkaBootstrapResolved resolve_kafka_bootstrap() {
     KafkaBootstrapResolved out;
     if (const char* env = std::getenv("KAFKA_BOOTSTRAP")) {
         const std::string trimmed(env);
@@ -89,38 +91,18 @@ KafkaBootstrapResolved resolve_kafka_bootstrap(RuntimeConfig& runtime, const std
             return out;
         }
     }
-    const std::string from_runtime =
-        runtime.get_string("kafka_bootstrap_servers", "", "cdc_kafka_apply", conn_id);
-    if (!from_runtime.empty()) {
-        out.bootstrap = from_runtime;
-        out.source = "runtime_config";
-        return out;
-    }
-    out.bootstrap = "localhost:9092";
+    out.bootstrap = std::string(pipeline_defaults::kKafkaBootstrapDefault);
     out.source = "default";
     return out;
 }
 
-int catalog_apply_worker_id(long long catalog_id, int worker_count) {
-    if (worker_count <= 1) {
-        return 0;
-    }
-    return static_cast<int>(catalog_id % worker_count);
-}
-
 std::string kafka_apply_consumer_group(
-    RuntimeConfig& runtime,
-    PGconn* pg,
     const std::string& conn_id,
-    const std::string& tier,
     int worker_id,
     int worker_count) {
-    runtime.reload(pg);
-    std::string group = runtime.get_string("kafka_consumer_group", "datalake-cdc-apply", "cdc_kafka_apply", conn_id);
-    if (!tier.empty()) {
-        group += '-';
-        group += tier;
-    }
+    std::string group(pipeline_defaults::kKafkaConsumerGroupPrefix);
+    group += '-';
+    group += conn_id;
     if (worker_count > 1) {
         group += "-w";
         group += std::to_string(worker_id);
@@ -130,22 +112,15 @@ std::string kafka_apply_consumer_group(
 
 namespace {
 
-int capture_slice_max_seconds(
-    const RuntimeConfig& runtime,
-    const CdcConfig* cdc,
-    const std::string& conn_id,
-    const std::string& component) {
-    const int fallback = (cdc && cdc->slice_max_seconds > 0) ? cdc->slice_max_seconds : 15;
-    return runtime.get_int("capture_max_seconds", fallback, component, conn_id);
+int capture_slice_max_seconds(const CdcConfig* cdc) {
+    return (cdc && cdc->slice_max_seconds > 0) ? cdc->slice_max_seconds : 15;
 }
 
-int capture_slice_max_events(
-    const RuntimeConfig& runtime,
-    const CdcConfig* cdc,
-    const std::string& conn_id,
-    const std::string& component) {
-    const int fallback = (cdc && cdc->slice_max_events > 0) ? static_cast<int>(cdc->slice_max_events) : 10000000;
-    return runtime.get_int("capture_max_events", fallback, component, conn_id);
+int capture_slice_max_events(const CdcConfig* cdc) {
+    if (cdc && cdc->slice_max_events > 0) {
+        return static_cast<int>(cdc->slice_max_events);
+    }
+    return pipeline_defaults::kCaptureMaxEventsDefault;
 }
 
 }  // namespace
@@ -155,25 +130,24 @@ CaptureRuntimeConfig load_mariadb_capture_runtime(
     PGconn* pg,
     const std::string& conn_id,
     const CdcConfig* cdc) {
-    runtime.reload(pg);
+    (void)runtime;
+    (void)pg;
+    (void)conn_id;
     CaptureRuntimeConfig cfg;
-    cfg.max_seconds = capture_slice_max_seconds(runtime, cdc, conn_id, "cdc_kafka_capture");
-    cfg.max_events = capture_slice_max_events(runtime, cdc, conn_id, "cdc_kafka_capture");
+    cfg.max_seconds = capture_slice_max_seconds(cdc);
+    cfg.max_events = capture_slice_max_events(cdc);
     cfg.topic_prefix = topic_prefix_for_conn(conn_id);
-    cfg.topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
-    cfg.topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_capture", conn_id);
-    cfg.bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
-    cfg.linger_ms = runtime.get_int("capture_producer_linger_ms", 5, "cdc_kafka_capture", conn_id);
-    cfg.producer_batch = runtime.get_int("capture_producer_batch_size", 10000, "cdc_kafka_capture", conn_id);
-    cfg.producer_queue_max_messages =
-        runtime.get_int("capture_producer_queue_max_messages", 500000, "cdc_kafka_capture", conn_id);
-    cfg.producer_queue_max_kbytes =
-        runtime.get_int("capture_producer_queue_max_kbytes", 1048576, "cdc_kafka_capture", conn_id);
-    cfg.topic_partitions = runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_capture", conn_id);
-    cfg.idle_poll_seconds = runtime.get_int("capture_idle_poll_seconds", 3, "cdc_kafka_capture", conn_id);
-    cfg.quiet_exit_lagging_chunks =
-        runtime.get_int("capture_quiet_exit_lagging_chunks", 3, "cdc_kafka_capture", conn_id);
-    cfg.heartbeat_seconds = runtime.get_int("capture_heartbeat_seconds", 60, "cdc_kafka_capture", conn_id);
+    cfg.topic_mode = std::string(pipeline_defaults::kKafkaTopicMode);
+    cfg.topic_buckets = pipeline_defaults::kKafkaTopicBuckets;
+    cfg.bootstrap = resolve_kafka_bootstrap().bootstrap;
+    cfg.linger_ms = pipeline_defaults::kCaptureProducerLingerMs;
+    cfg.producer_batch = pipeline_defaults::kCaptureProducerBatchSize;
+    cfg.producer_queue_max_messages = pipeline_defaults::kCaptureProducerQueueMaxMessages;
+    cfg.producer_queue_max_kbytes = pipeline_defaults::kCaptureProducerQueueMaxKbytes;
+    cfg.topic_partitions = pipeline_defaults::kKafkaTopicPartitions;
+    cfg.idle_poll_seconds = pipeline_defaults::kCaptureIdlePollSeconds;
+    cfg.quiet_exit_lagging_chunks = pipeline_defaults::kCaptureQuietExitLaggingChunks;
+    cfg.heartbeat_seconds = pipeline_defaults::kCaptureHeartbeatSeconds;
     return cfg;
 }
 
@@ -182,23 +156,21 @@ CaptureRuntimeConfig load_mssql_capture_runtime(
     PGconn* pg,
     const std::string& conn_id,
     const CdcConfig* cdc) {
-    runtime.reload(pg);
+    (void)runtime;
+    (void)pg;
     CaptureRuntimeConfig cfg;
-    cfg.max_seconds = capture_slice_max_seconds(runtime, cdc, conn_id, "cdc_kafka_mssql_capture");
-    cfg.max_events = capture_slice_max_events(runtime, cdc, conn_id, "cdc_kafka_mssql_capture");
+    cfg.max_seconds = capture_slice_max_seconds(cdc);
+    cfg.max_events = capture_slice_max_events(cdc);
     cfg.topic_prefix = topic_prefix_for_conn(conn_id);
-    cfg.topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
-    cfg.topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_mssql_capture", conn_id);
-    cfg.bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
-    cfg.linger_ms = runtime.get_int("capture_producer_linger_ms", 5, "cdc_kafka_mssql_capture", conn_id);
-    cfg.producer_batch = runtime.get_int("capture_producer_batch_size", 10000, "cdc_kafka_mssql_capture", conn_id);
-    cfg.topic_partitions = runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mssql_capture", conn_id);
-    cfg.idle_poll_seconds =
-        runtime.get_int("capture_idle_poll_seconds", 3, "cdc_kafka_mssql_capture", conn_id);
-    cfg.heartbeat_seconds =
-        runtime.get_int("capture_heartbeat_seconds", 60, "cdc_kafka_mssql_capture", conn_id);
-    cfg.mssql_replay_on_idle =
-        runtime.get_bool("mssql_capture_replay_on_idle", false, "cdc_kafka_mssql_capture", conn_id);
+    cfg.topic_mode = std::string(pipeline_defaults::kKafkaTopicMode);
+    cfg.topic_buckets = pipeline_defaults::kKafkaTopicBuckets;
+    cfg.bootstrap = resolve_kafka_bootstrap().bootstrap;
+    cfg.linger_ms = pipeline_defaults::kCaptureProducerLingerMs;
+    cfg.producer_batch = pipeline_defaults::kCaptureProducerBatchSize;
+    cfg.topic_partitions = pipeline_defaults::kKafkaTopicPartitions;
+    cfg.idle_poll_seconds = pipeline_defaults::kCaptureIdlePollSeconds;
+    cfg.heartbeat_seconds = pipeline_defaults::kCaptureHeartbeatSeconds;
+    cfg.mssql_replay_on_idle = pipeline_defaults::kMssqlCaptureReplayOnIdle;
     return cfg;
 }
 
@@ -207,21 +179,20 @@ CaptureRuntimeConfig load_mongo_capture_runtime(
     PGconn* pg,
     const std::string& conn_id,
     const CdcConfig* cdc) {
-    runtime.reload(pg);
+    (void)runtime;
+    (void)pg;
     CaptureRuntimeConfig cfg;
-    cfg.max_seconds = capture_slice_max_seconds(runtime, cdc, conn_id, "cdc_kafka_mongo_capture");
-    cfg.max_events = capture_slice_max_events(runtime, cdc, conn_id, "cdc_kafka_mongo_capture");
+    cfg.max_seconds = capture_slice_max_seconds(cdc);
+    cfg.max_events = capture_slice_max_events(cdc);
     cfg.topic_prefix = topic_prefix_for_conn(conn_id);
-    cfg.topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
-    cfg.topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_mongo_capture", conn_id);
-    cfg.bootstrap = resolve_kafka_bootstrap(runtime, conn_id).bootstrap;
-    cfg.linger_ms = runtime.get_int("capture_producer_linger_ms", 5, "cdc_kafka_mongo_capture", conn_id);
-    cfg.producer_batch = runtime.get_int("capture_producer_batch_size", 10000, "cdc_kafka_mongo_capture", conn_id);
-    cfg.topic_partitions = runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mongo_capture", conn_id);
-    cfg.idle_poll_seconds =
-        runtime.get_int("capture_idle_poll_seconds", 3, "cdc_kafka_mongo_capture", conn_id);
-    cfg.heartbeat_seconds =
-        runtime.get_int("capture_heartbeat_seconds", 60, "cdc_kafka_mongo_capture", conn_id);
+    cfg.topic_mode = std::string(pipeline_defaults::kKafkaTopicMode);
+    cfg.topic_buckets = pipeline_defaults::kKafkaTopicBuckets;
+    cfg.bootstrap = resolve_kafka_bootstrap().bootstrap;
+    cfg.linger_ms = pipeline_defaults::kCaptureProducerLingerMs;
+    cfg.producer_batch = pipeline_defaults::kCaptureProducerBatchSize;
+    cfg.topic_partitions = pipeline_defaults::kKafkaTopicPartitions;
+    cfg.idle_poll_seconds = pipeline_defaults::kCaptureIdlePollSeconds;
+    cfg.heartbeat_seconds = pipeline_defaults::kCaptureHeartbeatSeconds;
     return cfg;
 }
 
@@ -336,18 +307,21 @@ std::vector<std::string> split_pk_columns(const std::string& pk_columns) {
     return out;
 }
 
-std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
+std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
     PGconn* pg,
     const std::string& conn_id,
-    const std::optional<std::string>& tier,
     int worker_id,
     int worker_count,
-    const std::string& db_engine) {
+    const std::string& db_engine,
+    CatalogPipeline pipeline) {
+    const char* load_filter = (pipeline == CatalogPipeline::Capture)
+        ? "(NOT needs_full_load OR capture_during_full_load = true)"
+        : "needs_full_load = false";
+
     std::ostringstream sql;
     std::vector<const char*> vals;
     vals.push_back(conn_id.c_str());
     int param_count = 1;
-    std::string tier_val;
     std::string worker_count_str;
     std::string worker_id_str;
 
@@ -359,7 +333,7 @@ std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
               AND conn_id = $1
               AND active = true
               AND cdc_enabled = true
-              AND (NOT needs_full_load OR capture_during_full_load = true)
+              AND )" << load_filter << R"(
               AND has_pk = true
               AND status NOT IN ('skipped', 'disabled')
         )";
@@ -371,7 +345,7 @@ std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
               AND conn_id = $1
               AND active = true
               AND cdc_enabled = true
-              AND (NOT needs_full_load OR capture_during_full_load = true)
+              AND )" << load_filter << R"(
               AND has_pk = true
               AND status NOT IN ('skipped', 'disabled')
         )";
@@ -383,17 +357,12 @@ std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
               AND conn_id = $1
               AND active = true
               AND cdc_enabled = true
-              AND (NOT needs_full_load OR capture_during_full_load = true)
+              AND )" << load_filter << R"(
               AND has_pk = true
               AND status NOT IN ('skipped', 'disabled')
         )";
     }
 
-    if (tier && !tier->empty()) {
-        sql << " AND service_tier::text = lower($" << ++param_count << ")";
-        tier_val = *tier;
-        vals.push_back(tier_val.c_str());
-    }
     if (worker_count > 1) {
         const int mod_param = ++param_count;
         const int eq_param = ++param_count;
@@ -420,14 +389,15 @@ std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
         if (res) {
             log_write(pg, {
                 .level = LogLevel::Error,
-                .component = "cdc_kafka_capture",
-                .message = "fetch_capture_catalog_tables query failed",
+                .component = pipeline == CatalogPipeline::Capture ? "cdc_kafka_capture" : "cdc_kafka_apply_cpp",
+                .message = "fetch_conn_catalog_tables query failed",
                 .batch_id = std::nullopt,
                 .conn_id = conn_id,
                 .source_schema = std::nullopt,
                 .source_table = std::nullopt,
                 .context = {
                     {"db_engine", db_engine},
+                    {"pipeline", pipeline == CatalogPipeline::Capture ? "capture" : "apply"},
                     {"error", PQresultErrorMessage(res)},
                 },
             });
@@ -485,16 +455,13 @@ bool engine_meta_has_stream_bookmark(const std::string& engine_meta_text) {
 
 }  // namespace
 
-void ensure_apply_positions_for_tier(
+void ensure_apply_positions_for_conn(
     PGconn* pg,
-    RuntimeConfig& runtime,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& db_engine);
 
 bool seed_stream_capture_bookmark_if_needed(
     PGconn* pg,
-    RuntimeConfig& runtime,
     const std::string& conn_id,
     long long catalog_id,
     const std::string& db_engine,
@@ -504,7 +471,7 @@ bool seed_stream_capture_bookmark_if_needed(
     PGresult* res = PQexecParams(
         pg,
         R"(
-        SELECT service_tier::text, source_database, source_schema, source_table,
+        SELECT source_database, source_schema, source_table,
                capture_during_full_load, engine_meta::text
         FROM cdc_catalog.catalog
         WHERE catalog_id = $1::bigint
@@ -521,13 +488,11 @@ bool seed_stream_capture_bookmark_if_needed(
         }
         return false;
     }
-    const char* t = PQgetvalue(res, 0, 0);
-    const char* sd = PQgetvalue(res, 0, 1);
-    const char* ss = PQgetvalue(res, 0, 2);
-    const char* st = PQgetvalue(res, 0, 3);
-    const char* st4 = PQgetvalue(res, 0, 4);
-    const char* emt = PQgetvalue(res, 0, 5);
-    const std::string tier = t ? t : "";
+    const char* sd = PQgetvalue(res, 0, 0);
+    const char* ss = PQgetvalue(res, 0, 1);
+    const char* st = PQgetvalue(res, 0, 2);
+    const char* st4 = PQgetvalue(res, 0, 3);
+    const char* emt = PQgetvalue(res, 0, 4);
     const std::string source_database = sd ? sd : "";
     const std::string source_schema = ss ? ss : "";
     const std::string source_table = st ? st : "";
@@ -541,7 +506,7 @@ bool seed_stream_capture_bookmark_if_needed(
         return true;
     }
 
-    ensure_apply_positions_for_tier(pg, runtime, conn_id, tier, db_engine);
+    ensure_apply_positions_for_conn(pg, conn_id, db_engine);
 
     std::string lake_schema;
     std::string lake_table;
@@ -556,19 +521,15 @@ bool seed_stream_capture_bookmark_if_needed(
         lake_table = source_table;
     }
 
-    const std::string topic_prefix = runtime_topic_prefix(runtime, pg, conn_id, db_engine);
-    const std::string topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
-    const int topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_capture", conn_id);
+    const std::string topic_prefix = topic_prefix_for_conn(conn_id);
+    const std::string topic_mode = std::string(pipeline_defaults::kKafkaTopicMode);
+    const int topic_buckets = pipeline_defaults::kKafkaTopicBuckets;
     const std::string topic = topic_for_catalog(topic_prefix, lake_schema, lake_table, topic_mode, topic_buckets);
-    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
 
     nlohmann::json partition_offsets = nlohmann::json::object();
 #ifdef HAVE_RDKAFKA
-    const int topic_partitions = (db_engine == "mssql")
-        ? runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mssql_capture", conn_id)
-        : (db_engine == "mongodb")
-            ? runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mongo_capture", conn_id)
-            : runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_capture", conn_id);
+    const int topic_partitions = pipeline_defaults::kKafkaTopicPartitions;
 
     char errstr[512];
     rd_kafka_conf_t* conf = rd_kafka_conf_new();
@@ -795,99 +756,16 @@ BinlogGapRebootResult reboot_conn_after_mariadb_binlog_gap(
     return out;
 }
 
-void flag_table_for_full_load(
-    PGconn* pg,
-    const std::string& conn_id,
-    const std::string& schema,
-    const std::string& table,
-    const std::string& db_engine,
-    const std::string& batch_id) {
-    const char* vals2[] = {conn_id.c_str(), db_engine.c_str(), schema.c_str(), table.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        UPDATE cdc_catalog.catalog
-        SET active = true,
-            needs_full_load = true,
-            cdc_enabled = true,
-            capture_during_full_load = true,
-            status = 'pending',
-            updated_at = now()
-        WHERE conn_id = $1
-          AND db_engine = $2::cdc_catalog.db_engine
-          AND source_schema = $3
-          AND source_table = $4
-        )",
-        4,
-        nullptr,
-        vals2,
-        nullptr,
-        nullptr,
-        0);
-    if (res) {
-        PQclear(res);
-    }
-
-    const char* lookup_vals[] = {conn_id.c_str(), db_engine.c_str(), schema.c_str(), table.c_str()};
-    res = PQexecParams(
-        pg,
-        R"(
-        SELECT catalog_id FROM cdc_catalog.catalog
-        WHERE conn_id = $1 AND db_engine = $2::cdc_catalog.db_engine
-          AND source_schema = $3 AND source_table = $4
-        )",
-        4,
-        nullptr,
-        lookup_vals,
-        nullptr,
-        nullptr,
-        0);
-    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-        const char* cid_str = PQgetvalue(res, 0, 0);
-        const long long catalog_id = cid_str ? std::atoll(cid_str) : 0;
-        PQclear(res);
-        res = nullptr;
-        RuntimeConfig runtime;
-        runtime.reload(pg);
-        try {
-            seed_stream_capture_bookmark_if_needed(pg, runtime, conn_id, catalog_id, db_engine, batch_id);
-        } catch (const std::exception& ex) {
-            log_write(pg, {
-                .level = LogLevel::Warning,
-                .component = "cdc_catalog_onboard",
-                .message = "stream capture bookmark skipped during flag_table_for_full_load",
-                .batch_id = batch_id.empty() ? std::nullopt : std::make_optional(batch_id),
-                .conn_id = conn_id,
-                .source_schema = schema,
-                .source_table = table,
-                .context = {{"error", ex.what()}},
-            });
-        }
-    }
-    if (res) {
-        PQclear(res);
-    }
-
-    log_write(pg, {
-        .level = LogLevel::Info,
-        .component = "cdc_catalog_onboard",
-        .message = "table flagged for full load with concurrent kafka stream capture",
-        .batch_id = batch_id.empty() ? std::nullopt : std::make_optional(batch_id),
-        .conn_id = conn_id,
-        .source_schema = schema,
-        .source_table = table,
-        .context = {{"db_engine", db_engine}},
-    });
-}
-
 void enable_cdc_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::string& db_engine,
     const std::string& batch_id,
     bool expect_updates) {
-    std::string sql = R"(
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
         UPDATE cdc_catalog.catalog
         SET cdc_enabled = true,
             needs_full_load = false,
@@ -900,21 +778,10 @@ void enable_cdc_after_full_load(
           AND has_pk = true
           AND status NOT IN ('skipped', 'disabled', 'failed')
           AND (NOT cdc_enabled OR needs_full_load = true)
-    )";
-    std::vector<const char*> vals = {conn_id.c_str(), db_engine.c_str()};
-    std::string tier_val;
-    if (service_tier && !service_tier->empty()) {
-        sql += " AND service_tier::text = lower($3)";
-        tier_val = *service_tier;
-        vals.push_back(tier_val.c_str());
-    }
-
-    PGresult* res = PQexecParams(
-        pg,
-        sql.c_str(),
-        static_cast<int>(vals.size()),
+        )",
+        2,
         nullptr,
-        vals.data(),
+        vals,
         nullptr,
         nullptr,
         0);
@@ -935,7 +802,6 @@ void enable_cdc_after_full_load(
         .context = {
             {"count", count},
             {"db_engine", db_engine},
-            {"tier", service_tier.value_or("")},
             {"expect_updates", expect_updates},
         },
     });
@@ -993,39 +859,6 @@ void mark_catalog_cdc_in_progress(PGconn* pg, long long catalog_id) {
 
 namespace {
 
-// #region agent log
-void agent_debug_log_skip_status(
-    const char* function,
-    long long catalog_id,
-    bool needs_full_load,
-    const char* hypothesis_id) {
-    const char* log_path = std::getenv("DATASYNC_DEBUG_LOG");
-    if (!log_path || !log_path[0]) {
-        return;
-    }
-    try {
-        std::ofstream f(log_path, std::ios::app);
-        if (!f) {
-            return;
-        }
-        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-        const nlohmann::json line = {
-            {"sessionId", "e0d3ad"},
-            {"hypothesisId", hypothesis_id},
-            {"location", function},
-            {"message", "skipped status change due to needs_full_load"},
-            {"catalog_id", catalog_id},
-            {"needs_full_load", needs_full_load},
-            {"timestamp", now_ms},
-        };
-        f << line.dump() << '\n';
-    } catch (...) {
-    }
-}
-// #endregion
-
 bool catalog_needs_full_load(PGconn* pg, long long catalog_id) {
     const std::string id = std::to_string(catalog_id);
     const char* vals[] = {id.c_str()};
@@ -1059,9 +892,6 @@ void mark_catalog_cdc_success(PGconn* pg, long long catalog_id) {
     const char* vals[] = {id.c_str()};
     const bool needs_full_load = catalog_needs_full_load(pg, catalog_id);
     if (needs_full_load) {
-        // #region agent log
-        agent_debug_log_skip_status("mark_catalog_cdc_success", catalog_id, true, "H1");
-        // #endregion
         pg_exec_params_simple(
             pg,
             R"(
@@ -1135,9 +965,6 @@ void mark_catalog_reconcile_healed(PGconn* pg, long long catalog_id) {
     const std::string id = std::to_string(catalog_id);
     const char* vals[] = {id.c_str()};
     if (catalog_needs_full_load(pg, catalog_id)) {
-        // #region agent log
-        agent_debug_log_skip_status("mark_catalog_reconcile_healed", catalog_id, true, "H2");
-        // #endregion
         return;
     }
     pg_exec_params_simple(
@@ -1203,29 +1030,21 @@ void rollback_cdc_in_progress_ids(PGconn* pg, const std::set<long long>& catalog
 int clear_stale_cdc_in_progress(
     PGconn* pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::string& db_engine) {
-    std::string sql = R"(
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
         UPDATE cdc_catalog.catalog
         SET status = 'success',
             updated_at = now()
         WHERE conn_id = $1
           AND db_engine = $2::cdc_catalog.db_engine
           AND status = 'cdc_in_progress'
-    )";
-    std::vector<const char*> vals = {conn_id.c_str(), db_engine.c_str()};
-    std::string tier_val;
-    if (service_tier && !service_tier->empty()) {
-        sql += " AND service_tier::text = lower($3)";
-        tier_val = *service_tier;
-        vals.push_back(tier_val.c_str());
-    }
-    PGresult* res = PQexecParams(
-        pg,
-        sql.c_str(),
-        static_cast<int>(vals.size()),
+        )",
+        2,
         nullptr,
-        vals.data(),
+        vals,
         nullptr,
         nullptr,
         0);
@@ -1246,40 +1065,6 @@ int clear_stale_cdc_in_progress(
 int count_full_load_pending(
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& tier,
-    const std::string& db_engine) {
-    const char* vals[] = {conn_id.c_str(), tier.c_str(), db_engine.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        SELECT COUNT(*)::int
-        FROM cdc_catalog.catalog
-        WHERE conn_id = $1
-          AND service_tier::text = lower($2)
-          AND db_engine = $3::cdc_catalog.db_engine
-          AND active = true
-          AND needs_full_load = true
-          AND status NOT IN ('skipped', 'disabled')
-        )",
-        3,
-        nullptr,
-        vals,
-        nullptr,
-        nullptr,
-        0);
-    int count = 0;
-    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-        count = std::atoi(PQgetvalue(res, 0, 0));
-    }
-    if (res) {
-        PQclear(res);
-    }
-    return count;
-}
-
-int count_full_load_pending_any_tier(
-    PGconn* pg,
-    const std::string& conn_id,
     const std::string& db_engine) {
     const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
     PGresult* res = PQexecParams(
@@ -1307,53 +1092,17 @@ int count_full_load_pending_any_tier(
         PQclear(res);
     }
     return count;
-}
-
-std::vector<std::string> list_full_load_pending_tiers(
-    PGconn* pg,
-    const std::string& conn_id,
-    const std::string& db_engine) {
-    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        SELECT DISTINCT service_tier::text
-        FROM cdc_catalog.catalog
-        WHERE conn_id = $1
-          AND db_engine = $2::cdc_catalog.db_engine
-          AND active = true
-          AND needs_full_load = true
-          AND status NOT IN ('skipped', 'disabled')
-        ORDER BY 1
-        )",
-        2,
-        nullptr,
-        vals,
-        nullptr,
-        nullptr,
-        0);
-    std::vector<std::string> tiers;
-    if (res && PQresultStatus(res) == PGRES_TUPLES_OK) {
-        for (int i = 0; i < PQntuples(res); ++i) {
-            const char* t = PQgetvalue(res, i, 0);
-            if (t && *t) {
-                tiers.emplace_back(t);
-            }
-        }
-    }
-    if (res) {
-        PQclear(res);
-    }
-    return tiers;
 }
 
 ApplySkipReasonCounts fetch_apply_skip_reasons(
     PGconn* pg,
     const std::string& conn_id,
-    const std::optional<std::string>& tier,
     const std::string& db_engine) {
     ApplySkipReasonCounts out;
-    std::string sql = R"(
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
         SELECT
             count(*)::int AS active_total,
             count(*) FILTER (WHERE needs_full_load)::int AS needs_full_load,
@@ -1370,21 +1119,10 @@ ApplySkipReasonCounts fetch_apply_skip_reasons(
         WHERE conn_id = $1
           AND db_engine = $2::cdc_catalog.db_engine
           AND active = true
-    )";
-    std::vector<const char*> vals = {conn_id.c_str(), db_engine.c_str()};
-    std::string tier_val;
-    if (tier && !tier->empty()) {
-        sql += " AND service_tier::text = lower($3)";
-        tier_val = *tier;
-        vals.push_back(tier_val.c_str());
-    }
-
-    PGresult* res = PQexecParams(
-        pg,
-        sql.c_str(),
-        static_cast<int>(vals.size()),
+        )",
+        2,
         nullptr,
-        vals.data(),
+        vals,
         nullptr,
         nullptr,
         0);
@@ -1408,9 +1146,8 @@ void log_cdc_skip_no_tables(
     const std::string& pipeline,
     const std::string& batch_id,
     const std::string& conn_id,
-    const std::optional<std::string>& tier,
     const std::string& db_engine) {
-    const ApplySkipReasonCounts reasons = fetch_apply_skip_reasons(pg, conn_id, tier, db_engine);
+    const ApplySkipReasonCounts reasons = fetch_apply_skip_reasons(pg, conn_id, db_engine);
 
     nlohmann::json catalog_sample = nlohmann::json::array();
     const char* sample_vals[] = {conn_id.c_str(), db_engine.c_str()};
@@ -1460,10 +1197,7 @@ void log_cdc_skip_no_tables(
                 const auto it = row.find("active");
                 return it != row.end() && it->is_string() && *it == "t";
             });
-        if (tier && !tier->empty() && any_active) {
-            hint = "tables exist for conn but none on tier " + *tier +
-                   " — check cdc_catalog.catalog.service_tier or run apply on matching tier";
-        } else if (!any_active) {
+        if (!any_active) {
             hint = "rows exist but active=false on all — run: UPDATE cdc_catalog.catalog SET active=true WHERE ...";
         }
     } else if (reasons.apply_ready == 0 && reasons.needs_full_load > 0) {
@@ -1482,7 +1216,6 @@ void log_cdc_skip_no_tables(
         .source_table = std::nullopt,
         .context = {
             {"pipeline", pipeline},
-            {"tier", tier.value_or("all")},
             {"db_engine", db_engine},
             {"hint", hint},
             {"active_total", reasons.active_total},
@@ -1496,29 +1229,26 @@ void log_cdc_skip_no_tables(
     });
 }
 
-void ensure_apply_positions_for_tier(
+void ensure_apply_positions_for_conn(
     PGconn* pg,
-    RuntimeConfig& runtime,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& db_engine) {
-    const std::string topic_prefix = runtime_topic_prefix(runtime, pg, conn_id, db_engine);
-    const std::string topic_mode = runtime.get_string("kafka_topic_mode", "bucketed", "cdc_kafka_capture", conn_id);
-    const int topic_buckets = runtime.get_int("kafka_topic_buckets", 64, "cdc_kafka_capture", conn_id);
+    const std::string topic_prefix = topic_prefix_for_conn(conn_id);
+    const std::string topic_mode = std::string(pipeline_defaults::kKafkaTopicMode);
+    const int topic_buckets = pipeline_defaults::kKafkaTopicBuckets;
 
-    const char* vals[] = {conn_id.c_str(), tier.c_str(), db_engine.c_str()};
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
     PGresult* res = PQexecParams(
         pg,
         R"(
         SELECT catalog_id, source_database, source_schema, source_table
         FROM cdc_catalog.catalog
         WHERE conn_id = $1
-          AND service_tier::text = lower($2)
-          AND db_engine = $3::cdc_catalog.db_engine
+          AND db_engine = $2::cdc_catalog.db_engine
           AND active = true
           AND has_pk = true
         )",
-        3,
+        2,
         nullptr,
         vals,
         nullptr,
@@ -1637,22 +1367,16 @@ void ensure_apply_positions_for_tier(
 FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& db_engine,
     const std::string& batch_id) {
     FullLoadKafkaResetStats stats;
 
-    RuntimeConfig runtime;
-    runtime.reload(pg);
-    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
     const std::string bootstrap = kafka.bootstrap;
-    int apply_workers = runtime.get_int("apply_worker_count", 1, "cdc_kafka_apply", conn_id);
-    if (apply_workers <= 0) {
-        apply_workers = 1;
-    }
-    ensure_apply_positions_for_tier(pg, runtime, conn_id, tier, db_engine);
+    const int apply_workers = kApplyWorkerCount;
+    ensure_apply_positions_for_conn(pg, conn_id, db_engine);
 
-    const char* vals[] = {conn_id.c_str(), tier.c_str(), db_engine.c_str()};
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
     PGresult* res = PQexecParams(
         pg,
         R"(
@@ -1660,12 +1384,11 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
         FROM cdc_catalog.apply_position ap
         JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
         WHERE ap.conn_id = $1
-          AND c.service_tier::text = lower($2)
-          AND c.db_engine = $3::cdc_catalog.db_engine
+          AND c.db_engine = $2::cdc_catalog.db_engine
           AND c.active = true
         ORDER BY ap.source_schema, ap.source_table
         )",
-        3,
+        2,
         nullptr,
         vals,
         nullptr,
@@ -1683,7 +1406,7 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
             .conn_id = conn_id,
             .source_schema = std::nullopt,
             .source_table = std::nullopt,
-            .context = {{"tier", tier}, {"db_engine", db_engine}},
+            .context = {{"db_engine", db_engine}},
         });
         stats.errors += 1;
         return stats;
@@ -1719,17 +1442,13 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
             .conn_id = conn_id,
             .source_schema = std::nullopt,
             .source_table = std::nullopt,
-            .context = {{"tier", tier}, {"db_engine", db_engine}},
+            .context = {{"db_engine", db_engine}},
         });
         return stats;
     }
 
 #ifdef HAVE_RDKAFKA
-    const int topic_partitions = (db_engine == "mssql")
-        ? runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mssql_capture", conn_id)
-        : (db_engine == "mongodb")
-            ? runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_mongo_capture", conn_id)
-            : runtime.get_int("kafka_topic_partitions", 6, "cdc_kafka_capture", conn_id);
+    const int topic_partitions = pipeline_defaults::kKafkaTopicPartitions;
 
     std::set<std::string> unique_topic_names;
     for (const auto& row : rows) {
@@ -1752,13 +1471,12 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
         FROM cdc_catalog.catalog c
         JOIN cdc_catalog.apply_position ap ON ap.catalog_id = c.catalog_id
         WHERE c.conn_id = $1
-          AND c.service_tier::text = lower($2)
-          AND c.db_engine = $3::cdc_catalog.db_engine
+          AND c.db_engine = $2::cdc_catalog.db_engine
           AND c.capture_during_full_load = true
           AND NOT c.needs_full_load
           AND c.status = 'success'
         )",
-        3,
+        2,
         nullptr,
         vals,
         nullptr,
@@ -1807,7 +1525,7 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
             try {
                 for (int w = 0; w < apply_workers; ++w) {
                     const std::string consumer_group =
-                        kafka_apply_consumer_group(runtime, pg, conn_id, tier, w, apply_workers);
+                        kafka_apply_consumer_group(conn_id, w, apply_workers);
                     const long long stored_offset =
                         use_bookmark
                             ? reset_apply_consumer_offset(
@@ -1855,7 +1573,6 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
                 .source_schema = std::nullopt,
                 .source_table = std::nullopt,
                 .context = {
-                    {"tier", tier},
                     {"db_engine", db_engine},
                     {"topics_reset", stats.topics_reset},
                     {"topics_expected", static_cast<int>(unique_topics.size())},
@@ -1944,7 +1661,6 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
     }
 #else
     (void)bootstrap;
-    (void)consumer_group;
 #endif
 
     if (stats.errors > 0) {
@@ -1957,7 +1673,6 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
             .source_schema = std::nullopt,
             .source_table = std::nullopt,
             .context = {
-                {"tier", tier},
                 {"db_engine", db_engine},
                 {"tables", stats.tables},
                 {"topics_reset", stats.topics_reset},
@@ -1977,11 +1692,10 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
           AND c.source_schema = ae.source_schema
           AND c.source_table = ae.source_table
           AND c.conn_id = $1
-          AND c.service_tier::text = lower($2)
-          AND c.db_engine = $3::cdc_catalog.db_engine
+          AND c.db_engine = $2::cdc_catalog.db_engine
           AND c.active = true
         )",
-        3,
+        2,
         nullptr,
         vals,
         nullptr,
@@ -2006,7 +1720,6 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
         .context = {
-            {"tier", tier},
             {"db_engine", db_engine},
             {"tables", stats.tables},
             {"topics_reset", stats.topics_reset},
@@ -2022,70 +1735,24 @@ bool onboard_conn_after_full_load(
     const AppConfig& cfg,
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& db_engine,
     const std::string& batch_id) {
-    enable_cdc_after_full_load(pg, conn_id, tier, db_engine, batch_id, true);
+    enable_cdc_after_full_load(pg, conn_id, db_engine, batch_id, true);
 #ifdef HAVE_FREETDS
     if (db_engine == "mssql") {
-        seed_mssql_cdc_lsn_for_conn(cfg, pg, conn_id, tier, batch_id);
+        seed_mssql_cdc_lsn_for_conn(cfg, pg, conn_id, batch_id);
     }
 #endif
 #ifdef HAVE_MONGOC
     if (db_engine == "mongodb") {
-        seed_mongo_cdc_resume_for_conn(cfg, pg, conn_id, tier, batch_id);
+        seed_mongo_cdc_resume_for_conn(cfg, pg, conn_id, batch_id);
     }
 #endif
-    const auto stats = reset_kafka_apply_after_full_load(pg, conn_id, tier, db_engine, batch_id);
+    const auto stats = reset_kafka_apply_after_full_load(pg, conn_id, db_engine, batch_id);
     return stats.errors == 0;
 }
 
 #ifdef HAVE_RDKAFKA
-
-long long kafka_backlog_messages(
-    const std::string& bootstrap,
-    const std::string& consumer_group,
-    const std::string& topic,
-    int partition) {
-    char errstr[512];
-    rd_kafka_conf_t* conf = rd_kafka_conf_new();
-    rd_kafka_conf_set(conf, "bootstrap.servers", bootstrap.c_str(), errstr, sizeof(errstr));
-    rd_kafka_conf_set(conf, "group.id", consumer_group.c_str(), errstr, sizeof(errstr));
-    rd_kafka_conf_set(conf, "enable.auto.commit", "false", errstr, sizeof(errstr));
-
-    rd_kafka_t* consumer = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, sizeof(errstr));
-    if (!consumer) {
-        rd_kafka_conf_destroy(conf);
-        throw std::runtime_error(std::string("kafka consumer create failed: ") + errstr);
-    }
-    rd_kafka_poll_set_consumer(consumer);
-
-    rd_kafka_topic_partition_list_t* parts = rd_kafka_topic_partition_list_new(1);
-    rd_kafka_topic_partition_list_add(parts, topic.c_str(), partition);
-
-    int64_t low = 0;
-    int64_t high = 0;
-    rd_kafka_resp_err_t err = query_kafka_watermark_offsets_retry(
-        consumer, topic.c_str(), partition, &low, &high, 15000, 12);
-    if (err != RD_KAFKA_RESP_ERR_NO_ERROR) {
-        rd_kafka_topic_partition_list_destroy(parts);
-        rd_kafka_destroy(consumer);
-        throw std::runtime_error(std::string("watermark query failed: ") + rd_kafka_err2str(err));
-    }
-
-    err = rd_kafka_committed(consumer, parts, 15000);
-    long long pos = low;
-    if (err == RD_KAFKA_RESP_ERR_NO_ERROR && parts->cnt > 0) {
-        const int64_t committed = parts->elems[0].offset;
-        if (committed >= 0) {
-            pos = committed;
-        }
-    }
-
-    rd_kafka_topic_partition_list_destroy(parts);
-    rd_kafka_destroy(consumer);
-    return std::max<int64_t>(0, high - pos);
-}
 
 long long reset_apply_offset_to_end(
     const std::string& bootstrap,
@@ -2380,14 +2047,6 @@ void ensure_kafka_topics_exist(
 }
 
 #else
-
-long long kafka_backlog_messages(
-    const std::string&,
-    const std::string&,
-    const std::string&,
-    int) {
-    return 0;
-}
 
 long long reset_apply_offset_to_end(
     const std::string&,

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Host:      ./install.sh | ./install.sh start  → build + Kafka + daemon + discover
+#             ./install.sh kafka-retention [TOPIC_PREFIX=…]  → alter existing topic retention
 # Systemd:   ExecStart=$ROOT/install.sh start  ExecStop=$ROOT/install.sh stop
 #            sudo ./install.sh systemd-install  (once — installs DataSync.service)
 # Container: install.sh container …            (Docker ENTRYPOINT only)
@@ -117,7 +118,6 @@ container_dispatch() {
   local CONFIG="${DATASYNC_CONFIG:-/app/config.json}"
   local ROOT="${DATASYNC_ROOT:-/app}"
   local BIN="${DATASYNC_BIN:-/usr/local/bin/DataSync}"
-  local PROD_OPS_SQL="${DATASYNC_PROD_OPS_SQL:-$ROOT/prod_ops.sql}"
   local QUIET="${DATASYNC_INSTALL_QUIET:-0}"
 
   log() { [[ "$QUIET" == "1" ]] || printf '==> %s\n' "$*" >&2; }
@@ -246,27 +246,8 @@ catalog_schema_exists() {
     "SELECT 1 FROM information_schema.schemata WHERE schema_name = 'cdc_catalog'" 2>/dev/null || true)" == "1" ]]
 }
 
-apply_sql_section() {
-  local section="$1" host="$2" port="$3" user="$4" db="$5"
-  [[ -f "$PROD_OPS_SQL" ]] || fail "missing $(basename "$PROD_OPS_SQL")"
-  local tmp
-  tmp="$(mktemp)"
-  awk -v sec="$section" '
-    $0 ~ "^-- @section:" sec "$" {in_sec=1; next}
-    /^-- @section:/ {if (in_sec) exit; next}
-    in_sec {print}
-  ' "$PROD_OPS_SQL" >"$tmp"
-  if [[ ! -s "$tmp" ]]; then
-    rm -f "$tmp"
-    fail "empty section ${section} in $(basename "$PROD_OPS_SQL")"
-  fi
-  psql -h "$host" -p "$port" -U "$user" -d "$db" -v ON_ERROR_STOP=1 -q -f "$tmp"
-  rm -f "$tmp"
-}
-
 apply_catalog_schema() {
   [[ "${DATASYNC_RUN_MIGRATIONS:-0}" == "1" ]] || return 0
-  [[ -f "$PROD_OPS_SQL" ]] || fail "missing $(basename "$PROD_OPS_SQL")"
   [[ -f "$CONFIG" ]] || return 0
 
   if ! mapfile -t pg < <(read_pg_cfg); then
@@ -287,8 +268,8 @@ apply_catalog_schema() {
     return 0
   fi
 
-  log "Applying cdc_catalog → ${pg[2]}"
-  apply_sql_section datasync_baseline "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"
+  log "Applying cdc_catalog baseline → ${pg[2]}"
+  "$BIN" migrate --baseline --config "$CONFIG"
   if [[ "$QUIET" == "1" ]]; then
     if [[ "$db_created" == "1" ]]; then
       ok "cdc_catalog @ ${pg[2]} (created db + schema)"
@@ -300,7 +281,6 @@ apply_catalog_schema() {
 
 apply_lake_schema() {
   [[ "${DATASYNC_RUN_MIGRATIONS:-0}" == "1" ]] || return 0
-  [[ -f "$PROD_OPS_SQL" ]] || fail "missing $(basename "$PROD_OPS_SQL")"
   [[ -f "$CONFIG" ]] || return 0
 
   if ! mapfile -t pg < <(read_datalake_cfg); then
@@ -328,7 +308,7 @@ apply_lake_schema() {
   fi
 
   log "Applying lake schema → ${pg[2]}"
-  apply_sql_section datalake_lake "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"
+  "$BIN" migrate --lake --config "$CONFIG"
   if [[ "$QUIET" == "1" ]]; then
     if [[ "$db_created" == "1" ]]; then
       ok "lake @ ${pg[2]} (created db + schema)"
@@ -374,30 +354,9 @@ check_catalog_integrity() {
   done
 }
 
-ensure_schema_migrations_table() {
-  local host="$1" port="$2" user="$3" db="$4"
-  psql -h "$host" -p "$port" -U "$user" -d "$db" -v ON_ERROR_STOP=1 -q <<'SQL'
-CREATE TABLE IF NOT EXISTS cdc_catalog.schema_migrations (
-    version integer NOT NULL PRIMARY KEY,
-    description text NOT NULL,
-    applied_at timestamp with time zone DEFAULT now() NOT NULL
-);
-SQL
-  local count
-  count=$(psql -h "$host" -p "$port" -U "$user" -d "$db" -tAc \
-    "SELECT COUNT(*) FROM cdc_catalog.schema_migrations" 2>/dev/null || echo "0")
-  if [[ "$count" == "0" ]]; then
-    psql -h "$host" -p "$port" -U "$user" -d "$db" -v ON_ERROR_STOP=1 -q \
-      -c "INSERT INTO cdc_catalog.schema_migrations (version, description)
-          VALUES (1, 'baseline cdc_catalog_schema_structure')
-          ON CONFLICT (version) DO NOTHING"
-  fi
-}
-
 apply_catalog_incremental() {
-  local host="$1" port="$2" user="$3" db="$4"
-  log "Applying prod_ops incremental (migrations, seed, tune)"
-  apply_sql_section datasync_incremental "$host" "$port" "$user" "$db"
+  log "Applying schema incremental (DataSync migrate)"
+  "$BIN" migrate --config "$CONFIG"
 }
 
 post_schema_bootstrap() {
@@ -415,39 +374,7 @@ post_schema_bootstrap() {
   fi
 
   verify_catalog_integrity "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"
-  ensure_schema_migrations_table "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"
-  apply_catalog_incremental "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"
-  patch_kafka_bootstrap
-}
-
-patch_kafka_bootstrap() {
-  [[ -n "${KAFKA_BOOTSTRAP:-}" ]] || return 0
-  [[ -f "$CONFIG" ]] || return 0
-
-  if ! mapfile -t pg < <(read_pg_cfg); then
-    return 0
-  fi
-  export PGPASSWORD="${pg[4]}"
-  apply_pg_sslmode "${pg[5]:-}"
-
-  if ! pg_database_exists "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"; then
-    return 0
-  fi
-
-  if ! catalog_schema_exists "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"; then
-    return 0
-  fi
-
-  local json_val
-  json_val=$(python3 -c "import json; print(json.dumps('${KAFKA_BOOTSTRAP}'))")
-
-  psql -h "${pg[0]}" -p "${pg[1]}" -U "${pg[3]}" -d "${pg[2]}" -v ON_ERROR_STOP=1 -q <<SQL
-INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
-VALUES ('kafka_bootstrap_servers', 'cdc_kafka_apply', '', '${json_val}'::jsonb, 'Kafka bootstrap fallback when KAFKA_BOOTSTRAP env unset')
-ON CONFLICT (config_key, component, conn_id)
-DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = now();
-SQL
-  [[ "$QUIET" == "1" ]] || log "runtime_config kafka_bootstrap_servers=${KAFKA_BOOTSTRAP}"
+  apply_catalog_incremental
 }
 
 lake_schema_ok() {
@@ -590,13 +517,7 @@ if [[ "${1:-}" == "schema-only" ]]; then
 fi
 
 if [[ "${1:-}" == "diagnose-only" ]]; then
-  if ! mapfile -t pg < <(read_pg_cfg); then
-    fail "diagnose-only: config unreadable"
-  fi
-  export PGPASSWORD="${pg[4]}"
-  apply_pg_sslmode "${pg[5]:-}"
-  apply_sql_section diagnostics "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"
-  exit 0
+  exec "$BIN" migrate --diagnostics --config "$CONFIG"
 fi
 
 cd "$ROOT"
@@ -657,6 +578,53 @@ host_stack_stop() {
   docker_compose stop datasync kafka 2>/dev/null || true
 }
 
+kafka_set_topic_retention() {
+  ensure_container_runtime || exit 1
+  cd "$ROOT"
+  local bootstrap="${KAFKA_BOOTSTRAP:-127.0.0.1:9092}"
+  local retention_ms="${KAFKA_RETENTION_MS:-259200000}"
+  local retention_bytes="${KAFKA_RETENTION_BYTES:-1073741824}"
+  local segment_bytes="${KAFKA_SEGMENT_BYTES:-134217728}"
+  local topic_prefix="${TOPIC_PREFIX:-}"
+  local config="retention.ms=${retention_ms},retention.bytes=${retention_bytes},segment.bytes=${segment_bytes},cleanup.policy=delete"
+  local -a kafka_topics kafka_configs
+
+  if docker_compose ps kafka --format '{{.State}}' 2>/dev/null | grep -qi running; then
+    kafka_topics=(docker_compose exec -T kafka kafka-topics --bootstrap-server "$bootstrap")
+    kafka_configs=(docker_compose exec -T kafka kafka-configs --bootstrap-server "$bootstrap")
+  elif command -v kafka-topics >/dev/null 2>&1; then
+    kafka_topics=(kafka-topics --bootstrap-server "$bootstrap")
+    kafka_configs=(kafka-configs --bootstrap-server "$bootstrap")
+  else
+    warn "kafka-topics not found — start Kafka (./install.sh start) or install Kafka CLI"
+    exit 1
+  fi
+
+  mapfile -t topics < <("${kafka_topics[@]}" --list 2>/dev/null | sort)
+  if [[ ${#topics[@]} -eq 0 ]]; then
+    warn "no topics at ${bootstrap}"
+    exit 1
+  fi
+
+  local count=0 topic
+  for topic in "${topics[@]}"; do
+    [[ -n "$topic" ]] || continue
+    if [[ -n "$topic_prefix" && "$topic" != "${topic_prefix}"* ]]; then
+      continue
+    fi
+    [[ "$topic" == __* ]] && continue
+    printf '==> alter %s -> %s\n' "$topic" "$config" >&2
+    "${kafka_configs[@]}" \
+      --entity-type topics \
+      --entity-name "$topic" \
+      --alter \
+      --add-config "$config"
+    count=$((count + 1))
+  done
+  ok "kafka retention: ${count} topic(s) updated"
+  printf '  disk may not shrink until log cleaner runs (~5m)\n' >&2
+}
+
 install_systemd_unit() {
   local unit_src="$ROOT/DataSync.service"
   local unit_dst="/etc/systemd/system/DataSync.service"
@@ -686,8 +654,11 @@ case "${1:-}" in
   systemd-install)
     install_systemd_unit
     ;;
+  kafka-retention)
+    kafka_set_topic_retention
+    ;;
   *)
-    warn "usage: ./install.sh [start|stop|systemd-install]  |  install.sh container <cmd>"
+    warn "usage: ./install.sh [start|stop|kafka-retention|systemd-install]  |  install.sh container <cmd>"
     exit 2
     ;;
 esac

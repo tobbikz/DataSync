@@ -21,7 +21,6 @@ struct TableTarget {
 std::vector<TableTarget> fetch_ddl_targets(
     PGconn* pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::optional<std::string>& source_schema,
     const std::optional<std::string>& source_table) {
     std::string sql = R"(
@@ -33,10 +32,6 @@ std::vector<TableTarget> fetch_ddl_targets(
           AND cdc_enabled = true
     )";
     std::vector<std::string> vals = {conn_id};
-    if (service_tier && !service_tier->empty()) {
-        sql += " AND service_tier::text = lower($" + std::to_string(vals.size() + 1) + ")";
-        vals.push_back(*service_tier);
-    }
     if (source_schema && !source_schema->empty()) {
         sql += " AND source_schema = $" + std::to_string(vals.size() + 1);
         vals.push_back(*source_schema);
@@ -84,7 +79,6 @@ DdlSyncRunStats run_mariadb_ddl_sync(
     PGconn* log_pg,
     const std::string& batch_id,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::optional<std::string>& source_schema,
     const std::optional<std::string>& source_table) {
     DdlSyncRunStats stats;
@@ -99,7 +93,6 @@ DdlSyncRunStats run_mariadb_ddl_sync(
         .conn_id = conn_id,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"tier", service_tier.value_or("all")}},
     });
 
     const MariaDbSource* source = find_mariadb_source(cfg, conn_id);
@@ -109,7 +102,7 @@ DdlSyncRunStats run_mariadb_ddl_sync(
 
     PgConn app_pg(cfg.datasync.conn_string());
     PgConn lake_pg(cfg.datalake.conn_string());
-    const auto targets = fetch_ddl_targets(app_pg.raw, conn_id, service_tier, source_schema, source_table);
+    const auto targets = fetch_ddl_targets(app_pg.raw, conn_id, source_schema, source_table);
     if (targets.empty()) {
         log_write(log_pg, {
             .level = LogLevel::Info,
@@ -185,11 +178,10 @@ int run_mariadb_ddl_sync_cli(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::optional<std::string>& source_schema,
     const std::optional<std::string>& source_table) {
     const std::string batch_id = make_batch_id();
-    const auto stats = run_mariadb_ddl_sync(cfg, log_pg, batch_id, conn_id, service_tier, source_schema, source_table);
+    const auto stats = run_mariadb_ddl_sync(cfg, log_pg, batch_id, conn_id, source_schema, source_table);
     std::cout << "{\"batch_id\":\"" << batch_id << "\",\"tables_processed\":" << stats.tables_processed
               << ",\"tables_success\":" << stats.tables_success << ",\"tables_failed\":" << stats.tables_failed
               << ",\"columns_added\":" << stats.columns_added << "}" << std::endl;

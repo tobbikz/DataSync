@@ -5,54 +5,56 @@ alwaysApply: true
 
 # Runtime config (cdc_catalog.runtime_config)
 
-All tunables (batch size, workers, parallelism, retention, DDL flags) come from **`cdc_catalog.runtime_config`**.
-
-`config.json` is **credentials only** (postgres + mariadb connections).
+Tunables en **`cdc_catalog.runtime_config`** — **solo 5 filas canónicas**. Todo lo demás está en `cpp/include/pipeline_defaults.hpp`. `config.json` = **credentials only**.
 
 ## Rules
 
-- **Never hardcode** production tuning in C++ — read via `RuntimeConfig` with JSON/file value as fallback default only.
-- **Reload before each run** and **before each table/batch** in long jobs (`runtime.reload(pg)`).
-- **Scope lookup**: `(component, conn_id)` → `(component, '')` → `(global, '')`.
-- **Per-conn override**: same `config_key`, set `conn_id = 'MARIADB_LOCAL'`.
+- Read via `RuntimeConfig` with `pipeline_defaults::k*Default` fallback when key absent in DB.
+- **Reload** before each run and before each table/batch in long jobs.
+- Scope: `(component, conn_id)` → `(component, '')` → `(global, '')`.
 
-## Table
+## Hardcoded in C++ (`pipeline_defaults.hpp`)
 
-DDL: `prod_ops.sql` → `@section:datasync_baseline` + incremental seeds
+Workers, Kafka topic mode/buckets/partitions, capture producer queue, reconcile tolerances, DDL flags, catalog chunk size, daemon sync interval, etc.
 
-| Key | Component | Example |
+| Constant | Value |
+|----------|-------|
+| `kApplyWorkerCount` | 4 |
+| `kCaptureWorkerCount` | 1 |
+| `kFullLoadParallelTables` | 2 |
+| `kFullLoadWorkers` | 4 |
+| `kKafkaTopicMode` | bucketed |
+| `kKafkaTopicBuckets` | 64 |
+
+DDL + seeds: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate` (migration 002 + 038 → **5 rows**).
+
+## Canonical keys (only these in runtime_config)
+
+| Key | Component | Default |
 |-----|-----------|---------|
-| `full_load_batch_size` | mariadb_load | `5000` |
-| `full_load_workers` | mariadb_load | `1` |
-| `full_load_parallel_tables` | mariadb_load | `1` |
-| `catalog_chunk_size` | catalog | `500` |
-| `logs_retention_days` | global | `7` |
-| `ddl_sync_indexes` | mariadb_load | `true` |
-| `ddl_sync_foreign_keys` | mariadb_load | `true` |
+| `full_load_batch_size` | mariadb_load | 50000 |
+| `apply_batch_size` | cdc_kafka_apply | 20000 |
+| `reconcile_interval_hours` | cdc_kafka_reconcile | 4 |
+| `logs_retention_days` | global | 7 |
+| `applied_events_retention_days` | cdc_kafka_apply | 7 |
 
-## Change at runtime (no redeploy)
+## Kafka bootstrap / consumer group
 
-```sql
-UPDATE cdc_catalog.runtime_config
-SET config_value = '10000'::jsonb, updated_at = now()
-WHERE config_key = 'full_load_batch_size'
-  AND component = 'mariadb_load'
-  AND conn_id = '';
-```
-
-Next `full-load` run picks up the new value automatically.
+- Bootstrap: env `KAFKA_BOOTSTRAP` → `localhost:9092` (no runtime_config)
+- Consumer group prefix: `datalake-cdc-apply-{conn_id}-w{N}` (hardcoded)
 
 ## C++ pattern
 
 ```cpp
+#include "pipeline_defaults.hpp"
+
 RuntimeConfig runtime;
-runtime.reload(pg);  // before each table in full load
-const auto batch = runtime.get_size_t("full_load_batch_size", 5000, "mariadb_load", conn_id);
-const int workers = runtime.get_int("full_load_workers", 1, "mariadb_load", conn_id);
-const int parallel_tables = runtime.get_int("full_load_parallel_tables", 1, "mariadb_load", conn_id);
+runtime.reload(pg);
+const auto batch = runtime.get_size_t(
+    "full_load_batch_size",
+    pipeline_defaults::kFullLoadBatchSizeDefault,
+    "mariadb_load",
+    conn_id);
+const int workers = pipeline_defaults::kFullLoadWorkers;
+const int parallel_tables = pipeline_defaults::kFullLoadParallelTables;
 ```
-
-## Parallelism (implemented)
-
-- **`full_load_parallel_tables`**: tables within the same schema load concurrently in batches (each with own PG + MariaDB connection).
-- **`full_load_workers`**: splits numeric single-column PK into ranges; each worker runs keyset COPY on its segment. Composite or non-numeric PK → sequential fallback with log checkpoint.

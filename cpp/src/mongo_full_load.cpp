@@ -1,6 +1,7 @@
 #include "mongo_full_load.hpp"
 
 #include "capture_common.hpp"
+#include "full_load_common.hpp"
 #include "mongo_conn.hpp"
 #include "mongo_preflight.hpp"
 #include "mongo_kafka_capture.hpp"
@@ -8,6 +9,7 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
+#include "pipeline_defaults.hpp"
 
 #include <chrono>
 #include <exception>
@@ -28,10 +30,8 @@ FullLoadRunStats run_mongo_full_load(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& batch_id,
-    const std::optional<std::string>& service_tier,
     const std::optional<std::string>& conn_id_filter) {
     (void)cfg;
-    (void)service_tier;
     (void)conn_id_filter;
     if (log_pg) {
         log_write(
@@ -71,76 +71,13 @@ void log_fl(
     const std::string& conn_id = {},
     const std::string& schema = {},
     const std::string& table = {}) {
-    if (!log_pg) {
-        return;
-    }
-    LogEvent ev;
-    ev.level = level;
-    ev.component = "mongo_load";
-    ev.message = message;
-    ev.batch_id = batch_id;
-    if (!conn_id.empty()) {
-        ev.conn_id = conn_id;
-    }
-    if (!schema.empty()) {
-        ev.source_schema = schema;
-    }
-    if (!table.empty()) {
-        ev.source_table = table;
-    }
-    ev.context = context;
-    if (log_mtx) {
-        std::lock_guard<std::mutex> lock(*log_mtx);
-        log_write(log_pg, ev);
-    } else {
-        log_write(log_pg, ev);
-    }
+    full_load::log(log_pg, log_mtx, "mongo_load", level, batch_id, message, context, conn_id, schema, table);
 }
 
-long long elapsed_ms(const std::chrono::steady_clock::time_point& start) {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now() - start)
-        .count();
-}
-
-std::string csv_escape(const std::string& value) {
-    bool quote = value.empty();
-    for (char c : value) {
-        if (c == ',' || c == '"' || c == '\n' || c == '\r') {
-            quote = true;
-            break;
-        }
-    }
-    if (!quote) {
-        return value;
-    }
-    std::string out = "\"";
-    for (char c : value) {
-        out += (c == '"') ? "\"\"" : std::string(1, c);
-    }
-    out += "\"";
-    return out;
-}
-
-std::string utc_now_ts() {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    gmtime_r(&t, &tm);
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S+00");
-    return oss.str();
-}
-
-std::string utc_now_date() {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    gmtime_r(&t, &tm);
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d");
-    return oss.str();
-}
+using full_load::csv_escape;
+using full_load::elapsed_ms;
+using full_load::utc_now_date;
+using full_load::utc_now_ts;
 
 nlohmann::json bson_to_json(const bson_t* doc) {
     char* json_str = bson_as_relaxed_extended_json(doc, nullptr);
@@ -171,18 +108,10 @@ std::string json_cell_csv(const nlohmann::json& v) {
     return csv_escape(v.dump());
 }
 
-std::vector<MongoCatalogTableRow> fetch_full_load_targets(PGconn* pg, const std::optional<std::string>& service_tier) {
-    const char* sql_tier = R"(
-        SELECT catalog_id, conn_id, source_database, source_schema, source_table
-        FROM cdc_catalog.catalog
-        WHERE db_engine = 'mongodb'
-          AND active = true
-          AND needs_full_load = true
-          AND status NOT IN ('skipped', 'disabled')
-          AND service_tier::text = lower($1)
-        ORDER BY conn_id, source_database, source_table
-    )";
-    const char* sql_all = R"(
+std::vector<MongoCatalogTableRow> fetch_full_load_targets(PGconn* pg) {
+    PGresult* res = PQexec(
+        pg,
+        R"(
         SELECT catalog_id, conn_id, source_database, source_schema, source_table
         FROM cdc_catalog.catalog
         WHERE db_engine = 'mongodb'
@@ -190,15 +119,7 @@ std::vector<MongoCatalogTableRow> fetch_full_load_targets(PGconn* pg, const std:
           AND needs_full_load = true
           AND status NOT IN ('skipped', 'disabled')
         ORDER BY conn_id, source_database, source_table
-    )";
-
-    PGresult* res = nullptr;
-    if (service_tier && !service_tier->empty()) {
-        const char* vals[] = {service_tier->c_str()};
-        res = PQexecParams(pg, sql_tier, 1, nullptr, vals, nullptr, nullptr, 0);
-    } else {
-        res = PQexec(pg, sql_all);
-    }
+        )");
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (res) {
             PQclear(res);
@@ -467,11 +388,13 @@ bool load_one_collection(
     runtime.reload(app_pg.raw);
 
     const std::size_t batch_size = runtime.get_size_t(
-        "full_load_batch_size", 5000, "mongo_load", target.conn_id);
-    const int source_sleep_ms = runtime.get_int("full_load_source_sleep_ms", 0, "mongo_load", target.conn_id);
-    const int partition_months =
-        runtime.get_int("lake_partition_months_ahead", 3, "mongo_load", target.conn_id);
-    const bool ddl_sync = runtime.get_bool("ddl_sync_columns", true, "mongo_load", target.conn_id);
+        "full_load_batch_size",
+        pipeline_defaults::kFullLoadBatchSizeDefault,
+        "mariadb_load",
+        target.conn_id);
+    const int source_sleep_ms = pipeline_defaults::kFullLoadSourceSleepMs;
+    const int partition_months = pipeline_defaults::kLakePartitionMonthsAhead;
+    const bool ddl_sync = pipeline_defaults::kDdlSyncColumns;
 
     log_fl(
         log_pg,
@@ -516,10 +439,8 @@ bool load_one_collection(
     mark_catalog_full_load_in_progress(app_pg.raw, target.catalog_id);
 
     {
-        RuntimeConfig bookmark_runtime;
-        bookmark_runtime.reload(app_pg.raw);
         seed_stream_capture_bookmark_if_needed(
-            app_pg.raw, bookmark_runtime, target.conn_id, target.catalog_id, "mongodb", batch_id);
+            app_pg.raw, target.conn_id, target.catalog_id, "mongodb", batch_id);
     }
 
     mongoc_collection_t* coll = mongo.collection(target.source_database, target.source_table);
@@ -615,7 +536,6 @@ FullLoadRunStats run_mongo_full_load(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& batch_id,
-    const std::optional<std::string>& service_tier,
     const std::optional<std::string>& conn_id_filter) {
     const auto run_start = std::chrono::steady_clock::now();
     FullLoadRunStats stats;
@@ -636,11 +556,12 @@ FullLoadRunStats run_mongo_full_load(
         LogLevel::Info,
         batch_id,
         "full load started",
-        {{"service_tier", service_tier.value_or("all")},
-         {"batch_size", runtime.get_size_t("full_load_batch_size", 5000, "mongo_load")},
-         {"parallel_tables", runtime.get_int("full_load_parallel_tables", 1, "mongo_load")}});
+        {{"batch_size",
+          runtime.get_size_t(
+              "full_load_batch_size", pipeline_defaults::kFullLoadBatchSizeDefault, "mariadb_load")},
+         {"parallel_tables", kFullLoadParallelTables}});
 
-    const auto targets_all = fetch_full_load_targets(app_pg.raw, service_tier);
+    const auto targets_all = fetch_full_load_targets(app_pg.raw);
     std::vector<MongoCatalogTableRow> targets;
     targets.reserve(targets_all.size());
     for (const auto& row : targets_all) {
@@ -729,8 +650,7 @@ FullLoadRunStats run_mongo_full_load(
             continue;
         }
 
-        const int parallel_tables =
-            std::max(1, runtime.get_int("full_load_parallel_tables", 1, "mongo_load", conn_id));
+        const int parallel_tables = kFullLoadParallelTables;
 
         std::size_t idx = 0;
         while (idx < conn_targets.size()) {

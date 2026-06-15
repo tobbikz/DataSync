@@ -10,7 +10,7 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
-#include "service_tiers.hpp"
+#include "pipeline_defaults.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -19,7 +19,6 @@
 #include <optional>
 #include <thread>
 #include <vector>
-#include <algorithm>
 
 namespace {
 
@@ -66,18 +65,14 @@ std::vector<std::string> all_conn_ids(const AppConfig& cfg) {
     return ids;
 }
 
-int run_apply_workers(
-    const AppConfig& cfg,
-    const std::string& conn_id,
-    const std::string& tier,
-    int tier_apply_worker_count) {
-    const int worker_count = tier_apply_worker_count > 0 ? tier_apply_worker_count : 1;
+int run_apply_workers(const AppConfig& cfg, const std::string& conn_id) {
+    const int worker_count = kApplyWorkerCount;
     if (worker_count <= 1) {
         PgConn pg(cfg.datasync.conn_string());
         if (!pg.raw) {
             return 1;
         }
-        return run_kafka_apply_native_cli(cfg, pg.raw, conn_id, tier, 0, 1);
+        return run_kafka_apply_native_cli(cfg, pg.raw, conn_id, 0, 1);
     }
 
     std::vector<std::thread> threads;
@@ -91,7 +86,7 @@ int run_apply_workers(
                     failures.fetch_add(1);
                     return;
                 }
-                const int rc = run_kafka_apply_native_cli(cfg, pg.raw, conn_id, tier, worker_id, worker_count);
+                const int rc = run_kafka_apply_native_cli(cfg, pg.raw, conn_id, worker_id, worker_count);
                 if (rc != 0) {
                     failures.fetch_add(1);
                 }
@@ -109,14 +104,12 @@ int run_apply_workers(
 void spawn_daemon_full_load_background(
     AppConfig cfg,
     std::string conn_id,
-    std::string tier_code,
     std::string batch_id,
     int pending_before,
     std::string db_engine) {
     std::thread t(
         [cfg = std::move(cfg),
          conn_id = std::move(conn_id),
-         tier_code = std::move(tier_code),
          batch_id = std::move(batch_id),
          pending_before,
          db_engine = std::move(db_engine)]() {
@@ -125,17 +118,15 @@ void spawn_daemon_full_load_background(
                 if (!pg.raw) {
                     return;
                 }
-                const auto outcome =
-                    try_run_daemon_full_load_isolated(cfg, pg.raw, conn_id, tier_code, batch_id);
+                const auto outcome = try_run_daemon_full_load_isolated(cfg, pg.raw, conn_id, batch_id);
                 if (!outcome) {
                     log_write(pg.raw, {
                         .level = LogLevel::Info,
                         .component = "cdc_daemon",
-                        .message = "daemon full-load skipped: tier lock held by another full-load",
+                        .message = "daemon full-load skipped: conn lock held by another full-load",
                         .batch_id = batch_id,
                         .conn_id = conn_id,
                         .context = {
-                            {"tier", tier_code},
                             {"db_engine", db_engine},
                             {"pending_tables", pending_before},
                             {"phase", "full_load_background"},
@@ -157,7 +148,6 @@ void spawn_daemon_full_load_background(
                     .batch_id = batch_id,
                     .conn_id = conn_id,
                     .context = {
-                        {"tier", tier_code},
                         {"db_engine", db_engine},
                         {"full_load_exit", outcome->exit_code},
                         {"pending_tables", outcome->pending_tables},
@@ -176,7 +166,7 @@ void spawn_daemon_full_load_background(
                             .message = "daemon full-load background failed",
                             .batch_id = batch_id,
                             .conn_id = conn_id,
-                            .context = {{"tier", tier_code}, {"error", ex.what()}},
+                            .context = {{"error", ex.what()}},
                         });
                     }
                 } catch (...) {
@@ -187,11 +177,7 @@ void spawn_daemon_full_load_background(
     g_background_threads.push_back(std::move(t));
 }
 
-int run_one_cycle(
-    const AppConfig& cfg,
-    PGconn* log_pg,
-    const std::string& conn_id,
-    const ServiceTier& tier) {
+int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_id) {
     const std::string batch_id = make_batch_id();
     const std::string db_engine = conn_engine(cfg, conn_id);
 
@@ -203,14 +189,13 @@ int run_one_cycle(
         .conn_id = conn_id,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"tier", tier.tier_code}, {"db_engine", db_engine}},
+        .context = {{"db_engine", db_engine}},
     });
 
-    const int pending_before =
-        count_full_load_pending(log_pg, conn_id, tier.tier_code, db_engine);
-    const bool tier_full_load_busy = full_load_tier_busy(conn_id, tier.tier_code);
+    const int pending_before = count_full_load_pending(log_pg, conn_id, db_engine);
+    const bool conn_full_load_busy = full_load_conn_busy(conn_id);
     bool full_load_spawned = false;
-    if (pending_before > 0 && !tier_full_load_busy) {
+    if (pending_before > 0 && !conn_full_load_busy) {
         full_load_spawned = true;
         log_write(log_pg, {
             .level = LogLevel::Info,
@@ -221,7 +206,6 @@ int run_one_cycle(
             .source_schema = std::nullopt,
             .source_table = std::nullopt,
             .context = {
-                {"tier", tier.tier_code},
                 {"db_engine", db_engine},
                 {"pending_tables", pending_before},
                 {"phase", "full_load_background"},
@@ -229,25 +213,16 @@ int run_one_cycle(
             },
         });
         spawn_daemon_full_load_background(
-            snapshot_app_config(cfg),
-            conn_id,
-            tier.tier_code,
-            batch_id,
-            pending_before,
-            db_engine);
+            snapshot_app_config(cfg), conn_id, batch_id, pending_before, db_engine);
     }
 
-    const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, tier.tier_code, batch_id);
+    const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, batch_id);
     const int pre_rc = pre.errors > 0 ? 1 : 0;
-    RuntimeConfig apply_runtime;
-    apply_runtime.reload(log_pg);
-    const int apply_workers = apply_runtime.get_int(
-        "apply_worker_count", tier.apply_worker_count, "cdc_kafka_apply", conn_id);
-    const int apply_rc = run_apply_workers(cfg, conn_id, tier.tier_code, apply_workers);
+    const int apply_rc = run_apply_workers(cfg, conn_id);
     int cycle_errors = (pre_rc != 0 ? 1 : 0) + (apply_rc != 0 ? 1 : 0);
 
     try {
-        const int cleared = clear_stale_cdc_in_progress(log_pg, conn_id, tier.tier_code, db_engine);
+        const int cleared = clear_stale_cdc_in_progress(log_pg, conn_id, db_engine);
         if (cleared > 0) {
             log_write(log_pg, {
                 .level = LogLevel::Info,
@@ -257,7 +232,7 @@ int run_one_cycle(
                 .conn_id = conn_id,
                 .source_schema = std::nullopt,
                 .source_table = std::nullopt,
-                .context = {{"cleared", cleared}, {"tier", tier.tier_code}, {"db_engine", db_engine}},
+                .context = {{"cleared", cleared}, {"db_engine", db_engine}},
             });
         }
     } catch (const std::exception& ex) {
@@ -269,7 +244,7 @@ int run_one_cycle(
             .conn_id = conn_id,
             .source_schema = std::nullopt,
             .source_table = std::nullopt,
-            .context = {{"error", ex.what()}, {"tier", tier.tier_code}},
+            .context = {{"error", ex.what()}},
         });
     }
 
@@ -282,12 +257,11 @@ int run_one_cycle(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
         .context = {
-            {"tier", tier.tier_code},
             {"db_engine", db_engine},
             {"pre_apply_exit", pre_rc},
             {"apply_exit", apply_rc},
             {"full_load_pending", pending_before},
-            {"full_load_tier_busy", tier_full_load_busy},
+            {"full_load_conn_busy", conn_full_load_busy},
             {"full_load_spawned", full_load_spawned},
             {"errors", cycle_errors},
         },
@@ -296,20 +270,14 @@ int run_one_cycle(
     return cycle_errors == 0 ? 0 : 1;
 }
 
-int run_parallel_daemon_round(
-    const AppConfig& cfg,
-    const std::vector<std::string>& conn_ids,
-    const std::vector<ServiceTier>& tiers) {
+int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::string>& conn_ids) {
     std::atomic<int> failures{0};
     const std::string round_batch_id = make_batch_id();
 
     {
         PgConn catalog_pg(cfg.datasync.conn_string());
         if (catalog_pg.raw) {
-            RuntimeConfig runtime;
-            runtime.reload(catalog_pg.raw);
-            const int sync_every =
-                runtime.get_int("catalog_sync_interval_rounds", 12, "catalog", "");
+            const int sync_every = pipeline_defaults::kCatalogSyncIntervalRounds;
             const int round = g_catalog_sync_round.fetch_add(1) + 1;
             const bool do_sync = sync_every <= 1 || round == 1 || (round % sync_every) == 0;
             if (do_sync) {
@@ -331,8 +299,7 @@ int run_parallel_daemon_round(
             }
             try {
                 const std::string db_engine = conn_engine(cfg, conn_id);
-                const int cleared =
-                    clear_stale_cdc_in_progress(capture_pg.raw, conn_id, std::nullopt, db_engine);
+                const int cleared = clear_stale_cdc_in_progress(capture_pg.raw, conn_id, db_engine);
                 if (cleared > 0) {
                     log_write(capture_pg.raw, {
                         .level = LogLevel::Info,
@@ -370,25 +337,28 @@ int run_parallel_daemon_round(
         try {
             capture_threads.emplace_back(make_capture_fn(conn_id));
         } catch (...) {
-            for (auto& t : capture_threads) if (t.joinable()) t.join();
+            for (auto& t : capture_threads) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
             throw;
         }
     }
 
     std::vector<std::thread> threads;
-    threads.reserve(conn_ids.size() * tiers.size());
+    threads.reserve(conn_ids.size());
 
-    for (const auto& tier : tiers) {
-        for (const auto& conn_id : conn_ids) {
-            try {
-                threads.emplace_back([&, tier, conn_id]() {
+    for (const auto& conn_id : conn_ids) {
+        try {
+            threads.emplace_back([&, conn_id]() {
                 PgConn pg(cfg.datasync.conn_string());
                 if (!pg.raw) {
                     failures.fetch_add(1);
                     return;
                 }
                 try {
-                    if (run_one_cycle(cfg, pg.raw, conn_id, tier) != 0) {
+                    if (run_one_cycle(cfg, pg.raw, conn_id) != 0) {
                         failures.fetch_add(1);
                     }
                 } catch (const std::exception& ex) {
@@ -401,14 +371,17 @@ int run_parallel_daemon_round(
                         .conn_id = conn_id,
                         .source_schema = std::nullopt,
                         .source_table = std::nullopt,
-                        .context = {{"tier", tier.tier_code}, {"error", ex.what()}},
+                        .context = {{"error", ex.what()}},
                     });
                 }
             });
-            } catch (...) {
-                for (auto& t : threads) if (t.joinable()) t.join();
-                throw;
+        } catch (...) {
+            for (auto& t : threads) {
+                if (t.joinable()) {
+                    t.join();
+                }
             }
+            throw;
         }
     }
 
@@ -444,7 +417,6 @@ void run_startup_full_load_sweep(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::vector<std::string>& conn_ids,
-    const std::vector<ServiceTier>& tiers,
     int& exit_code) {
     log_write(log_pg, {
         .level = LogLevel::Info,
@@ -455,33 +427,27 @@ void run_startup_full_load_sweep(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
     });
-    for (const auto& tier : tiers) {
+    for (const auto& conn_id : conn_ids) {
         if (g_shutdown.load()) {
             break;
         }
-        for (const auto& conn_id : conn_ids) {
-            if (g_shutdown.load()) {
-                break;
-            }
-            try {
-                const auto sweep = try_run_daemon_full_load_isolated(
-                    cfg, log_pg, conn_id, tier.tier_code, make_batch_id());
-                if (sweep && sweep->ran && sweep->exit_code != 0) {
-                    exit_code = 1;
-                }
-            } catch (const std::exception& ex) {
+        try {
+            const auto sweep = try_run_daemon_full_load_isolated(cfg, log_pg, conn_id, make_batch_id());
+            if (sweep && sweep->ran && sweep->exit_code != 0) {
                 exit_code = 1;
-                log_write(log_pg, {
-                    .level = LogLevel::Error,
-                    .component = "cdc_daemon",
-                    .message = "daemon startup full-load sweep failed",
-                    .batch_id = make_batch_id(),
-                    .conn_id = conn_id,
-                    .source_schema = std::nullopt,
-                    .source_table = std::nullopt,
-                    .context = {{"tier", tier.tier_code}, {"error", ex.what()}},
-                });
             }
+        } catch (const std::exception& ex) {
+            exit_code = 1;
+            log_write(log_pg, {
+                .level = LogLevel::Error,
+                .component = "cdc_daemon",
+                .message = "daemon startup full-load sweep failed",
+                .batch_id = make_batch_id(),
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {{"error", ex.what()}},
+            });
         }
     }
     log_write(log_pg, {
@@ -516,10 +482,7 @@ std::vector<std::string> wait_for_daemon_connections(PGconn* log_pg, AppConfig& 
 
 }  // namespace
 
-int run_cdc_daemon(
-    AppConfig& cfg,
-    PGconn* log_pg,
-    bool once) {
+int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
@@ -530,7 +493,8 @@ int run_cdc_daemon(
 
     RuntimeConfig runtime;
     runtime.reload(log_pg);
-    const int retention_days = runtime.get_int("logs_retention_days", 7, "global");
+    const int retention_days =
+        runtime.get_int("logs_retention_days", pipeline_defaults::kLogsRetentionDaysDefault, "global");
     purge_logs(log_pg, retention_days);
 
     const auto conn_ids_initial = wait_for_daemon_connections(log_pg, cfg);
@@ -538,26 +502,12 @@ int run_cdc_daemon(
         return 0;
     }
 
-    const auto tiers = load_service_tiers(cfg);
-    if (tiers.empty()) {
-        log_write(log_pg, {
-            .level = LogLevel::Error,
-            .component = "cdc_daemon",
-            .message = "daemon failed: no active tiers in config.json cdc.tiers",
-            .batch_id = make_batch_id(),
-            .conn_id = std::nullopt,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-        });
-        return 1;
-    }
-
     const std::string batch_id = make_batch_id();
 
     for (const auto& conn_id : conn_ids_initial) {
         const std::string db_engine = conn_engine(cfg, conn_id);
         clear_stale_full_load_in_progress(log_pg, conn_id, db_engine, 30);
-        clear_stale_cdc_in_progress(log_pg, conn_id, std::nullopt, db_engine);
+        clear_stale_cdc_in_progress(log_pg, conn_id, db_engine);
         log_write(log_pg, {
             .level = LogLevel::Info,
             .component = "cdc_daemon",
@@ -570,7 +520,7 @@ int run_cdc_daemon(
         });
     }
 
-    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, "");
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_daemon",
@@ -580,10 +530,8 @@ int run_cdc_daemon(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
         .context = {
-            {"tiers", tiers.size()},
             {"conn_ids", conn_ids_initial.size()},
             {"once", once},
-            {"parallel_tiers", true},
             {"round_idle_seconds", round_idle_seconds(cfg.cdc)},
             {"slice_max_seconds", cfg.cdc.slice_max_seconds},
             {"slice_max_events", cfg.cdc.slice_max_events},
@@ -599,14 +547,14 @@ int run_cdc_daemon(
     std::size_t last_conn_count = conn_ids_initial.size();
 
     const AppConfig startup_cfg = snapshot_app_config(cfg);
-    std::thread startup_full_load_thread([startup_cfg, conn_ids_initial, tiers]() {
+    std::thread startup_full_load_thread([startup_cfg, conn_ids_initial]() {
         try {
             PgConn pg(startup_cfg.datasync.conn_string());
             if (!pg.raw) {
                 return;
             }
             int sweep_exit = 0;
-            run_startup_full_load_sweep(startup_cfg, pg.raw, conn_ids_initial, tiers, sweep_exit);
+            run_startup_full_load_sweep(startup_cfg, pg.raw, conn_ids_initial, sweep_exit);
         } catch (const std::exception& ex) {
             try {
                 PgConn pg(startup_cfg.datasync.conn_string());
@@ -630,9 +578,8 @@ int run_cdc_daemon(
             if (!pg.raw) {
                 return;
             }
-            (void)run_reconcile_loop(reconcile_cfg, pg.raw, std::nullopt, false, &g_shutdown);
+            (void)run_reconcile_loop(reconcile_cfg, pg.raw, false, &g_shutdown);
         } catch (const std::exception&) {
-            // reconcile errors are logged inside run_reconcile_loop
         }
     });
 
@@ -664,11 +611,11 @@ int run_cdc_daemon(
                     },
                 });
                 const AppConfig sweep_cfg = snapshot_app_config(cfg);
-                run_startup_full_load_sweep(sweep_cfg, log_pg, conn_ids, tiers, exit_code);
+                run_startup_full_load_sweep(sweep_cfg, log_pg, conn_ids, exit_code);
                 last_conn_count = conn_ids.size();
             }
             const AppConfig round_cfg = snapshot_app_config(cfg);
-            if (run_parallel_daemon_round(round_cfg, conn_ids, tiers) != 0) {
+            if (run_parallel_daemon_round(round_cfg, conn_ids) != 0) {
                 exit_code = 1;
             }
         }

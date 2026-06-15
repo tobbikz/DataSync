@@ -1,5 +1,7 @@
 #pragma once
 
+#include "pg_conn.hpp"
+
 #include <libpq-fe.h>
 #include <mysql/mysql.h>
 
@@ -38,9 +40,6 @@ std::string mariadb_bytea_to_copy_csv(const std::string& value);
 
 /** SQL literal for BYTEA upserts (CDC apply). */
 std::string mariadb_bytea_to_sql_literal(const std::string& value);
-
-void pg_exec(PGconn* pg, const std::string& sql);
-void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const* vals);
 
 std::vector<MariaDbColumn> fetch_mariadb_columns(MYSQL* mysql, const std::string& schema, const std::string& table);
 

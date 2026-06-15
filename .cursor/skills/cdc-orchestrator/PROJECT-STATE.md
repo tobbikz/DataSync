@@ -101,4 +101,4 @@ Build: `cpp/build-kafka` OK.
 |----------|---------|-----|
 | `DATASYNC_CONFIG` | `/app/config.json` | PG credentials |
 | `DATASYNC_RUN_MIGRATIONS` | `0` | `1` = apply catalog DDL on start |
-| `KAFKA_BOOTSTRAP` | — | Patch `runtime_config.kafka_bootstrap_servers` |
+| `KAFKA_BOOTSTRAP` | `127.0.0.1:9092` | Kafka bootstrap (env only; C++ reads via `resolve_kafka_bootstrap`) |

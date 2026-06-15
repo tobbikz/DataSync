@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/iks/Projects/DataSync/cpp/build-kafka/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

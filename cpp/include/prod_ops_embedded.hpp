@@ -1,7 +1,67 @@
--- DataSync prod_ops.sql — single SQL file (schema, migrations, seed, prod tune, diagnostics)
--- Applied by: docker compose run -e DATASYNC_RUN_MIGRATIONS=1 datasync schema-only (per-section)
---
--- @section:datasync_baseline
+#pragma once
+
+#include <string_view>
+
+namespace prod_ops_embedded {
+    inline std::string_view datalake_lake() {
+        return R"PO_datalake_lak(
+-- DataLake helpers — apply to config.json → datalake.database (idempotent via install).
+-- Partition DDL for raw/staging tables lives here; control plane stays in cdc_catalog (datasync DB).
+
+CREATE SCHEMA IF NOT EXISTS lake;
+
+CREATE OR REPLACE FUNCTION lake.month_bounds(p_month date)
+    RETURNS TABLE(start_date date, end_date date)
+    LANGUAGE sql
+    IMMUTABLE
+    AS $$
+    SELECT date_trunc('month', p_month)::date,
+           (date_trunc('month', p_month) + interval '1 month')::date;
+$$;
+
+CREATE OR REPLACE FUNCTION lake.ensure_monthly_partitions(
+    p_schema text,
+    p_table text,
+    p_months_ahead integer DEFAULT 3
+) RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    m date;
+    end_m date;
+    part_name text;
+    start_d date;
+    end_d date;
+    created integer := 0;
+BEGIN
+    m := date_trunc('month', CURRENT_DATE)::date;
+    end_m := (date_trunc('month', CURRENT_DATE) + make_interval(months => p_months_ahead + 1))::date;
+
+    WHILE m < end_m LOOP
+        SELECT lb.start_date, lb.end_date INTO start_d, end_d FROM lake.month_bounds(m) lb;
+        part_name := format('%s_%s', p_table, to_char(start_d, 'YYYY_MM'));
+
+        IF to_regclass(format('%I.%I', p_schema, part_name)) IS NULL THEN
+            EXECUTE format(
+                'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.%I FOR VALUES FROM (%L) TO (%L)',
+                p_schema, part_name, p_schema, p_table,
+                start_d::text || ' 00:00:00+00',
+                end_d::text || ' 00:00:00+00'
+            );
+            created := created + 1;
+        END IF;
+        m := (m + interval '1 month')::date;
+    END LOOP;
+    RETURN created;
+END;
+$$;
+
+COMMENT ON FUNCTION lake.ensure_monthly_partitions(text, text, integer) IS
+    'Create monthly RANGE partitions on _dl_load_timestamp for a partitioned lake table.';
+)PO_datalake_lak";
+    }
+    inline std::string_view datasync_baseline() {
+        return R"PO_datasync_bas(
 --
 -- CDC catalog schema-only backup (no data)
 -- Source: local DataLake @ 2025-06-06
@@ -92,21 +152,6 @@ CREATE TYPE cdc_catalog.replication_status AS ENUM (
 --
 
 COMMENT ON TYPE cdc_catalog.replication_status IS 'pending | full_load_in_progress | cdc_in_progress | success | failed | skipped | disabled';
-
-
---
--- Name: service_tier; Type: TYPE; Schema: cdc_catalog; Owner: -
---
-
-CREATE TYPE cdc_catalog.service_tier AS ENUM (
-    'gold',
-    'silver',
-    'bronze',
-    'hot',
-    'platinum',
-    'trash',
-    'firehose'
-);
 
 
 --
@@ -210,7 +255,6 @@ CREATE TABLE cdc_catalog.apply_batch_stats (
     catalog_id bigint,
     source_schema text NOT NULL,
     source_table text NOT NULL,
-    service_tier text,
     events_inserts bigint DEFAULT 0 NOT NULL,
     events_updates bigint DEFAULT 0 NOT NULL,
     events_deletes bigint DEFAULT 0 NOT NULL,
@@ -223,7 +267,6 @@ CREATE TABLE cdc_catalog.apply_batch_stats (
     context jsonb DEFAULT '{}'::jsonb NOT NULL,
     logged_at timestamp with time zone DEFAULT now() NOT NULL,
     is_stale boolean DEFAULT false NOT NULL,
-    is_starving boolean DEFAULT false NOT NULL,
     is_inactive boolean DEFAULT false NOT NULL,
     is_quarantined boolean DEFAULT false NOT NULL,
     reconciliation_rag text DEFAULT 'UNKNOWN'::text NOT NULL,
@@ -235,18 +278,10 @@ CREATE TABLE cdc_catalog.apply_batch_stats (
     capture_lag_seconds integer DEFAULT 0 NOT NULL,
     kafka_consumer_lag bigint DEFAULT 0 NOT NULL,
     reconcile_row_delta bigint,
-    catchup_triggered boolean DEFAULT false NOT NULL,
-    fk_deferred_retries integer DEFAULT 0 NOT NULL,
     dedup_skipped integer DEFAULT 0 NOT NULL,
     parse_skipped bigint DEFAULT 0 NOT NULL,
     dropped_unrecoverable bigint DEFAULT 0 NOT NULL,
     semaphore text GENERATED ALWAYS AS (reconciliation_rag) STORED,
-    host_cpu_percent double precision,
-    host_mem_used_mb bigint,
-    host_mem_percent integer,
-    host_net_rx_mb bigint,
-    host_net_tx_mb bigint,
-    process_rss_mb bigint,
     CONSTRAINT apply_batch_stats_reconciliation_rag_chk CHECK ((reconciliation_rag = ANY (ARRAY['GREEN'::text, 'AMBER'::text, 'RED'::text, 'UNKNOWN'::text])))
 );
 
@@ -263,13 +298,6 @@ COMMENT ON TABLE cdc_catalog.apply_batch_stats IS 'Per-table apply slice stats: 
 --
 
 COMMENT ON COLUMN cdc_catalog.apply_batch_stats.is_stale IS 'apply_position lag exceeds apply_max_table_staleness_seconds or status stale/lagging/gap';
-
-
---
--- Name: COLUMN apply_batch_stats.is_starving; Type: COMMENT; Schema: cdc_catalog; Owner: -
---
-
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.is_starving IS 'Slice had Kafka events for table but zero applied (fairness starvation)';
 
 
 --
@@ -308,20 +336,6 @@ COMMENT ON COLUMN cdc_catalog.apply_batch_stats.reconcile_row_delta IS 'source_r
 
 
 --
--- Name: COLUMN apply_batch_stats.catchup_triggered; Type: COMMENT; Schema: cdc_catalog; Owner: -
---
-
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.catchup_triggered IS 'Mini full-load catchup ran for this table in same batch_id';
-
-
---
--- Name: COLUMN apply_batch_stats.fk_deferred_retries; Type: COMMENT; Schema: cdc_catalog; Owner: -
---
-
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.fk_deferred_retries IS 'FK violation fallbacks to row-level merge in this batch';
-
-
---
 -- Name: COLUMN apply_batch_stats.dedup_skipped; Type: COMMENT; Schema: cdc_catalog; Owner: -
 --
 
@@ -333,48 +347,6 @@ COMMENT ON COLUMN cdc_catalog.apply_batch_stats.dedup_skipped IS 'Kafka events s
 --
 
 COMMENT ON COLUMN cdc_catalog.apply_batch_stats.semaphore IS 'GREEN/AMBER/RED mirror of reconciliation_rag (latest reconcile)';
-
-
---
--- Name: COLUMN apply_batch_stats.host_cpu_percent; Type: COMMENT; Schema: cdc_catalog; Owner: -
---
-
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.host_cpu_percent IS 'Host CPU busy % during apply slice (from /proc/stat delta)';
-
-
---
--- Name: COLUMN apply_batch_stats.host_mem_used_mb; Type: COMMENT; Schema: cdc_catalog; Owner: -
---
-
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.host_mem_used_mb IS 'DataSync process RSS MB at slice sample time (/proc/self/status VmRSS)';
-
-
---
--- Name: COLUMN apply_batch_stats.host_mem_percent; Type: COMMENT; Schema: cdc_catalog; Owner: -
---
-
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.host_mem_percent IS 'DataSync process RSS as % of host MemTotal (not host-wide used %)';
-
-
---
--- Name: COLUMN apply_batch_stats.host_net_rx_mb; Type: COMMENT; Schema: cdc_catalog; Owner: -
---
-
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.host_net_rx_mb IS 'Host network RX MB during apply slice (excludes lo)';
-
-
---
--- Name: COLUMN apply_batch_stats.host_net_tx_mb; Type: COMMENT; Schema: cdc_catalog; Owner: -
---
-
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.host_net_tx_mb IS 'Host network TX MB during apply slice (excludes lo)';
-
-
---
--- Name: COLUMN apply_batch_stats.process_rss_mb; Type: COMMENT; Schema: cdc_catalog; Owner: -
---
-
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.process_rss_mb IS 'Same as host_mem_used_mb: DataSync RSS MB at sample time';
 
 
 --
@@ -473,7 +445,6 @@ CREATE TABLE cdc_catalog.catalog (
     cdc_enabled boolean DEFAULT false NOT NULL,
     needs_full_load boolean DEFAULT true NOT NULL,
     capture_during_full_load boolean DEFAULT false NOT NULL,
-    service_tier cdc_catalog.service_tier DEFAULT 'bronze'::cdc_catalog.service_tier NOT NULL,
     status cdc_catalog.replication_status DEFAULT 'pending'::cdc_catalog.replication_status NOT NULL,
     last_full_load_at timestamp with time zone,
     last_cdc_at timestamp with time zone,
@@ -571,45 +542,6 @@ CREATE TABLE cdc_catalog.cdc_mssql_lsn (
 --
 
 COMMENT ON TABLE cdc_catalog.cdc_mssql_lsn IS 'Per-table SQL Server CDC LSN checkpoint for cdc_kafka MSSQL capture';
-
-
---
--- Name: cdc_run_fairness_metrics; Type: TABLE; Schema: cdc_catalog; Owner: -
---
-
-CREATE TABLE cdc_catalog.cdc_run_fairness_metrics (
-    run_id bigint NOT NULL,
-    batch_id text NOT NULL,
-    conn_id text NOT NULL,
-    service_tier text,
-    stop_reason text NOT NULL,
-    tables_total integer DEFAULT 0 NOT NULL,
-    tables_met_target integer DEFAULT 0 NOT NULL,
-    tables_starved integer DEFAULT 0 NOT NULL,
-    tables_quiet integer DEFAULT 0 NOT NULL,
-    oldest_lag_seconds integer DEFAULT 0 NOT NULL,
-    events_seen bigint DEFAULT 0 NOT NULL,
-    events_applied bigint DEFAULT 0 NOT NULL,
-    parse_skipped bigint DEFAULT 0 NOT NULL,
-    dropped_unrecoverable bigint DEFAULT 0 NOT NULL,
-    duration_ms bigint DEFAULT 0 NOT NULL,
-    context jsonb DEFAULT '{}'::jsonb NOT NULL,
-    logged_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
--- Name: cdc_run_fairness_metrics_run_id_seq; Type: SEQUENCE; Schema: cdc_catalog; Owner: -
---
-
-ALTER TABLE cdc_catalog.cdc_run_fairness_metrics ALTER COLUMN run_id ADD GENERATED ALWAYS AS IDENTITY (
-    SEQUENCE NAME cdc_catalog.cdc_run_fairness_metrics_run_id_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1
-);
 
 
 --
@@ -719,7 +651,6 @@ CREATE TABLE cdc_catalog.reconciliation_result (
     conn_id text NOT NULL,
     source_schema text NOT NULL,
     source_table text NOT NULL,
-    service_tier text,
     source_row_count bigint,
     lake_row_count bigint,
     row_count_delta bigint,
@@ -763,7 +694,6 @@ CREATE TABLE cdc_catalog.reconciliation_run (
     run_id bigint NOT NULL,
     batch_id text NOT NULL,
     conn_id text NOT NULL,
-    service_tier text,
     started_at timestamp with time zone DEFAULT now() NOT NULL,
     finished_at timestamp with time zone,
     status text DEFAULT 'running'::text NOT NULL,
@@ -775,11 +705,11 @@ CREATE TABLE cdc_catalog.reconciliation_run (
     reconcile_mode text DEFAULT 'full'::text NOT NULL,
     context jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT reconciliation_run_status_check CHECK ((status = ANY (ARRAY['running'::text, 'ok'::text, 'warn'::text, 'fail'::text]))),
-    CONSTRAINT reconciliation_run_mode_check CHECK ((reconcile_mode = ANY (ARRAY['full'::text, 'light'::text])))
+    CONSTRAINT reconciliation_run_mode_check CHECK ((reconcile_mode = 'full'::text))
 );
 
 
-COMMENT ON TABLE cdc_catalog.reconciliation_run IS 'One row per cdc_kafka reconcile CLI run (independent of capture/apply daemon). reconcile_mode = full (row count + PK checksum + lag) vs light (row count + lag only).';
+COMMENT ON TABLE cdc_catalog.reconciliation_run IS 'One row per reconcile CLI run (full: row count + PK checksum + lag).';
 
 
 --
@@ -827,7 +757,6 @@ CREATE VIEW cdc_catalog.v_apply_stale AS
     ap.conn_id,
     ap.source_schema,
     ap.source_table,
-    c.service_tier,
     ap.last_applied_at,
     ap.apply_lag_seconds,
     ap.status,
@@ -876,7 +805,6 @@ COMMENT ON VIEW cdc_catalog.v_capture_health IS 'GTID capture cursor health per 
 
 CREATE VIEW cdc_catalog.v_cdc_pipeline_summary AS
  SELECT c.conn_id,
-    (c.service_tier)::text AS service_tier,
     count(*) FILTER (WHERE (c.active AND c.cdc_enabled AND (NOT c.needs_full_load))) AS cdc_ready,
     count(*) FILTER (WHERE (ap.status = 'healthy'::cdc_catalog.cdc_health_status)) AS apply_healthy,
     count(*) FILTER (WHERE (ap.status = ANY (ARRAY['stale'::cdc_catalog.cdc_health_status, 'lagging'::cdc_catalog.cdc_health_status]))) AS apply_lagging,
@@ -885,7 +813,7 @@ CREATE VIEW cdc_catalog.v_cdc_pipeline_summary AS
    FROM (cdc_catalog.catalog c
      LEFT JOIN cdc_catalog.apply_position ap USING (catalog_id))
   WHERE (c.db_engine = 'mariadb'::cdc_catalog.db_engine)
-  GROUP BY c.conn_id, c.service_tier;
+  GROUP BY c.conn_id;
 
 
 --
@@ -961,14 +889,6 @@ ALTER TABLE ONLY cdc_catalog.cdc_mssql_lsn
 
 
 --
--- Name: cdc_run_fairness_metrics cdc_run_fairness_metrics_pkey; Type: CONSTRAINT; Schema: cdc_catalog; Owner: -
---
-
-ALTER TABLE ONLY cdc_catalog.cdc_run_fairness_metrics
-    ADD CONSTRAINT cdc_run_fairness_metrics_pkey PRIMARY KEY (run_id);
-
-
---
 -- Name: connections connections_pkey; Type: CONSTRAINT; Schema: cdc_catalog; Owner: -
 --
 
@@ -1027,7 +947,7 @@ CREATE INDEX apply_batch_stats_batch_idx ON cdc_catalog.apply_batch_stats USING 
 -- Name: apply_batch_stats_health_idx; Type: INDEX; Schema: cdc_catalog; Owner: -
 --
 
-CREATE INDEX apply_batch_stats_health_idx ON cdc_catalog.apply_batch_stats USING btree (conn_id, is_stale, is_starving, is_inactive);
+CREATE INDEX apply_batch_stats_health_idx ON cdc_catalog.apply_batch_stats USING btree (conn_id, is_stale, is_inactive);
 
 
 --
@@ -1069,7 +989,7 @@ CREATE INDEX apply_position_stale_idx ON cdc_catalog.apply_position USING btree 
 -- Name: catalog_active_cdc_idx; Type: INDEX; Schema: cdc_catalog; Owner: -
 --
 
-CREATE INDEX catalog_active_cdc_idx ON cdc_catalog.catalog USING btree (service_tier, conn_id) WHERE ((active = true) AND (cdc_enabled = true) AND (needs_full_load = false));
+CREATE INDEX catalog_active_cdc_idx ON cdc_catalog.catalog USING btree (conn_id) WHERE ((active = true) AND (cdc_enabled = true) AND (needs_full_load = false));
 
 
 --
@@ -1090,7 +1010,7 @@ CREATE INDEX catalog_failed_idx ON cdc_catalog.catalog USING btree (last_error_a
 -- Name: catalog_needs_full_load_idx; Type: INDEX; Schema: cdc_catalog; Owner: -
 --
 
-CREATE INDEX catalog_needs_full_load_idx ON cdc_catalog.catalog USING btree (service_tier, conn_id) WHERE ((active = true) AND (needs_full_load = true));
+CREATE INDEX catalog_needs_full_load_idx ON cdc_catalog.catalog USING btree (conn_id) WHERE ((active = true) AND (needs_full_load = true));
 
 
 --
@@ -1105,13 +1025,6 @@ CREATE INDEX cdc_applied_events_applied_at_idx ON cdc_catalog.cdc_applied_events
 --
 
 CREATE INDEX cdc_applied_events_table_idx ON cdc_catalog.cdc_applied_events USING btree (conn_id, source_schema, source_table, applied_at DESC);
-
-
---
--- Name: cdc_fairness_metrics_batch_idx; Type: INDEX; Schema: cdc_catalog; Owner: -
---
-
-CREATE INDEX cdc_fairness_metrics_batch_idx ON cdc_catalog.cdc_run_fairness_metrics USING btree (batch_id, conn_id);
 
 
 --
@@ -1250,63 +1163,10 @@ ALTER TABLE ONLY cdc_catalog.schema_migrations
 --
 -- PostgreSQL database dump complete
 --
-
-
--- @section:datalake_lake
--- DataLake helpers — apply to config.json → datalake.database (idempotent via install).
--- Partition DDL for raw/staging tables lives here; control plane stays in cdc_catalog (datasync DB).
-
-CREATE SCHEMA IF NOT EXISTS lake;
-
-CREATE OR REPLACE FUNCTION lake.month_bounds(p_month date)
-    RETURNS TABLE(start_date date, end_date date)
-    LANGUAGE sql
-    IMMUTABLE
-    AS $$
-    SELECT date_trunc('month', p_month)::date,
-           (date_trunc('month', p_month) + interval '1 month')::date;
-$$;
-
-CREATE OR REPLACE FUNCTION lake.ensure_monthly_partitions(
-    p_schema text,
-    p_table text,
-    p_months_ahead integer DEFAULT 3
-) RETURNS integer
-    LANGUAGE plpgsql
-    AS $$
-DECLARE
-    m date;
-    end_m date;
-    part_name text;
-    start_d date;
-    end_d date;
-    created integer := 0;
-BEGIN
-    m := date_trunc('month', CURRENT_DATE)::date;
-    end_m := (date_trunc('month', CURRENT_DATE) + make_interval(months => p_months_ahead + 1))::date;
-
-    WHILE m < end_m LOOP
-        SELECT lb.start_date, lb.end_date INTO start_d, end_d FROM lake.month_bounds(m) lb;
-        part_name := format('%s_%s', p_table, to_char(start_d, 'YYYY_MM'));
-
-        IF to_regclass(format('%I.%I', p_schema, part_name)) IS NULL THEN
-            EXECUTE format(
-                'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.%I FOR VALUES FROM (%L) TO (%L)',
-                p_schema, part_name, p_schema, p_table,
-                start_d::text || ' 00:00:00+00',
-                end_d::text || ' 00:00:00+00'
-            );
-            created := created + 1;
-        END IF;
-        m := (m + interval '1 month')::date;
-    END LOOP;
-    RETURN created;
-END;
-$$;
-
-COMMENT ON FUNCTION lake.ensure_monthly_partitions(text, text, integer) IS
-    'Create monthly RANGE partitions on _dl_load_timestamp for a partitioned lake table.';
--- @section:datasync_incremental
+)PO_datasync_bas";
+    }
+    inline std::string_view datasync_incremental() {
+        return R"PO_datasync_inc(
 -- Snapshot + concurrent stream: capture to Kafka while full load runs.
 ALTER TABLE cdc_catalog.catalog
     ADD COLUMN IF NOT EXISTS capture_during_full_load boolean NOT NULL DEFAULT false;
@@ -1326,10 +1186,8 @@ DROP FUNCTION IF EXISTS cdc_catalog.refresh_pipeline_health_live(
 
 DROP TABLE IF EXISTS cdc_catalog.pipeline_health;
 
--- Migration 002: canonical runtime_config (22 global rows) + one-time reconcile history reset.
--- Latency/mirror knobs (apply_max_seconds, apply_append_only, capture_max_seconds, catchup thresholds)
--- are C++ binary defaults — not runtime_config.
--- Credentials: config.json + cdc_catalog.connections. Kafka bootstrap patched by install.sh (KAFKA_BOOTSTRAP).
+-- Migration 002: canonical runtime_config (5 global rows) + one-time reconcile history reset.
+-- All other tuning: cpp/include/pipeline_defaults.hpp. Kafka bootstrap: KAFKA_BOOTSTRAP env.
 
 DO $$
 BEGIN
@@ -1363,135 +1221,47 @@ WHERE component = 'cdc_kafka_health'
         ('apply_catchup_lag_seconds', 'cdc_kafka_apply'),
         ('apply_catchup_max_tables', 'cdc_kafka_apply'),
         ('apply_catchup_min_kafka_messages', 'cdc_kafka_apply'),
+        ('apply_worker_count', 'cdc_kafka_apply'),
+        ('apply_process_rss_cap_mb', 'cdc_kafka_apply'),
+        ('full_load_parallel_tables', 'mariadb_load'),
+        ('kafka_purge_consumed_enabled', 'cdc_kafka_apply'),
+        ('kafka_purge_consumed_interval_seconds', 'cdc_kafka_apply'),
+        ('kafka_purge_consumed_max_lag', 'cdc_kafka_apply'),
+        ('kafka_purge_consumed_min_deletable_offsets', 'cdc_kafka_apply'),
         ('kafka_topic_partitions', 'cdc_kafka_capture'),
         ('kafka_topic_partitions', 'cdc_kafka_apply')
     );
 
 DELETE FROM cdc_catalog.runtime_config
 WHERE (config_key, component, COALESCE(conn_id, '')) NOT IN (
-    ('capture_producer_queue_max_messages', 'cdc_kafka_capture', ''),
-    ('capture_producer_queue_max_kbytes',   'cdc_kafka_capture', ''),
-    ('apply_worker_count',                  'cdc_kafka_apply', ''),
-    ('full_load_max_fail_retries',          'mariadb_load', ''),
-    ('full_load_failed_cooldown_minutes',   'mariadb_load', ''),
-    ('kafka_bootstrap_servers',             'cdc_kafka_apply', ''),
-    ('apply_batch_size',                    'cdc_kafka_apply', ''),
-    ('apply_dedup_enabled',                 'cdc_kafka_apply', ''),
-    ('capture_quiet_exit_lagging_chunks',   'cdc_kafka_capture', ''),
-    ('capture_max_events',                  'cdc_kafka_capture', ''),
-    ('apply_max_events',                    'cdc_kafka_apply', ''),
-    ('full_load_batch_size',                'mariadb_load', ''),
-    ('full_load_workers',                   'mariadb_load', ''),
-    ('logs_retention_days',                 'global', ''),
-    ('reconcile_interval_hours',             'cdc_kafka_reconcile', ''),
-    ('reconcile_enabled',                   'cdc_kafka_reconcile', ''),
-    ('applied_events_retention_days',       'cdc_kafka_apply', ''),
-    ('apply_process_rss_cap_mb',            'cdc_kafka_apply', ''),
-    ('kafka_topic_mode',                    'global', ''),
-    ('kafka_topic_buckets',                 'global', ''),
-    ('catalog_sync_interval_rounds',        'catalog', ''),
-    ('full_load_parallel_tables',           'mariadb_load', '')
+    ('full_load_batch_size',          'mariadb_load',        ''),
+    ('apply_batch_size',              'cdc_kafka_apply',     ''),
+    ('reconcile_interval_hours',      'cdc_kafka_reconcile', ''),
+    ('logs_retention_days',           'global',              ''),
+    ('applied_events_retention_days', 'cdc_kafka_apply',     '')
 );
 
 INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
 VALUES
-    ('capture_producer_queue_max_messages', 'cdc_kafka_capture', '', '500000'::jsonb, 'Kafka producer queue depth'),
-    ('capture_producer_queue_max_kbytes',   'cdc_kafka_capture', '', '1048576'::jsonb, 'Kafka producer queue memory KB'),
-    ('apply_worker_count',                  'cdc_kafka_apply',   '', '1'::jsonb, 'Native apply worker threads (overrides config.json tier apply_workers)'),
-    ('full_load_max_fail_retries',          'mariadb_load',    '', '5'::jsonb, 'Pause full-load retries after N failures (needs_full_load=false)'),
-    ('full_load_failed_cooldown_minutes',   'mariadb_load',    '', '240'::jsonb, 'Re-enable paused full-load tables after cooldown minutes'),
-    ('kafka_bootstrap_servers',             'cdc_kafka_apply',   '', '"127.0.0.1:9092"'::jsonb, 'Kafka bootstrap (overridden by install.sh KAFKA_BOOTSTRAP)'),
-    ('apply_batch_size',                    'cdc_kafka_apply',   '', '500'::jsonb, 'Apply batch before flush'),
-    ('kafka_purge_consumed_enabled',        'cdc_kafka_apply',   '', 'true'::jsonb, 'DeleteRecords on caught-up partitions after apply'),
-    ('kafka_purge_consumed_interval_seconds','cdc_kafka_apply','', '300'::jsonb, 'Min seconds between consumed-log purges per conn/tier'),
-    ('kafka_purge_consumed_max_lag',        'cdc_kafka_apply',   '', '0'::jsonb, 'Purge only when consumer lag <= this'),
-    ('kafka_purge_consumed_min_deletable_offsets','cdc_kafka_apply','','1000'::jsonb, 'Min offsets between low watermark and commit before purge'),
-    ('apply_dedup_enabled',                 'cdc_kafka_apply',   '', 'true'::jsonb, 'Dedup applied events audit'),
-    ('capture_quiet_exit_lagging_chunks',   'cdc_kafka_capture', '', '3'::jsonb, 'Exit after N lagging idle binlog chunks'),
-    ('capture_max_events',                  'cdc_kafka_capture', '', '2000000'::jsonb, 'MariaDB capture slice max binlog events'),
-    ('apply_max_events',                    'cdc_kafka_apply',   '', '2000000'::jsonb, 'Apply slice max events per conn/tier'),
-    ('full_load_batch_size',                'mariadb_load',    '', '50000'::jsonb, 'MariaDB full-load COPY batch size'),
-    ('full_load_workers',                   'mariadb_load',    '', '4'::jsonb, 'MariaDB full-load keyset workers per table'),
-    ('logs_retention_days',                 'global',          '', '7'::jsonb, 'Purge cdc_catalog.logs retention'),
-    ('reconcile_interval_hours',             'cdc_kafka_reconcile', '', '4'::jsonb, 'Hours between reconcile-loop runs'),
-    ('reconcile_enabled',                   'cdc_kafka_reconcile', '', 'true'::jsonb, 'Enable reconciliation pipeline'),
-    ('applied_events_retention_days',       'cdc_kafka_apply',   '', '7'::jsonb, 'Dedup audit retention'),
-    ('apply_process_rss_cap_mb',            'cdc_kafka_apply',   '', '10240'::jsonb, 'Soft RSS cap MB for native apply'),
-    ('kafka_topic_mode',                    'global',          '', '"bucketed"'::jsonb, 'Kafka topic layout'),
-    ('kafka_topic_buckets',                 'global',          '', '64'::jsonb, 'Bucket count when bucketed mode'),
-    ('catalog_sync_interval_rounds',        'catalog',         '', '12'::jsonb, 'Daemon: run discover every N rounds (1=every round)'),
-    ('full_load_parallel_tables',           'mariadb_load',    '', '4'::jsonb, 'Parallel full-load tables per conn')
+    ('full_load_batch_size',          'mariadb_load',        '', '50000'::jsonb, 'MariaDB full-load COPY batch size'),
+    ('apply_batch_size',              'cdc_kafka_apply',     '', '20000'::jsonb, 'Apply batch before flush'),
+    ('reconcile_interval_hours',      'cdc_kafka_reconcile', '', '4'::jsonb, 'Hours between reconcile-loop runs'),
+    ('logs_retention_days',           'global',              '', '7'::jsonb, 'Purge cdc_catalog.logs retention'),
+    ('applied_events_retention_days', 'cdc_kafka_apply',     '', '7'::jsonb, 'Dedup audit retention')
 ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
     config_value = EXCLUDED.config_value,
     description  = EXCLUDED.description,
     updated_at   = now();
 
-\echo '=== runtime_config canonical (expect 22 rows) ==='
+\echo '=== runtime_config canonical (expect 5 rows) ==='
 SELECT COUNT(*) AS runtime_config_rows FROM cdc_catalog.runtime_config;
 SELECT config_key, component, config_value
 FROM cdc_catalog.runtime_config
 ORDER BY component, config_key;
-
--- @section:monitoring_views
-
-CREATE OR REPLACE VIEW cdc_catalog.v_apply_latest AS
-SELECT DISTINCT ON (conn_id, source_schema, source_table)
-    stat_id,
-    batch_id,
-    conn_id,
-    catalog_id,
-    source_schema,
-    source_table,
-    service_tier,
-    events_total,
-    events_updates,
-    events_inserts,
-    events_deletes,
-    duration_ms,
-    events_per_minute,
-    kafka_topic,
-    kafka_partition,
-    kafka_offset,
-    kafka_consumer_lag,
-    apply_lag_seconds,
-    is_stale,
-    is_inactive,
-    is_starving,
-    reconciliation_rag,
-    logged_at
-FROM cdc_catalog.apply_batch_stats
-ORDER BY conn_id, source_schema, source_table, logged_at DESC;
-
-CREATE OR REPLACE VIEW cdc_catalog.v_kafka_consumer AS
-SELECT
-    ap.conn_id,
-    ap.source_schema,
-    ap.source_table,
-    c.service_tier,
-    ap.kafka_topic,
-    ap.kafka_partition,
-    ap.kafka_offset AS consumed_offset,
-    ap.last_applied_at,
-    ap.apply_lag_seconds,
-    ap.status AS apply_position_status,
-    latest.kafka_consumer_lag,
-    latest.events_total AS last_slice_events,
-    latest.logged_at AS last_apply_at,
-    latest.is_inactive,
-    latest.is_stale,
-    latest.reconciliation_rag
-FROM cdc_catalog.apply_position ap
-JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
-LEFT JOIN cdc_catalog.v_apply_latest latest
-    ON latest.conn_id = ap.conn_id
-   AND latest.source_schema = ap.source_schema
-   AND latest.source_table = ap.source_table;
-
-COMMENT ON VIEW cdc_catalog.v_apply_latest IS 'Latest apply_batch_stats row per table (replaces manual apply_batch_stats ORDER BY logged_at)';
-COMMENT ON VIEW cdc_catalog.v_kafka_consumer IS 'Per-table apply offset + last-known Kafka consumer lag (no docker exec)';
-
--- @section:diagnostics
-
+)PO_datasync_inc";
+    }
+    inline std::string_view diagnostics() {
+        return R"PO_diagnostics(
 \echo '=== connections (daemon only captures these conn_id) ==='
 SELECT alias AS conn_id, db_engine, host, port, active
 FROM cdc_catalog.connections
@@ -1508,7 +1278,6 @@ SELECT
     capture_during_full_load,
     has_pk,
     status,
-    service_tier,
     (active
      AND cdc_enabled
      AND (NOT needs_full_load OR capture_during_full_load)
@@ -1525,10 +1294,9 @@ SELECT
 FROM cdc_catalog.catalog
 ORDER BY conn_id, capture_ready DESC, source_schema, source_table;
 
-\echo '=== summary by conn / tier ==='
+\echo '=== summary by conn / engine ==='
 SELECT
     conn_id,
-    service_tier,
     db_engine,
     COUNT(*) AS total,
     COUNT(*) FILTER (WHERE active) AS active,
@@ -1544,8 +1312,8 @@ SELECT
           AND status NOT IN ('skipped', 'disabled')
     ) AS capture_ready
 FROM cdc_catalog.catalog
-GROUP BY conn_id, service_tier, db_engine
-ORDER BY conn_id, service_tier;
+GROUP BY conn_id, db_engine
+ORDER BY conn_id;
 
 \echo '=== capture_position (binlog cursor — required for MariaDB capture) ==='
 SELECT conn_id, binlog_file, binlog_position, status, last_error, updated_at
@@ -1570,9 +1338,9 @@ ALTER TABLE cdc_catalog.reconciliation_run
 
 ALTER TABLE cdc_catalog.reconciliation_run
     ADD CONSTRAINT reconciliation_run_mode_check
-        CHECK (reconcile_mode = ANY (ARRAY['full'::text, 'light'::text]));
+        CHECK (reconcile_mode = 'full'::text);
 
-COMMENT ON TABLE cdc_catalog.reconciliation_run IS 'One row per cdc_kafka reconcile CLI run (independent of capture/apply daemon). reconcile_mode = full (row count + PK checksum + lag) vs light (row count + lag only).';
+COMMENT ON TABLE cdc_catalog.reconciliation_run IS 'One row per reconcile CLI run (full: row count + PK checksum + lag).';
 
 -- Migration 004: apply observability columns on existing deployments.
 ALTER TABLE cdc_catalog.apply_batch_stats
@@ -1581,20 +1349,263 @@ ALTER TABLE cdc_catalog.apply_batch_stats
 ALTER TABLE cdc_catalog.apply_batch_stats
     ADD COLUMN IF NOT EXISTS dropped_unrecoverable bigint NOT NULL DEFAULT 0;
 
-ALTER TABLE cdc_catalog.cdc_run_fairness_metrics
-    ADD COLUMN IF NOT EXISTS parse_skipped bigint NOT NULL DEFAULT 0;
-
-ALTER TABLE cdc_catalog.cdc_run_fairness_metrics
-    ADD COLUMN IF NOT EXISTS dropped_unrecoverable bigint NOT NULL DEFAULT 0;
-
 COMMENT ON COLUMN cdc_catalog.apply_batch_stats.parse_skipped IS
     'Kafka messages skipped due to JSON/payload parse failure in apply slice (per table batch)';
 
 COMMENT ON COLUMN cdc_catalog.apply_batch_stats.dropped_unrecoverable IS
     'Events dropped because lake schema/table could not be resolved (per table batch)';
 
-COMMENT ON COLUMN cdc_catalog.cdc_run_fairness_metrics.parse_skipped IS
-    'Total Kafka messages skipped due to parse failure in apply slice';
+-- Migration 035: drop service_tier (tier routing removed from C++ daemon).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 35) THEN
+        DROP VIEW IF EXISTS cdc_catalog.v_kafka_consumer;
+        DROP VIEW IF EXISTS cdc_catalog.v_apply_latest;
+        DROP VIEW IF EXISTS cdc_catalog.v_apply_stale;
+        DROP VIEW IF EXISTS cdc_catalog.v_cdc_pipeline_summary;
+        DROP INDEX IF EXISTS cdc_catalog.catalog_active_cdc_idx;
+        DROP INDEX IF EXISTS cdc_catalog.catalog_needs_full_load_idx;
+        ALTER TABLE cdc_catalog.apply_batch_stats DROP COLUMN IF EXISTS service_tier;
+        ALTER TABLE cdc_catalog.reconciliation_run DROP COLUMN IF EXISTS service_tier;
+        ALTER TABLE cdc_catalog.reconciliation_result DROP COLUMN IF EXISTS service_tier;
+        ALTER TABLE cdc_catalog.cdc_run_fairness_metrics DROP COLUMN IF EXISTS service_tier;
+        ALTER TABLE cdc_catalog.catalog DROP COLUMN IF EXISTS service_tier;
+        CREATE INDEX IF NOT EXISTS catalog_active_cdc_idx
+            ON cdc_catalog.catalog USING btree (conn_id)
+            WHERE active = true AND cdc_enabled = true AND needs_full_load = false;
+        CREATE INDEX IF NOT EXISTS catalog_needs_full_load_idx
+            ON cdc_catalog.catalog USING btree (conn_id)
+            WHERE active = true AND needs_full_load = true;
+        CREATE OR REPLACE VIEW cdc_catalog.v_apply_stale AS
+         SELECT ap.catalog_id, ap.conn_id, ap.source_schema, ap.source_table,
+                ap.last_applied_at, ap.apply_lag_seconds, ap.status, ap.quarantined_at,
+                ap.last_error, (now() - ap.last_applied_at) AS lag_interval
+           FROM cdc_catalog.apply_position ap
+           JOIN cdc_catalog.catalog c USING (catalog_id)
+          WHERE c.active = true AND c.cdc_enabled = true AND c.needs_full_load = false
+            AND ap.status = ANY (ARRAY['stale','lagging','gap_detected','quarantined','failed']::cdc_catalog.cdc_health_status[]);
+        CREATE OR REPLACE VIEW cdc_catalog.v_cdc_pipeline_summary AS
+         SELECT c.conn_id,
+                count(*) FILTER (WHERE c.active AND c.cdc_enabled AND NOT c.needs_full_load) AS cdc_ready,
+                count(*) FILTER (WHERE ap.status = 'healthy'::cdc_catalog.cdc_health_status) AS apply_healthy,
+                count(*) FILTER (WHERE ap.status = ANY (ARRAY['stale','lagging']::cdc_catalog.cdc_health_status[])) AS apply_lagging,
+                count(*) FILTER (WHERE ap.status = 'quarantined'::cdc_catalog.cdc_health_status) AS apply_quarantined,
+                max(ap.apply_lag_seconds) AS max_apply_lag_seconds
+           FROM cdc_catalog.catalog c
+           LEFT JOIN cdc_catalog.apply_position ap USING (catalog_id)
+          WHERE c.db_engine = 'mariadb'::cdc_catalog.db_engine
+          GROUP BY c.conn_id;
+        CREATE OR REPLACE VIEW cdc_catalog.v_apply_latest AS
+         SELECT DISTINCT ON (conn_id, source_schema, source_table)
+                stat_id, batch_id, conn_id, catalog_id, source_schema, source_table,
+                events_total, events_updates, events_inserts, events_deletes,
+                duration_ms, events_per_minute, kafka_topic, kafka_partition, kafka_offset,
+                kafka_consumer_lag, apply_lag_seconds, is_stale, is_inactive,
+                reconciliation_rag, dedup_skipped, parse_skipped, dropped_unrecoverable,
+                logged_at
+           FROM cdc_catalog.apply_batch_stats
+          ORDER BY conn_id, source_schema, source_table, logged_at DESC;
+        CREATE OR REPLACE VIEW cdc_catalog.v_kafka_consumer AS
+         SELECT ap.conn_id, ap.source_schema, ap.source_table, ap.kafka_topic, ap.kafka_partition,
+                ap.kafka_offset AS consumed_offset, ap.last_applied_at, ap.apply_lag_seconds,
+                ap.status AS apply_position_status, latest.kafka_consumer_lag,
+                latest.events_total AS last_slice_events, latest.logged_at AS last_apply_at,
+                latest.is_inactive, latest.is_stale, latest.reconciliation_rag
+           FROM cdc_catalog.apply_position ap
+           JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
+           LEFT JOIN cdc_catalog.v_apply_latest latest
+             ON latest.conn_id = ap.conn_id AND latest.source_schema = ap.source_schema
+            AND latest.source_table = ap.source_table;
+        DROP TYPE IF EXISTS cdc_catalog.service_tier;
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (35, 'drop service_tier column and enum from cdc_catalog');
+        RAISE NOTICE 'migration 035: service_tier dropped';
+    END IF;
+END $$;
 
-COMMENT ON COLUMN cdc_catalog.cdc_run_fairness_metrics.dropped_unrecoverable IS
-    'Total events dropped as unrecoverable in apply slice';
+-- Migration 036: reconcile full only (also applied via DataSync migrate + sql/036_*.sql).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 36) THEN
+        ALTER TABLE cdc_catalog.reconciliation_run
+            DROP CONSTRAINT IF EXISTS reconciliation_run_mode_check;
+        ALTER TABLE cdc_catalog.reconciliation_run
+            ADD CONSTRAINT reconciliation_run_mode_check
+            CHECK (reconcile_mode = 'full'::text);
+        DELETE FROM cdc_catalog.runtime_config
+        WHERE component = 'cdc_kafka_reconcile'
+          AND config_key IN ('reconcile_mode', 'reconcile_full_interval_hours');
+        UPDATE cdc_catalog.reconciliation_run
+        SET reconcile_mode = 'full'
+        WHERE reconcile_mode IS DISTINCT FROM 'full';
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (36, 'reconcile full only; drop light/auto runtime keys');
+        RAISE NOTICE 'migration 036: reconcile full only';
+    END IF;
+END $$;
+
+-- Migration 037: drop legacy apply_batch_stats columns, fairness table, dead runtime keys.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 37) THEN
+        DROP VIEW IF EXISTS cdc_catalog.v_kafka_consumer;
+        DROP VIEW IF EXISTS cdc_catalog.v_apply_latest;
+
+        DROP INDEX IF EXISTS cdc_catalog.apply_batch_stats_health_idx;
+
+        ALTER TABLE cdc_catalog.apply_batch_stats
+            DROP COLUMN IF EXISTS catchup_triggered,
+            DROP COLUMN IF EXISTS fk_deferred_retries,
+            DROP COLUMN IF EXISTS is_starving,
+            DROP COLUMN IF EXISTS host_cpu_percent,
+            DROP COLUMN IF EXISTS host_mem_used_mb,
+            DROP COLUMN IF EXISTS host_mem_percent,
+            DROP COLUMN IF EXISTS host_net_rx_mb,
+            DROP COLUMN IF EXISTS host_net_tx_mb,
+            DROP COLUMN IF EXISTS process_rss_mb;
+
+        DROP TABLE IF EXISTS cdc_catalog.cdc_run_fairness_metrics;
+
+        CREATE INDEX IF NOT EXISTS apply_batch_stats_health_idx
+            ON cdc_catalog.apply_batch_stats USING btree (conn_id, is_stale, is_inactive);
+
+        CREATE OR REPLACE VIEW cdc_catalog.v_apply_latest AS
+         SELECT DISTINCT ON (conn_id, source_schema, source_table)
+                stat_id, batch_id, conn_id, catalog_id, source_schema, source_table,
+                events_total, events_updates, events_inserts, events_deletes,
+                duration_ms, events_per_minute, kafka_topic, kafka_partition, kafka_offset,
+                kafka_consumer_lag, apply_lag_seconds, is_stale, is_inactive,
+                reconciliation_rag, dedup_skipped, parse_skipped, dropped_unrecoverable,
+                logged_at
+           FROM cdc_catalog.apply_batch_stats
+          ORDER BY conn_id, source_schema, source_table, logged_at DESC;
+
+        CREATE OR REPLACE VIEW cdc_catalog.v_kafka_consumer AS
+         SELECT ap.conn_id, ap.source_schema, ap.source_table, ap.kafka_topic, ap.kafka_partition,
+                ap.kafka_offset AS consumed_offset, ap.last_applied_at, ap.apply_lag_seconds,
+                ap.status AS apply_position_status, latest.kafka_consumer_lag,
+                latest.events_total AS last_slice_events, latest.logged_at AS last_apply_at,
+                latest.is_inactive, latest.is_stale, latest.reconciliation_rag
+           FROM cdc_catalog.apply_position ap
+           JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
+           LEFT JOIN cdc_catalog.v_apply_latest latest
+             ON latest.conn_id = ap.conn_id AND latest.source_schema = ap.source_schema
+            AND latest.source_table = ap.source_table;
+
+        DELETE FROM cdc_catalog.runtime_config
+        WHERE config_key IN (
+            'apply_worker_count',
+            'full_load_parallel_tables',
+            'apply_process_rss_cap_mb',
+            'apply_append_only',
+            'apply_catchup_enabled',
+            'apply_catchup_kafka_messages',
+            'apply_catchup_lag_seconds',
+            'apply_catchup_max_tables',
+            'apply_catchup_min_kafka_messages',
+            'apply_exit_on_targets_met',
+            'kafka_purge_consumed_enabled',
+            'kafka_purge_consumed_interval_seconds',
+            'kafka_purge_consumed_max_lag',
+            'kafka_purge_consumed_min_deletable_offsets'
+        );
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (37, 'drop legacy apply_batch_stats columns, cdc_run_fairness_metrics, dead runtime keys');
+        RAISE NOTICE 'migration 037: apply_batch_stats cleanup';
+    END IF;
+END $$;
+
+-- Migration 038: runtime_config canonical 5 keys only; rest in pipeline_defaults.hpp.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 38) THEN
+        DELETE FROM cdc_catalog.runtime_config
+        WHERE config_key = 'apply_target_events_per_table'
+           OR (config_key, component, COALESCE(conn_id, '')) NOT IN (
+                ('full_load_batch_size',          'mariadb_load',        ''),
+                ('apply_batch_size',              'cdc_kafka_apply',     ''),
+                ('reconcile_interval_hours',      'cdc_kafka_reconcile', ''),
+                ('logs_retention_days',           'global',              ''),
+                ('applied_events_retention_days', 'cdc_kafka_apply',     '')
+           );
+
+        INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
+        VALUES
+            ('full_load_batch_size',          'mariadb_load',        '', '50000'::jsonb, 'MariaDB full-load COPY batch size'),
+            ('apply_batch_size',              'cdc_kafka_apply',     '', '20000'::jsonb, 'Apply batch before flush'),
+            ('reconcile_interval_hours',      'cdc_kafka_reconcile', '', '4'::jsonb, 'Hours between reconcile-loop runs'),
+            ('logs_retention_days',           'global',              '', '7'::jsonb, 'Purge cdc_catalog.logs retention'),
+            ('applied_events_retention_days', 'cdc_kafka_apply',     '', '7'::jsonb, 'Dedup audit retention')
+        ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
+            config_value = EXCLUDED.config_value,
+            description  = EXCLUDED.description,
+            updated_at   = now();
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (38, 'runtime_config 5 keys only; pipeline_defaults.hpp for rest');
+        RAISE NOTICE 'migration 038: runtime_config reduced to 5 canonical keys';
+    END IF;
+END $$;
+)PO_diagnostics";
+    }
+    inline std::string_view monitoring_views() {
+        return R"PO_monitoring_v(
+CREATE OR REPLACE VIEW cdc_catalog.v_apply_latest AS
+SELECT DISTINCT ON (conn_id, source_schema, source_table)
+    stat_id,
+    batch_id,
+    conn_id,
+    catalog_id,
+    source_schema,
+    source_table,
+    events_total,
+    events_updates,
+    events_inserts,
+    events_deletes,
+    duration_ms,
+    events_per_minute,
+    kafka_topic,
+    kafka_partition,
+    kafka_offset,
+    kafka_consumer_lag,
+    apply_lag_seconds,
+    is_stale,
+    is_inactive,
+    reconciliation_rag,
+    dedup_skipped,
+    parse_skipped,
+    dropped_unrecoverable,
+    logged_at
+FROM cdc_catalog.apply_batch_stats
+ORDER BY conn_id, source_schema, source_table, logged_at DESC;
+
+CREATE OR REPLACE VIEW cdc_catalog.v_kafka_consumer AS
+SELECT
+    ap.conn_id,
+    ap.source_schema,
+    ap.source_table,
+    ap.kafka_topic,
+    ap.kafka_partition,
+    ap.kafka_offset AS consumed_offset,
+    ap.last_applied_at,
+    ap.apply_lag_seconds,
+    ap.status AS apply_position_status,
+    latest.kafka_consumer_lag,
+    latest.events_total AS last_slice_events,
+    latest.logged_at AS last_apply_at,
+    latest.is_inactive,
+    latest.is_stale,
+    latest.reconciliation_rag
+FROM cdc_catalog.apply_position ap
+JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
+LEFT JOIN cdc_catalog.v_apply_latest latest
+    ON latest.conn_id = ap.conn_id
+   AND latest.source_schema = ap.source_schema
+   AND latest.source_table = ap.source_table;
+
+COMMENT ON VIEW cdc_catalog.v_apply_latest IS 'Latest apply_batch_stats row per table (replaces manual apply_batch_stats ORDER BY logged_at)';
+COMMENT ON VIEW cdc_catalog.v_kafka_consumer IS 'Per-table apply offset + last-known Kafka consumer lag (no docker exec)';
+)PO_monitoring_v";
+    }
+}  // namespace prod_ops_embedded

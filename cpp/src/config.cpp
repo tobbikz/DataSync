@@ -86,14 +86,6 @@ CdcConfig default_cdc_config() {
     cdc.round_idle_seconds = 5;
     cdc.slice_max_seconds = 15;
     cdc.slice_max_events = 10'000'000;
-    cdc.tiers = {
-        {"platinum", 4, true, 1},
-        {"gold", 2, true, 2},
-        {"silver", 1, true, 3},
-        {"bronze", 1, true, 4},
-        {"trash", 1, true, 5},
-        {"firehose", 2, true, 6},
-    };
     return cdc;
 }
 
@@ -113,33 +105,6 @@ void parse_cdc_config(const nlohmann::json& root, CdcConfig& cdc) {
     }
     if (j.contains("slice_max_events")) {
         cdc.slice_max_events = j["slice_max_events"].get<int>();
-    }
-    if (!j.contains("tiers") || !j["tiers"].is_array()) {
-        return;
-    }
-    std::vector<CdcTierConfig> parsed;
-    for (const auto& item : j["tiers"]) {
-        if (!item.is_object()) {
-            continue;
-        }
-        CdcTierConfig tier;
-        tier.code = item.value("code", item.value("tier", ""));
-        tier.apply_workers = item.value("apply_workers", 1);
-        tier.active = item.value("active", true);
-        tier.sort_order = item.value("sort_order", 0);
-        if (tier.code.empty()) {
-            continue;
-        }
-        if (tier.apply_workers <= 0) {
-            tier.apply_workers = 1;
-        }
-        parsed.push_back(std::move(tier));
-    }
-    if (!parsed.empty()) {
-        cdc.tiers = std::move(parsed);
-        std::sort(cdc.tiers.begin(), cdc.tiers.end(), [](const CdcTierConfig& a, const CdcTierConfig& b) {
-            return a.sort_order < b.sort_order;
-        });
     }
 }
 

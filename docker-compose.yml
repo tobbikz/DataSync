@@ -59,7 +59,6 @@ services:
       KAFKA_BOOTSTRAP: 127.0.0.1:9092
     volumes:
       - ./config.json:/app/config.json:ro,z
-      - ./prod_ops.sql:/app/prod_ops.sql:ro,z
     restart: unless-stopped
     depends_on:
       kafka:

@@ -223,23 +223,6 @@ bool fill_table_key_from_event_id(ApplyEvent& e, const std::string& db_engine) {
     return !e.schema_name.empty() && !e.table_name.empty();
 }
 
-ApplyEvent parse_apply_event(const json& obj) {
-    ApplyEvent e;
-    e.event_id = obj.value("event_id", "");
-    e.op = obj.value("op", "c");
-    e.schema_name = obj.value("schema", obj.value("source_schema", ""));
-    e.table_name = obj.value("table", obj.value("source_table", ""));
-    e.topic = obj.value("topic", "");
-    e.partition = obj.value("partition", 0);
-    e.offset = obj.value("offset", 0LL);
-    if (obj.contains("gtid") && !obj["gtid"].is_null()) {
-        e.gtid = obj["gtid"].get<std::string>();
-    }
-    e.catalog_id = obj.value("catalog_id", 0LL);
-    e.row = obj.contains("row") && obj["row"].is_object() ? obj["row"] : json::object();
-    return e;
-}
-
 json parse_kafka_message_json(const std::string& payload) {
     for (std::size_t skip = 0; skip <= 32 && skip < payload.size(); ++skip) {
         json data = json::parse(payload.substr(skip), nullptr, false);

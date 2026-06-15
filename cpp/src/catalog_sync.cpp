@@ -8,6 +8,7 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
+#include "pipeline_defaults.hpp"
 
 #include <mysql/mysql.h>
 
@@ -611,10 +612,8 @@ CatalogSyncStats run_mssql_catalog_sync(
     const auto run_start = std::chrono::steady_clock::now();
     PgConn pg(cfg.datasync.conn_string());
 
-    RuntimeConfig runtime;
-    runtime.reload(pg.raw);
-    const std::size_t chunk_size = runtime.get_size_t("catalog_chunk_size", 500, "catalog", conn_id);
-    const int batch_sleep_ms = runtime.get_int("catalog_batch_sleep_ms", 200, "catalog", conn_id);
+    const std::size_t chunk_size = pipeline_defaults::kCatalogChunkSize;
+    const int batch_sleep_ms = pipeline_defaults::kCatalogBatchSleepMs;
 
     CatalogSyncStats stats;
     stats.tables_discovered = static_cast<int>(discovered.size());
@@ -751,10 +750,8 @@ CatalogSyncStats run_catalog_sync(
     const auto run_start = std::chrono::steady_clock::now();
     PgConn pg(cfg.datasync.conn_string());
 
-    RuntimeConfig runtime;
-    runtime.reload(pg.raw);
-    const std::size_t chunk_size = runtime.get_size_t("catalog_chunk_size", 500, "catalog", conn_id);
-    const int batch_sleep_ms = runtime.get_int("catalog_batch_sleep_ms", 200, "catalog", conn_id);
+    const std::size_t chunk_size = pipeline_defaults::kCatalogChunkSize;
+    const int batch_sleep_ms = pipeline_defaults::kCatalogBatchSleepMs;
 
     CatalogSyncStats stats;
     stats.tables_discovered = static_cast<int>(discovered.size());

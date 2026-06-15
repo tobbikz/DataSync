@@ -6,7 +6,6 @@
 #include "kafka_topics.hpp"
 #include "mssql_conn.hpp"
 #include "mssql_lake.hpp"
-#include "mariadb_schema.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
@@ -329,7 +328,6 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::string& batch_id,
     int worker_id,
     int worker_count) {
@@ -339,6 +337,16 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
 
     const MssqlSource* source = find_mssql_source(cfg, conn_id);
     if (!source) {
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_kafka_mssql_capture",
+            .message = "mssql connect failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"reason", "source not found in config"}},
+        });
         throw std::runtime_error("MSSQL source not found: " + conn_id);
     }
 
@@ -346,7 +354,7 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     runtime.reload(log_pg);
     const CaptureRuntimeConfig rcfg =
         load_mssql_capture_runtime(runtime, log_pg, conn_id, &cfg.cdc);
-    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_kafka_mssql_capture",
@@ -356,18 +364,17 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
         .context = {
-            {"tier", service_tier.value_or("all")},
             {"kafka_bootstrap", kafka.bootstrap},
             {"kafka_bootstrap_source", kafka.source},
             {"topic_prefix", rcfg.topic_prefix},
         },
     });
     const auto tables =
-        fetch_capture_catalog_tables(log_pg, conn_id, service_tier, worker_id, worker_count, "mssql");
-    clear_stale_cdc_in_progress(log_pg, conn_id, service_tier, "mssql");
+        fetch_capture_catalog_tables(log_pg, conn_id, worker_id, worker_count, "mssql");
+    clear_stale_cdc_in_progress(log_pg, conn_id, "mssql");
     if (tables.empty()) {
         log_cdc_skip_no_tables(
-            log_pg, "cdc_kafka_mssql_capture", "capture", batch_id, conn_id, service_tier, "mssql");
+            log_pg, "cdc_kafka_mssql_capture", "capture", batch_id, conn_id, "mssql");
         return stats;
     }
 
@@ -680,7 +687,6 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             {"lsn_auto_seeded", lsn_auto_seeded},
             {"lsn_recovered", lsn_recovered},
             {"duration_ms", stats.duration_ms},
-            {"tier", service_tier.value_or("all")},
         },
     });
 
@@ -752,7 +758,6 @@ int seed_mssql_cdc_lsn_for_conn(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::string& batch_id) {
     const MssqlSource* source = find_mssql_source(cfg, conn_id);
     if (!source) {
@@ -768,12 +773,6 @@ int seed_mssql_cdc_lsn_for_conn(
           AND cdc_enabled = true
     )";
     std::vector<const char*> vals = {conn_id.c_str()};
-    std::string tier_val;
-    if (service_tier && !service_tier->empty()) {
-        sql += " AND service_tier::text = lower($2)";
-        tier_val = *service_tier;
-        vals.push_back(tier_val.c_str());
-    }
 
     PGresult* res = PQexecParams(
         log_pg,

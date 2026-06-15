@@ -64,3 +64,6 @@ struct PgConn {
     PgConn(const PgConn&) = delete;
     PgConn& operator=(const PgConn&) = delete;
 };
+
+void pg_exec(PGconn* pg, const std::string& sql);
+void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const* vals);

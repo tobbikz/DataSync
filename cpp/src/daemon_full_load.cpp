@@ -19,13 +19,12 @@
 
 namespace {
 
-std::mutex g_tier_lock_registry_mu;
-std::map<std::pair<std::string, std::string>, std::shared_ptr<std::mutex>> g_tier_locks;
+std::mutex g_conn_lock_registry_mu;
+std::map<std::string, std::shared_ptr<std::mutex>> g_conn_locks;
 
-std::shared_ptr<std::mutex> tier_full_load_mutex(const std::string& conn_id, const std::string& tier) {
-    const auto key = std::make_pair(conn_id, tier);
-    std::lock_guard<std::mutex> guard(g_tier_lock_registry_mu);
-    auto& slot = g_tier_locks[key];
+std::shared_ptr<std::mutex> conn_full_load_mutex(const std::string& conn_id) {
+    std::lock_guard<std::mutex> guard(g_conn_lock_registry_mu);
+    auto& slot = g_conn_locks[conn_id];
     if (!slot) {
         slot = std::make_shared<std::mutex>();
     }
@@ -34,35 +33,23 @@ std::shared_ptr<std::mutex> tier_full_load_mutex(const std::string& conn_id, con
 
 }  // namespace
 
-bool full_load_tier_busy(const std::string& conn_id, const std::string& tier) {
-    const auto mu = tier_full_load_mutex(conn_id, tier);
+bool full_load_conn_busy(const std::string& conn_id) {
+    const auto mu = conn_full_load_mutex(conn_id);
     std::unique_lock<std::mutex> lock(*mu, std::try_to_lock);
     return !lock.owns_lock();
-}
-
-std::optional<TierFullLoadLock> TierFullLoadLock::try_acquire(
-    const std::string& conn_id,
-    const std::string& tier) {
-    const auto mu = tier_full_load_mutex(conn_id, tier);
-    std::unique_lock<std::mutex> guard(*mu, std::try_to_lock);
-    if (!guard.owns_lock()) {
-        return std::nullopt;
-    }
-    return TierFullLoadLock(mu, std::move(guard));
 }
 
 std::optional<DaemonFullLoadOutcome> try_run_daemon_full_load_isolated(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& batch_id) {
-    const auto mu = tier_full_load_mutex(conn_id, tier);
+    const auto mu = conn_full_load_mutex(conn_id);
     std::unique_lock<std::mutex> lock(*mu, std::try_to_lock);
     if (!lock.owns_lock()) {
         return std::nullopt;
     }
-    return run_daemon_full_load_isolated(cfg, log_pg, conn_id, tier, batch_id);
+    return run_daemon_full_load_isolated(cfg, log_pg, conn_id, batch_id);
 }
 
 namespace {
@@ -113,20 +100,19 @@ int run_conn_full_load(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& batch_id,
-    const std::string& conn_id,
-    const std::optional<std::string>& service_tier) {
+    const std::string& conn_id) {
     const std::string engine = conn_engine(cfg, conn_id);
     const std::optional<std::string> conn_filter = conn_id;
 
     if (engine == "mssql") {
-        const auto stats = run_mssql_full_load(cfg, log_pg, batch_id, service_tier, conn_filter);
+        const auto stats = run_mssql_full_load(cfg, log_pg, batch_id, conn_filter);
         return full_load_process_exit_code(stats);
     }
     if (engine == "mongodb") {
-        const auto stats = run_mongo_full_load(cfg, log_pg, batch_id, service_tier, conn_filter);
+        const auto stats = run_mongo_full_load(cfg, log_pg, batch_id, conn_filter);
         return full_load_process_exit_code(stats);
     }
-    const auto stats = run_mariadb_full_load(cfg, log_pg, batch_id, service_tier, conn_filter);
+    const auto stats = run_mariadb_full_load(cfg, log_pg, batch_id, conn_filter);
     return full_load_process_exit_code(stats);
 }
 
@@ -134,35 +120,11 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& batch_id) {
     DaemonFullLoadOutcome outcome;
     const std::string db_engine = conn_engine(cfg, conn_id);
-    outcome.pending_tables = count_full_load_pending(log_pg, conn_id, tier, db_engine);
+    outcome.pending_tables = count_full_load_pending(log_pg, conn_id, db_engine);
     if (outcome.pending_tables <= 0) {
-        const int pending_any_tier = count_full_load_pending_any_tier(log_pg, conn_id, db_engine);
-        if (pending_any_tier > 0) {
-            const auto pending_tiers = list_full_load_pending_tiers(log_pg, conn_id, db_engine);
-            nlohmann::json tier_list = nlohmann::json::array();
-            for (const auto& t : pending_tiers) {
-                tier_list.push_back(t);
-            }
-            log_write(log_pg, {
-                .level = LogLevel::Warning,
-                .component = "cdc_daemon",
-                .message = "full-load skipped: tables pending on another service_tier",
-                .batch_id = batch_id,
-                .conn_id = conn_id,
-                .source_schema = std::nullopt,
-                .source_table = std::nullopt,
-                .context = {
-                    {"tier", tier},
-                    {"db_engine", db_engine},
-                    {"pending_any_tier", pending_any_tier},
-                    {"pending_tiers", tier_list},
-                },
-            });
-        }
         return outcome;
     }
 
@@ -177,7 +139,6 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
         .context = {
-            {"tier", tier},
             {"db_engine", db_engine},
             {"pending_tables", outcome.pending_tables},
             {"phase", "full_load"},
@@ -188,8 +149,6 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
     std::vector<std::string> args = {
         binary,
         "full-load",
-        "--tier",
-        tier,
         "--conn-id",
         conn_id,
         "--skip-onboard",
@@ -200,11 +159,11 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
     }
     outcome.exit_code = spawn_wait(args);
 
-    outcome.pending_after = count_full_load_pending(log_pg, conn_id, tier, db_engine);
+    outcome.pending_after = count_full_load_pending(log_pg, conn_id, db_engine);
     outcome.tables_loaded = std::max(0, outcome.pending_tables - outcome.pending_after);
 
     if (outcome.tables_loaded > 0) {
-        if (!onboard_conn_after_full_load(cfg, log_pg, conn_id, tier, db_engine, batch_id)) {
+        if (!onboard_conn_after_full_load(cfg, log_pg, conn_id, db_engine, batch_id)) {
             if (outcome.exit_code == 0) {
                 outcome.exit_code = 1;
             }
@@ -223,7 +182,6 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
         .context = {
-            {"tier", tier},
             {"db_engine", db_engine},
             {"pending_tables", outcome.pending_tables},
             {"pending_after", outcome.pending_after},

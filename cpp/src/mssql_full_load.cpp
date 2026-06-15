@@ -1,6 +1,7 @@
 #include "mssql_full_load.hpp"
 
 #include "capture_common.hpp"
+#include "full_load_common.hpp"
 #include "mariadb_datetime.hpp"
 #include "mssql_conn.hpp"
 #include "mssql_kafka_capture.hpp"
@@ -10,6 +11,7 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
+#include "pipeline_defaults.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -32,10 +34,8 @@ FullLoadRunStats run_mssql_full_load(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& batch_id,
-    const std::optional<std::string>& service_tier,
     const std::optional<std::string>& conn_id_filter) {
     (void)cfg;
-    (void)service_tier;
     (void)conn_id_filter;
     if (log_pg) {
         log_write(
@@ -74,76 +74,13 @@ void log_fl(
     const std::string& conn_id = {},
     const std::string& schema = {},
     const std::string& table = {}) {
-    if (!log_pg) {
-        return;
-    }
-    LogEvent ev;
-    ev.level = level;
-    ev.component = "mssql_load";
-    ev.message = message;
-    ev.batch_id = batch_id;
-    if (!conn_id.empty()) {
-        ev.conn_id = conn_id;
-    }
-    if (!schema.empty()) {
-        ev.source_schema = schema;
-    }
-    if (!table.empty()) {
-        ev.source_table = table;
-    }
-    ev.context = context;
-    if (log_mtx) {
-        std::lock_guard<std::mutex> lock(*log_mtx);
-        log_write(log_pg, ev);
-    } else {
-        log_write(log_pg, ev);
-    }
+    full_load::log(log_pg, log_mtx, "mssql_load", level, batch_id, message, context, conn_id, schema, table);
 }
 
-long long elapsed_ms(const std::chrono::steady_clock::time_point& start) {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now() - start)
-        .count();
-}
-
-std::string csv_escape(const std::string& value) {
-    bool quote = value.empty();
-    for (char c : value) {
-        if (c == ',' || c == '"' || c == '\n' || c == '\r') {
-            quote = true;
-            break;
-        }
-    }
-    if (!quote) {
-        return value;
-    }
-    std::string out = "\"";
-    for (char c : value) {
-        out += (c == '"') ? "\"\"" : std::string(1, c);
-    }
-    out += "\"";
-    return out;
-}
-
-std::string utc_now_ts() {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    gmtime_r(&t, &tm);
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S+00");
-    return oss.str();
-}
-
-std::string utc_now_date() {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    gmtime_r(&t, &tm);
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d");
-    return oss.str();
-}
+using full_load::csv_escape;
+using full_load::elapsed_ms;
+using full_load::utc_now_date;
+using full_load::utc_now_ts;
 
 std::string brack(const std::string& name) {
     std::string escaped;
@@ -490,18 +427,10 @@ long long copy_rows_offset(
     return total_rows;
 }
 
-std::vector<MssqlCatalogTableRow> fetch_full_load_targets(PGconn* pg, const std::optional<std::string>& service_tier) {
-    const char* sql_tier = R"(
-        SELECT catalog_id, conn_id, source_database, source_schema, source_table, has_pk, COALESCE(pk_columns, '')
-        FROM cdc_catalog.catalog
-        WHERE db_engine = 'mssql'
-          AND active = true
-          AND needs_full_load = true
-          AND status NOT IN ('skipped', 'disabled')
-          AND service_tier::text = lower($1)
-        ORDER BY conn_id, source_database, source_schema, source_table
-    )";
-    const char* sql_all = R"(
+std::vector<MssqlCatalogTableRow> fetch_full_load_targets(PGconn* pg) {
+    PGresult* res = PQexec(
+        pg,
+        R"(
         SELECT catalog_id, conn_id, source_database, source_schema, source_table, has_pk, COALESCE(pk_columns, '')
         FROM cdc_catalog.catalog
         WHERE db_engine = 'mssql'
@@ -509,15 +438,7 @@ std::vector<MssqlCatalogTableRow> fetch_full_load_targets(PGconn* pg, const std:
           AND needs_full_load = true
           AND status NOT IN ('skipped', 'disabled')
         ORDER BY conn_id, source_database, source_schema, source_table
-    )";
-
-    PGresult* res = nullptr;
-    if (service_tier && !service_tier->empty()) {
-        const char* vals[] = {service_tier->c_str()};
-        res = PQexecParams(pg, sql_tier, 1, nullptr, vals, nullptr, nullptr, 0);
-    } else {
-        res = PQexec(pg, sql_all);
-    }
+        )");
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (res) {
             PQclear(res);
@@ -602,10 +523,12 @@ TableLoadOutcome load_one_table(
     runtime.reload(app_pg.raw);
 
     const std::size_t batch_size = runtime.get_size_t(
-        "full_load_batch_size", 5000, "mssql_load", target.conn_id);
-    const int source_sleep_ms = runtime.get_int("full_load_source_sleep_ms", 0, "mssql_load", target.conn_id);
-    const int partition_months =
-        runtime.get_int("lake_partition_months_ahead", 3, "mssql_load", target.conn_id);
+        "full_load_batch_size",
+        pipeline_defaults::kFullLoadBatchSizeDefault,
+        "mariadb_load",
+        target.conn_id);
+    const int source_sleep_ms = pipeline_defaults::kFullLoadSourceSleepMs;
+    const int partition_months = pipeline_defaults::kLakePartitionMonthsAhead;
 
     log_fl(
         log_pg,
@@ -655,10 +578,8 @@ TableLoadOutcome load_one_table(
     mark_catalog_full_load_in_progress(app_pg.raw, target.catalog_id);
 
     {
-        RuntimeConfig bookmark_runtime;
-        bookmark_runtime.reload(app_pg.raw);
         seed_stream_capture_bookmark_if_needed(
-            app_pg.raw, bookmark_runtime, target.conn_id, target.catalog_id, "mssql", batch_id);
+            app_pg.raw, target.conn_id, target.catalog_id, "mssql", batch_id);
     }
 
     if (!target.has_pk || target.pk_columns.empty()) {
@@ -696,7 +617,7 @@ TableLoadOutcome load_one_table(
         target.source_table);
 
     DdlSyncResult ddl{};
-    if (runtime.get_bool("ddl_sync_columns", true, "mssql_load", target.conn_id)) {
+    if (pipeline_defaults::kDdlSyncColumns) {
         ddl = sync_mssql_ddl_after_truncate(
             lake_pg.raw,
             mssql,
@@ -722,7 +643,7 @@ TableLoadOutcome load_one_table(
         target.source_schema,
         target.source_table);
 
-    const int workers = std::max(1, runtime.get_int("full_load_workers", 1, "mssql_load", target.conn_id));
+    const int workers = std::max(1, pipeline_defaults::kFullLoadWorkers);
     if (workers > 1 && source_pk_cols.size() == 1) {
         if (const auto bounds = fetch_mssql_numeric_pk_bounds(
                 mssql.handle, target.source_schema, target.source_table, source_pk_cols[0])) {
@@ -823,7 +744,6 @@ FullLoadRunStats run_mssql_full_load(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& batch_id,
-    const std::optional<std::string>& service_tier,
     const std::optional<std::string>& conn_id_filter) {
     const auto run_start = std::chrono::steady_clock::now();
     FullLoadRunStats stats;
@@ -842,11 +762,12 @@ FullLoadRunStats run_mssql_full_load(
         LogLevel::Info,
         batch_id,
         "full load started",
-        {{"service_tier", service_tier.value_or("all")},
-         {"batch_size", runtime.get_size_t("full_load_batch_size", 5000, "mssql_load")},
-         {"parallel_tables", runtime.get_int("full_load_parallel_tables", 1, "mssql_load")}});
+        {{"batch_size",
+          runtime.get_size_t(
+              "full_load_batch_size", pipeline_defaults::kFullLoadBatchSizeDefault, "mariadb_load")},
+         {"parallel_tables", kFullLoadParallelTables}});
 
-    const auto targets_all = fetch_full_load_targets(app_pg.raw, service_tier);
+    const auto targets_all = fetch_full_load_targets(app_pg.raw);
     std::vector<MssqlCatalogTableRow> targets;
     targets.reserve(targets_all.size());
     for (const auto& row : targets_all) {
@@ -904,8 +825,7 @@ FullLoadRunStats run_mssql_full_load(
             continue;
         }
 
-        const int parallel_tables =
-            std::max(1, runtime.get_int("full_load_parallel_tables", 1, "mssql_load", conn_id));
+        const int parallel_tables = kFullLoadParallelTables;
 
         MssqlConn order_mssql(*src);
         std::map<std::string, std::vector<MssqlCatalogTableRow>> by_schema;

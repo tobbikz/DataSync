@@ -3,8 +3,9 @@ config.json
 cpp/config.json
 **/config.cdc-test.json
 
-# C++ build (cmake -B cpp/build + vendored deps/rdkafka in Docker)
+# C++ build — single out-of-tree dir: cmake -S cpp -B cpp/build
 cpp/build/
+cpp/build-kafka/
 
 # Python
 __pycache__/

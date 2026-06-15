@@ -1,8 +1,6 @@
 #include "cdc_pre_apply.hpp"
 
 #include "capture_common.hpp"
-#include "cdc_catchup.hpp"
-#include "config.hpp"
 #include "mariadb_kafka_capture.hpp"
 #include "mongo_conn.hpp"
 #include "mongo_kafka_capture.hpp"
@@ -13,6 +11,7 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
+#include "pipeline_defaults.hpp"
 
 #ifdef HAVE_FREETDS
 #include "mssql_conn.hpp"
@@ -29,28 +28,27 @@
 namespace {
 
 #ifdef HAVE_FREETDS
-int sync_mssql_columns_for_tier(
+int sync_mssql_columns_for_conn(
     const AppConfig& cfg,
     PGconn* log_pg,
     RuntimeConfig& runtime,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& batch_id) {
     (void)runtime;
     const MssqlSource* source = find_mssql_source(cfg, conn_id);
     if (!source) {
         return 0;
     }
-    const char* vals[] = {conn_id.c_str(), tier.c_str()};
+    const char* vals[] = {conn_id.c_str()};
     PGresult* res = PQexecParams(
         log_pg,
         R"(
         SELECT source_database, source_schema, source_table
         FROM cdc_catalog.catalog
         WHERE conn_id = $1 AND db_engine = 'mssql' AND active = true
-          AND cdc_enabled = true AND service_tier::text = lower($2)
+          AND cdc_enabled = true
         )",
-        2,
+        1,
         nullptr,
         vals,
         nullptr,
@@ -72,7 +70,7 @@ int sync_mssql_columns_for_tier(
             const std::string db = PQgetvalue(res, i, 0);
             const std::string schema = PQgetvalue(res, i, 1);
             const std::string table = PQgetvalue(res, i, 2);
-            if (!runtime.get_bool("ddl_sync_columns", true, "mssql_load", conn_id)) {
+            if (!pipeline_defaults::kDdlSyncColumns) {
                 continue;
             }
             const auto ddl = sync_mssql_columns_to_lake(
@@ -102,7 +100,7 @@ int sync_mssql_columns_for_tier(
             .conn_id = conn_id,
             .source_schema = std::nullopt,
             .source_table = std::nullopt,
-            .context = {{"tier", tier}, {"error", ex.what()}},
+            .context = {{"error", ex.what()}},
         });
     }
     return synced;
@@ -110,31 +108,30 @@ int sync_mssql_columns_for_tier(
 #endif
 
 #ifdef HAVE_MONGOC
-int sync_mongo_columns_for_tier(
+int sync_mongo_columns_for_conn(
     const AppConfig& cfg,
     PGconn* log_pg,
     RuntimeConfig& runtime,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& batch_id) {
     const MongoSource* source = find_mongo_source(cfg, conn_id);
     if (!source) {
         return 0;
     }
-    if (!runtime.get_bool("ddl_sync_columns", true, "mongo_load", conn_id)) {
+    if (!pipeline_defaults::kDdlSyncColumns) {
         return 0;
     }
 
-    const char* vals[] = {conn_id.c_str(), tier.c_str()};
+    const char* vals[] = {conn_id.c_str()};
     PGresult* res = PQexecParams(
         log_pg,
         R"(
         SELECT source_database, source_schema, source_table
         FROM cdc_catalog.catalog
         WHERE conn_id = $1 AND db_engine = 'mongodb' AND active = true
-          AND cdc_enabled = true AND service_tier::text = lower($2)
+          AND cdc_enabled = true
         )",
-        2,
+        1,
         nullptr,
         vals,
         nullptr,
@@ -148,7 +145,7 @@ int sync_mongo_columns_for_tier(
     }
 
     const std::size_t sample_limit =
-        runtime.get_size_t("ddl_sync_sample_size", 1000, "mongo_load", conn_id);
+        pipeline_defaults::kDdlSyncSampleSize;
 
     int synced = 0;
     try {
@@ -197,64 +194,21 @@ int sync_mongo_columns_for_tier(
 }
 #endif
 
-PreApplyCycleResult run_mariadb_pre_apply(
-    const AppConfig& cfg,
-    PGconn* log_pg,
-    const std::string& conn_id,
-    const std::string& tier,
-    const std::string& batch_id) {
-    PreApplyCycleResult result;
-    result.payload = {
-        {"batch_id", batch_id},
-        {"tier", tier},
-        {"conn_id", conn_id},
-        {"db_engine", "mariadb"},
-    };
-
-    const auto catchup = run_catchup_if_needed(cfg, log_pg, conn_id, tier, batch_id);
-    if (!catchup.empty()) {
-        nlohmann::json arr = nlohmann::json::array();
-        for (const auto& item : catchup) {
-            arr.push_back(item.error.empty() ? item.payload : nlohmann::json{{"error", item.error}});
-            if (!item.error.empty()) {
-                result.errors += 1;
-            }
-        }
-        result.payload["catchup"] = arr;
-    }
-
-    return result;
-}
-
 PreApplyCycleResult run_mssql_pre_apply(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& batch_id) {
     PreApplyCycleResult result;
     result.payload = {
         {"batch_id", batch_id},
-        {"tier", tier},
         {"conn_id", conn_id},
         {"db_engine", "mssql"},
     };
 
-    const auto catchup = run_catchup_if_needed(cfg, log_pg, conn_id, tier, batch_id);
-    if (!catchup.empty()) {
-        nlohmann::json arr = nlohmann::json::array();
-        for (const auto& item : catchup) {
-            arr.push_back(item.error.empty() ? item.payload : nlohmann::json{{"error", item.error}});
-            if (!item.error.empty()) {
-                result.errors += 1;
-            }
-        }
-        result.payload["catchup"] = arr;
-    }
-
 #ifdef HAVE_FREETDS
     RuntimeConfig runtime;
-    const int ddl_synced = sync_mssql_columns_for_tier(cfg, log_pg, runtime, conn_id, tier, batch_id);
+    const int ddl_synced = sync_mssql_columns_for_conn(cfg, log_pg, runtime, conn_id, batch_id);
     if (ddl_synced > 0) {
         result.payload["ddl_sync"] = {{"tables", ddl_synced}};
     }
@@ -266,32 +220,18 @@ PreApplyCycleResult run_mongo_pre_apply(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& batch_id) {
     PreApplyCycleResult result;
     result.payload = {
         {"batch_id", batch_id},
-        {"tier", tier},
         {"conn_id", conn_id},
         {"db_engine", "mongodb"},
     };
 
-    const auto catchup = run_catchup_if_needed(cfg, log_pg, conn_id, tier, batch_id);
-    if (!catchup.empty()) {
-        nlohmann::json arr = nlohmann::json::array();
-        for (const auto& item : catchup) {
-            arr.push_back(item.error.empty() ? item.payload : nlohmann::json{{"error", item.error}});
-            if (!item.error.empty()) {
-                result.errors += 1;
-            }
-        }
-        result.payload["catchup"] = arr;
-    }
-
 #ifdef HAVE_MONGOC
     RuntimeConfig runtime;
     runtime.reload(log_pg);
-    const int ddl_synced = sync_mongo_columns_for_tier(cfg, log_pg, runtime, conn_id, tier, batch_id);
+    const int ddl_synced = sync_mongo_columns_for_conn(cfg, log_pg, runtime, conn_id, batch_id);
     if (ddl_synced > 0) {
         result.payload["ddl_sync"] = {{"tables", ddl_synced}};
     }
@@ -307,11 +247,10 @@ int run_conn_capture_slice(
     const std::string& conn_id,
     const std::string& batch_id) {
     const std::string db_engine = conn_engine(cfg, conn_id);
-    const std::optional<std::string> all_tiers;
 
     RuntimeConfig runtime;
     runtime.reload(log_pg);
-    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_kafka_daemon",
@@ -322,7 +261,6 @@ int run_conn_capture_slice(
         .source_table = std::nullopt,
         .context = {
             {"db_engine", db_engine},
-            {"tier", "all"},
             {"kafka_bootstrap", kafka.bootstrap},
             {"kafka_bootstrap_source", kafka.source},
             {"topic_prefix", topic_prefix_for_conn(conn_id)},
@@ -332,7 +270,7 @@ int run_conn_capture_slice(
     int errors = 0;
     if (db_engine == "mssql") {
         try {
-            const auto stats = run_mssql_kafka_capture_slice(cfg, log_pg, conn_id, all_tiers, batch_id);
+            const auto stats = run_mssql_kafka_capture_slice(cfg, log_pg, conn_id, batch_id);
             errors = stats.errors;
         } catch (const std::exception& ex) {
             errors = 1;
@@ -348,11 +286,39 @@ int run_conn_capture_slice(
             });
         }
     } else if (db_engine == "mongodb") {
-        const auto stats = run_mongo_kafka_capture_slice(cfg, log_pg, conn_id, all_tiers, batch_id);
-        errors = stats.errors;
+        try {
+            const auto stats = run_mongo_kafka_capture_slice(cfg, log_pg, conn_id, batch_id);
+            errors = stats.errors;
+        } catch (const std::exception& ex) {
+            errors = 1;
+            log_write(log_pg, {
+                .level = LogLevel::Error,
+                .component = "cdc_kafka_mongo_capture",
+                .message = "mongo capture slice failed",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {{"error", ex.what()}},
+            });
+        }
     } else {
-        const auto stats = run_mariadb_kafka_capture_slice(cfg, log_pg, conn_id, all_tiers, batch_id);
-        errors = stats.errors;
+        try {
+            const auto stats = run_mariadb_kafka_capture_slice(cfg, log_pg, conn_id, batch_id);
+            errors = stats.errors;
+        } catch (const std::exception& ex) {
+            errors = 1;
+            log_write(log_pg, {
+                .level = LogLevel::Error,
+                .component = "cdc_kafka_capture",
+                .message = "mariadb capture slice failed",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {{"error", ex.what()}},
+            });
+        }
     }
 
     log_write(log_pg, {
@@ -372,7 +338,6 @@ PreApplyCycleResult run_pre_apply_cycle(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& batch_id) {
     const auto cycle_start = std::chrono::steady_clock::now();
     const std::string db_engine = conn_engine(cfg, conn_id);
@@ -385,20 +350,35 @@ PreApplyCycleResult run_pre_apply_cycle(
         .conn_id = conn_id,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"tier", tier}, {"db_engine", db_engine}, {"phase", "pre_apply"}},
+        .context = {{"db_engine", db_engine}, {"phase", "pre_apply"}},
     });
 
     PreApplyCycleResult result;
     if (db_engine == "mssql") {
-        result = run_mssql_pre_apply(cfg, log_pg, conn_id, tier, batch_id);
+        result = run_mssql_pre_apply(cfg, log_pg, conn_id, batch_id);
     } else if (db_engine == "mongodb") {
-        result = run_mongo_pre_apply(cfg, log_pg, conn_id, tier, batch_id);
+        result = run_mongo_pre_apply(cfg, log_pg, conn_id, batch_id);
     } else {
-        result = run_mariadb_pre_apply(cfg, log_pg, conn_id, tier, batch_id);
+        result.payload = {
+            {"batch_id", batch_id},
+            {"conn_id", conn_id},
+            {"db_engine", "mariadb"},
+        };
     }
 
     result.payload["duration_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
                                         std::chrono::steady_clock::now() - cycle_start)
                                         .count();
+
+    log_write(log_pg, {
+        .level = result.errors > 0 ? LogLevel::Warning : LogLevel::Info,
+        .component = "cdc_kafka_daemon",
+        .message = result.errors > 0 ? "pre-apply cycle completed with errors" : "pre-apply cycle completed",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = result.payload,
+    });
     return result;
 }

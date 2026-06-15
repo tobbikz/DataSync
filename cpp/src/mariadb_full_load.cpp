@@ -1,6 +1,7 @@
 #include "mariadb_full_load.hpp"
 
 #include "capture_common.hpp"
+#include "full_load_common.hpp"
 #include "mariadb_binlog.hpp"
 #include "mariadb_conn.hpp"
 #include "mariadb_copy_format.hpp"
@@ -11,6 +12,7 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "runtime_config.hpp"
+#include "pipeline_defaults.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -64,37 +66,13 @@ void log_fl(
     const std::string& conn_id = {},
     const std::string& schema = {},
     const std::string& table = {}) {
-    if (!log_pg) {
-        return;
-    }
-    LogEvent ev;
-    ev.level = level;
-    ev.component = "mariadb_load";
-    ev.message = message;
-    ev.batch_id = batch_id;
-    if (!conn_id.empty()) {
-        ev.conn_id = conn_id;
-    }
-    if (!schema.empty()) {
-        ev.source_schema = schema;
-    }
-    if (!table.empty()) {
-        ev.source_table = table;
-    }
-    ev.context = context;
-    if (log_mtx) {
-        std::lock_guard<std::mutex> lock(*log_mtx);
-        log_write(log_pg, ev);
-    } else {
-        log_write(log_pg, ev);
-    }
+    full_load::log(log_pg, log_mtx, "mariadb_load", level, batch_id, message, context, conn_id, schema, table);
 }
 
-long long elapsed_ms(const std::chrono::steady_clock::time_point& start) {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now() - start)
-        .count();
-}
+using full_load::csv_escape;
+using full_load::elapsed_ms;
+using full_load::utc_now_date;
+using full_load::utc_now_ts;
 
 std::string format_pk_row_sample(
     MYSQL_ROW row,
@@ -123,49 +101,12 @@ void advance_keyset_pk_values(MYSQL_ROW row, const std::vector<std::size_t>& pk_
     }
 }
 
-std::string csv_escape(const std::string& value) {
-    bool quote = value.empty();
-    for (char c : value) {
-        if (c == ',' || c == '"' || c == '\n' || c == '\r') {
-            quote = true;
-            break;
-        }
-    }
-    if (!quote) {
-        return value;
-    }
-    std::string out = "\"";
-    for (char c : value) {
-        out += (c == '"') ? "\"\"" : std::string(1, c);
-    }
-    out += "\"";
-    return out;
-}
-
 std::string sql_quote(const std::string& value) {
     std::string out = "'";
     for (char c : value) {
         out += (c == '\'') ? "''" : std::string(1, c);
     }
     out += "'";
-    return out;
-}
-
-std::vector<std::string> split_pk_columns(const std::string& pk_columns) {
-    std::vector<std::string> out;
-    std::string part;
-    std::istringstream iss(pk_columns);
-    while (std::getline(iss, part, ',')) {
-        while (!part.empty() && std::isspace(static_cast<unsigned char>(part.front()))) {
-            part.erase(part.begin());
-        }
-        while (!part.empty() && std::isspace(static_cast<unsigned char>(part.back()))) {
-            part.pop_back();
-        }
-        if (!part.empty()) {
-            out.push_back(part);
-        }
-    }
     return out;
 }
 
@@ -181,26 +122,6 @@ void apply_catalog_pk_columns(std::vector<MariaDbColumn>& cols, const std::vecto
             }
         }
     }
-}
-
-std::string utc_now_ts() {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    gmtime_r(&t, &tm);
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S+00");
-    return oss.str();
-}
-
-std::string utc_now_date() {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    gmtime_r(&t, &tm);
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d");
-    return oss.str();
 }
 
 struct PkRange {
@@ -221,10 +142,12 @@ bool is_integer_pk_type(const MariaDbColumn& col) {
 }
 
 MariaDbRetryOptions mariadb_retry_options(RuntimeConfig& runtime, const std::string& conn_id) {
+    (void)runtime;
+    (void)conn_id;
     MariaDbRetryOptions opts;
-    opts.max_attempts = runtime.get_int("mariadb_reconnect_max_attempts", 0, "mariadb_load", conn_id);
-    opts.base_ms = std::max(100, runtime.get_int("mariadb_reconnect_base_ms", 500, "mariadb_load", conn_id));
-    opts.max_ms = std::max(opts.base_ms, runtime.get_int("mariadb_reconnect_max_ms", 60000, "mariadb_load", conn_id));
+    opts.max_attempts = pipeline_defaults::kMariadbReconnectMaxAttempts;
+    opts.base_ms = std::max(100, pipeline_defaults::kMariadbReconnectBaseMs);
+    opts.max_ms = std::max(opts.base_ms, pipeline_defaults::kMariadbReconnectMaxMs);
     return opts;
 }
 
@@ -659,48 +582,7 @@ long long copy_rows_parallel(
     return total_rows;
 }
 
-std::vector<CatalogTableRow> fetch_full_load_targets(PGconn* pg, const std::optional<std::string>& service_tier) {
-    if (service_tier && !service_tier->empty()) {
-        const char* vals[] = {service_tier->c_str()};
-        PGresult* res = PQexecParams(
-            pg,
-            R"(
-            SELECT catalog_id, conn_id, source_schema, source_table, has_pk, COALESCE(pk_columns, '')
-            FROM cdc_catalog.catalog
-            WHERE db_engine = 'mariadb'
-              AND active = true
-              AND needs_full_load = true
-              AND status NOT IN ('skipped', 'disabled', 'full_load_in_progress')
-              AND service_tier::text = lower($1)
-            ORDER BY conn_id, source_schema, source_table
-            )",
-            1,
-            nullptr,
-            vals,
-            nullptr,
-            nullptr,
-            0);
-        if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
-            if (res) {
-                PQclear(res);
-            }
-            throw std::runtime_error("failed to fetch full load targets");
-        }
-        std::vector<CatalogTableRow> out;
-        for (int i = 0; i < PQntuples(res); ++i) {
-            CatalogTableRow row;
-            row.catalog_id = std::atoll(PQgetvalue(res, i, 0));
-            row.conn_id = PQgetvalue(res, i, 1);
-            row.source_schema = PQgetvalue(res, i, 2);
-            row.source_table = PQgetvalue(res, i, 3);
-            row.has_pk = std::string(PQgetvalue(res, i, 4)) == "t";
-            row.pk_columns = PQgetvalue(res, i, 5);
-            out.push_back(std::move(row));
-        }
-        PQclear(res);
-        return out;
-    }
-
+std::vector<CatalogTableRow> fetch_full_load_targets(PGconn* pg) {
     PGresult* res = PQexec(
         pg,
         R"(
@@ -755,8 +637,8 @@ void mark_catalog_success(PGconn* pg, long long catalog_id) {
 }
 
 void reactivate_full_load_after_cooldown(PGconn* pg, RuntimeConfig& runtime, const std::string& conn_id) {
-    const int max_retries = runtime.get_int("full_load_max_fail_retries", 5, "mariadb_load", conn_id);
-    const int cooldown_min = runtime.get_int("full_load_failed_cooldown_minutes", 240, "mariadb_load", conn_id);
+    const int max_retries = pipeline_defaults::kFullLoadMaxFailRetries;
+    const int cooldown_min = pipeline_defaults::kFullLoadFailedCooldownMinutes;
     const std::string max_str = std::to_string(max_retries);
     const std::string cooldown_str = std::to_string(cooldown_min);
     const char* vals[] = {conn_id.c_str(), max_str.c_str(), cooldown_str.c_str()};
@@ -786,7 +668,7 @@ void mark_catalog_failed(
     const std::string& error) {
     RuntimeConfig runtime;
     runtime.reload(pg);
-    const int max_retries = runtime.get_int("full_load_max_fail_retries", 5, "mariadb_load", conn_id);
+    const int max_retries = pipeline_defaults::kFullLoadMaxFailRetries;
     const std::string trunc = error.substr(0, 950);
     const std::string id = std::to_string(catalog_id);
     const std::string max_str = std::to_string(max_retries);
@@ -819,38 +701,6 @@ void mark_catalog_failed(
 }
 
 enum class TableLoadOutcome { Success, Skipped, Failed };
-
-// #region agent log
-void agent_debug_log_full_load(
-    const char* location,
-    const char* hypothesis_id,
-    long long catalog_id,
-    const nlohmann::json& data) {
-    const char* log_path = std::getenv("DATASYNC_DEBUG_LOG");
-    if (!log_path || !log_path[0]) {
-        return;
-    }
-    try {
-        std::ofstream f(log_path, std::ios::app);
-        if (!f) {
-            return;
-        }
-        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-        const nlohmann::json line = {
-            {"sessionId", "e0d3ad"},
-            {"hypothesisId", hypothesis_id},
-            {"location", location},
-            {"catalog_id", catalog_id},
-            {"data", data},
-            {"timestamp", now_ms},
-        };
-        f << line.dump() << '\n';
-    } catch (...) {
-    }
-}
-// #endregion
 
 long long lake_table_row_count(PGconn* pg, const std::string& schema, const std::string& table) {
     const std::string sql =
@@ -904,9 +754,12 @@ TableLoadOutcome load_one_table(
     runtime.reload(app_pg.raw);
 
     const std::size_t batch_size = runtime.get_size_t(
-        "full_load_batch_size", 5000, "mariadb_load", target.conn_id);
-    const int source_sleep_ms = runtime.get_int("full_load_source_sleep_ms", 0, "mariadb_load", target.conn_id);
-    const int workers = runtime.get_int("full_load_workers", 1, "mariadb_load", target.conn_id);
+        "full_load_batch_size",
+        pipeline_defaults::kFullLoadBatchSizeDefault,
+        "mariadb_load",
+        target.conn_id);
+    const int source_sleep_ms = pipeline_defaults::kFullLoadSourceSleepMs;
+    const int workers = pipeline_defaults::kFullLoadWorkers;
 
     log_fl(
         log_pg,
@@ -941,7 +794,7 @@ TableLoadOutcome load_one_table(
     apply_catalog_pk_columns(cols, pk_cols);
 
     const int partition_months =
-        runtime.get_int("lake_partition_months_ahead", 3, "mariadb_load", target.conn_id);
+        pipeline_defaults::kLakePartitionMonthsAhead;
 
     migrate_lake_table_schema(lake_pg.raw, target.source_schema, target.source_table, cols);
     ensure_lake_table_base(lake_pg.raw, target.source_schema, target.source_table, cols, partition_months);
@@ -959,20 +812,8 @@ TableLoadOutcome load_one_table(
     };
 
     try {
-    const long long rows_before_truncate =
-        lake_table_row_count(lake_pg.raw, target.source_schema, target.source_table);
-    // #region agent log
-    agent_debug_log_full_load(
-        "load_one_table:pre_truncate",
-        "H3",
-        target.catalog_id,
-        {{"rows_before_truncate", rows_before_truncate},
-         {"schema", target.source_schema},
-         {"table", target.source_table}});
-    // #endregion
-
     try {
-        truncate_lake_table(lake_pg.raw, target.source_schema, target.source_table);
+    truncate_lake_table(lake_pg.raw, target.source_schema, target.source_table);
     } catch (const std::exception& ex) {
         log_fl(
             log_pg,
@@ -991,16 +832,6 @@ TableLoadOutcome load_one_table(
 
     const long long rows_after_truncate =
         lake_table_row_count(lake_pg.raw, target.source_schema, target.source_table);
-    // #region agent log
-    agent_debug_log_full_load(
-        "load_one_table:post_truncate",
-        "H4",
-        target.catalog_id,
-        {{"rows_before_truncate", rows_before_truncate},
-         {"rows_after_truncate", rows_after_truncate},
-         {"schema", target.source_schema},
-         {"table", target.source_table}});
-    // #endregion
 
     log_fl(
         log_pg,
@@ -1008,17 +839,15 @@ TableLoadOutcome load_one_table(
         rows_after_truncate == 0 ? LogLevel::Info : LogLevel::Warning,
         batch_id,
         rows_after_truncate == 0 ? "lake table truncated" : "lake table truncate incomplete",
-        {{"rows_before_truncate", rows_before_truncate}, {"rows_after_truncate", rows_after_truncate}},
+        {{"rows_after_truncate", rows_after_truncate}},
         target.conn_id,
         target.source_schema,
         target.source_table);
 
     {
-        RuntimeConfig bookmark_runtime;
-        bookmark_runtime.reload(app_pg.raw);
         try {
             seed_stream_capture_bookmark_if_needed(
-                app_pg.raw, bookmark_runtime, target.conn_id, target.catalog_id, "mariadb", batch_id);
+                app_pg.raw, target.conn_id, target.catalog_id, "mariadb", batch_id);
         } catch (const std::exception& ex) {
             log_fl(
                 log_pg,
@@ -1093,7 +922,6 @@ TableLoadOutcome load_one_table(
         batch_id,
         "table full load completed",
         {{"rows_loaded", rows_out},
-         {"rows_before_truncate", rows_before_truncate},
          {"duration_ms", elapsed_ms(start)},
          {"workers", workers}},
         target.conn_id,
@@ -1101,7 +929,30 @@ TableLoadOutcome load_one_table(
         target.source_table);
     release_lock();
     return TableLoadOutcome::Success;
+    } catch (const std::exception& ex) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Error,
+            batch_id,
+            "table full load failed",
+            {{"error", ex.what()}},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
+        release_lock();
+        throw;
     } catch (...) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Error,
+            batch_id,
+            "table full load failed",
+            {{"error", "unknown exception"}},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
         release_lock();
         throw;
     }
@@ -1113,7 +964,6 @@ FullLoadRunStats run_mariadb_full_load(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& batch_id,
-    const std::optional<std::string>& service_tier,
     const std::optional<std::string>& conn_id_filter) {
     const auto run_start = std::chrono::steady_clock::now();
     FullLoadRunStats stats;
@@ -1128,12 +978,13 @@ FullLoadRunStats run_mariadb_full_load(
         LogLevel::Info,
         batch_id,
         "full load started",
-        {{"service_tier", service_tier.value_or("all")},
-         {"batch_size", runtime.get_size_t("full_load_batch_size", 5000, "mariadb_load")},
-         {"workers", runtime.get_int("full_load_workers", 1, "mariadb_load")},
-         {"parallel_tables", runtime.get_int("full_load_parallel_tables", 1, "mariadb_load")}});
+        {{"batch_size",
+          runtime.get_size_t(
+              "full_load_batch_size", pipeline_defaults::kFullLoadBatchSizeDefault, "mariadb_load")},
+         {"workers", pipeline_defaults::kFullLoadWorkers},
+         {"parallel_tables", kFullLoadParallelTables}});
 
-    const auto targets_all = fetch_full_load_targets(app_pg.raw, service_tier);
+    const auto targets_all = fetch_full_load_targets(app_pg.raw);
     std::vector<CatalogTableRow> targets;
     targets.reserve(targets_all.size());
     for (const auto& row : targets_all) {
@@ -1150,7 +1001,7 @@ FullLoadRunStats run_mariadb_full_load(
     }
     for (const auto& cid : conn_ids) {
         const int stale_minutes =
-            runtime.get_int("full_load_stale_in_progress_minutes", 30, "mariadb_load", cid);
+            pipeline_defaults::kFullLoadStaleInProgressMinutes;
         clear_stale_full_load_in_progress(app_pg.raw, cid, "mariadb", stale_minutes);
     }
 
@@ -1220,7 +1071,7 @@ FullLoadRunStats run_mariadb_full_load(
             continue;
         }
 
-        const int parallel_tables = std::max(1, runtime.get_int("full_load_parallel_tables", 1, "mariadb_load", conn_id));
+        const int parallel_tables = kFullLoadParallelTables;
 
         try {
             if (capture_binlog_position_t0_if_absent(app_pg.raw, order_db.handle, conn_id)) {
@@ -1294,8 +1145,10 @@ FullLoadRunStats run_mariadb_full_load(
                             if (outcome == TableLoadOutcome::Success) {
                                 stats.tables_success += 1;
                                 stats.total_rows += rows;
-                            } else {
+                            } else if (outcome == TableLoadOutcome::Skipped) {
                                 stats.tables_skipped += 1;
+                            } else {
+                                stats.tables_failed += 1;
                             }
                         } catch (const std::exception& ex) {
                             try {
@@ -1303,16 +1156,6 @@ FullLoadRunStats run_mariadb_full_load(
                                 mark_catalog_failed(fail_pg.raw, target.catalog_id, target.conn_id, ex.what());
                             } catch (...) {
                             }
-                            log_fl(
-                                log_pg,
-                                &log_mtx,
-                                LogLevel::Error,
-                                batch_id,
-                                "table full load failed",
-                                {{"error", ex.what()}},
-                                target.conn_id,
-                                target.source_schema,
-                                target.source_table);
                             std::lock_guard<std::mutex> lock(stats_mtx);
                             stats.tables_processed += 1;
                             stats.tables_failed += 1;

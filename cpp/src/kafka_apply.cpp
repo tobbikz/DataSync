@@ -1,12 +1,9 @@
 #include "kafka_apply_detail.hpp"
 #include "kafka_apply.hpp"
 #include "capture_common.hpp"
-#include "host_metrics.hpp"
 #include "lake_columns.hpp"
 #include "mariadb_datetime.hpp"
 #include "mssql_conn.hpp"
-
-#include "mariadb_datetime.hpp"
 #include "mariadb_schema.hpp"
 #include "mssql_lake.hpp"
 #include "mongo_lake.hpp"
@@ -64,12 +61,9 @@ struct TableHealthSnapshot {
 
 struct BatchStatsMetrics {
     long long kafka_consumer_lag{0};
-    bool catchup_triggered{false};
-    int fk_deferred_retries{0};
     int dedup_skipped{0};
     int parse_skipped{0};
     int dropped_unrecoverable{0};
-    const HostMetricsSampler* host_sampler{nullptr};
 };
 
 std::string table_state_key(const std::string& schema, const std::string& table) {
@@ -197,26 +191,6 @@ TableHealthSnapshot fetch_table_health_by_catalog_id(
     }
     PQclear(res);
     return out;
-}
-
-std::string utc_now_ts() {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    gmtime_r(&t, &tm);
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S+00");
-    return oss.str();
-}
-
-std::string utc_now_date() {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    gmtime_r(&t, &tm);
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d");
-    return oss.str();
 }
 
 std::string unique_load_timestamptz(long long ts_ms, int row_index) {
@@ -403,81 +377,9 @@ std::string json_cell_csv(const json& val_in, const std::string& pg_type, bool m
     return csv_escape_local(s);
 }
 
-std::string json_cell_sql(const json& val_in, const std::string& pg_type) {
-    json val = val_in;
-    if (pg_type == "BOOLEAN" || pg_type == "bool") {
-        if (val.is_null()) {
-            return "NULL";
-        }
-        return format_boolean_copy_cell(val) == "t" ? "true" : "false";
-    }
-    if (val.is_string() && is_numeric_pg_type(pg_type)) {
-        const std::string s = sanitize_numeric_string_for_pg(val.get<std::string>());
-        if (s.empty()) {
-            val = nullptr;
-        } else if (is_integer_pg_type(pg_type)) {
-            try {
-                val = std::stoll(s);
-            } catch (...) {
-                val = s;
-            }
-        } else {
-            val = s;
-        }
-    }
-    if (val.is_null()) {
-        return "NULL";
-    }
-    if (val.is_boolean()) {
-        return val.get<bool>() ? "true" : "false";
-    }
-    if (val.is_number_integer() || val.is_number_unsigned()) {
-        const long long n = val.get<long long>();
-        if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP") {
-            return pg_escape_literal(epoch_to_timestamptz(n));
-        }
-        if (pg_type == "DATE") {
-            return pg_escape_literal(epoch_to_date(n));
-        }
-        return std::to_string(n);
-    }
-    if (val.is_number_float()) {
-        return std::to_string(val.get<double>());
-    }
-    if (is_bytea_pg_type(pg_type)) {
-        if (val.is_string()) {
-            return mariadb_bytea_to_sql_literal(val.get<std::string>());
-        }
-        return "NULL";
-    }
-    std::string s = val.is_string() ? val.get<std::string>() : val.dump();
-    if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || pg_type == "DATE") {
-        return normalize_pg_sql_literal(pg_escape_literal(s), pg_type);
-    }
-    return pg_escape_literal(sanitize_mariadb_text_for_pg(s));
-}
-
-std::vector<std::string> split_pk(const std::string& pk_columns) {
-    std::vector<std::string> out;
-    std::string part;
-    std::istringstream iss(pk_columns);
-    while (std::getline(iss, part, ',')) {
-        while (!part.empty() && std::isspace(static_cast<unsigned char>(part.front()))) {
-            part.erase(part.begin());
-        }
-        while (!part.empty() && std::isspace(static_cast<unsigned char>(part.back()))) {
-            part.pop_back();
-        }
-        if (!part.empty()) {
-            out.push_back(part);
-        }
-    }
-    return out;
-}
-
 /** Source/business PK from catalog — excludes lake-only _dl_* columns (e.g. _dl_load_timestamp). */
 std::vector<std::string> business_pk_cols(const TableBatchMeta& meta) {
-    auto cols = split_pk(meta.pk_columns);
+    auto cols = split_pk_columns(meta.pk_columns);
     if (!cols.empty()) {
         return cols;
     }
@@ -488,52 +390,6 @@ std::vector<std::string> business_pk_cols(const TableBatchMeta& meta) {
     }
     return cols;
 }
-
-// #region agent log
-void agent_debug_log_apply_pk(
-    const char* location,
-    const char* hypothesis_id,
-    long long catalog_id,
-    const std::vector<std::string>& check_pk,
-    const std::vector<std::string>& lake_pk,
-    const nlohmann::json& row_sample) {
-    const char* log_path = std::getenv("DATASYNC_DEBUG_LOG");
-    if (!log_path || !log_path[0]) {
-        log_path = "/home/iks/Projects/DataSync/.cursor/debug-e0d3ad.log";
-    }
-    try {
-        std::ofstream f(log_path, std::ios::app);
-        if (!f) {
-            return;
-        }
-        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-        nlohmann::json check_arr = nlohmann::json::array();
-        for (const auto& c : check_pk) {
-            check_arr.push_back(c);
-        }
-        nlohmann::json lake_arr = nlohmann::json::array();
-        for (const auto& c : lake_pk) {
-            lake_arr.push_back(c);
-        }
-        const nlohmann::json line = {
-            {"sessionId", "e0d3ad"},
-            {"hypothesisId", hypothesis_id},
-            {"location", location},
-            {"message", "apply pk validation"},
-            {"catalog_id", catalog_id},
-            {"data",
-             {{"business_pk", check_arr},
-              {"lake_pk", lake_arr},
-              {"row_keys_sample", row_sample}}},
-            {"timestamp", now_ms},
-        };
-        f << line.dump() << '\n';
-    } catch (...) {
-    }
-}
-// #endregion
 
 std::vector<std::string> fetch_lake_pk(PGconn* pg, const std::string& schema, const std::string& table) {
     const char* vals[] = {schema.c_str(), table.c_str()};
@@ -905,14 +761,12 @@ void insert_apply_batch_stats(
     long long catalog_id,
     const std::string& source_schema,
     const std::string& source_table,
-    const std::string& service_tier,
     const ApplyOpCounts& counts,
     long long duration_ms,
     const std::string& topic,
     int partition,
     long long offset,
     const TableHealthSnapshot& health,
-    bool is_starving,
     bool is_inactive,
     int events_seen_in_slice,
     const BatchStatsMetrics& metrics,
@@ -931,7 +785,6 @@ void insert_apply_batch_stats(
     const std::string lag = std::to_string(health.apply_lag_seconds);
     const std::string seen = std::to_string(events_seen_in_slice);
     const std::string stale = health.is_stale ? "true" : "false";
-    const std::string starving = is_starving ? "true" : "false";
     const std::string inactive = is_inactive ? "true" : "false";
     const std::string quarantined = health.is_quarantined ? "true" : "false";
     const std::string active = health.catalog_active ? "true" : "false";
@@ -939,27 +792,9 @@ void insert_apply_batch_stats(
     const std::string capture_lag = std::to_string(health.capture_lag_seconds);
     const std::string kafka_lag = std::to_string(metrics.kafka_consumer_lag);
     const std::string row_delta = std::to_string(health.reconcile_row_delta);
-    const std::string catchup = metrics.catchup_triggered ? "true" : "false";
-    const std::string fk_retries = std::to_string(metrics.fk_deferred_retries);
     const std::string dedup_skip = std::to_string(metrics.dedup_skipped);
     const std::string parse_skip = std::to_string(metrics.parse_skipped);
     const std::string dropped = std::to_string(metrics.dropped_unrecoverable);
-    HostMetricsSlice host{};
-    if (metrics.host_sampler) {
-        host = metrics.host_sampler->current_snapshot();
-    }
-    const std::string cpu_pct =
-        host.host_cpu_percent >= 0 ? std::to_string(host.host_cpu_percent) : "";
-    const std::string mem_mb =
-        host.host_mem_used_mb >= 0 ? std::to_string(host.host_mem_used_mb) : "";
-    const std::string mem_pct =
-        host.host_mem_percent >= 0 ? std::to_string(host.host_mem_percent) : "";
-    const std::string net_rx =
-        host.host_net_rx_mb >= 0 ? std::to_string(host.host_net_rx_mb) : "";
-    const std::string net_tx =
-        host.host_net_tx_mb >= 0 ? std::to_string(host.host_net_tx_mb) : "";
-    const std::string rss_mb =
-        host.process_rss_mb >= 0 ? std::to_string(host.process_rss_mb) : "";
     const std::string ctx_json = context.is_null() ? "{}" : context.dump();
     const char* vals[] = {
         batch_id.c_str(),
@@ -967,7 +802,6 @@ void insert_apply_batch_stats(
         cid.empty() ? nullptr : cid.c_str(),
         source_schema.c_str(),
         source_table.c_str(),
-        service_tier.empty() ? nullptr : service_tier.c_str(),
         ins.c_str(),
         upd.c_str(),
         del.c_str(),
@@ -978,7 +812,6 @@ void insert_apply_batch_stats(
         part.c_str(),
         off.empty() ? nullptr : off.c_str(),
         stale.c_str(),
-        starving.c_str(),
         inactive.c_str(),
         quarantined.c_str(),
         health.reconciliation_rag.c_str(),
@@ -990,49 +823,35 @@ void insert_apply_batch_stats(
         capture_lag.c_str(),
         kafka_lag.c_str(),
         row_delta.c_str(),
-        catchup.c_str(),
-        fk_retries.c_str(),
         dedup_skip.c_str(),
         parse_skip.c_str(),
         dropped.c_str(),
-        cpu_pct.empty() ? nullptr : cpu_pct.c_str(),
-        mem_mb.empty() ? nullptr : mem_mb.c_str(),
-        mem_pct.empty() ? nullptr : mem_pct.c_str(),
-        net_rx.empty() ? nullptr : net_rx.c_str(),
-        net_tx.empty() ? nullptr : net_tx.c_str(),
-        rss_mb.empty() ? nullptr : rss_mb.c_str(),
         ctx_json.c_str()};
     pg_exec_params_simple(
         pg,
         R"(
         INSERT INTO cdc_catalog.apply_batch_stats (
-            batch_id, conn_id, catalog_id, source_schema, source_table, service_tier,
+            batch_id, conn_id, catalog_id, source_schema, source_table,
             events_inserts, events_updates, events_deletes, events_total,
             duration_ms, events_per_minute, kafka_topic, kafka_partition, kafka_offset,
-            is_stale, is_starving, is_inactive, is_quarantined, reconciliation_rag,
+            is_stale, is_inactive, is_quarantined, reconciliation_rag,
             apply_lag_seconds, apply_position_status, events_seen_in_slice,
             catalog_active, cdc_enabled,
             capture_lag_seconds, kafka_consumer_lag, reconcile_row_delta,
-            catchup_triggered, fk_deferred_retries, dedup_skipped,
-            parse_skipped, dropped_unrecoverable,
-            host_cpu_percent, host_mem_used_mb, host_mem_percent,
-            host_net_rx_mb, host_net_tx_mb, process_rss_mb,
+            dedup_skipped, parse_skipped, dropped_unrecoverable,
             context
         ) VALUES (
-            $1, $2, NULLIF($3, '')::bigint, $4, $5, $6,
-            $7::bigint, $8::bigint, $9::bigint, $10::bigint,
-            $11::bigint, $12::bigint, $13, NULLIF($14, '')::integer, NULLIF($15, '')::bigint,
-            $16::boolean, $17::boolean, $18::boolean, $19::boolean, $20,
-            $21::integer, $22, $23::integer, $24::boolean, $25::boolean,
-            $26::integer, $27::bigint, $28::bigint,
-            $29::boolean, $30::integer, $31::integer,
-            $32::bigint, $33::bigint,
-            NULLIF($34, '')::double precision, NULLIF($35, '')::bigint, NULLIF($36, '')::integer,
-            NULLIF($37, '')::bigint, NULLIF($38, '')::bigint, NULLIF($39, '')::bigint,
-            $40::jsonb
+            $1, $2, NULLIF($3, '')::bigint, $4, $5,
+            $6::bigint, $7::bigint, $8::bigint, $9::bigint,
+            $10::bigint, $11::bigint, $12, NULLIF($13, '')::integer, NULLIF($14, '')::bigint,
+            $15::boolean, $16::boolean, $17::boolean, $18,
+            $19::integer, $20, $21::integer, $22::boolean, $23::boolean,
+            $24::integer, $25::bigint, $26::bigint,
+            $27::integer, $28::bigint, $29::bigint,
+            $30::jsonb
         )
         )",
-        40,
+        30,
         vals);
 }
 
@@ -1097,14 +916,6 @@ void merge_from_staging(
     pg_exec(pg, sql);
 }
 
-bool is_duplicate_key_error(const std::string& msg) {
-    return msg.find("duplicate key") != std::string::npos || msg.find("23505") != std::string::npos;
-}
-
-bool is_foreign_key_error(const std::string& msg) {
-    return msg.find("foreign key") != std::string::npos || msg.find("23503") != std::string::npos;
-}
-
 void delete_target_by_staging_pk(
     PGconn* pg,
     const std::string& fq,
@@ -1155,20 +966,20 @@ void copy_upserts_via_staging(
 
 long long apply_table_batch(
     PGconn* pg,
+    PGconn* log_pg,
+    const std::string& conn_id,
     const std::string& batch_id,
     const TableBatchMeta& meta,
     const std::vector<ApplyEvent>& upserts,
     const std::vector<ApplyEvent>& deletes,
-    bool append_only,
     int staging_id,
-    const std::string& source_system = "MariaDB",
-    int* fk_deferred_retries = nullptr) {
+    const std::string& source_system = "MariaDB") {
     if (meta.schema_name.empty() || meta.table_name.empty()) {
         throw std::runtime_error("apply_table_batch: empty lake schema or table name");
     }
     const std::string fq = pg_ident(meta.schema_name) + "." + pg_ident(meta.table_name);
     ensure_partitions(pg, meta.schema_name, meta.table_name);
-    const auto lake_pk_cols = meta.lake_pk.empty() ? split_pk(meta.pk_columns) : meta.lake_pk;
+    const auto lake_pk_cols = meta.lake_pk.empty() ? split_pk_columns(meta.pk_columns) : meta.lake_pk;
     const auto business_pk = business_pk_cols(meta);
     auto delete_pk_cols = business_pk;
 
@@ -1258,7 +1069,28 @@ long long apply_table_batch(
             try {
                 pg_exec(pg, "ALTER TABLE " + fq + " ADD COLUMN IF NOT EXISTS " + pg_ident(col) + " " + pg_type + " NULL");
                 data_cols.push_back(col);
-            } catch (...) {}
+            } catch (const std::exception& ex) {
+                if (log_pg) {
+                    log_write(log_pg, {
+                        .level = LogLevel::Warning,
+                        .component = "cdc_kafka_apply_cpp",
+                        .message = "apply schema drift add column failed",
+                        .batch_id = batch_id,
+                        .conn_id = conn_id,
+                        .source_schema = meta.catalog_source_schema.empty() ? std::nullopt
+                                                                            : std::optional(meta.catalog_source_schema),
+                        .source_table = meta.catalog_source_table.empty() ? std::nullopt
+                                                                          : std::optional(meta.catalog_source_table),
+                        .context = {
+                            {"lake_schema", meta.schema_name},
+                            {"lake_table", meta.table_name},
+                            {"column", col},
+                            {"pg_type", pg_type},
+                            {"error", ex.what()},
+                        },
+                    });
+                }
+            }
         }
     }
 
@@ -1291,19 +1123,6 @@ long long apply_table_batch(
         }
         if (missing_pk) {
             skipped_missing_pk += 1;
-            if (skipped_missing_pk <= 3) {
-                nlohmann::json row_keys = nlohmann::json::array();
-                for (auto it = e.row.begin(); it != e.row.end(); ++it) {
-                    row_keys.push_back(it.key());
-                }
-                agent_debug_log_apply_pk(
-                    "apply_table_batch:upsert_skip",
-                    "H1",
-                    meta.catalog_id,
-                    business_pk,
-                    lake_pk_cols,
-                    row_keys);
-            }
             continue;
         }
         const std::string row_ts = unique_load_timestamptz(e.ts_ms, row_index++);
@@ -1322,39 +1141,17 @@ long long apply_table_batch(
         lines.push_back(line.str());
     }
     if (lines.empty()) {
-        (void)skipped_missing_pk;
         return applied_deletes + static_cast<long long>(upserts.size() - skipped_missing_pk);
     }
 
-    const bool all_inserts =
-        append_only &&
-        std::all_of(upserts.begin(), upserts.end(), [](const ApplyEvent& e) { return e.op == "c" || e.op == "r"; });
     const std::string col_list_str = col_list.str();
     const std::string staging_name = "cdc_stg_" + std::to_string(staging_id);
 
-    if (all_inserts && !lake_pk_cols.empty()) {
-        const std::string sp = "sp_apply_copy";
-        pg_exec(pg, "SAVEPOINT " + sp);
-        try {
-            copy_csv_lines(pg, "COPY " + fq + " (" + col_list_str + ") FROM STDIN WITH (FORMAT csv)", lines);
-            pg_exec(pg, "RELEASE SAVEPOINT " + sp);
-        } catch (const std::exception& ex) {
-            pg_exec(pg, "ROLLBACK TO SAVEPOINT " + sp);
-            pg_exec(pg, "RELEASE SAVEPOINT " + sp);
-            if (!is_duplicate_key_error(ex.what()) && !is_foreign_key_error(ex.what())) {
-                throw;
-            }
-            if (fk_deferred_retries && is_foreign_key_error(ex.what())) {
-                *fk_deferred_retries += 1;
-            }
-            copy_upserts_via_staging(pg, fq, col_list_str, lines, all_cols, lake_pk_cols, staging_name);
-        }
-    } else if (!lake_pk_cols.empty()) {
-        // CDC updates / mixed upserts: staging COPY, optional batch DELETE by source PK, then DISTINCT ON merge.
+    if (!lake_pk_cols.empty()) {
         const std::vector<std::string> dedup_cols =
             !delete_pk_cols.empty() ? delete_pk_cols : lake_pk_cols;
         const std::vector<std::string> batch_delete_cols =
-            (!append_only && !delete_pk_cols.empty()) ? delete_pk_cols : std::vector<std::string>{};
+            !delete_pk_cols.empty() ? delete_pk_cols : std::vector<std::string>{};
         copy_upserts_via_staging(
             pg,
             fq,
@@ -1460,6 +1257,20 @@ json apply_events_batch(
                     engine_catalog_map[lk_schema + "|" + lk_table] = {
                         cid_str ? std::atoll(cid_str) : 0, pk_str ? pk_str : ""};
                 }
+            } else if (cr) {
+                log_write(app_pg, {
+                    .level = LogLevel::Warning,
+                    .component = "cdc_kafka_apply_cpp",
+                    .message = "apply engine catalog lookup failed",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {
+                        {"db_engine", db_eng},
+                        {"error", PQresultErrorMessage(cr)},
+                    },
+                });
             }
             if (cr) {
                 PQclear(cr);
@@ -1617,19 +1428,6 @@ json apply_events_batch(
                 }
                 if (missing_pk) {
                     skipped_missing_pk += 1;
-                    if (skipped_missing_pk <= 3) {
-                        nlohmann::json row_keys = nlohmann::json::array();
-                        for (auto it = e.row.begin(); it != e.row.end(); ++it) {
-                            row_keys.push_back(it.key());
-                        }
-                        agent_debug_log_apply_pk(
-                            "apply_events_batch:upsert_skip",
-                            "H1",
-                            meta.catalog_id,
-                            business_pk,
-                            meta.lake_pk,
-                            row_keys);
-                    }
                 } else {
                     valid_upserts.push_back(std::move(e));
                 }
@@ -1680,19 +1478,18 @@ json apply_events_batch(
             PQclear(lake_begin);
         }
         pg_exec(lake_pg, "SAVEPOINT sp_lake_apply");
-        int fk_retries = 0;
         long long table_applied = 0;
         try {
             table_applied = apply_table_batch(
                 lake_pg,
+                app_pg,
+                conn_id,
                 batch_id,
                 meta,
                 upserts,
                 deletes,
-                options.append_only,
                 staging_id++,
-                options.source_system,
-                &fk_retries);
+                options.source_system);
         } catch (const std::exception& ex) {
             { PGresult* r = PQexec(lake_pg, "ROLLBACK"); if (r) PQclear(r); }
             (*table_errors_acc) += 1;
@@ -1768,24 +1565,14 @@ json apply_events_batch(
                 const ApplyOpCounts op_counts = count_apply_ops(audit);
                 const std::string state_key =
                     table_state_key(meta.catalog_source_schema, meta.catalog_source_table);
-                bool is_starving = false;
                 int events_seen_in_slice = 0;
                 BatchStatsMetrics metrics;
                 if (const auto it = options.slice_table_state.find(state_key);
                     it != options.slice_table_state.end()) {
-                    is_starving = it->second.is_starving;
                     events_seen_in_slice = it->second.events_seen_in_slice;
                     metrics.kafka_consumer_lag = it->second.kafka_consumer_lag;
-                    metrics.catchup_triggered = it->second.catchup_triggered;
                     metrics.dedup_skipped = it->second.dedup_skipped;
                 }
-                const long long events_applied_total =
-                    op_counts.inserts + op_counts.updates + op_counts.deletes;
-                if (events_applied_total > 0) {
-                    is_starving = false;
-                }
-                metrics.fk_deferred_retries = fk_retries;
-                metrics.host_sampler = options.host_sampler;
                 if (options.parse_skipped_by_table) {
                     const TableKey pk{meta.catalog_source_schema, meta.catalog_source_table};
                     const auto ps_it = options.parse_skipped_by_table->find(pk);
@@ -1824,18 +1611,18 @@ json apply_events_batch(
                     meta.catalog_id,
                     meta.catalog_source_schema,
                     meta.catalog_source_table,
-                    options.service_tier,
                     op_counts,
                     table_duration_ms,
                     last.topic,
                     last.partition,
                     last.offset,
                     health,
-                    is_starving,
                     false,
                     events_seen_in_slice,
                     metrics,
                     batch_context);
+                const long long events_applied_total =
+                    op_counts.inserts + op_counts.updates + op_counts.deletes;
                 log_write(app_pg, {
                     .level = LogLevel::Info,
                     .component = "cdc_kafka_apply_cpp",
@@ -1855,7 +1642,6 @@ json apply_events_batch(
                         {"kafka_topic", last.topic},
                         {"kafka_partition", last.partition},
                         {"kafka_offset", last.offset},
-                        {"fk_deferred_retries", fk_retries},
                     },
                 });
                 kafka_offset_out = {last.topic + ":" + std::to_string(last.partition), last.offset};
@@ -2037,116 +1823,21 @@ std::unordered_set<std::string> filter_new_event_ids(PGconn* pg, const std::vect
     return fresh;
 }
 
-void record_quiet_table_batch_stats(
-    PGconn* app_pg,
-    const std::string& batch_id,
-    const std::string& conn_id,
-    const std::string& service_tier,
-    const ApplyBatchOptions& options,
-    const std::vector<QuietTableRef>& tables,
-    int events_seen_in_slice,
-    bool is_starving,
-    bool is_inactive) {
-    const ApplyOpCounts zero_counts;
-    for (const auto& table : tables) {
-        const TableHealthSnapshot health = fetch_table_health_by_catalog_id(
-            app_pg,
-            table.catalog_id,
-            options.apply_staleness_seconds,
-            options.apply_inactive_seconds);
-        bool inactive = is_inactive;
-        if (!inactive && health.seconds_since_last_apply >= 0 &&
-            health.seconds_since_last_apply > options.apply_inactive_seconds) {
-            inactive = true;
-        }
-        BatchStatsMetrics metrics;
-        metrics.host_sampler = options.host_sampler;
-        if (options.catchup_tables.count(table_state_key(table.source_schema, table.source_table)) > 0) {
-            metrics.catchup_triggered = true;
-        }
-        insert_apply_batch_stats(
-            app_pg,
-            batch_id,
-            conn_id,
-            table.catalog_id,
-            table.source_schema,
-            table.source_table,
-            service_tier,
-            zero_counts,
-            0,
-            "",
-            0,
-            -1,
-            health,
-            is_starving,
-            inactive,
-            events_seen_in_slice,
-            metrics);
-    }
-}
-
 }  // namespace kafka_apply_detail
 
 using kafka_apply_detail::ApplyEvent;
 using kafka_apply_detail::apply_events_batch;
-using kafka_apply_detail::parse_apply_event;
-
-int run_kafka_apply_stdin_batch(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_id) {
-    using json = nlohmann::json;
-    const json payload = json::parse(std::string((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>()));
-    const std::string batch_id = payload.value("batch_id", make_batch_id());
-    const std::string cid = payload.value("conn_id", conn_id);
-    kafka_apply_detail::ApplyBatchOptions options;
-    options.append_only = payload.value("append_only", true);
-    std::vector<ApplyEvent> events;
-    for (const auto& item : payload.at("events")) {
-        events.push_back(parse_apply_event(item));
-    }
-
-    PgConn app_pg(cfg.datasync.conn_string());
-    PgConn lake_pg(cfg.datalake.conn_string());
-
-    json result;
-    try {
-        result = apply_events_batch(app_pg.raw, lake_pg.raw, cid, batch_id, events, options);
-    } catch (const std::exception& ex) {
-        LogEvent ev;
-        ev.level = LogLevel::Error;
-        ev.component = "cdc_kafka_apply_cpp";
-        ev.message = "kafka apply batch failed";
-        ev.batch_id = batch_id;
-        ev.conn_id = cid;
-        ev.context = {{"error", ex.what()}};
-        log_write(log_pg, ev);
-        std::cout << json{{"applied", 0}, {"error", ex.what()}}.dump() << std::endl;
-        return 1;
-    }
-
-    LogEvent ev;
-    ev.level = LogLevel::Info;
-    ev.component = "cdc_kafka_apply_cpp";
-    ev.message = "kafka apply batch completed";
-    ev.batch_id = batch_id;
-    ev.conn_id = cid;
-    ev.context = {{"applied", result.value("applied", 0)}};
-    log_write(log_pg, ev);
-
-    std::cout << result.dump() << std::endl;
-    return 0;
-}
 
 #ifndef HAVE_RDKAFKA
 int run_kafka_apply_native_cli(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     int worker_id,
     int worker_count) {
     (void)cfg;
     (void)log_pg;
     (void)conn_id;
-    (void)service_tier;
     (void)worker_id;
     (void)worker_count;
     std::cerr << "kafka-apply requires librdkafka (rebuild Docker image: ./install.sh)\n";

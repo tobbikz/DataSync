@@ -43,19 +43,11 @@ struct MongoSource {
     bool replica_set_in_extras{false};
 };
 
-/** CDC daemon tuning — config.json only (not runtime_config / service_tiers table). */
-struct CdcTierConfig {
-    std::string code;
-    int apply_workers{1};
-    bool active{true};
-    int sort_order{0};
-};
-
+/** CDC daemon tuning — config.json only (not runtime_config). */
 struct CdcConfig {
     int round_idle_seconds{5};
     int slice_max_seconds{60};
     int slice_max_events{10'000'000};
-    std::vector<CdcTierConfig> tiers;
 };
 
 struct AppConfig {
@@ -69,7 +61,6 @@ struct AppConfig {
     CdcConfig cdc;
 };
 
-/** Default platinum/gold/silver/bronze/trash/firehose when config.json omits cdc.tiers. */
 CdcConfig default_cdc_config();
 
 /** Load DataSync + DataLake PG from config.json (project root). Sources from cdc_catalog.connections. */

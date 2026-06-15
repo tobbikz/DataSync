@@ -1,13 +1,13 @@
 #pragma once
 
 #include "config.hpp"
+#include "pipeline_defaults.hpp"
 #include "runtime_config.hpp"
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include <atomic>
-#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -75,13 +75,23 @@ CaptureRuntimeConfig load_mongo_capture_runtime(
     const std::string& conn_id,
     const CdcConfig* cdc = nullptr);
 
-/** Kafka bootstrap: KAFKA_BOOTSTRAP env → runtime_config → localhost:9092 */
+/** Kafka bootstrap: KAFKA_BOOTSTRAP env → localhost:9092 */
 struct KafkaBootstrapResolved {
     std::string bootstrap;
-    std::string source;  // env | runtime_config | default
+    std::string source;  // env | default
 };
 
-KafkaBootstrapResolved resolve_kafka_bootstrap(RuntimeConfig& runtime, const std::string& conn_id);
+KafkaBootstrapResolved resolve_kafka_bootstrap();
+
+enum class CatalogPipeline { Capture, Apply };
+
+std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
+    PGconn* pg,
+    const std::string& conn_id,
+    int worker_id,
+    int worker_count,
+    const std::string& db_engine,
+    CatalogPipeline pipeline);
 
 /** Topic prefix is always conn_id (not runtime_config). */
 inline std::string topic_prefix_for_conn(const std::string& conn_id) {
@@ -91,17 +101,6 @@ inline std::string topic_prefix_for_conn(const std::string& conn_id) {
     return conn_id;
 }
 
-inline std::string runtime_topic_prefix(
-    RuntimeConfig& runtime,
-    PGconn* pg,
-    const std::string& conn_id,
-    const std::string& db_engine) {
-    (void)runtime;
-    (void)pg;
-    (void)db_engine;
-    return topic_prefix_for_conn(conn_id);
-}
-
 /** Log why capture/apply found zero eligible tables (cdc_catalog.logs). */
 void log_cdc_skip_no_tables(
     PGconn* pg,
@@ -109,30 +108,33 @@ void log_cdc_skip_no_tables(
     const std::string& pipeline,
     const std::string& batch_id,
     const std::string& conn_id,
-    const std::optional<std::string>& tier,
     const std::string& db_engine);
 
-// Per-tier suffix avoids Kafka consumer group rebalance when daemon runs tiers in parallel.
-// When apply_worker_count > 1, append -w{N} so each worker owns independent Kafka offsets.
+using pipeline_defaults::kApplyWorkerCount;
+using pipeline_defaults::kCaptureWorkerCount;
+using pipeline_defaults::kFullLoadParallelTables;
+
+// Per-conn suffix + -w{N} when kApplyWorkerCount > 1 (independent Kafka offsets per worker).
 std::string kafka_apply_consumer_group(
-    RuntimeConfig& runtime,
-    PGconn* pg,
     const std::string& conn_id,
-    const std::string& tier,
     int worker_id = 0,
     int worker_count = 1);
 
-int catalog_apply_worker_id(long long catalog_id, int worker_count);
-
-std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
+inline std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
     PGconn* pg,
     const std::string& conn_id,
-    const std::optional<std::string>& tier,
     int worker_id,
     int worker_count,
-    const std::string& db_engine);
+    const std::string& db_engine) {
+    return fetch_conn_catalog_tables(pg, conn_id, worker_id, worker_count, db_engine, CatalogPipeline::Capture);
+}
 
 std::vector<std::string> split_pk_columns(const std::string& pk_columns);
+
+/** Alias for split_pk_columns (lake apply / reconcile). */
+inline std::vector<std::string> split_pk(const std::string& pk_columns) {
+    return split_pk_columns(pk_columns);
+}
 
 void ensure_capture_kafka_topics(
     PGconn* pg,
@@ -143,12 +145,6 @@ void ensure_capture_kafka_topics(
     const std::vector<std::pair<std::string, std::string>>& tables);
 
 #ifdef HAVE_RDKAFKA
-long long kafka_backlog_messages(
-    const std::string& bootstrap,
-    const std::string& consumer_group,
-    const std::string& topic,
-    int partition);
-
 long long reset_apply_offset_to_end(
     const std::string& bootstrap,
     const std::string& consumer_group,
@@ -162,7 +158,6 @@ long long reset_apply_consumer_offset(
     int partition,
     long long offset);
 
-// Create Kafka topics if missing (idempotent; TOPIC_ALREADY_EXISTS is OK).
 void ensure_kafka_topics_exist(
     const std::string& bootstrap,
     const std::vector<std::string>& topics,
@@ -173,18 +168,9 @@ void ensure_kafka_topics_exist(
 void enable_cdc_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::string& db_engine,
     const std::string& batch_id,
     bool expect_updates = false);
-
-void flag_table_for_full_load(
-    PGconn* pg,
-    const std::string& conn_id,
-    const std::string& schema,
-    const std::string& table,
-    const std::string& db_engine,
-    const std::string& batch_id = "");
 
 struct BinlogGapRebootResult {
     bool ran{false};
@@ -192,78 +178,51 @@ struct BinlogGapRebootResult {
     int tables_flagged{0};
 };
 
-/** After MariaDB purged binlog files: reseed capture T0 and batch-flag conn tables for full-load reboot. */
 BinlogGapRebootResult reboot_conn_after_mariadb_binlog_gap(
     PGconn* pg,
     MYSQL* mysql,
     const std::string& conn_id,
     const std::string& batch_id);
 
-/** Bookmark Kafka offsets in catalog.engine_meta when capture_during_full_load is set. */
 bool seed_stream_capture_bookmark_if_needed(
     PGconn* pg,
-    RuntimeConfig& runtime,
     const std::string& conn_id,
     long long catalog_id,
     const std::string& db_engine,
     const std::string& batch_id);
 
-/** Set catalog.status while a table is actively loading (full load COPY). */
 void mark_catalog_full_load_in_progress(PGconn* pg, long long catalog_id);
 
-/** Mark table skipped (no PK, unsupported) — clears in_progress, disables CDC for this table. */
 void mark_catalog_skipped(PGconn* pg, long long catalog_id, const std::string& reason);
 
-/** Set catalog.status while CDC capture or apply is processing a table. */
 void mark_catalog_cdc_in_progress(PGconn* pg, long long catalog_id);
 
-/** Mark CDC idle: status success + last_cdc_at. */
 void mark_catalog_cdc_success(PGconn* pg, long long catalog_id);
 
-/** Record CDC apply failure on catalog (status failed + last_error). */
 void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string& error);
 
-/** Reconcile drift: status failed, optional needs_full_load (source_ahead / append_zombie). */
 void mark_catalog_reconcile_failed(
     PGconn* pg,
     long long catalog_id,
     const std::string& error,
     bool needs_full_load);
 
-/** Clear reconcile-only failure when table passes a subsequent reconcile run. */
 void mark_catalog_reconcile_healed(PGconn* pg, long long catalog_id);
 
-/** Reset stale full_load_in_progress rows (crash/reload) back to pending. */
 void clear_stale_full_load_in_progress(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine,
     int stale_minutes = 30);
 
-/** Reset stale cdc_in_progress rows (crash/reload) back to success. Returns rows updated. */
 int clear_stale_cdc_in_progress(
     PGconn* pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::string& db_engine);
 
-/** Revert cdc_in_progress to success without updating last_cdc_at (failed capture/apply slice). */
 void rollback_cdc_in_progress_ids(PGconn* pg, const std::set<long long>& catalog_ids);
 
 int count_full_load_pending(
-    PGconn* pg,
-    const std::string& conn_id,
-    const std::string& tier,
-    const std::string& db_engine);
-
-/** Pending full-load rows for conn across any tier (tier-mismatch diagnostics). */
-int count_full_load_pending_any_tier(
-    PGconn* pg,
-    const std::string& conn_id,
-    const std::string& db_engine);
-
-/** Distinct service_tier values with pending full-load for conn. */
-std::vector<std::string> list_full_load_pending_tiers(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine);
@@ -277,11 +236,9 @@ struct ApplySkipReasonCounts {
     int apply_ready{0};
 };
 
-/** Why apply found zero tables (per conn + optional tier filter). */
 ApplySkipReasonCounts fetch_apply_skip_reasons(
     PGconn* pg,
     const std::string& conn_id,
-    const std::optional<std::string>& tier,
     const std::string& db_engine);
 
 struct FullLoadKafkaResetStats {
@@ -291,19 +248,15 @@ struct FullLoadKafkaResetStats {
     int errors{0};
 };
 
-// Catchup parity after full-load: reset consumer offsets to end + prune dedup for tier tables.
 FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& db_engine,
     const std::string& batch_id);
 
-// Returns false if kafka offset reset failed (dedup is NOT cleared on failure).
 bool onboard_conn_after_full_load(
     const AppConfig& cfg,
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& tier,
     const std::string& db_engine,
     const std::string& batch_id);

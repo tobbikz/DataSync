@@ -1,3 +1,0 @@
-/home/iks/Projects/DataSync/cpp/build-kafka/CMakeFiles/DataSync.dir
-/home/iks/Projects/DataSync/cpp/build-kafka/CMakeFiles/edit_cache.dir
-/home/iks/Projects/DataSync/cpp/build-kafka/CMakeFiles/rebuild_cache.dir

@@ -199,7 +199,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::string& batch_id,
     int worker_id,
     int worker_count) {
@@ -209,6 +208,16 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
 
     const MariaDbSource* source = find_mariadb_source(cfg, conn_id);
     if (!source) {
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_kafka_capture",
+            .message = "mariadb connect failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"reason", "source not found in config"}},
+        });
         throw std::runtime_error("MariaDB source not found: " + conn_id);
     }
 
@@ -216,7 +225,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     runtime.reload(log_pg);
     const CaptureRuntimeConfig rcfg =
         load_mariadb_capture_runtime(runtime, log_pg, conn_id, &cfg.cdc);
-    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap(runtime, conn_id);
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
 
     log_write(log_pg, {
         .level = LogLevel::Info,
@@ -227,7 +236,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
         .context = {
-            {"tier", service_tier.value_or("all")},
             {"worker_id", worker_id},
             {"worker_count", worker_count},
             {"kafka_bootstrap", kafka.bootstrap},
@@ -252,11 +260,11 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     std::lock_guard<std::mutex> capture_lock(*conn_mu_ptr);
 
     const auto tables =
-        fetch_capture_catalog_tables(log_pg, conn_id, service_tier, worker_id, worker_count, "mariadb");
-    clear_stale_cdc_in_progress(log_pg, conn_id, service_tier, "mariadb");
+        fetch_capture_catalog_tables(log_pg, conn_id, worker_id, worker_count, "mariadb");
+    clear_stale_cdc_in_progress(log_pg, conn_id, "mariadb");
     if (tables.empty()) {
         log_cdc_skip_no_tables(
-            log_pg, "cdc_kafka_capture", "capture", batch_id, conn_id, service_tier, "mariadb");
+            log_pg, "cdc_kafka_capture", "capture", batch_id, conn_id, "mariadb");
         return stats;
     }
 
@@ -268,7 +276,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         .conn_id = conn_id,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"table_count", static_cast<int>(tables.size())}, {"tier", service_tier.value_or("all")}},
+        .context = {{"table_count", static_cast<int>(tables.size())}},
     });
 
     std::set<std::pair<std::string, std::string>> wanted;
@@ -828,7 +836,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             {"binlog_file", stats.binlog_file},
             {"binlog_position", stats.binlog_position},
             {"duration_ms", stats.duration_ms},
-            {"tier", service_tier.value_or("all")},
             {"kafka_bootstrap", rcfg.bootstrap},
             {"topic_prefix", rcfg.topic_prefix},
             {"tables_watched", static_cast<int>(wanted.size())},
@@ -843,12 +850,27 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 reboot_conn_after_mariadb_binlog_gap(log_pg, recovery_conn.handle, conn_id, batch_id);
             rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
             stats.errors = reboot.ran ? 0 : 1;
+            log_write(log_pg, {
+                .level = reboot.ran ? LogLevel::Warning : LogLevel::Error,
+                .component = "cdc_kafka_capture",
+                .message = reboot.ran ? "capture binlog gap reboot completed"
+                                      : "capture binlog gap reboot failed",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"error", ex.what()},
+                    {"t0_reset", reboot.t0_reset},
+                    {"tables_flagged", reboot.tables_flagged},
+                },
+            });
             return stats;
         }
         rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
         mark_capture_position_failed(log_pg, conn_id, ex.what());
         log_write(log_pg, {
-            .level = LogLevel::Warning,
+            .level = LogLevel::Error,
             .component = "cdc_kafka_capture",
             .message = "capture slice failed; cdc_in_progress rolled back",
             .batch_id = batch_id,

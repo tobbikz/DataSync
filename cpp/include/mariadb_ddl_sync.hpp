@@ -51,7 +51,6 @@ DdlSyncRunStats run_mariadb_ddl_sync(
     PGconn* log_pg,
     const std::string& batch_id,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::optional<std::string>& source_schema,
     const std::optional<std::string>& source_table);
 
@@ -59,6 +58,5 @@ int run_mariadb_ddl_sync_cli(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::optional<std::string>& service_tier,
     const std::optional<std::string>& source_schema = std::nullopt,
     const std::optional<std::string>& source_table = std::nullopt);

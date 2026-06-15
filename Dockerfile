@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     nlohmann-json3-dev \
     pkg-config \
+    python3 \
     freetds-dev \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/* \
@@ -65,7 +66,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /opt/rdkafka/lib /opt/rdkafka/lib
 COPY --from=builder /src/cpp/build/DataSync /usr/local/bin/DataSync
-COPY install.sh prod_ops.sql /app/
+COPY install.sh /app/
 
 RUN chmod +x /app/install.sh
 
