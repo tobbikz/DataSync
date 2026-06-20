@@ -190,7 +190,9 @@ std::string mariadb_to_pg_type(const std::string& mysql_type_raw) {
             return "INTEGER";
         }
         if (t == "int" || t.rfind("int(", 0) == 0 || t.find("integer") != std::string::npos) {
-            return is_unsigned ? "BIGINT" : "INTEGER";
+            // Signed MariaDB INT stores -1 as 0xFFFFFFFF in binlog; lake must use BIGINT.
+            (void)is_unsigned;
+            return "BIGINT";
         }
         return "NUMERIC";
     }
@@ -522,6 +524,7 @@ void ensure_lake_table_base(
     const std::vector<MariaDbColumn>& cols,
     int partition_months_ahead) {
     pg_exec(pg, "CREATE SCHEMA IF NOT EXISTS " + pg_ident(schema));
+    drop_lake_table_if_not_partitioned(pg, schema, table);
 
     std::vector<std::string> col_defs;
     std::vector<std::string> pk_cols;
@@ -636,9 +639,30 @@ void migrate_lake_table_schema(
                     " (" + existing + " -> " + desired + "): " + ex.what() +
                     "; table dropped for safety");
             }
-            return;
         }
     }
+}
+
+void widen_lake_integer_column_to_bigint(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    const std::string& column) {
+    if (!pg_lake_table_exists(pg, schema, table)) {
+        return;
+    }
+    const std::string current = lake_column_data_type(pg, schema, table, column);
+    if (current.empty() || current == "bigint") {
+        return;
+    }
+    if (current != "integer" && current != "smallint") {
+        return;
+    }
+    const std::string fq = pg_ident(schema) + "." + pg_ident(table);
+    const std::string ident = pg_ident(column);
+    pg_exec(
+        pg,
+        "ALTER TABLE " + fq + " ALTER COLUMN " + ident + " TYPE bigint USING " + ident + "::bigint");
 }
 
 bool pg_lake_table_exists(PGconn* pg, const std::string& schema, const std::string& table) {
@@ -658,4 +682,39 @@ bool pg_lake_table_exists(PGconn* pg, const std::string& schema, const std::stri
         PQclear(res);
     }
     return ok;
+}
+
+bool pg_lake_table_is_partitioned(PGconn* pg, const std::string& schema, const std::string& table) {
+    const char* vals[] = {schema.c_str(), table.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(SELECT c.relkind = 'p'
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE n.nspname = $1 AND c.relname = $2)",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    bool partitioned = false;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        partitioned = PQgetvalue(res, 0, 0)[0] == 't';
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return partitioned;
+}
+
+void drop_lake_table_if_not_partitioned(PGconn* pg, const std::string& schema, const std::string& table) {
+    if (!pg_lake_table_exists(pg, schema, table)) {
+        return;
+    }
+    if (pg_lake_table_is_partitioned(pg, schema, table)) {
+        return;
+    }
+    const std::string fq = pg_ident(schema) + "." + pg_ident(table);
+    pg_exec(pg, "DROP TABLE " + fq + " CASCADE");
 }

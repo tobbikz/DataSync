@@ -284,6 +284,58 @@ std::string sanitize_numeric_string_for_pg(const std::string& s) {
     return s;
 }
 
+constexpr long long kPgInt32Max = 2147483647LL;
+constexpr long long kPgInt32Min = -2147483648LL;
+
+bool is_int32_bounded_pg_type(const std::string& pg_type) {
+    return pg_type == "int4" || pg_type == "INTEGER" || pg_type == "integer" || pg_type == "int2" ||
+           pg_type == "SMALLINT" || pg_type == "smallint";
+}
+
+bool json_numeric_exceeds_int32(const json& val) {
+    if (val.is_number_unsigned()) {
+        return val.get<uint64_t>() > static_cast<uint64_t>(kPgInt32Max);
+    }
+    if (val.is_number_integer()) {
+        const long long n = val.get<long long>();
+        return n > kPgInt32Max || n < kPgInt32Min;
+    }
+    if (val.is_string()) {
+        try {
+            const long long n = std::stoll(sanitize_numeric_string_for_pg(val.get<std::string>()));
+            return n > kPgInt32Max || n < kPgInt32Min;
+        } catch (...) {
+            return false;
+        }
+    }
+    return false;
+}
+
+void ensure_lake_int32_columns_wide_enough(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    std::map<std::string, std::string>& col_types,
+    const std::vector<ApplyEvent>& events) {
+    std::set<std::string> widen;
+    for (const auto& e : events) {
+        for (auto it = e.row.begin(); it != e.row.end(); ++it) {
+            const std::string& col = it.key();
+            const auto type_it = col_types.find(col);
+            if (type_it == col_types.end() || !is_int32_bounded_pg_type(type_it->second)) {
+                continue;
+            }
+            if (json_numeric_exceeds_int32(it.value())) {
+                widen.insert(col);
+            }
+        }
+    }
+    for (const auto& col : widen) {
+        widen_lake_integer_column_to_bigint(pg, schema, table, col);
+        col_types[col] = "int8";
+    }
+}
+
 }  // namespace
 
 std::string format_boolean_copy_cell(const json& val) {
@@ -969,7 +1021,7 @@ long long apply_table_batch(
     PGconn* log_pg,
     const std::string& conn_id,
     const std::string& batch_id,
-    const TableBatchMeta& meta,
+    TableBatchMeta& meta,
     const std::vector<ApplyEvent>& upserts,
     const std::vector<ApplyEvent>& deletes,
     int staging_id,
@@ -979,6 +1031,8 @@ long long apply_table_batch(
     }
     const std::string fq = pg_ident(meta.schema_name) + "." + pg_ident(meta.table_name);
     ensure_partitions(pg, meta.schema_name, meta.table_name);
+    ensure_lake_int32_columns_wide_enough(pg, meta.schema_name, meta.table_name, meta.col_types, deletes);
+    ensure_lake_int32_columns_wide_enough(pg, meta.schema_name, meta.table_name, meta.col_types, upserts);
     const auto lake_pk_cols = meta.lake_pk.empty() ? split_pk_columns(meta.pk_columns) : meta.lake_pk;
     const auto business_pk = business_pk_cols(meta);
     auto delete_pk_cols = business_pk;
@@ -1490,6 +1544,7 @@ json apply_events_batch(
                 deletes,
                 staging_id++,
                 options.source_system);
+            lake_col_types_cache[lake_key] = meta.col_types;
         } catch (const std::exception& ex) {
             { PGresult* r = PQexec(lake_pg, "ROLLBACK"); if (r) PQclear(r); }
             (*table_errors_acc) += 1;

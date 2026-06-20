@@ -61,9 +61,22 @@ void truncate_lake_table(PGconn* pg, const std::string& schema, const std::strin
 
 bool pg_lake_table_exists(PGconn* pg, const std::string& schema, const std::string& table);
 
+/** True when schema.table exists as a partitioned parent (pg_class.relkind = p). */
+bool pg_lake_table_is_partitioned(PGconn* pg, const std::string& schema, const std::string& table);
+
+/** Drop legacy non-partitioned lake shells so PARTITION BY RANGE create can succeed. */
+void drop_lake_table_if_not_partitioned(PGconn* pg, const std::string& schema, const std::string& table);
+
 /** Drop and recreate the lake table if column types changed (e.g., int unsigned → bigint). */
 void migrate_lake_table_schema(
     PGconn* pg,
     const std::string& schema,
     const std::string& table,
     const std::vector<MariaDbColumn>& cols);
+
+/** Widen integer/smallint lake columns to bigint (CDC unsigned bit patterns in signed MariaDB ints). */
+void widen_lake_integer_column_to_bigint(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    const std::string& column);

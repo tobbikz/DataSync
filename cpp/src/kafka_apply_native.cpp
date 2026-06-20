@@ -1217,6 +1217,8 @@ int run_kafka_apply_native_cli(
             .source_schema = std::nullopt,
             .source_table = std::nullopt,
             .context = {
+                {"worker_id", worker_id},
+                {"worker_count", worker_count},
                 {"stop_reason", stop_reason},
                 {"events_seen", events_seen},
                 {"events_applied", events_applied},

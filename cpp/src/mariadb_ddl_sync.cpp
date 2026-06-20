@@ -493,6 +493,29 @@ int sync_foreign_keys(
     return created;
 }
 
+int sync_integer_column_types(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    const std::vector<MariaDbColumn>& cols) {
+    int changed = 0;
+    for (const auto& col : cols) {
+        if (col.pg_type != "BIGINT") {
+            continue;
+        }
+        if (!pg_column_exists(pg, schema, table, col.name)) {
+            continue;
+        }
+        const std::string current = pg_column_data_type(pg, schema, table, col.name);
+        if (current != "integer" && current != "smallint") {
+            continue;
+        }
+        widen_lake_integer_column_to_bigint(pg, schema, table, col.name);
+        changed += 1;
+    }
+    return changed;
+}
+
 }  // namespace
 
 DdlSyncResult sync_mariadb_ddl_after_truncate(
@@ -506,6 +529,7 @@ DdlSyncResult sync_mariadb_ddl_after_truncate(
     DdlSyncResult result;
     result.columns_added = sync_missing_columns(pg, schema, table, cols);
     result.columns_widened = sync_binary_column_types(pg, schema, table, cols);
+    result.columns_widened += sync_integer_column_types(pg, schema, table, cols);
 
     if (cfg.get_bool("ddl_sync_indexes", true, "mariadb_load", conn_id)) {
         result.indexes_created = sync_indexes(pg, schema, table, fetch_mariadb_indexes(mysql, schema, table));
@@ -532,5 +556,6 @@ DdlSyncResult sync_mariadb_columns_to_lake(
     DdlSyncResult result;
     result.columns_added = sync_missing_columns(pg, schema, table, cols);
     result.columns_widened = sync_binary_column_types(pg, schema, table, cols);
+    result.columns_widened += sync_integer_column_types(pg, schema, table, cols);
     return result;
 }

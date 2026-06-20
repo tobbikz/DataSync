@@ -256,6 +256,7 @@ void ensure_mssql_lake_table_base(
             "lake primary key mismatch for " + pg_schema + "." + pg_table +
             " — manual intervention required (DROP not allowed)");
     }
+    drop_lake_table_if_not_partitioned(pg, pg_schema, pg_table);
 
     std::vector<std::string> pk_set(source_pk_cols.begin(), source_pk_cols.end());
     std::vector<std::string> col_defs;

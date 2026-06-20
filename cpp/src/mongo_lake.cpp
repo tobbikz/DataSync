@@ -234,6 +234,7 @@ void ensure_mongo_lake_table_base(
     const std::map<std::string, std::string>& cols,
     int partition_months_ahead) {
     pg_exec(pg, "CREATE SCHEMA IF NOT EXISTS " + pg_ident(pg_schema));
+    drop_lake_table_if_not_partitioned(pg, pg_schema, pg_table);
 
     std::vector<std::string> col_defs;
     col_defs.push_back(pg_ident("mongo_id") + " TEXT NOT NULL");

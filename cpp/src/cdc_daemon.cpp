@@ -16,8 +16,10 @@
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "schema_migrate.hpp"
@@ -25,10 +27,13 @@
 namespace {
 
 AppConfig snapshot_app_config(const AppConfig& cfg);
+int round_idle_seconds(const CdcConfig& cdc);
 
 std::atomic<int> g_catalog_sync_round{0};
 std::vector<std::thread> g_background_threads;
 std::mutex g_background_threads_mu;
+std::mutex g_apply_workers_mu;
+std::unordered_set<std::string> g_apply_workers_spawned;
 
 void join_background_threads() {
     std::vector<std::thread> threads;
@@ -101,6 +106,97 @@ int run_apply_workers(const AppConfig& cfg, const std::string& conn_id) {
         thread.join();
     }
     return failures.load() > 0 ? 1 : 0;
+}
+
+void apply_worker_loop(AppConfig cfg, std::string conn_id, int worker_id, int worker_count) {
+    while (!g_shutdown.load()) {
+        try {
+            PgConn pg(cfg.datasync.conn_string());
+            if (!pg.raw) {
+                sleep_interruptible(round_idle_seconds(cfg.cdc));
+                continue;
+            }
+            const int rc = run_kafka_apply_native_cli(cfg, pg.raw, conn_id, worker_id, worker_count);
+            if (rc != 0) {
+                log_write(pg.raw, {
+                    .level = LogLevel::Warning,
+                    .component = "cdc_daemon",
+                    .message = "apply worker slice finished with errors",
+                    .batch_id = make_batch_id(),
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {
+                        {"worker_id", worker_id},
+                        {"worker_count", worker_count},
+                        {"exit_code", rc},
+                    },
+                });
+            }
+        } catch (const std::exception& ex) {
+            try {
+                PgConn pg(cfg.datasync.conn_string());
+                if (pg.raw) {
+                    log_write(pg.raw, {
+                        .level = LogLevel::Error,
+                        .component = "cdc_daemon",
+                        .message = "apply worker loop failed",
+                        .batch_id = make_batch_id(),
+                        .conn_id = conn_id,
+                        .source_schema = std::nullopt,
+                        .source_table = std::nullopt,
+                        .context = {
+                            {"worker_id", worker_id},
+                            {"worker_count", worker_count},
+                            {"error", ex.what()},
+                        },
+                    });
+                }
+            } catch (...) {
+            }
+        }
+        if (g_shutdown.load()) {
+            break;
+        }
+        sleep_interruptible(round_idle_seconds(cfg.cdc));
+    }
+}
+
+void ensure_apply_worker_loops(const AppConfig& cfg, const std::vector<std::string>& conn_ids) {
+    const int worker_count = kApplyWorkerCount;
+    const AppConfig worker_cfg = snapshot_app_config(cfg);
+    std::lock_guard<std::mutex> lock(g_apply_workers_mu);
+    for (const auto& conn_id : conn_ids) {
+        if (!g_apply_workers_spawned.insert(conn_id).second) {
+            continue;
+        }
+        for (int worker_id = 0; worker_id < worker_count; ++worker_id) {
+            std::thread t([worker_cfg, conn_id, worker_id, worker_count]() {
+                apply_worker_loop(worker_cfg, conn_id, worker_id, worker_count);
+            });
+            std::lock_guard<std::mutex> bg_lock(g_background_threads_mu);
+            g_background_threads.push_back(std::move(t));
+        }
+        try {
+            PgConn pg(cfg.datasync.conn_string());
+            if (pg.raw) {
+                log_write(pg.raw, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_daemon",
+                    .message = "apply worker loops started",
+                    .batch_id = make_batch_id(),
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {
+                        {"worker_count", worker_count},
+                        {"mode", "background"},
+                    },
+                });
+            }
+        } catch (...) {
+        }
+    }
 }
 
 void spawn_daemon_full_load_background(
@@ -179,7 +275,7 @@ void spawn_daemon_full_load_background(
     g_background_threads.push_back(std::move(t));
 }
 
-int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_id) {
+int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_id, bool sync_apply) {
     const std::string batch_id = make_batch_id();
     const std::string db_engine = conn_engine(cfg, conn_id);
 
@@ -220,7 +316,10 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
 
     const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, batch_id);
     const int pre_rc = pre.errors > 0 ? 1 : 0;
-    const int apply_rc = run_apply_workers(cfg, conn_id);
+    int apply_rc = 0;
+    if (sync_apply) {
+        apply_rc = run_apply_workers(cfg, conn_id);
+    }
     int cycle_errors = (pre_rc != 0 ? 1 : 0) + (apply_rc != 0 ? 1 : 0);
 
     try {
@@ -262,6 +361,7 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
             {"db_engine", db_engine},
             {"pre_apply_exit", pre_rc},
             {"apply_exit", apply_rc},
+            {"apply_mode", sync_apply ? "sync" : "background"},
             {"full_load_pending", pending_before},
             {"full_load_conn_busy", conn_full_load_busy},
             {"full_load_spawned", full_load_spawned},
@@ -272,7 +372,7 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
     return cycle_errors == 0 ? 0 : 1;
 }
 
-int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::string>& conn_ids) {
+int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::string>& conn_ids, bool sync_apply) {
     std::atomic<int> failures{0};
     const std::string round_batch_id = make_batch_id();
 
@@ -360,7 +460,7 @@ int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::strin
                     return;
                 }
                 try {
-                    if (run_one_cycle(cfg, pg.raw, conn_id) != 0) {
+                    if (run_one_cycle(cfg, pg.raw, conn_id, sync_apply) != 0) {
                         failures.fetch_add(1);
                     }
                 } catch (const std::exception& ex) {
@@ -572,8 +672,13 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
             {"kafka_bootstrap_source", kafka.source},
             {"topic_prefix_mode", "conn_id"},
             {"reconcile_embedded", true},
+            {"apply_mode", once ? "sync" : "background"},
         },
     });
+
+    if (!once) {
+        ensure_apply_worker_loops(cfg, conn_ids_initial);
+    }
 
     int cycles = 0;
     int exit_code = 0;
@@ -648,7 +753,10 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
                 last_conn_count = conn_ids.size();
             }
             const AppConfig round_cfg = snapshot_app_config(cfg);
-            if (run_parallel_daemon_round(round_cfg, conn_ids) != 0) {
+            if (!once) {
+                ensure_apply_worker_loops(round_cfg, conn_ids);
+            }
+            if (run_parallel_daemon_round(round_cfg, conn_ids, once) != 0) {
                 exit_code = 1;
             }
         }
