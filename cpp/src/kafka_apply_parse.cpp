@@ -311,6 +311,48 @@ bool parse_kafka_payload(
     return !out.schema_name.empty() && !out.table_name.empty();
 }
 
+bool kafka_payload_matches_table(
+    const json& data,
+    const std::string& lake_schema,
+    const std::string& lake_table,
+    const std::string& db_engine) {
+    if (!data.is_object()) {
+        return false;
+    }
+    const json source = data.contains("source") && data["source"].is_object() ? data["source"] : json::object();
+    const std::string actual_engine = data.value("db_engine", source.value("db_engine", db_engine));
+    std::string schema_name;
+    std::string table_name;
+    if (actual_engine == "mssql") {
+        const std::string src_db = data.value("source_database", source.value("database", ""));
+        const std::string src_schema = data.value("source_schema", source.value("db", ""));
+        const std::string src_table = data.value("source_table", source.value("table", ""));
+        if (src_schema.empty() || src_table.empty()) {
+            return false;
+        }
+        schema_name = mssql_pg_schema_name(src_db, src_schema);
+        table_name = mssql_pg_table_name(src_table);
+    } else if (actual_engine == "mongodb") {
+        const std::string src_db = data.value("source_database", source.value("database", ""));
+        const std::string src_coll = data.value("source_table", source.value("collection", ""));
+        if (src_db.empty() || src_coll.empty()) {
+            return false;
+        }
+        schema_name = mongo_pg_schema_name(src_db);
+        table_name = mongo_pg_table_name(src_coll);
+    } else {
+        schema_name = data.value("source_schema", data.value("schema", ""));
+        table_name = data.value("source_table", data.value("table", ""));
+        if (schema_name.empty()) {
+            schema_name = source.value("db", "");
+        }
+        if (table_name.empty()) {
+            table_name = source.value("table", "");
+        }
+    }
+    return schema_name == lake_schema && table_name == lake_table;
+}
+
 bool parse_kafka_payload(
     const char* payload,
     size_t len,

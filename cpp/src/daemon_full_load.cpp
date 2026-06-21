@@ -162,7 +162,8 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
     outcome.pending_after = count_full_load_pending(log_pg, conn_id, db_engine);
     outcome.tables_loaded = std::max(0, outcome.pending_tables - outcome.pending_after);
 
-    if (outcome.tables_loaded > 0) {
+    const int pending_onboard = count_full_load_pending_onboard(log_pg, conn_id, db_engine);
+    if (pending_onboard > 0) {
         if (!onboard_conn_after_full_load(cfg, log_pg, conn_id, db_engine, batch_id)) {
             if (outcome.exit_code == 0) {
                 outcome.exit_code = 1;
@@ -185,6 +186,7 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
             {"db_engine", db_engine},
             {"pending_tables", outcome.pending_tables},
             {"pending_after", outcome.pending_after},
+            {"pending_onboard", pending_onboard},
             {"tables_loaded", outcome.tables_loaded},
             {"exit_code", outcome.exit_code},
             {"phase", "full_load"},

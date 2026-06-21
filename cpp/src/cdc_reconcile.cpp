@@ -5,6 +5,7 @@
 #include "kafka_topics.hpp"
 #ifdef HAVE_RDKAFKA
 #include "kafka_lag.hpp"
+#include "kafka_table_lag.hpp"
 #endif
 #include "mariadb_conn.hpp"
 #include "mariadb_schema.hpp"
@@ -241,7 +242,7 @@ std::string eval_kafka_lag_status(long long kafka_lag, const ReconcileRuntime& c
     return "ok";
 }
 
-// Bucketed topics share partition watermarks; quiet tables show inflated lag vs their offset.
+// Bucketed topics shared partition watermarks; apply_batch_stats now stores exact table lag.
 // Never let kafka alone drive overall=fail/warn when row counts did not fail.
 std::string cap_kafka_for_overall(const std::string& row_status, const std::string& kafka_status) {
     if (kafka_status == "skip") {
@@ -467,6 +468,46 @@ struct ApplyMeta {
     int kafka_partition{-1};
     long long kafka_offset{-1};
 };
+
+struct TableKafkaLagSnapshot {
+    long long table_lag{-1};
+    bool is_inactive{false};
+};
+
+TableKafkaLagSnapshot fetch_latest_table_kafka_lag(PGconn* pg, long long catalog_id) {
+    TableKafkaLagSnapshot out;
+    const std::string cid = std::to_string(catalog_id);
+    const char* vals[] = {cid.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT kafka_consumer_lag, is_inactive
+        FROM cdc_catalog.apply_batch_stats
+        WHERE catalog_id = $1::bigint
+        ORDER BY logged_at DESC
+        LIMIT 1
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) < 1) {
+        if (res) {
+            PQclear(res);
+        }
+        return out;
+    }
+    if (!PQgetisnull(res, 0, 0)) {
+        out.table_lag = std::atoll(PQgetvalue(res, 0, 0));
+    }
+    if (!PQgetisnull(res, 0, 1)) {
+        out.is_inactive = (PQgetvalue(res, 0, 1)[0] == 't');
+    }
+    PQclear(res);
+    return out;
+}
 
 ApplyMeta fetch_apply_meta(PGconn* pg, long long catalog_id) {
     ApplyMeta out;
@@ -1161,14 +1202,34 @@ int run_reconcile_cli(
             bool kafka_inactive_table = false;
 #ifdef HAVE_RDKAFKA
             long long kafka_lag_probe = -1;
-            if (kafka_probe && !apply_meta.kafka_topic.empty() && apply_meta.kafka_offset >= 0) {
-                kafka_lag_probe = compute_kafka_consumer_lag(
+            long long kafka_partition_lag_probe = -1;
+            const TableKafkaLagSnapshot table_lag_snap = fetch_latest_table_kafka_lag(log_pg, row.catalog_id);
+            if (table_lag_snap.table_lag >= 0) {
+                kafka_lag_probe = table_lag_snap.table_lag;
+            } else if (
+                !apply_meta.kafka_topic.empty() && apply_meta.kafka_partition >= 0 &&
+                apply_meta.kafka_offset >= 0) {
+                const auto scan = kafka_table_lag::compute_exact_table_kafka_lag(
+                    kafka_bootstrap,
+                    apply_meta.kafka_topic,
+                    apply_meta.kafka_partition,
+                    apply_meta.kafka_offset,
+                    row.lake_schema,
+                    row.lake_table,
+                    db_engine,
+                    pipeline_defaults::kTableLagScanTimeoutMsDefault,
+                    pipeline_defaults::kTableLagScanMaxMessagesDefault);
+                kafka_lag_probe = scan.table_lag;
+                kafka_partition_lag_probe = scan.partition_lag;
+            } else if (kafka_probe && !apply_meta.kafka_topic.empty() && apply_meta.kafka_offset >= 0) {
+                kafka_partition_lag_probe = compute_kafka_consumer_lag(
                     kafka_probe->rk,
                     apply_meta.kafka_topic,
                     apply_meta.kafka_partition,
                     apply_meta.kafka_offset);
             }
-            kafka_inactive_table = is_apply_inactive_table(apply_meta, rcfg.apply_inactive_seconds);
+            kafka_inactive_table = table_lag_snap.is_inactive ||
+                is_apply_inactive_table(apply_meta, rcfg.apply_inactive_seconds);
             const std::string kafka_status_raw = kafka_inactive_table
                 ? "skip"
                 : eval_kafka_lag_status(kafka_lag_probe, rcfg);
@@ -1176,9 +1237,13 @@ int run_reconcile_cli(
                 cap_kafka_for_overall(row_status, kafka_status_raw);
             checks["kafka_consumer_lag"] = kafka_inactive_table ? 0 : kafka_lag_probe;
             checks["kafka_consumer_lag_probe"] = kafka_lag_probe;
+            checks["kafka_partition_lag_probe"] = kafka_partition_lag_probe;
+            checks["kafka_lag_kind"] = table_lag_snap.table_lag >= 0 ? "table_exact" : "scan_fallback";
             checks["kafka_inactive_table"] = kafka_inactive_table;
             if (kafka_inactive_table) {
-                checks["kafka_lag_skip_reason"] = "inactive_table_bucket_lag";
+                checks["kafka_lag_skip_reason"] = table_lag_snap.is_inactive
+                    ? "inactive_table_slice"
+                    : "inactive_table_no_recent_apply";
             }
             checks["kafka_lag_status_raw"] = kafka_status_raw;
             checks["kafka_lag_status"] = kafka_status_raw;

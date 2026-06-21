@@ -142,23 +142,7 @@ std::vector<MongoCatalogTableRow> fetch_full_load_targets(PGconn* pg) {
 }
 
 void mark_catalog_success(PGconn* pg, long long catalog_id) {
-    const std::string id = std::to_string(catalog_id);
-    const char* vals[] = {id.c_str()};
-    pg_exec_params_simple(
-        pg,
-        R"(
-        UPDATE cdc_catalog.catalog
-        SET needs_full_load = false,
-            cdc_enabled = true,
-            status = 'success',
-            last_full_load_at = now(),
-            last_error_at = NULL,
-            last_error = NULL,
-            updated_at = now()
-        WHERE catalog_id = $1::bigint
-        )",
-        1,
-        vals);
+    mark_catalog_full_load_data_ready(pg, catalog_id);
 }
 
 void mark_catalog_failed(PGconn* pg, long long catalog_id, const std::string& error) {

@@ -231,12 +231,16 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
     }
 
     std::vector<std::pair<std::string, std::string>> table_pairs;
+    std::set<std::pair<std::string, std::string>> hot_tables;
     table_pairs.reserve(collections.size());
     for (const auto& tbl : collections) {
-        table_pairs.emplace_back(tbl.source_schema, tbl.source_table);
+        table_pairs.emplace_back(tbl.lake_schema, tbl.lake_table);
+        if (tbl.hot) {
+            hot_tables.emplace(tbl.lake_schema, tbl.lake_table);
+        }
     }
     ensure_capture_kafka_topics(
-        log_pg, "cdc_kafka_mongo_capture", batch_id, conn_id, rcfg, table_pairs);
+        log_pg, "cdc_kafka_mongo_capture", batch_id, conn_id, rcfg, table_pairs, hot_tables);
 
     KafkaProducer producer(rcfg.bootstrap, rcfg.linger_ms, rcfg.producer_batch);
     if (!producer.available()) {
@@ -431,13 +435,15 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
             event.ts_ms = now_ms();
             event.ingestion_ts = utc_iso_timestamp_now();
 
-            const std::string topic = topic_for_catalog(
-                rcfg.topic_prefix, coll.lake_schema, coll.lake_table, rcfg.topic_mode, rcfg.topic_buckets);
+            const std::string topic = topic_for_catalog_table(
+                rcfg.topic_prefix, coll.lake_schema, coll.lake_table, rcfg.topic_mode, rcfg.topic_buckets, coll.hot);
             const nlohmann::json* row_for_key = (op == "d") ? &before : &after;
             const std::string msg_key = kafka_message_key_for_row(
                 coll.lake_schema, coll.lake_table, row_for_key, coll.pk_columns);
+            const int kafka_partition = kafka_produce_partition(
+                coll.catalog_id, msg_key, rcfg.topic_partitions, coll.hot);
             try {
-                producer.produce(topic, msg_key, event.to_kafka_dict().dump());
+                producer.produce(topic, msg_key, event.to_kafka_dict().dump(), kafka_partition);
             } catch (const std::exception& ex) {
                 log_write(log_pg, {
                     .level = LogLevel::Error,

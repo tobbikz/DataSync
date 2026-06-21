@@ -6,7 +6,9 @@
 namespace pipeline_defaults {
 
 // Worker / parallelism (hardcoded)
-constexpr int kApplyWorkerCount = 4;
+constexpr int kApplyWorkerCount = 8;
+/** Dedicated apply consumers per conn for catalog.hot tables (per_table Kafka topic). */
+constexpr int kHotApplyConsumerCount = 3;
 constexpr int kCaptureWorkerCount = 1;
 constexpr int kFullLoadParallelTables = 2;
 constexpr int kFullLoadWorkers = 4;
@@ -16,7 +18,8 @@ constexpr std::string_view kKafkaBootstrapDefault = "localhost:9092";
 constexpr std::string_view kKafkaConsumerGroupPrefix = "datalake-cdc-apply";
 constexpr std::string_view kKafkaTopicMode = "bucketed";
 constexpr int kKafkaTopicBuckets = 64;
-constexpr int kKafkaTopicPartitions = 6;
+/** Must be a multiple of kApplyWorkerCount and kHotApplyConsumerCount for partition sharding. */
+constexpr int kKafkaTopicPartitions = 24;
 
 // Capture producer / slice
 constexpr int kCaptureProducerLingerMs = 5;
@@ -82,6 +85,19 @@ constexpr int kReconcileCaptureLagFailSeconds = 900;
 // RuntimeConfig keys — defaults when absent in DB
 constexpr std::size_t kFullLoadBatchSizeDefault = 50000;
 constexpr int kApplyBatchSizeDefault = 20000;
+constexpr int kHotApplyBatchSizeDefault = 30000;
+/** Per-statement cap on lake PG apply connections (0 = disabled). */
+constexpr int kApplyLakeStatementTimeoutMsDefault = 300000;
+/** Roll back idle apply transactions on lake PG (0 = disabled). */
+constexpr int kApplyLakeIdleInTxnTimeoutMsDefault = 600000;
+/** Lake apply: disable synchronous_commit for faster WAL flush (hot always; cold when true). */
+constexpr bool kApplyLakeSynchronousCommitOffDefault = true;
+/** Per-table exact lag scan timeout (inactive / quiet tables at slice end). */
+constexpr int kTableLagScanTimeoutMsDefault = 120000;
+/** 0 = unlimited messages scanned per table lag probe. */
+constexpr long long kTableLagScanMaxMessagesDefault = 0;
+/** End-of-slice lag-only drain polls after main apply loop. */
+constexpr int kApplyLagDrainQuietPollsDefault = 5;
 constexpr int kReconcileIntervalHoursDefault = 4;
 constexpr int kLogsRetentionDaysDefault = 7;
 constexpr int kAppliedEventsRetentionDaysDefault = 7;

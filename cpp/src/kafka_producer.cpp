@@ -132,7 +132,7 @@ bool KafkaProducer::available() const {
     return impl_ && impl_->body.available;
 }
 
-void KafkaProducer::produce(const std::string& topic, const std::string& key, const std::string& value) {
+void KafkaProducer::produce(const std::string& topic, const std::string& key, const std::string& value, int partition) {
     if (!impl_ || !impl_->body.available) {
         throw std::runtime_error("Kafka producer unavailable: " + (impl_ ? impl_->body.first_error : "null"));
     }
@@ -140,13 +140,24 @@ void KafkaProducer::produce(const std::string& topic, const std::string& key, co
     rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR__FAIL;
     for (int attempt = 0; attempt < 200; ++attempt) {
         impl_->body.pending.fetch_add(1);
-        err = rd_kafka_producev(
-            impl_->body.producer,
-            RD_KAFKA_V_TOPIC(topic.c_str()),
-            RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
-            RD_KAFKA_V_KEY(const_cast<char*>(key.data()), key.size()),
-            RD_KAFKA_V_VALUE(const_cast<char*>(value.data()), value.size()),
-            RD_KAFKA_V_END);
+        if (partition >= 0) {
+            err = rd_kafka_producev(
+                impl_->body.producer,
+                RD_KAFKA_V_TOPIC(topic.c_str()),
+                RD_KAFKA_V_PARTITION(partition),
+                RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+                RD_KAFKA_V_KEY(const_cast<char*>(key.data()), key.size()),
+                RD_KAFKA_V_VALUE(const_cast<char*>(value.data()), value.size()),
+                RD_KAFKA_V_END);
+        } else {
+            err = rd_kafka_producev(
+                impl_->body.producer,
+                RD_KAFKA_V_TOPIC(topic.c_str()),
+                RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+                RD_KAFKA_V_KEY(const_cast<char*>(key.data()), key.size()),
+                RD_KAFKA_V_VALUE(const_cast<char*>(value.data()), value.size()),
+                RD_KAFKA_V_END);
+        }
         if (err == RD_KAFKA_RESP_ERR_NO_ERROR) {
             rd_kafka_poll(impl_->body.producer, 0);
             return;

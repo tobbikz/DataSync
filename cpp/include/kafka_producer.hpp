@@ -23,7 +23,7 @@ public:
     KafkaProducer& operator=(const KafkaProducer&) = delete;
 
     bool available() const;
-    void produce(const std::string& topic, const std::string& key, const std::string& value);
+    void produce(const std::string& topic, const std::string& key, const std::string& value, int partition = -1);
     int flush(int timeout_sec);
     KafkaProducerStats stats() const;
 

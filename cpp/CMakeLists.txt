@@ -31,6 +31,7 @@ set(DATASYNC_SOURCES
     src/kafka_topics.cpp
     src/kafka_apply_native.cpp
     src/kafka_lag.cpp
+    src/kafka_table_lag.cpp
     src/kafka_producer.cpp
     src/cdc_envelope.cpp
     src/capture_common.cpp

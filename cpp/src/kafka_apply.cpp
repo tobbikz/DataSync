@@ -9,6 +9,7 @@
 #include "mongo_lake.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
+#include "pipeline_defaults.hpp"
 #include "runtime_config.hpp"
 
 #include <nlohmann/json.hpp>
@@ -34,6 +35,40 @@ namespace kafka_apply_detail {
 using json = nlohmann::json;
 using TableKey = std::pair<std::string, std::string>;
 
+void configure_lake_apply_session(
+    PGconn* lake_pg,
+    RuntimeConfig& runtime,
+    bool hot_path,
+    const std::string& conn_id) {
+    if (!lake_pg) {
+        return;
+    }
+    const int stmt_ms = runtime.get_int(
+        "apply_lake_statement_timeout_ms",
+        pipeline_defaults::kApplyLakeStatementTimeoutMsDefault,
+        "cdc_kafka_apply",
+        conn_id);
+    if (stmt_ms > 0) {
+        pg_exec(lake_pg, "SET statement_timeout = " + std::to_string(stmt_ms));
+    }
+    const int idle_ms = runtime.get_int(
+        "apply_lake_idle_in_txn_timeout_ms",
+        pipeline_defaults::kApplyLakeIdleInTxnTimeoutMsDefault,
+        "cdc_kafka_apply",
+        conn_id);
+    if (idle_ms > 0) {
+        pg_exec(lake_pg, "SET idle_in_transaction_session_timeout = " + std::to_string(idle_ms));
+    }
+    const bool sync_off = hot_path || runtime.get_bool(
+        "apply_lake_synchronous_commit_off",
+        pipeline_defaults::kApplyLakeSynchronousCommitOffDefault,
+        "cdc_kafka_apply",
+        conn_id);
+    if (sync_off) {
+        pg_exec(lake_pg, "SET synchronous_commit = off");
+    }
+}
+
 struct TableBatchMeta {
     long long catalog_id{0};
     std::string schema_name;
@@ -44,6 +79,7 @@ struct TableBatchMeta {
     std::vector<std::string> lake_pk;
     std::vector<std::string> data_cols;
     std::map<std::string, std::string> col_types;
+    bool hot{false};
 };
 
 struct TableHealthSnapshot {
@@ -907,20 +943,13 @@ void insert_apply_batch_stats(
         vals);
 }
 
-void merge_from_staging(
+void insert_from_staging(
     PGconn* pg,
     const std::string& fq,
     const std::string& staging,
     const std::vector<std::string>& all_cols,
-    const std::vector<std::string>& lake_pk,
     const std::vector<std::string>& dedup_pk) {
-    if (lake_pk.empty()) {
-        throw std::runtime_error("merge_from_staging: lake PK required");
-    }
-    const std::vector<std::string>& distinct_pk = dedup_pk.empty() ? lake_pk : dedup_pk;
-
     std::ostringstream insert_cols;
-    std::ostringstream lake_pk_sql;
     std::ostringstream dedup_pk_sql;
     for (std::size_t i = 0; i < all_cols.size(); ++i) {
         if (i) {
@@ -928,44 +957,58 @@ void merge_from_staging(
         }
         insert_cols << pg_ident(all_cols[i]);
     }
-    for (std::size_t i = 0; i < lake_pk.size(); ++i) {
-        if (i) {
-            lake_pk_sql << ", ";
-        }
-        lake_pk_sql << pg_ident(lake_pk[i]);
-    }
-    for (std::size_t i = 0; i < distinct_pk.size(); ++i) {
+    for (std::size_t i = 0; i < dedup_pk.size(); ++i) {
         if (i) {
             dedup_pk_sql << ", ";
         }
-        dedup_pk_sql << pg_ident(distinct_pk[i]);
-    }
-    std::ostringstream set_clause;
-    for (const auto& col : all_cols) {
-        if (std::find(lake_pk.begin(), lake_pk.end(), col) != lake_pk.end()) {
-            continue;
-        }
-        if (!set_clause.str().empty()) {
-            set_clause << ", ";
-        }
-        set_clause << pg_ident(col) << " = EXCLUDED." << pg_ident(col);
+        dedup_pk_sql << pg_ident(dedup_pk[i]);
     }
     std::string from_clause = staging;
-    if (!distinct_pk.empty()) {
+    if (!dedup_pk.empty()) {
         std::ostringstream order_pk;
-        for (std::size_t i = 0; i < distinct_pk.size(); ++i) {
+        for (std::size_t i = 0; i < dedup_pk.size(); ++i) {
             if (i) {
                 order_pk << ", ";
             }
-            order_pk << pg_ident(distinct_pk[i]);
+            order_pk << pg_ident(dedup_pk[i]);
         }
         from_clause = "(SELECT DISTINCT ON (" + dedup_pk_sql.str() + ") " + insert_cols.str() + " FROM " + staging +
                       " ORDER BY " + order_pk.str() + ", ctid DESC) AS deduped";
     }
     const std::string sql = "INSERT INTO " + fq + " (" + insert_cols.str() + ") SELECT " + insert_cols.str() +
-                            " FROM " + from_clause + " ON CONFLICT (" + lake_pk_sql.str() + ") DO UPDATE SET " +
-                            set_clause.str();
+                            " FROM " + from_clause;
     pg_exec(pg, sql);
+}
+
+void ensure_mirror_apply_pk_index(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    const std::vector<std::string>& pk_cols) {
+    if (pk_cols.empty()) {
+        return;
+    }
+    static thread_local std::unordered_set<std::string> ensured;
+    const std::string cache_key = schema + "\0" + table;
+    if (ensured.count(cache_key) > 0) {
+        return;
+    }
+    std::string idx_name = "dl_mir_" + schema + "_" + table + "_pk";
+    if (idx_name.size() > 63) {
+        idx_name.resize(63);
+    }
+    std::ostringstream cols;
+    for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+        if (i) {
+            cols << ", ";
+        }
+        cols << pg_ident(pk_cols[i]);
+    }
+    const std::string fq = pg_ident(schema) + "." + pg_ident(table);
+    pg_exec(
+        pg,
+        "CREATE INDEX IF NOT EXISTS " + pg_ident(idx_name) + " ON " + fq + " (" + cols.str() + ")");
+    ensured.insert(cache_key);
 }
 
 void delete_target_by_staging_pk(
@@ -1003,14 +1046,17 @@ void copy_upserts_via_staging(
     const std::string& staging_name,
     const std::vector<std::string>& dedup_pk_cols = {},
     const std::vector<std::string>& delete_pk_cols = {}) {
+    (void)lake_pk_cols;
     const std::string staging = pg_ident(staging_name);
     pg_exec(pg, "CREATE TEMP TABLE " + staging + " (LIKE " + fq + " INCLUDING DEFAULTS) ON COMMIT DROP");
     copy_csv_lines(pg, "COPY " + staging + " (" + col_list + ") FROM STDIN WITH (FORMAT csv)", lines);
     if (!delete_pk_cols.empty()) {
         delete_target_by_staging_pk(pg, fq, staging, delete_pk_cols);
     }
-    if (!lake_pk_cols.empty()) {
-        merge_from_staging(pg, fq, staging, all_cols, lake_pk_cols, dedup_pk_cols);
+    const std::vector<std::string>& dedup_cols =
+        dedup_pk_cols.empty() ? delete_pk_cols : dedup_pk_cols;
+    if (!dedup_cols.empty() || !all_cols.empty()) {
+        insert_from_staging(pg, fq, staging, all_cols, dedup_cols);
     } else {
         pg_exec(pg, "INSERT INTO " + fq + " (" + col_list + ") SELECT " + col_list + " FROM " + staging);
     }
@@ -1036,6 +1082,9 @@ long long apply_table_batch(
     const auto lake_pk_cols = meta.lake_pk.empty() ? split_pk_columns(meta.pk_columns) : meta.lake_pk;
     const auto business_pk = business_pk_cols(meta);
     auto delete_pk_cols = business_pk;
+    if (!delete_pk_cols.empty()) {
+        ensure_mirror_apply_pk_index(pg, meta.schema_name, meta.table_name, delete_pk_cols);
+    }
 
     int skipped_missing_pk_deletes = 0;
     if (!deletes.empty() && !delete_pk_cols.empty()) {
@@ -1203,9 +1252,8 @@ long long apply_table_batch(
 
     if (!lake_pk_cols.empty()) {
         const std::vector<std::string> dedup_cols =
-            !delete_pk_cols.empty() ? delete_pk_cols : lake_pk_cols;
-        const std::vector<std::string> batch_delete_cols =
-            !delete_pk_cols.empty() ? delete_pk_cols : std::vector<std::string>{};
+            !delete_pk_cols.empty() ? delete_pk_cols : business_pk;
+        // Mirror lake: pre-delete by business PK, then INSERT (one current row per PK).
         copy_upserts_via_staging(
             pg,
             fq,
@@ -1215,7 +1263,7 @@ long long apply_table_batch(
             lake_pk_cols,
             staging_name,
             dedup_cols,
-            batch_delete_cols);
+            delete_pk_cols);
     } else {
         copy_csv_lines(pg, "COPY " + fq + " (" + col_list_str + ") FROM STDIN WITH (FORMAT csv)", lines);
     }
@@ -1336,6 +1384,9 @@ json apply_events_batch(
         TableBatchMeta meta;
         meta.schema_name = key.first;
         meta.table_name = key.second;
+        if (const auto hot_it = options.table_hot.find(key); hot_it != options.table_hot.end()) {
+            meta.hot = hot_it->second;
+        }
         const std::string lake_key = meta.schema_name + "|" + meta.table_name;
         const auto pk_it = lake_pk_cache.find(lake_key);
         if (pk_it != lake_pk_cache.end()) {
@@ -1878,6 +1929,94 @@ std::unordered_set<std::string> filter_new_event_ids(PGconn* pg, const std::vect
     return fresh;
 }
 
+std::map<std::pair<std::string, std::string>, SliceLagTableState> fetch_apply_cursors_for_tables(
+    PGconn* app_pg,
+    const std::map<std::pair<std::string, std::string>, long long>& catalog_id_by_lake_key) {
+    std::map<std::pair<std::string, std::string>, SliceLagTableState> out;
+    for (const auto& [lake_key, catalog_id] : catalog_id_by_lake_key) {
+        if (catalog_id <= 0) {
+            continue;
+        }
+        const std::string cid = std::to_string(catalog_id);
+        const char* vals[] = {cid.c_str()};
+        PGresult* res = PQexecParams(
+            app_pg,
+            R"(
+            SELECT kafka_topic, kafka_partition, kafka_offset
+            FROM cdc_catalog.apply_position
+            WHERE catalog_id = $1::bigint
+            )",
+            1,
+            nullptr,
+            vals,
+            nullptr,
+            nullptr,
+            0);
+        SliceLagTableState state;
+        if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+            if (!PQgetisnull(res, 0, 0)) {
+                state.kafka_topic = PQgetvalue(res, 0, 0);
+            }
+            if (!PQgetisnull(res, 0, 1)) {
+                state.kafka_partition = std::atoi(PQgetvalue(res, 0, 1));
+            }
+            if (!PQgetisnull(res, 0, 2)) {
+                state.kafka_offset = std::atoll(PQgetvalue(res, 0, 2));
+            }
+        }
+        if (res) {
+            PQclear(res);
+        }
+        out[lake_key] = state;
+    }
+    return out;
+}
+
+void record_slice_table_lag_stats(
+    PGconn* app_pg,
+    const std::string& conn_id,
+    const std::string& batch_id,
+    long long catalog_id,
+    const std::string& source_schema,
+    const std::string& source_table,
+    const SliceLagTableState& state,
+    int apply_staleness_seconds,
+    int apply_inactive_seconds) {
+    if (catalog_id <= 0) {
+        return;
+    }
+    TableHealthSnapshot health = fetch_table_health_by_catalog_id(
+        app_pg, catalog_id, apply_staleness_seconds, apply_inactive_seconds);
+    ApplyOpCounts counts;
+    counts.inserts = state.inactive ? 0 : state.events_applied_in_slice;
+    BatchStatsMetrics metrics;
+    metrics.kafka_consumer_lag = state.table_lag;
+    const json batch_context = {
+        {"lag_kind", "table_exact"},
+        {"kafka_partition_lag", state.partition_lag},
+        {"events_seen_in_slice", state.events_seen_in_slice},
+        {"events_applied_in_slice", state.events_applied_in_slice},
+        {"slice_inactive", state.inactive},
+    };
+    insert_apply_batch_stats(
+        app_pg,
+        batch_id,
+        conn_id,
+        catalog_id,
+        source_schema,
+        source_table,
+        counts,
+        0,
+        state.kafka_topic,
+        state.kafka_partition,
+        state.kafka_offset,
+        health,
+        state.inactive,
+        state.events_seen_in_slice,
+        metrics,
+        batch_context);
+}
+
 }  // namespace kafka_apply_detail
 
 using kafka_apply_detail::ApplyEvent;
@@ -1889,12 +2028,14 @@ int run_kafka_apply_native_cli(
     PGconn* log_pg,
     const std::string& conn_id,
     int worker_id,
-    int worker_count) {
+    int worker_count,
+    CatalogHotTier hot_tier) {
     (void)cfg;
     (void)log_pg;
     (void)conn_id;
     (void)worker_id;
     (void)worker_count;
+    (void)hot_tier;
     std::cerr << "kafka-apply requires librdkafka (rebuild Docker image: ./install.sh)\n";
     return 2;
 }

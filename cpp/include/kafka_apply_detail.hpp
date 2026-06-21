@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+class RuntimeConfig;
+
 namespace kafka_apply_detail {
 
 struct ApplyEvent {
@@ -47,7 +49,43 @@ struct ApplyBatchOptions {
     const std::map<std::pair<std::string, std::string>, int>* parse_skipped_by_table{nullptr};
     /** Optional: per-table dropped_unrecoverable (mutated by apply_events_batch). */
     std::map<std::pair<std::string, std::string>, int>* dropped_unrecoverable_by_table{nullptr};
+    /** Lake schema|table → catalog.hot (batch sizing / synchronous_commit). */
+    std::map<std::pair<std::string, std::string>, bool> table_hot;
 };
+
+struct SliceLagTableState {
+    long long table_lag{0};
+    long long partition_lag{0};
+    int events_seen_in_slice{0};
+    int events_applied_in_slice{0};
+    bool inactive{true};
+    std::string kafka_topic;
+    int kafka_partition{-1};
+    long long kafka_offset{-1};
+};
+
+/** End-of-slice lag heartbeat row per catalog table (authoritative kafka_consumer_lag). */
+void record_slice_table_lag_stats(
+    PGconn* app_pg,
+    const std::string& conn_id,
+    const std::string& batch_id,
+    long long catalog_id,
+    const std::string& source_schema,
+    const std::string& source_table,
+    const SliceLagTableState& state,
+    int apply_staleness_seconds,
+    int apply_inactive_seconds);
+
+std::map<std::pair<std::string, std::string>, SliceLagTableState> fetch_apply_cursors_for_tables(
+    PGconn* app_pg,
+    const std::map<std::pair<std::string, std::string>, long long>& catalog_id_by_lake_key);
+
+/** Lake PG session knobs for apply workers (timeouts, hot synchronous_commit). */
+void configure_lake_apply_session(
+    PGconn* lake_pg,
+    RuntimeConfig& runtime,
+    bool hot_path,
+    const std::string& conn_id);
 
 nlohmann::json apply_events_batch(
     PGconn* app_pg,
@@ -93,6 +131,13 @@ bool parse_kafka_payload(
     int partition,
     long long offset,
     const std::vector<std::string>& pk_cols,
+    const std::string& db_engine = "mariadb");
+
+/** True when CDC payload targets lake schema.table (no full row parse). */
+bool kafka_payload_matches_table(
+    const nlohmann::json& data,
+    const std::string& lake_schema,
+    const std::string& lake_table,
     const std::string& db_engine = "mariadb");
 
 /** Fill missing/null columns from CDC before image (partial UPDATE payloads). */

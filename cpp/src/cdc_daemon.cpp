@@ -73,42 +73,57 @@ std::vector<std::string> all_conn_ids(const AppConfig& cfg) {
 }
 
 int run_apply_workers(const AppConfig& cfg, const std::string& conn_id) {
-    const int worker_count = kApplyWorkerCount;
-    if (worker_count <= 1) {
-        PgConn pg(cfg.datasync.conn_string());
-        if (!pg.raw) {
-            return 1;
-        }
-        return run_kafka_apply_native_cli(cfg, pg.raw, conn_id, 0, 1);
-    }
-
-    std::vector<std::thread> threads;
-    std::atomic<int> failures{0};
-    threads.reserve(static_cast<std::size_t>(worker_count));
-    for (int worker_id = 0; worker_id < worker_count; ++worker_id) {
-        threads.emplace_back([&, worker_id]() {
-            try {
-                PgConn pg(cfg.datasync.conn_string());
-                if (!pg.raw) {
-                    failures.fetch_add(1);
-                    return;
-                }
-                const int rc = run_kafka_apply_native_cli(cfg, pg.raw, conn_id, worker_id, worker_count);
-                if (rc != 0) {
-                    failures.fetch_add(1);
-                }
-            } catch (const std::exception&) {
-                failures.fetch_add(1);
+    int failures = 0;
+    auto run_pool = [&](CatalogHotTier tier, int workers) {
+        if (workers <= 1) {
+            PgConn pg(cfg.datasync.conn_string());
+            if (!pg.raw) {
+                failures += 1;
+                return;
             }
-        });
-    }
-    for (auto& thread : threads) {
-        thread.join();
-    }
-    return failures.load() > 0 ? 1 : 0;
+            if (run_kafka_apply_native_cli(cfg, pg.raw, conn_id, 0, 1, tier) != 0) {
+                failures += 1;
+            }
+            return;
+        }
+        std::vector<std::thread> threads;
+        std::atomic<int> pool_failures{0};
+        threads.reserve(static_cast<std::size_t>(workers));
+        for (int worker_id = 0; worker_id < workers; ++worker_id) {
+            threads.emplace_back([&, worker_id]() {
+                try {
+                    PgConn pg(cfg.datasync.conn_string());
+                    if (!pg.raw) {
+                        pool_failures.fetch_add(1);
+                        return;
+                    }
+                    const int rc =
+                        run_kafka_apply_native_cli(cfg, pg.raw, conn_id, worker_id, workers, tier);
+                    if (rc != 0) {
+                        pool_failures.fetch_add(1);
+                    }
+                } catch (const std::exception&) {
+                    pool_failures.fetch_add(1);
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        failures += pool_failures.load();
+    };
+    run_pool(CatalogHotTier::ColdOnly, kApplyWorkerCount);
+    run_pool(CatalogHotTier::HotOnly, pipeline_defaults::kHotApplyConsumerCount);
+    return failures > 0 ? 1 : 0;
 }
 
-void apply_worker_loop(AppConfig cfg, std::string conn_id, int worker_id, int worker_count) {
+void apply_worker_loop(
+    AppConfig cfg,
+    std::string conn_id,
+    int worker_id,
+    int worker_count,
+    CatalogHotTier hot_tier) {
+    const bool hot_path = hot_tier == CatalogHotTier::HotOnly;
     while (!g_shutdown.load()) {
         try {
             PgConn pg(cfg.datasync.conn_string());
@@ -116,7 +131,8 @@ void apply_worker_loop(AppConfig cfg, std::string conn_id, int worker_id, int wo
                 sleep_interruptible(round_idle_seconds(cfg.cdc));
                 continue;
             }
-            const int rc = run_kafka_apply_native_cli(cfg, pg.raw, conn_id, worker_id, worker_count);
+            const int rc =
+                run_kafka_apply_native_cli(cfg, pg.raw, conn_id, worker_id, worker_count, hot_tier);
             if (rc != 0) {
                 log_write(pg.raw, {
                     .level = LogLevel::Warning,
@@ -129,6 +145,7 @@ void apply_worker_loop(AppConfig cfg, std::string conn_id, int worker_id, int wo
                     .context = {
                         {"worker_id", worker_id},
                         {"worker_count", worker_count},
+                        {"hot_path", hot_path},
                         {"exit_code", rc},
                     },
                 });
@@ -148,6 +165,7 @@ void apply_worker_loop(AppConfig cfg, std::string conn_id, int worker_id, int wo
                         .context = {
                             {"worker_id", worker_id},
                             {"worker_count", worker_count},
+                            {"hot_path", hot_path},
                             {"error", ex.what()},
                         },
                     });
@@ -162,40 +180,71 @@ void apply_worker_loop(AppConfig cfg, std::string conn_id, int worker_id, int wo
     }
 }
 
-void ensure_apply_worker_loops(const AppConfig& cfg, const std::vector<std::string>& conn_ids) {
-    const int worker_count = kApplyWorkerCount;
-    const AppConfig worker_cfg = snapshot_app_config(cfg);
+void spawn_apply_worker_pool(
+    const AppConfig& worker_cfg,
+    const std::string& conn_id,
+    CatalogHotTier hot_tier,
+    int worker_count,
+    const std::string& spawn_key) {
     std::lock_guard<std::mutex> lock(g_apply_workers_mu);
-    for (const auto& conn_id : conn_ids) {
-        if (!g_apply_workers_spawned.insert(conn_id).second) {
-            continue;
-        }
-        for (int worker_id = 0; worker_id < worker_count; ++worker_id) {
-            std::thread t([worker_cfg, conn_id, worker_id, worker_count]() {
-                apply_worker_loop(worker_cfg, conn_id, worker_id, worker_count);
+    if (!g_apply_workers_spawned.insert(spawn_key).second) {
+        return;
+    }
+    const bool hot_path = hot_tier == CatalogHotTier::HotOnly;
+    for (int worker_id = 0; worker_id < worker_count; ++worker_id) {
+        std::thread t([worker_cfg, conn_id, worker_id, worker_count, hot_tier]() {
+            apply_worker_loop(worker_cfg, conn_id, worker_id, worker_count, hot_tier);
+        });
+        std::lock_guard<std::mutex> bg_lock(g_background_threads_mu);
+        g_background_threads.push_back(std::move(t));
+    }
+    try {
+        PgConn pg(worker_cfg.datasync.conn_string());
+        if (pg.raw) {
+            log_write(pg.raw, {
+                .level = LogLevel::Info,
+                .component = "cdc_daemon",
+                .message = hot_path ? "hot apply worker loops started" : "apply worker loops started",
+                .batch_id = make_batch_id(),
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"worker_count", worker_count},
+                    {"hot_path", hot_path},
+                    {"mode", "background"},
+                },
             });
-            std::lock_guard<std::mutex> bg_lock(g_background_threads_mu);
-            g_background_threads.push_back(std::move(t));
         }
-        try {
-            PgConn pg(cfg.datasync.conn_string());
-            if (pg.raw) {
-                log_write(pg.raw, {
-                    .level = LogLevel::Info,
-                    .component = "cdc_daemon",
-                    .message = "apply worker loops started",
-                    .batch_id = make_batch_id(),
-                    .conn_id = conn_id,
-                    .source_schema = std::nullopt,
-                    .source_table = std::nullopt,
-                    .context = {
-                        {"worker_count", worker_count},
-                        {"mode", "background"},
-                    },
-                });
-            }
-        } catch (...) {
+    } catch (...) {
+    }
+}
+
+void ensure_apply_worker_loops(const AppConfig& cfg, const std::vector<std::string>& conn_ids) {
+    const AppConfig worker_cfg = snapshot_app_config(cfg);
+    int cold_workers = pipeline_defaults::kApplyWorkerCount;
+    try {
+        PgConn pg(worker_cfg.datasync.conn_string());
+        if (pg.raw) {
+            RuntimeConfig runtime;
+            runtime.reload(pg.raw);
+            cold_workers = runtime.get_int(
+                "apply_worker_count",
+                pipeline_defaults::kApplyWorkerCount,
+                "cdc_kafka_apply",
+                "");
         }
+    } catch (...) {
+    }
+    for (const auto& conn_id : conn_ids) {
+        spawn_apply_worker_pool(
+            worker_cfg, conn_id, CatalogHotTier::ColdOnly, cold_workers, conn_id + ":cold");
+        spawn_apply_worker_pool(
+            worker_cfg,
+            conn_id,
+            CatalogHotTier::HotOnly,
+            pipeline_defaults::kHotApplyConsumerCount,
+            conn_id + ":hot");
     }
 }
 
@@ -314,13 +363,35 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
             snapshot_app_config(cfg), conn_id, batch_id, pending_before, db_engine);
     }
 
+    const int pending_onboard = count_full_load_pending_onboard(log_pg, conn_id, db_engine);
+    int onboard_retry_rc = 0;
+    if (pending_onboard > 0 && !conn_full_load_busy && pending_before == 0) {
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_daemon",
+            .message = "full-load onboard retry: tables awaiting kafka offset reset",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"db_engine", db_engine},
+                {"pending_onboard", pending_onboard},
+                {"phase", "onboard_retry"},
+            },
+        });
+        if (!onboard_conn_after_full_load(cfg, log_pg, conn_id, db_engine, batch_id)) {
+            onboard_retry_rc = 1;
+        }
+    }
+
     const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, batch_id);
     const int pre_rc = pre.errors > 0 ? 1 : 0;
     int apply_rc = 0;
     if (sync_apply) {
         apply_rc = run_apply_workers(cfg, conn_id);
     }
-    int cycle_errors = (pre_rc != 0 ? 1 : 0) + (apply_rc != 0 ? 1 : 0);
+    int cycle_errors = (pre_rc != 0 ? 1 : 0) + (apply_rc != 0 ? 1 : 0) + onboard_retry_rc;
 
     try {
         const int cleared = clear_stale_cdc_in_progress(log_pg, conn_id, db_engine);

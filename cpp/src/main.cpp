@@ -23,10 +23,13 @@
 #include "mongo_conn.hpp"
 #endif
 
+#include <atomic>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -341,7 +344,38 @@ int main(int argc, char** argv) {
             return run_ddl_sync(cfg, log_pg.raw, conn_id, source_schema, source_table);
         }
         if (command == "kafka-apply") {
-            return run_kafka_apply_native_cli(cfg, log_pg.raw, conn_id, 0, kApplyWorkerCount);
+            int failures = 0;
+            auto run_pool = [&](CatalogHotTier tier, int workers) {
+                if (workers <= 1) {
+                    if (run_kafka_apply_native_cli(cfg, log_pg.raw, conn_id, 0, 1, tier) != 0) {
+                        failures += 1;
+                    }
+                    return;
+                }
+                std::vector<std::thread> threads;
+                std::atomic<int> pool_failures{0};
+                threads.reserve(static_cast<std::size_t>(workers));
+                for (int worker_id = 0; worker_id < workers; ++worker_id) {
+                    threads.emplace_back([&, worker_id]() {
+                        PgConn worker_pg(cfg.datasync.conn_string());
+                        if (!worker_pg.raw) {
+                            pool_failures.fetch_add(1);
+                            return;
+                        }
+                        if (run_kafka_apply_native_cli(
+                                cfg, worker_pg.raw, conn_id, worker_id, workers, tier) != 0) {
+                            pool_failures.fetch_add(1);
+                        }
+                    });
+                }
+                for (auto& thread : threads) {
+                    thread.join();
+                }
+                failures += pool_failures.load();
+            };
+            run_pool(CatalogHotTier::ColdOnly, kApplyWorkerCount);
+            run_pool(CatalogHotTier::HotOnly, pipeline_defaults::kHotApplyConsumerCount);
+            return failures > 0 ? 1 : 0;
         }
         if (command == "capture") {
             return run_capture_cli(cfg, log_pg.raw, conn_id, 0, kCaptureWorkerCount);

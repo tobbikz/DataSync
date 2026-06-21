@@ -325,7 +325,7 @@ COMMENT ON COLUMN cdc_catalog.apply_batch_stats.capture_lag_seconds IS 'Conn-lev
 -- Name: COLUMN apply_batch_stats.kafka_consumer_lag; Type: COMMENT; Schema: cdc_catalog; Owner: -
 --
 
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.kafka_consumer_lag IS 'High watermark minus consumed offset for table topic/partition';
+COMMENT ON COLUMN cdc_catalog.apply_batch_stats.kafka_consumer_lag IS 'Exact table backlog in Kafka (messages matching this table ahead of apply offset; not partition watermark)';
 
 
 --
@@ -445,6 +445,7 @@ CREATE TABLE cdc_catalog.catalog (
     cdc_enabled boolean DEFAULT false NOT NULL,
     needs_full_load boolean DEFAULT true NOT NULL,
     capture_during_full_load boolean DEFAULT false NOT NULL,
+    hot boolean DEFAULT false NOT NULL,
     status cdc_catalog.replication_status DEFAULT 'pending'::cdc_catalog.replication_status NOT NULL,
     last_full_load_at timestamp with time zone,
     last_cdc_at timestamp with time zone,
@@ -1545,6 +1546,73 @@ BEGIN
         INSERT INTO cdc_catalog.schema_migrations (version, description)
         VALUES (38, 'runtime_config 5 keys only; pipeline_defaults.hpp for rest');
         RAISE NOTICE 'migration 038: runtime_config reduced to 5 canonical keys';
+    END IF;
+END $$;
+
+-- Migration 039: catalog.hot — per_table Kafka topic + dedicated apply consumer pool.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 39) THEN
+        ALTER TABLE cdc_catalog.catalog
+            ADD COLUMN IF NOT EXISTS hot boolean NOT NULL DEFAULT false;
+
+        COMMENT ON COLUMN cdc_catalog.catalog.hot IS
+            'Operator flag: dedicated per_table Kafka topic and hot apply workers (see pipeline_defaults kHotApplyConsumerCount).';
+
+        CREATE INDEX IF NOT EXISTS idx_catalog_hot
+            ON cdc_catalog.catalog (conn_id)
+            WHERE hot = true AND active = true AND cdc_enabled = true;
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (39, 'catalog hot flag for per_table topics and dedicated apply path');
+        RAISE NOTICE 'migration 039: catalog.hot column added';
+    END IF;
+END $$;
+
+-- Migration 040: apply throughput runtime keys (mirror apply, kafka sharding, lake commit tuning).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 40) THEN
+        INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
+        VALUES
+            ('apply_worker_count', 'cdc_kafka_apply', '', '8'::jsonb,
+             'Cold-path apply worker threads per connection (must divide kafka_topic_partitions evenly)'),
+            ('kafka_topic_partitions', 'cdc_kafka_capture', '', '24'::jsonb,
+             'Kafka topic partition count for CDC topics (capture producer routing)'),
+            ('kafka_topic_partitions', 'cdc_kafka_apply', '', '24'::jsonb,
+             'Kafka topic partition count for apply consumer shard assignment'),
+            ('apply_lake_synchronous_commit_off', 'cdc_kafka_apply', '', 'true'::jsonb,
+             'SET synchronous_commit=off on lake apply connections (cold path; hot always off)')
+        ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
+            config_value = EXCLUDED.config_value,
+            description  = EXCLUDED.description,
+            updated_at   = now();
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (40, 'apply throughput: workers, kafka partitions, synchronous_commit');
+        RAISE NOTICE 'migration 040: apply throughput runtime keys';
+    END IF;
+END $$;
+
+-- Migration 041: exact table lag scan timeout + column comment refresh.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 41) THEN
+        INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
+        VALUES
+            ('table_lag_scan_timeout_ms', 'cdc_kafka_apply', '', '120000'::jsonb,
+             'Max milliseconds for end-of-slice exact Kafka table lag scan per catalog table')
+        ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
+            config_value = EXCLUDED.config_value,
+            description  = EXCLUDED.description,
+            updated_at   = now();
+
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.kafka_consumer_lag IS
+            'Exact table backlog in Kafka (messages matching this table ahead of apply offset; not partition watermark)';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (41, 'exact table kafka lag: scan timeout runtime key, column comment');
+        RAISE NOTICE 'migration 041: exact table kafka lag';
     END IF;
 END $$;
 )PO_diagnostics";

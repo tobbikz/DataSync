@@ -27,7 +27,11 @@ struct CaptureCatalogTable {
     nlohmann::json engine_meta = nlohmann::json::object();
     std::string lake_schema;
     std::string lake_table;
+    bool hot{false};
 };
+
+/** Which catalog.hot rows to include in capture/apply table fetch. */
+enum class CatalogHotTier { All, ColdOnly, HotOnly };
 
 struct CaptureRuntimeConfig {
     int max_seconds{300};
@@ -91,7 +95,8 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
     int worker_id,
     int worker_count,
     const std::string& db_engine,
-    CatalogPipeline pipeline);
+    CatalogPipeline pipeline,
+    CatalogHotTier hot_tier = CatalogHotTier::All);
 
 /** Topic prefix is always conn_id (not runtime_config). */
 inline std::string topic_prefix_for_conn(const std::string& conn_id) {
@@ -114,11 +119,13 @@ using pipeline_defaults::kApplyWorkerCount;
 using pipeline_defaults::kCaptureWorkerCount;
 using pipeline_defaults::kFullLoadParallelTables;
 
-// Per-conn suffix + -w{N} when kApplyWorkerCount > 1 (independent Kafka offsets per worker).
+// Per-conn suffix + -w{N} when worker_count > 1 (independent Kafka offsets per worker).
+// hot_path=true → separate consumer group (datalake-cdc-apply-hot-…).
 std::string kafka_apply_consumer_group(
     const std::string& conn_id,
     int worker_id = 0,
-    int worker_count = 1);
+    int worker_count = 1,
+    bool hot_path = false);
 
 inline std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
     PGconn* pg,
@@ -142,7 +149,8 @@ void ensure_capture_kafka_topics(
     const std::string& batch_id,
     const std::string& conn_id,
     const CaptureRuntimeConfig& rcfg,
-    const std::vector<std::pair<std::string, std::string>>& tables);
+    const std::vector<std::pair<std::string, std::string>>& tables,
+    const std::set<std::pair<std::string, std::string>>& hot_tables = {});
 
 #ifdef HAVE_RDKAFKA
 long long reset_apply_offset_to_end(
@@ -163,6 +171,7 @@ void ensure_kafka_topics_exist(
     const std::vector<std::string>& topics,
     int partition_count,
     int replication_factor = 1);
+
 #endif
 
 void enable_cdc_after_full_load(
@@ -192,6 +201,9 @@ bool seed_stream_capture_bookmark_if_needed(
     const std::string& batch_id);
 
 void mark_catalog_full_load_in_progress(PGconn* pg, long long catalog_id);
+
+/** Data copied; keep cdc off until onboard resets Kafka offsets for this table. */
+void mark_catalog_full_load_data_ready(PGconn* pg, long long catalog_id);
 
 void mark_catalog_skipped(PGconn* pg, long long catalog_id, const std::string& reason);
 
@@ -223,6 +235,12 @@ int clear_stale_cdc_in_progress(
 void rollback_cdc_in_progress_ids(PGconn* pg, const std::set<long long>& catalog_ids);
 
 int count_full_load_pending(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine);
+
+/** Tables loaded (needs_full_load=false) awaiting Kafka onboard + cdc enable. */
+int count_full_load_pending_onboard(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine);
