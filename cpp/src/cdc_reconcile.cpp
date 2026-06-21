@@ -105,7 +105,74 @@ struct CatalogReconcileRow {
     std::string lake_schema;
     std::string lake_table;
     std::string pk_columns;
+    std::string catalog_status;
+    bool active{true};
+    bool cdc_enabled{true};
+    bool needs_full_load{false};
+    bool has_pk{true};
 };
+
+std::optional<std::string> reconcile_catalog_skip_reason(const CatalogReconcileRow& row) {
+    if (!row.active) {
+        return "inactive";
+    }
+    if (!row.cdc_enabled) {
+        return "cdc_disabled";
+    }
+    if (row.needs_full_load) {
+        return "needs_full_load";
+    }
+    if (!row.has_pk) {
+        return "no_pk";
+    }
+    if (row.catalog_status == "skipped") {
+        return "catalog_skipped";
+    }
+    if (row.catalog_status == "disabled") {
+        return "catalog_disabled";
+    }
+    return std::nullopt;
+}
+
+void populate_lake_keys(CatalogReconcileRow& row) {
+    if (row.db_engine == "mongodb") {
+        row.source_schema = mongo_catalog_source_schema(row.source_database, row.source_schema);
+    }
+    if (row.db_engine == "mssql") {
+        row.lake_schema = mssql_pg_schema_name(row.source_database, row.source_schema);
+        row.lake_table = mssql_pg_table_name(row.source_table);
+    } else if (row.db_engine == "mongodb") {
+        row.lake_schema = mongo_pg_schema_name(row.source_database);
+        row.lake_table = mongo_pg_table_name(row.source_table);
+    } else {
+        row.lake_schema = row.source_schema;
+        row.lake_table = row.source_table;
+    }
+}
+
+void abort_stale_reconcile_runs(PGconn* pg, const std::string& conn_id) {
+    const char* vals[] = {conn_id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.reconciliation_run
+        SET status = 'fail',
+            finished_at = COALESCE(finished_at, now()),
+            context = context || jsonb_build_object('aborted_stale', true)
+        WHERE conn_id = $1
+          AND status = 'running'
+          AND started_at < now() - interval '2 hours'
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res) {
+        PQclear(res);
+    }
+}
 
 std::string mssql_brack(const std::string& name) {
     std::string out = "[";
@@ -294,14 +361,9 @@ std::vector<CatalogReconcileRow> fetch_reconcile_catalog(
     std::ostringstream sql;
     sql << R"(
         SELECT catalog_id, conn_id, db_engine::text, source_database, source_schema, source_table,
-               pk_columns
+               pk_columns, status::text, active, cdc_enabled, needs_full_load, has_pk
         FROM cdc_catalog.catalog
         WHERE conn_id = $1
-          AND active = true
-          AND cdc_enabled = true
-          AND needs_full_load = false
-          AND has_pk = true
-          AND status NOT IN ('skipped', 'disabled')
         ORDER BY source_schema, source_table
     )";
     if (max_tables > 0) {
@@ -335,19 +397,12 @@ std::vector<CatalogReconcileRow> fetch_reconcile_catalog(
         row.source_schema = PQgetvalue(res, i, 4) ? PQgetvalue(res, i, 4) : "";
         row.source_table = PQgetvalue(res, i, 5) ? PQgetvalue(res, i, 5) : "";
         row.pk_columns = PQgetvalue(res, i, 6) ? PQgetvalue(res, i, 6) : "";
-        if (row.db_engine == "mongodb") {
-            row.source_schema = mongo_catalog_source_schema(row.source_database, row.source_schema);
-        }
-        if (row.db_engine == "mssql") {
-            row.lake_schema = mssql_pg_schema_name(row.source_database, row.source_schema);
-            row.lake_table = mssql_pg_table_name(row.source_table);
-        } else if (row.db_engine == "mongodb") {
-            row.lake_schema = mongo_pg_schema_name(row.source_database);
-            row.lake_table = mongo_pg_table_name(row.source_table);
-        } else {
-            row.lake_schema = row.source_schema;
-            row.lake_table = row.source_table;
-        }
+        row.catalog_status = PQgetvalue(res, i, 7) ? PQgetvalue(res, i, 7) : "";
+        row.active = !PQgetisnull(res, i, 8) && PQgetvalue(res, i, 8)[0] == 't';
+        row.cdc_enabled = !PQgetisnull(res, i, 9) && PQgetvalue(res, i, 9)[0] == 't';
+        row.needs_full_load = !PQgetisnull(res, i, 10) && PQgetvalue(res, i, 10)[0] == 't';
+        row.has_pk = !PQgetisnull(res, i, 11) && PQgetvalue(res, i, 11)[0] == 't';
+        populate_lake_keys(row);
         rows.push_back(std::move(row));
     }
     PQclear(res);
@@ -1099,6 +1154,7 @@ int run_reconcile_cli(
     }
 
     const int max_tables = rcfg.max_tables > 0 ? rcfg.max_tables : 0;
+    abort_stale_reconcile_runs(log_pg, conn_id);
     const auto tables = fetch_reconcile_catalog(log_pg, conn_id, max_tables);
     const int stale_tables = count_stale_tables(log_pg, conn_id);
     constexpr const char* kReconcileMode = "full";
@@ -1112,6 +1168,7 @@ int run_reconcile_cli(
         {{"db_engine", db_engine},
          {"mode", kReconcileMode},
          {"tables_planned", static_cast<int>(tables.size())},
+         {"catalog_tables_total", static_cast<int>(tables.size())},
          {"stale_tables", stale_tables}});
 
     PgConn lake_pg(cfg.datalake.conn_string());
@@ -1160,11 +1217,27 @@ int run_reconcile_cli(
     int tables_ok = 0;
     int tables_warn = 0;
     int tables_fail = 0;
+    int tables_skip = 0;
     int table_errors = 0;
 
     for (const auto& row : tables) {
         runtime.reload(log_pg);
         try {
+            if (const auto skip_reason = reconcile_catalog_skip_reason(row)) {
+                nlohmann::json checks = nlohmann::json::object();
+                checks["reconcile_mode"] = kReconcileMode;
+                checks["skip_reason"] = *skip_reason;
+                checks["catalog_status"] = row.catalog_status;
+                checks["active"] = row.active;
+                checks["cdc_enabled"] = row.cdc_enabled;
+                checks["needs_full_load"] = row.needs_full_load;
+                checks["has_pk"] = row.has_pk;
+                insert_reconcile_result(
+                    log_pg, run_id, row, -1, -1, "skip", ApplyMeta{}, "skip", checks);
+                tables_skip += 1;
+                continue;
+            }
+
             long long source_rows = -1;
             if (db_engine == "mariadb" && mariadb) {
                 source_rows = mariadb_table_count(mariadb->handle, row.source_schema, row.source_table);
@@ -1381,7 +1454,11 @@ int run_reconcile_cli(
         tables_warn,
         tables_fail,
         stale_tables,
-        {{"table_errors", table_errors}, {"db_engine", db_engine}, {"mode", kReconcileMode}});
+        {{"table_errors", table_errors},
+         {"tables_skip", tables_skip},
+         {"db_engine", db_engine},
+         {"mode", kReconcileMode},
+         {"catalog_tables_total", static_cast<int>(tables.size())}});
 
     log_write(log_pg, {
         .level = run_status == "fail" ? LogLevel::Warning : LogLevel::Info,
@@ -1399,6 +1476,7 @@ int run_reconcile_cli(
             {"tables_ok", tables_ok},
             {"tables_warn", tables_warn},
             {"tables_fail", tables_fail},
+            {"tables_skip", tables_skip},
             {"stale_tables", stale_tables},
             {"table_errors", table_errors},
         },

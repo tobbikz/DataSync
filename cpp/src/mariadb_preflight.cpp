@@ -94,6 +94,15 @@ MariaDbPreflightResult check_mariadb_load_ready(MYSQL* mysql) {
     if (mysql_query(mysql, "SELECT 1") != 0) {
         result.ok = false;
         result.errors.push_back(std::string("connection check failed: ") + mysql_error(mysql));
+        return result;
     }
+    MYSQL_RES* res = mysql_store_result(mysql);
+    if (!res) {
+        result.ok = false;
+        result.errors.push_back(
+            std::string("connection check store_result failed: ") + mysql_error(mysql));
+        return result;
+    }
+    mysql_free_result(res);
     return result;
 }
