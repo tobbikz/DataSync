@@ -709,6 +709,26 @@ TableLoadOutcome load_one_table(
 
     mark_catalog_success(app_pg.raw, target.catalog_id);
 
+    if (!onboard_table_after_full_load(
+            app_pg.raw,
+            target.conn_id,
+            "mssql",
+            target.catalog_id,
+            batch_id,
+            target.source_schema,
+            target.source_table)) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Warning,
+            batch_id,
+            "table full load copied; onboard deferred (conn retry will retry kafka reset + cdc enable)",
+            {},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
+    }
+
     log_fl(
         log_pg,
         log_mtx,

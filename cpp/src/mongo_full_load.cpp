@@ -497,6 +497,26 @@ bool load_one_collection(
 
     mark_catalog_success(app_pg.raw, target.catalog_id);
 
+    if (!onboard_table_after_full_load(
+            app_pg.raw,
+            target.conn_id,
+            "mongodb",
+            target.catalog_id,
+            batch_id,
+            target.source_database,
+            target.source_table)) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Warning,
+            batch_id,
+            "table full load copied; onboard deferred (conn retry will retry kafka reset + cdc enable)",
+            {},
+            target.conn_id,
+            target.source_database,
+            target.source_table);
+    }
+
     log_fl(
         log_pg,
         log_mtx,

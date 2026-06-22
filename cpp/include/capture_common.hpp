@@ -181,6 +181,20 @@ void enable_cdc_after_full_load(
     const std::string& batch_id,
     bool expect_updates = false);
 
+bool enable_cdc_after_full_load_table(
+    PGconn* pg,
+    long long catalog_id,
+    const std::string& batch_id,
+    const std::string& conn_id,
+    const std::string& source_schema,
+    const std::string& source_table);
+
+void ensure_apply_position_for_catalog(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine,
+    long long catalog_id);
+
 struct BinlogGapRebootResult {
     bool ran{false};
     bool t0_reset{false};
@@ -202,7 +216,7 @@ bool seed_stream_capture_bookmark_if_needed(
 
 void mark_catalog_full_load_in_progress(PGconn* pg, long long catalog_id);
 
-/** Data copied; keep cdc off until onboard resets Kafka offsets for this table. */
+/** Data copied; onboard_table_after_full_load sets success + cdc_enabled when Kafka reset succeeds. */
 void mark_catalog_full_load_data_ready(PGconn* pg, long long catalog_id);
 
 void mark_catalog_skipped(PGconn* pg, long long catalog_id, const std::string& reason);
@@ -271,6 +285,23 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
     const std::string& conn_id,
     const std::string& db_engine,
     const std::string& batch_id);
+
+FullLoadKafkaResetStats reset_kafka_apply_after_full_load_table(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine,
+    long long catalog_id,
+    const std::string& batch_id);
+
+/** Kafka reset + cdc enable immediately after a table COPY succeeds. */
+bool onboard_table_after_full_load(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine,
+    long long catalog_id,
+    const std::string& batch_id,
+    const std::string& source_schema,
+    const std::string& source_table);
 
 bool onboard_conn_after_full_load(
     const AppConfig& cfg,

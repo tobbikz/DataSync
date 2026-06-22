@@ -27,6 +27,7 @@ std::atomic<bool> g_shutdown{false};
 #include <chrono>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <set>
 #include <thread>
 #include <vector>
@@ -932,6 +933,54 @@ void enable_cdc_after_full_load(
     });
 }
 
+bool enable_cdc_after_full_load_table(
+    PGconn* pg,
+    long long catalog_id,
+    const std::string& batch_id,
+    const std::string& conn_id,
+    const std::string& source_schema,
+    const std::string& source_table) {
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET cdc_enabled = true,
+            status = 'success',
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+          AND active = true
+          AND has_pk = true
+          AND needs_full_load = false
+          AND NOT cdc_enabled
+          AND status = 'full_load_in_progress'
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    const int count = (res && PQresultStatus(res) == PGRES_COMMAND_OK) ? std::atoi(PQcmdTuples(res)) : 0;
+    if (res) {
+        PQclear(res);
+    }
+
+    log_write(pg, {
+        .level = count == 0 ? LogLevel::Warning : LogLevel::Info,
+        .component = "cdc_catalog_onboard",
+        .message = count == 0 ? "enable cdc after table full-load: no row updated"
+                              : "enabled cdc after table full-load",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = source_schema,
+        .source_table = source_table,
+        .context = {{"catalog_id", catalog_id}, {"count", count}},
+    });
+    return count > 0;
+}
+
 void mark_catalog_full_load_in_progress(PGconn* pg, long long catalog_id) {
     const std::string id = std::to_string(catalog_id);
     const char* vals[] = {id.c_str()};
@@ -1545,94 +1594,174 @@ void ensure_apply_positions_for_conn(
     PQclear(res);
 }
 
-FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
+void ensure_apply_position_for_catalog(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine,
-    const std::string& batch_id) {
-    FullLoadKafkaResetStats stats;
+    long long catalog_id) {
+    const std::string topic_prefix = topic_prefix_for_conn(conn_id);
+    const std::string topic_mode = std::string(pipeline_defaults::kKafkaTopicMode);
+    const int topic_buckets = pipeline_defaults::kKafkaTopicBuckets;
+    const std::string catalog_id_str = std::to_string(catalog_id);
 
-    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
-    const std::string bootstrap = kafka.bootstrap;
-    const int apply_workers = kApplyWorkerCount;
-    ensure_apply_positions_for_conn(pg, conn_id, db_engine);
-
-    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
+    const char* vals[] = {catalog_id_str.c_str(), conn_id.c_str(), db_engine.c_str()};
     PGresult* res = PQexecParams(
         pg,
         R"(
-        SELECT ap.catalog_id, ap.source_schema, ap.source_table, ap.kafka_topic, ap.kafka_partition
-        FROM cdc_catalog.apply_position ap
-        JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
-        WHERE ap.conn_id = $1
-          AND c.db_engine = $2::cdc_catalog.db_engine
-          AND c.active = true
-          AND c.needs_full_load = false
-          AND NOT c.cdc_enabled
-          AND c.status = 'full_load_in_progress'
-        ORDER BY ap.source_schema, ap.source_table
+        SELECT catalog_id, source_database, source_schema, source_table, hot
+        FROM cdc_catalog.catalog
+        WHERE catalog_id = $1::bigint
+          AND conn_id = $2
+          AND db_engine = $3::cdc_catalog.db_engine
+          AND active = true
+          AND has_pk = true
         )",
-        2,
+        3,
         nullptr,
         vals,
         nullptr,
         nullptr,
         0);
-    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
         if (res) {
             PQclear(res);
         }
-        log_write(pg, {
-            .level = LogLevel::Warning,
-            .component = "cdc_catalog_onboard",
-            .message = "full-load kafka reset skipped: apply_position query failed",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {{"db_engine", db_engine}},
-        });
-        stats.errors += 1;
-        return stats;
+        return;
     }
 
-    struct ApplyRow {
-        long long catalog_id;
-        std::string schema;
-        std::string table;
-        std::string topic;
-        int partition;
-    };
-    std::vector<ApplyRow> rows;
-    rows.reserve(static_cast<size_t>(PQntuples(res)));
-    for (int i = 0; i < PQntuples(res); ++i) {
-        rows.push_back({
-            std::atoll(PQgetvalue(res, i, 0)),
-            PQgetvalue(res, i, 1),
-            PQgetvalue(res, i, 2),
-            PQgetvalue(res, i, 3),
-            std::stoi(PQgetvalue(res, i, 4)),
-        });
-        stats.tables += 1;
-    }
+    const std::string row_catalog_id = PQgetvalue(res, 0, 0);
+    const std::string source_database = PQgetvalue(res, 0, 1);
+    const std::string source_schema = PQgetvalue(res, 0, 2);
+    const std::string source_table = PQgetvalue(res, 0, 3);
+    const char* hot_raw = PQgetvalue(res, 0, 4);
+    const bool table_hot = hot_raw && (hot_raw[0] == 't' || hot_raw[0] == 'T' || hot_raw[0] == '1');
     PQclear(res);
 
+    std::string lake_schema;
+    std::string lake_table;
+    if (db_engine == "mssql") {
+        lake_schema = mssql_pg_schema_name(source_database, source_schema);
+        lake_table = mssql_pg_table_name(source_table);
+    } else if (db_engine == "mongodb") {
+        lake_schema = mongo_pg_schema_name(source_database);
+        lake_table = mongo_pg_table_name(source_table);
+    } else {
+        lake_schema = source_schema;
+        lake_table = source_table;
+    }
+    const std::string topic = topic_for_catalog_table(
+        topic_prefix, lake_schema, lake_table, topic_mode, topic_buckets, table_hot);
+    const std::string pos_schema = (db_engine == "mongodb")
+        ? mongo_catalog_source_schema(source_database, source_schema)
+        : (db_engine == "mssql" ? source_schema : lake_schema);
+    const char* ins_vals[] = {
+        row_catalog_id.c_str(),
+        conn_id.c_str(),
+        pos_schema.c_str(),
+        lake_table.c_str(),
+        topic.c_str(),
+    };
+    auto mark_ap_failed = [&](const std::string& err_msg) {
+        const std::string trunc = err_msg.substr(0, 950);
+        const char* fail_vals[] = {row_catalog_id.c_str(), trunc.c_str()};
+        PGresult* fail = PQexecParams(
+            pg,
+            R"(
+            UPDATE cdc_catalog.catalog
+            SET status = 'failed',
+                last_error = $2,
+                last_error_at = now(),
+                updated_at = now()
+            WHERE catalog_id = $1::bigint
+            )",
+            2, nullptr, fail_vals, nullptr, nullptr, 0);
+        if (fail) {
+            PQclear(fail);
+        }
+    };
+    PGresult* ap_res = PQexecParams(
+        pg,
+        R"(
+        INSERT INTO cdc_catalog.apply_position
+            (catalog_id, conn_id, source_schema, source_table, kafka_topic, status)
+        VALUES ($1::bigint, $2, $3, $4, $5, 'healthy')
+        ON CONFLICT (conn_id, source_schema, source_table) DO UPDATE SET
+            catalog_id = EXCLUDED.catalog_id,
+            kafka_topic = EXCLUDED.kafka_topic,
+            status = 'healthy'::cdc_catalog.cdc_health_status,
+            updated_at = now()
+        )",
+        5, nullptr, ins_vals, nullptr, nullptr, 0);
+    if (ap_res) {
+        const auto ap_st = PQresultStatus(ap_res);
+        if (ap_st != PGRES_COMMAND_OK && ap_st != PGRES_TUPLES_OK) {
+            const std::string ap_err = PQerrorMessage(pg);
+            PQclear(ap_res);
+            ap_res = nullptr;
+            if (ap_err.find("apply_position_pkey") != std::string::npos) {
+                const char* upd_vals[] = {
+                    conn_id.c_str(),
+                    pos_schema.c_str(),
+                    lake_table.c_str(),
+                    topic.c_str(),
+                    row_catalog_id.c_str(),
+                };
+                PGresult* ap_upd = PQexecParams(
+                    pg,
+                    R"(
+                    UPDATE cdc_catalog.apply_position
+                    SET conn_id = $1,
+                        source_schema = $2,
+                        source_table = $3,
+                        kafka_topic = $4,
+                        status = 'healthy'::cdc_catalog.cdc_health_status,
+                        updated_at = now()
+                    WHERE catalog_id = $5::bigint
+                    )",
+                    5, nullptr, upd_vals, nullptr, nullptr, 0);
+                if (ap_upd) {
+                    const auto upd_st = PQresultStatus(ap_upd);
+                    if (upd_st != PGRES_COMMAND_OK) {
+                        mark_ap_failed("apply_position fallback update failed: " + std::string(PQerrorMessage(pg)));
+                    }
+                    PQclear(ap_upd);
+                }
+            } else {
+                mark_ap_failed(ap_err);
+                throw std::runtime_error(std::string("SQL failed: ") + ap_err);
+            }
+        }
+        if (ap_res) {
+            PQclear(ap_res);
+        }
+    }
+}
+
+struct OnboardApplyRow {
+    long long catalog_id;
+    std::string schema;
+    std::string table;
+    std::string topic;
+    int partition;
+};
+
+static FullLoadKafkaResetStats execute_kafka_onboard_reset(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine,
+    const std::string& batch_id,
+    const std::string& bootstrap,
+    const std::vector<OnboardApplyRow>& rows,
+    const std::optional<long long>& single_catalog_id) {
+    FullLoadKafkaResetStats stats;
+    stats.tables = static_cast<int>(rows.size());
     if (rows.empty()) {
-        log_write(pg, {
-            .level = LogLevel::Info,
-            .component = "cdc_catalog_onboard",
-            .message = "full-load kafka reset skipped: no tables pending onboard",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {{"db_engine", db_engine}},
-        });
         return stats;
     }
 
 #ifdef HAVE_RDKAFKA
     const int topic_partitions = pipeline_defaults::kKafkaTopicPartitions;
+    const int apply_workers = kApplyWorkerCount;
 
     std::set<std::string> unique_topic_names;
     for (const auto& row : rows) {
@@ -1648,8 +1777,11 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
 
     std::map<std::pair<std::string, int>, long long> bookmark_targets;
     std::vector<long long> stream_catalog_ids;
-    PGresult* stream_res = PQexecParams(
-        pg,
+    const char* conn_vals[] = {conn_id.c_str(), db_engine.c_str()};
+    const std::string catalog_filter = single_catalog_id
+        ? " AND c.catalog_id = " + std::to_string(*single_catalog_id)
+        : "";
+    const std::string stream_sql =
         R"(
         SELECT c.catalog_id, c.engine_meta::text, ap.kafka_topic
         FROM cdc_catalog.catalog c
@@ -1660,19 +1792,22 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
           AND NOT c.needs_full_load
           AND c.status = 'full_load_in_progress'
           AND NOT c.cdc_enabled
-        )",
+        )" + catalog_filter;
+    PGresult* stream_res = PQexecParams(
+        pg,
+        stream_sql.c_str(),
         2,
         nullptr,
-        vals,
+        conn_vals,
         nullptr,
         nullptr,
         0);
     if (stream_res && PQresultStatus(stream_res) == PGRES_TUPLES_OK) {
         for (int i = 0; i < PQntuples(stream_res); ++i) {
-            const long long catalog_id = std::atoll(PQgetvalue(stream_res, i, 0));
+            const long long cid = std::atoll(PQgetvalue(stream_res, i, 0));
             const std::string meta_text = PQgetvalue(stream_res, i, 1);
             const std::string topic = PQgetvalue(stream_res, i, 2);
-            stream_catalog_ids.push_back(catalog_id);
+            stream_catalog_ids.push_back(cid);
             try {
                 const auto meta = nlohmann::json::parse(meta_text);
                 if (!meta.contains("stream_kafka_offsets") || !meta["stream_kafka_offsets"].is_object()) {
@@ -1772,6 +1907,7 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
                     {"topics_reset", stats.topics_reset},
                     {"topics_expected", static_cast<int>(unique_topics.size())},
                     {"errors", stats.errors},
+                    {"single_table", single_catalog_id.has_value()},
                 },
             });
             return stats;
@@ -1851,6 +1987,7 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
             .context = {
                 {"stream_tables", static_cast<int>(stream_catalog_ids.size())},
                 {"bookmark_partitions", static_cast<int>(bookmark_targets.size())},
+                {"single_table", single_catalog_id.has_value()},
             },
         });
     }
@@ -1859,53 +1996,75 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
 #endif
 
     if (stats.errors > 0) {
-        log_write(pg, {
-            .level = LogLevel::Warning,
-            .component = "cdc_catalog_onboard",
-            .message = "full-load kafka reset aborted: dedup preserved",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {
-                {"db_engine", db_engine},
-                {"tables", stats.tables},
-                {"topics_reset", stats.topics_reset},
-                {"errors", stats.errors},
-            },
-        });
         return stats;
     }
 
-    PGresult* dedup = PQexecParams(
-        pg,
-        R"(
-        DELETE FROM cdc_catalog.cdc_applied_events ae
-        USING cdc_catalog.catalog c
-        WHERE ae.conn_id = $1
-          AND c.conn_id = ae.conn_id
-          AND c.source_schema = ae.source_schema
-          AND c.source_table = ae.source_table
-          AND c.conn_id = $1
-          AND c.db_engine = $2::cdc_catalog.db_engine
-          AND c.active = true
-          AND c.needs_full_load = false
-          AND NOT c.cdc_enabled
-          AND c.status = 'full_load_in_progress'
-        )",
-        2,
-        nullptr,
-        vals,
-        nullptr,
-        nullptr,
-        0);
-    if (dedup && PQresultStatus(dedup) == PGRES_COMMAND_OK) {
-        stats.dedup_deleted = std::atoll(PQcmdTuples(dedup));
+    if (single_catalog_id) {
+        const std::string cid = std::to_string(*single_catalog_id);
+        const char* dedup_vals[] = {conn_id.c_str(), db_engine.c_str(), cid.c_str()};
+        PGresult* dedup = PQexecParams(
+            pg,
+            R"(
+            DELETE FROM cdc_catalog.cdc_applied_events ae
+            USING cdc_catalog.catalog c
+            WHERE ae.conn_id = $1
+              AND c.conn_id = ae.conn_id
+              AND c.source_schema = ae.source_schema
+              AND c.source_table = ae.source_table
+              AND c.catalog_id = $3::bigint
+              AND c.conn_id = $1
+              AND c.db_engine = $2::cdc_catalog.db_engine
+              AND c.active = true
+              AND c.needs_full_load = false
+              AND NOT c.cdc_enabled
+              AND c.status = 'full_load_in_progress'
+            )",
+            3,
+            nullptr,
+            dedup_vals,
+            nullptr,
+            nullptr,
+            0);
+        if (dedup && PQresultStatus(dedup) == PGRES_COMMAND_OK) {
+            stats.dedup_deleted = std::atoll(PQcmdTuples(dedup));
+        } else {
+            stats.errors += 1;
+        }
+        if (dedup) {
+            PQclear(dedup);
+        }
     } else {
-        stats.errors += 1;
-    }
-    if (dedup) {
-        PQclear(dedup);
+        const char* dedup_vals[] = {conn_id.c_str(), db_engine.c_str()};
+        PGresult* dedup = PQexecParams(
+            pg,
+            R"(
+            DELETE FROM cdc_catalog.cdc_applied_events ae
+            USING cdc_catalog.catalog c
+            WHERE ae.conn_id = $1
+              AND c.conn_id = ae.conn_id
+              AND c.source_schema = ae.source_schema
+              AND c.source_table = ae.source_table
+              AND c.conn_id = $1
+              AND c.db_engine = $2::cdc_catalog.db_engine
+              AND c.active = true
+              AND c.needs_full_load = false
+              AND NOT c.cdc_enabled
+              AND c.status = 'full_load_in_progress'
+            )",
+            2,
+            nullptr,
+            dedup_vals,
+            nullptr,
+            nullptr,
+            0);
+        if (dedup && PQresultStatus(dedup) == PGRES_COMMAND_OK) {
+            stats.dedup_deleted = std::atoll(PQcmdTuples(dedup));
+        } else {
+            stats.errors += 1;
+        }
+        if (dedup) {
+            PQclear(dedup);
+        }
     }
 
     log_write(pg, {
@@ -1923,10 +2082,204 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
             {"topics_reset", stats.topics_reset},
             {"dedup_deleted", stats.dedup_deleted},
             {"errors", stats.errors},
+            {"single_table", single_catalog_id.has_value()},
         },
     });
 
     return stats;
+}
+
+FullLoadKafkaResetStats reset_kafka_apply_after_full_load_table(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine,
+    long long catalog_id,
+    const std::string& batch_id) {
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
+    ensure_apply_position_for_catalog(pg, conn_id, db_engine, catalog_id);
+
+    const std::string catalog_id_str = std::to_string(catalog_id);
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str(), catalog_id_str.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT ap.catalog_id, ap.source_schema, ap.source_table, ap.kafka_topic, ap.kafka_partition
+        FROM cdc_catalog.apply_position ap
+        JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
+        WHERE ap.conn_id = $1
+          AND c.db_engine = $2::cdc_catalog.db_engine
+          AND c.catalog_id = $3::bigint
+          AND c.active = true
+          AND c.needs_full_load = false
+          AND NOT c.cdc_enabled
+          AND c.status = 'full_load_in_progress'
+        )",
+        3,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        FullLoadKafkaResetStats stats;
+        stats.errors += 1;
+        log_write(pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_catalog_onboard",
+            .message = "table full-load kafka reset skipped: apply_position query failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"db_engine", db_engine}, {"catalog_id", catalog_id}},
+        });
+        return stats;
+    }
+
+    std::vector<OnboardApplyRow> rows;
+    if (PQntuples(res) > 0) {
+        rows.push_back({
+            std::atoll(PQgetvalue(res, 0, 0)),
+            PQgetvalue(res, 0, 1),
+            PQgetvalue(res, 0, 2),
+            PQgetvalue(res, 0, 3),
+            std::stoi(PQgetvalue(res, 0, 4)),
+        });
+    }
+    PQclear(res);
+
+    if (rows.empty()) {
+        FullLoadKafkaResetStats stats;
+        log_write(pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_catalog_onboard",
+            .message = "table full-load kafka reset skipped: table not pending onboard",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"db_engine", db_engine}, {"catalog_id", catalog_id}},
+        });
+        return stats;
+    }
+
+    return execute_kafka_onboard_reset(
+        pg, conn_id, db_engine, batch_id, kafka.bootstrap, rows, catalog_id);
+}
+
+bool onboard_table_after_full_load(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine,
+    long long catalog_id,
+    const std::string& batch_id,
+    const std::string& source_schema,
+    const std::string& source_table) {
+    const auto stats =
+        reset_kafka_apply_after_full_load_table(pg, conn_id, db_engine, catalog_id, batch_id);
+    if (stats.errors > 0) {
+        return false;
+    }
+    return enable_cdc_after_full_load_table(
+        pg, catalog_id, batch_id, conn_id, source_schema, source_table);
+}
+
+FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine,
+    const std::string& batch_id) {
+    FullLoadKafkaResetStats stats;
+
+    const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
+    const std::string bootstrap = kafka.bootstrap;
+    ensure_apply_positions_for_conn(pg, conn_id, db_engine);
+
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT ap.catalog_id, ap.source_schema, ap.source_table, ap.kafka_topic, ap.kafka_partition
+        FROM cdc_catalog.apply_position ap
+        JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
+        WHERE ap.conn_id = $1
+          AND c.db_engine = $2::cdc_catalog.db_engine
+          AND c.active = true
+          AND c.needs_full_load = false
+          AND NOT c.cdc_enabled
+          AND c.status = 'full_load_in_progress'
+        ORDER BY ap.source_schema, ap.source_table
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        log_write(pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_catalog_onboard",
+            .message = "full-load kafka reset skipped: apply_position query failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"db_engine", db_engine}},
+        });
+        stats.errors += 1;
+        return stats;
+    }
+
+    struct ApplyRow {
+        long long catalog_id;
+        std::string schema;
+        std::string table;
+        std::string topic;
+        int partition;
+    };
+    std::vector<ApplyRow> rows;
+    rows.reserve(static_cast<size_t>(PQntuples(res)));
+    for (int i = 0; i < PQntuples(res); ++i) {
+        rows.push_back({
+            std::atoll(PQgetvalue(res, i, 0)),
+            PQgetvalue(res, i, 1),
+            PQgetvalue(res, i, 2),
+            PQgetvalue(res, i, 3),
+            std::stoi(PQgetvalue(res, i, 4)),
+        });
+        stats.tables += 1;
+    }
+    PQclear(res);
+
+    if (rows.empty()) {
+        log_write(pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_catalog_onboard",
+            .message = "full-load kafka reset skipped: no tables pending onboard",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"db_engine", db_engine}},
+        });
+        return stats;
+    }
+
+    std::vector<OnboardApplyRow> onboard_rows;
+    onboard_rows.reserve(rows.size());
+    for (const auto& row : rows) {
+        onboard_rows.push_back({row.catalog_id, row.schema, row.table, row.topic, row.partition});
+    }
+
+    return execute_kafka_onboard_reset(
+        pg, conn_id, db_engine, batch_id, bootstrap, onboard_rows, std::nullopt);
 }
 
 bool onboard_conn_after_full_load(
