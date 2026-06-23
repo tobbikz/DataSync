@@ -28,6 +28,7 @@ set(DATASYNC_SOURCES
     src/mariadb_binlog_cli.cpp
     src/kafka_apply.cpp
     src/kafka_apply_parse.cpp
+    src/lake_apply_index.cpp
     src/kafka_topics.cpp
     src/kafka_apply_native.cpp
     src/kafka_lag.cpp

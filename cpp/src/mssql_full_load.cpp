@@ -2,6 +2,7 @@
 
 #include "capture_common.hpp"
 #include "full_load_common.hpp"
+#include "lake_apply_index.hpp"
 #include "mariadb_datetime.hpp"
 #include "mssql_conn.hpp"
 #include "mssql_kafka_capture.hpp"
@@ -587,6 +588,7 @@ TableLoadOutcome load_one_table(
     const std::string pg_table = mssql_pg_table_name(target.source_table);
 
     ensure_mssql_lake_table_base(lake_pg.raw, pg_schema, pg_table, cols, source_pk_cols, partition_months);
+    ensure_mirror_apply_pk_index(lake_pg.raw, pg_schema, pg_table, source_pk_cols);
     truncate_lake_table(lake_pg.raw, pg_schema, pg_table);
 
     log_fl(

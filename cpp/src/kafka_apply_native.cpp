@@ -6,6 +6,7 @@
 #include "kafka_table_lag.hpp"
 #include "kafka_topics.hpp"
 #include "capture_common.hpp"
+#include "lake_apply_index.hpp"
 
 #include "config.hpp"
 #include "mariadb_schema.hpp"
@@ -798,6 +799,27 @@ int run_kafka_apply_native_cli(
     PgConn lake_pg(cfg.datalake.conn_string());
     runtime.reload(app_pg.raw);
     configure_lake_apply_session(lake_pg.raw, runtime, hot_path, conn_id);
+
+    if (worker_id == 0) {
+        const auto idx_stats = backfill_mirror_apply_pk_indexes(app_pg.raw, lake_pg.raw, conn_id);
+        if (idx_stats.indexes_created > 0 || idx_stats.errors > 0) {
+            log_write(log_pg, {
+                .level = idx_stats.errors > 0 ? LogLevel::Warning : LogLevel::Info,
+                .component = "cdc_kafka_apply_cpp",
+                .message = "mirror apply PK index backfill",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"tables_seen", idx_stats.tables_seen},
+                    {"indexes_created", idx_stats.indexes_created},
+                    {"tables_skipped", idx_stats.tables_skipped},
+                    {"errors", idx_stats.errors},
+                },
+            });
+        }
+    }
 
     const std::string db_engine = conn_engine(cfg, conn_id);
     clear_stale_cdc_in_progress(app_pg.raw, conn_id, db_engine);

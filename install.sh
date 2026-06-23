@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Host:      ./install.sh | ./install.sh start  → build + Kafka + daemon (+ discover opcional)
 #             ./install.sh kafka-retention [TOPIC_PREFIX=…]  → alter existing topic retention
+# Migration: ./install.sh stop; rsync -a kafka-data/ newhost:…/DataSync/kafka-data/; ./install.sh start
+#            (keep CLUSTER_ID in docker-compose.yml unchanged on the target host)
 # Systemd:   ExecStart=$ROOT/install.sh start  ExecStop=$ROOT/install.sh stop
 #            sudo ./install.sh systemd-install  (once — installs DataSync.service)
 # Container: install.sh container …            (Docker ENTRYPOINT only)
@@ -525,6 +527,32 @@ exec "$BIN" "$@"
 
 }
 
+# cp-kafka image runs as appuser (uid/gid 1000). Override if your image differs.
+DATASYNC_KAFKA_UID="${DATASYNC_KAFKA_UID:-1000}"
+DATASYNC_KAFKA_GID="${DATASYNC_KAFKA_GID:-1000}"
+
+ensure_kafka_data_dir() {
+  local dir="${DATASYNC_KAFKA_DATA:-$ROOT/kafka-data}"
+  local uid="${DATASYNC_KAFKA_UID}"
+  local gid="${DATASYNC_KAFKA_GID}"
+
+  if [[ ! -d "$dir" ]]; then
+    mkdir -p "$dir"
+    printf '✔ created Kafka data dir: %s\n' "$dir"
+  fi
+
+  # Bind mount must be writable by appuser inside cp-kafka (systemd often creates the dir as root).
+  if chown -R "${uid}:${gid}" "$dir" 2>/dev/null; then
+    :
+  elif [[ "${EUID:-$(id -u)}" -ne 0 ]] && command -v sudo >/dev/null 2>&1 \
+      && sudo chown -R "${uid}:${gid}" "$dir" 2>/dev/null; then
+    :
+  else
+    chmod 1777 "$dir" 2>/dev/null || chmod 777 "$dir" 2>/dev/null || true
+    warn "could not chown ${dir} to ${uid}:${gid} — run: sudo chown -R ${uid}:${gid} ${dir}"
+  fi
+}
+
 wait_kafka_compose() {
   local i state
   for i in $(seq 1 120); do
@@ -562,6 +590,8 @@ host_build_datasync() {
 host_stack_start() {
   ensure_container_runtime || exit 1
   cd "$ROOT"
+  export DATASYNC_KAFKA_DATA="${DATASYNC_KAFKA_DATA:-$ROOT/kafka-data}"
+  ensure_kafka_data_dir
   host_build_datasync
   docker_compose up -d kafka
   wait_kafka_compose || exit 1

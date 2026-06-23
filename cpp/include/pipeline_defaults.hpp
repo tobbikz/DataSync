@@ -86,6 +86,8 @@ constexpr int kReconcileCaptureLagFailSeconds = 900;
 constexpr std::size_t kFullLoadBatchSizeDefault = 50000;
 constexpr int kApplyBatchSizeDefault = 20000;
 constexpr int kHotApplyBatchSizeDefault = 30000;
+/** Max PK rows per DELETE statement when applying CDC deletes to mirror tables. */
+constexpr std::size_t kApplyDeleteChunkSizeDefault = 5000;
 /** Per-statement cap on lake PG apply connections (0 = disabled). */
 constexpr int kApplyLakeStatementTimeoutMsDefault = 300000;
 /** Roll back idle apply transactions on lake PG (0 = disabled). */

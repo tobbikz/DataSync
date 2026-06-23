@@ -1,6 +1,7 @@
 #include "kafka_apply_detail.hpp"
 #include "kafka_apply.hpp"
 #include "capture_common.hpp"
+#include "lake_apply_index.hpp"
 #include "lake_columns.hpp"
 #include "mariadb_datetime.hpp"
 #include "mssql_conn.hpp"
@@ -980,60 +981,166 @@ void insert_from_staging(
     pg_exec(pg, sql);
 }
 
-void ensure_mirror_apply_pk_index(
+void create_pk_delete_staging_table(
     PGconn* pg,
-    const std::string& schema,
-    const std::string& table,
-    const std::vector<std::string>& pk_cols) {
-    if (pk_cols.empty()) {
-        return;
-    }
-    static thread_local std::unordered_set<std::string> ensured;
-    const std::string cache_key = schema + "\0" + table;
-    if (ensured.count(cache_key) > 0) {
-        return;
-    }
-    std::string idx_name = "dl_mir_" + schema + "_" + table + "_pk";
-    if (idx_name.size() > 63) {
-        idx_name.resize(63);
-    }
-    std::ostringstream cols;
+    const std::string& staging_name,
+    const std::vector<std::string>& pk_cols,
+    const std::map<std::string, std::string>& col_types) {
+    std::ostringstream ct;
+    ct << "CREATE TEMP TABLE " << pg_ident(staging_name) << " (";
     for (std::size_t i = 0; i < pk_cols.size(); ++i) {
         if (i) {
-            cols << ", ";
+            ct << ", ";
         }
-        cols << pg_ident(pk_cols[i]);
+        ct << pg_ident(pk_cols[i]) << " "
+           << (col_types.count(pk_cols[i]) ? col_types.at(pk_cols[i]) : "TEXT") << " NOT NULL";
     }
-    const std::string fq = pg_ident(schema) + "." + pg_ident(table);
+    if (!pk_cols.empty()) {
+        ct << ", PRIMARY KEY (";
+        for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+            if (i) {
+                ct << ", ";
+            }
+            ct << pg_ident(pk_cols[i]);
+        }
+        ct << ")";
+    }
+    ct << ") ON COMMIT DROP";
+    pg_exec(pg, ct.str());
+}
+
+std::optional<std::string> build_pk_csv_line(
+    const json& row,
+    const std::vector<std::string>& pk_cols,
+    const std::map<std::string, std::string>& col_types,
+    bool mssql_text) {
+    std::ostringstream line;
+    for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+        const json* val = row.contains(pk_cols[i]) ? &row.at(pk_cols[i]) : nullptr;
+        if (!val || val->is_null()) {
+            return std::nullopt;
+        }
+        if (i) {
+            line << ',';
+        }
+        const std::string pg_type = col_types.count(pk_cols[i]) ? col_types.at(pk_cols[i]) : "";
+        line << json_cell_csv(*val, pg_type, mssql_text);
+    }
+    return line.str();
+}
+
+std::string materialize_distinct_staging_keys(
+    PGconn* pg,
+    const std::string& staging_name,
+    const std::vector<std::string>& pk_cols) {
+    const std::string keys_name = staging_name + "_keys";
+    std::ostringstream pk_cols_sql;
+    std::ostringstream pk_not_null;
+    for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+        if (i) {
+            pk_cols_sql << ", ";
+            pk_not_null << ", ";
+        }
+        pk_cols_sql << pg_ident(pk_cols[i]);
+        pk_not_null << pg_ident(pk_cols[i]) << " IS NOT NULL";
+    }
     pg_exec(
         pg,
-        "CREATE INDEX IF NOT EXISTS " + pg_ident(idx_name) + " ON " + fq + " (" + cols.str() + ")");
-    ensured.insert(cache_key);
+        "CREATE TEMP TABLE " + pg_ident(keys_name) + " ON COMMIT DROP AS SELECT DISTINCT " + pk_cols_sql.str() +
+            " FROM " + pg_ident(staging_name) + " WHERE " + pk_not_null.str());
+    std::ostringstream pk_def;
+    for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+        if (i) {
+            pk_def << ", ";
+        }
+        pk_def << pg_ident(pk_cols[i]);
+    }
+    pg_exec(pg, "ALTER TABLE " + pg_ident(keys_name) + " ADD PRIMARY KEY (" + pk_def.str() + ")");
+    return keys_name;
+}
+
+bool staging_table_has_rows(PGconn* pg, const std::string& staging_name) {
+    PGresult* res = PQexec(
+        pg,
+        ("SELECT EXISTS (SELECT 1 FROM " + pg_ident(staging_name) + " LIMIT 1)").c_str());
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) < 1) {
+        if (res) {
+            PQclear(res);
+        }
+        throw std::runtime_error("staging row count probe failed");
+    }
+    const char* val = PQgetvalue(res, 0, 0);
+    const bool exists = val && (val[0] == 't' || val[0] == 'T');
+    PQclear(res);
+    return exists;
 }
 
 void delete_target_by_staging_pk(
     PGconn* pg,
     const std::string& fq,
-    const std::string& staging,
-    const std::vector<std::string>& delete_pk_cols) {
+    const std::string& staging_name,
+    const std::vector<std::string>& delete_pk_cols,
+    bool staging_keys_unique) {
     if (delete_pk_cols.empty()) {
         return;
     }
-    std::ostringstream pk_cols_sql;
+    const std::string work_staging =
+        staging_keys_unique ? staging_name : materialize_distinct_staging_keys(pg, staging_name, delete_pk_cols);
+
     std::ostringstream join_clause;
+    std::ostringstream returning_cols;
     for (std::size_t i = 0; i < delete_pk_cols.size(); ++i) {
         if (i) {
-            pk_cols_sql << ", ";
             join_clause << " AND ";
+            returning_cols << ", ";
         }
         const std::string col = pg_ident(delete_pk_cols[i]);
-        pk_cols_sql << col;
-        join_clause << "t." << col << " IS NOT DISTINCT FROM s." << col;
+        returning_cols << col;
+        join_clause << "t." << col << " = s." << col;
     }
-    pg_exec(
+
+    const std::size_t chunk_size = pipeline_defaults::kApplyDeleteChunkSizeDefault;
+    const std::string work_ident = pg_ident(work_staging);
+    std::size_t chunk_pass = 0;
+    const std::size_t max_chunks = 200000;
+    while (staging_table_has_rows(pg, work_staging)) {
+        if (++chunk_pass > max_chunks) {
+            throw std::runtime_error(
+                "delete_target_by_staging_pk: exceeded max chunks for staging table " + staging_name);
+        }
+        std::ostringstream sql;
+        sql << "WITH chunk AS ("
+            << "SELECT ctid FROM " << work_ident << " ORDER BY ctid LIMIT " << chunk_size
+            << "), deleted_keys AS ("
+            << "DELETE FROM " << work_ident << " s USING chunk c WHERE s.ctid = c.ctid RETURNING "
+            << returning_cols.str() << ") DELETE FROM " << fq << " t USING deleted_keys s WHERE " << join_clause.str();
+        pg_exec(pg, sql.str());
+    }
+}
+
+void copy_pk_lines_and_delete_target(
+    PGconn* pg,
+    const std::string& fq,
+    const std::string& staging_name,
+    const std::vector<std::string>& delete_pk_cols,
+    const std::map<std::string, std::string>& col_types,
+    const std::vector<std::string>& pk_lines) {
+    if (pk_lines.empty() || delete_pk_cols.empty()) {
+        return;
+    }
+    create_pk_delete_staging_table(pg, staging_name, delete_pk_cols, col_types);
+    std::ostringstream del_col_list;
+    for (std::size_t i = 0; i < delete_pk_cols.size(); ++i) {
+        if (i) {
+            del_col_list << ", ";
+        }
+        del_col_list << pg_ident(delete_pk_cols[i]);
+    }
+    copy_csv_lines(
         pg,
-        "DELETE FROM " + fq + " t USING (SELECT DISTINCT " + pk_cols_sql.str() + " FROM " + staging + ") s WHERE " +
-            join_clause.str());
+        "COPY " + pg_ident(staging_name) + " (" + del_col_list.str() + ") FROM STDIN WITH (FORMAT csv)",
+        pk_lines);
+    delete_target_by_staging_pk(pg, fq, staging_name, delete_pk_cols, true);
 }
 
 void copy_upserts_via_staging(
@@ -1051,7 +1158,7 @@ void copy_upserts_via_staging(
     pg_exec(pg, "CREATE TEMP TABLE " + staging + " (LIKE " + fq + " INCLUDING DEFAULTS) ON COMMIT DROP");
     copy_csv_lines(pg, "COPY " + staging + " (" + col_list + ") FROM STDIN WITH (FORMAT csv)", lines);
     if (!delete_pk_cols.empty()) {
-        delete_target_by_staging_pk(pg, fq, staging, delete_pk_cols);
+        delete_target_by_staging_pk(pg, fq, staging_name, delete_pk_cols, false);
     }
     const std::vector<std::string>& dedup_cols =
         dedup_pk_cols.empty() ? delete_pk_cols : dedup_pk_cols;
@@ -1089,55 +1196,23 @@ long long apply_table_batch(
     int skipped_missing_pk_deletes = 0;
     if (!deletes.empty() && !delete_pk_cols.empty()) {
         const std::string del_stg = "cdc_stg_del_" + std::to_string(staging_id);
-        const std::string del_fq_stg = pg_ident(del_stg);
-
-        std::ostringstream del_col_list_ss;
-        for (std::size_t i = 0; i < delete_pk_cols.size(); ++i) {
-            if (i) del_col_list_ss << ", ";
-            del_col_list_ss << pg_ident(delete_pk_cols[i]);
-        }
-        const std::string del_col_list = del_col_list_ss.str();
-
-        std::ostringstream ct;
-        ct << "CREATE TEMP TABLE " << del_fq_stg << " (";
-        for (std::size_t i = 0; i < delete_pk_cols.size(); ++i) {
-            if (i) ct << ", ";
-            ct << pg_ident(delete_pk_cols[i]) << " "
-               << (meta.col_types.count(delete_pk_cols[i]) ? meta.col_types.at(delete_pk_cols[i]) : "TEXT");
-        }
-        ct << ") ON COMMIT DROP";
-        pg_exec(pg, ct.str());
+        const bool mssql_text_del = source_system == "MSSQL";
 
         std::vector<std::string> del_lines;
         del_lines.reserve(deletes.size());
+        std::unordered_set<std::string> seen_delete_keys;
         for (const auto& e : deletes) {
-            bool missing_pk = false;
-            for (const auto& pk_col : delete_pk_cols) {
-                const json* pk_val = e.row.contains(pk_col) ? &e.row[pk_col] : nullptr;
-                if (!pk_val || pk_val->is_null()) {
-                    missing_pk = true;
-                    break;
-                }
-            }
-            if (missing_pk) {
+            const auto pk_line = build_pk_csv_line(e.row, delete_pk_cols, meta.col_types, mssql_text_del);
+            if (!pk_line) {
                 skipped_missing_pk_deletes += 1;
                 continue;
             }
-            std::ostringstream line;
-            for (std::size_t i = 0; i < delete_pk_cols.size(); ++i) {
-                if (i) line << ',';
-                const json* val = e.row.contains(delete_pk_cols[i]) ? &e.row[delete_pk_cols[i]] : nullptr;
-                if (val) {
-                    const std::string pg_type = meta.col_types.count(delete_pk_cols[i]) ? meta.col_types.at(delete_pk_cols[i]) : "";
-                    line << json_cell_csv(*val, pg_type, false);
-                }
+            if (!seen_delete_keys.insert(*pk_line).second) {
+                continue;
             }
-            del_lines.push_back(line.str());
+            del_lines.push_back(*pk_line);
         }
-        if (!del_lines.empty()) {
-            copy_csv_lines(pg, "COPY " + del_fq_stg + " (" + del_col_list + ") FROM STDIN WITH (FORMAT csv)", del_lines);
-            delete_target_by_staging_pk(pg, fq, del_fq_stg, delete_pk_cols);
-        }
+        copy_pk_lines_and_delete_target(pg, fq, del_stg, delete_pk_cols, meta.col_types, del_lines);
     } else if (!deletes.empty()) {
         skipped_missing_pk_deletes = static_cast<int>(deletes.size());
     }
@@ -1213,6 +1288,9 @@ long long apply_table_batch(
     const bool mssql_text = source_system == "MSSQL";
     std::vector<std::string> lines;
     lines.reserve(upserts.size());
+    std::vector<std::string> upsert_pk_lines;
+    upsert_pk_lines.reserve(upserts.size());
+    std::unordered_set<std::string> seen_upsert_pk_keys;
     int row_index = 0;
     int skipped_missing_pk = 0;
     for (const auto& e : upserts) {
@@ -1227,6 +1305,12 @@ long long apply_table_batch(
         if (missing_pk) {
             skipped_missing_pk += 1;
             continue;
+        }
+        if (!delete_pk_cols.empty()) {
+            const auto pk_line = build_pk_csv_line(e.row, delete_pk_cols, meta.col_types, mssql_text);
+            if (pk_line && seen_upsert_pk_keys.insert(*pk_line).second) {
+                upsert_pk_lines.push_back(*pk_line);
+            }
         }
         const std::string row_ts = unique_load_timestamptz(e.ts_ms, row_index++);
         const std::string row_date = lake_columns::date_from_timestamptz(row_ts);
@@ -1253,7 +1337,11 @@ long long apply_table_batch(
     if (!lake_pk_cols.empty()) {
         const std::vector<std::string> dedup_cols =
             !delete_pk_cols.empty() ? delete_pk_cols : business_pk;
-        // Mirror lake: pre-delete by business PK, then INSERT (one current row per PK).
+        if (!delete_pk_cols.empty() && !upsert_pk_lines.empty()) {
+            const std::string pre_del_stg = "cdc_stg_udel_" + std::to_string(staging_id);
+            copy_pk_lines_and_delete_target(pg, fq, pre_del_stg, delete_pk_cols, meta.col_types, upsert_pk_lines);
+        }
+        // Mirror lake: INSERT after PK pre-delete (skinny staging; no DISTINCT on wide upsert staging).
         copy_upserts_via_staging(
             pg,
             fq,
@@ -1263,7 +1351,7 @@ long long apply_table_batch(
             lake_pk_cols,
             staging_name,
             dedup_cols,
-            delete_pk_cols);
+            {});
     } else {
         copy_csv_lines(pg, "COPY " + fq + " (" + col_list_str + ") FROM STDIN WITH (FORMAT csv)", lines);
     }

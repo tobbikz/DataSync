@@ -2,6 +2,7 @@
 
 #include "capture_common.hpp"
 #include "full_load_common.hpp"
+#include "lake_apply_index.hpp"
 #include "mariadb_binlog.hpp"
 #include "mariadb_conn.hpp"
 #include "mariadb_copy_format.hpp"
@@ -781,6 +782,7 @@ TableLoadOutcome load_one_table(
 
     migrate_lake_table_schema(lake_pg.raw, target.source_schema, target.source_table, cols);
     ensure_lake_table_base(lake_pg.raw, target.source_schema, target.source_table, cols, partition_months);
+    ensure_mirror_apply_pk_index(lake_pg.raw, target.source_schema, target.source_table, pk_cols);
 
     acquire_full_load_table_lock(lake_pg.raw, target.catalog_id);
     bool lock_released = false;

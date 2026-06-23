@@ -24,3 +24,6 @@ venv/
 # Logs / temp
 *.log
 /tmp/
+
+# Kafka KRaft log dir (bind mount from docker-compose)
+kafka-data/

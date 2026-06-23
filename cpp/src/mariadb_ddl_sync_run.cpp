@@ -1,6 +1,8 @@
 #include "mariadb_ddl_sync.hpp"
 
 #include "config.hpp"
+#include "capture_common.hpp"
+#include "lake_apply_index.hpp"
 #include "mariadb_conn.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
@@ -16,6 +18,7 @@ namespace {
 struct TableTarget {
     std::string schema;
     std::string table;
+    std::string pk_columns;
 };
 
 std::vector<TableTarget> fetch_ddl_targets(
@@ -24,12 +27,13 @@ std::vector<TableTarget> fetch_ddl_targets(
     const std::optional<std::string>& source_schema,
     const std::optional<std::string>& source_table) {
     std::string sql = R"(
-        SELECT source_schema, source_table
+        SELECT source_schema, source_table, COALESCE(pk_columns, '')
         FROM cdc_catalog.catalog
         WHERE conn_id = $1
           AND db_engine = 'mariadb'
           AND active = true
           AND cdc_enabled = true
+          AND has_pk = true
     )";
     std::vector<std::string> vals = {conn_id};
     if (source_schema && !source_schema->empty()) {
@@ -66,7 +70,7 @@ std::vector<TableTarget> fetch_ddl_targets(
         return out;
     }
     for (int i = 0; i < PQntuples(res); ++i) {
-        out.push_back({PQgetvalue(res, i, 0), PQgetvalue(res, i, 1)});
+        out.push_back({PQgetvalue(res, i, 0), PQgetvalue(res, i, 1), PQgetvalue(res, i, 2)});
     }
     PQclear(res);
     return out;
@@ -125,6 +129,10 @@ DdlSyncRunStats run_mariadb_ddl_sync(
             runtime.reload(app_pg.raw);
             const auto result = sync_mariadb_columns_to_lake(
                 lake_pg.raw, mysql.handle, target.schema, target.table, runtime, conn_id);
+            const auto pk_cols = split_pk_columns(target.pk_columns);
+            if (!pk_cols.empty()) {
+                ensure_mirror_apply_pk_index(lake_pg.raw, target.schema, target.table, pk_cols);
+            }
             stats.tables_success += 1;
             stats.columns_added += result.columns_added;
             if (result.columns_added > 0) {

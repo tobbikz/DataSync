@@ -2,6 +2,7 @@
 
 #include "capture_common.hpp"
 #include "full_load_common.hpp"
+#include "lake_apply_index.hpp"
 #include "mongo_conn.hpp"
 #include "mongo_preflight.hpp"
 #include "mongo_kafka_capture.hpp"

@@ -1615,6 +1615,16 @@ BEGIN
         RAISE NOTICE 'migration 041: exact table kafka lag';
     END IF;
 END $$;
+
+-- Migration 042: mirror apply PK indexes (dl_mir_*_pk) + chunked CDC deletes (C++ apply).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 42) THEN
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (42, 'mirror apply PK index backfill on apply worker 0; chunked CDC deletes (5000 PKs)');
+        RAISE NOTICE 'migration 042: mirror apply PK indexes + chunked deletes';
+    END IF;
+END $$;
 )PO_diagnostics";
     }
     inline std::string_view monitoring_views() {
