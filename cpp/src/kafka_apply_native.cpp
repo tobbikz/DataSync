@@ -332,7 +332,6 @@ void ensure_apply_positions(
         const std::string topic = topic_for_catalog_table(
             topic_prefix, key.first, key.second, topic_mode, topic_buckets, meta.hot);
         const std::string cid = std::to_string(meta.catalog_id);
-        const char* vals[] = {cid.c_str(), conn_id.c_str(), meta.source_schema.c_str(), meta.source_table.c_str(), topic.c_str()};
         auto mark_ap_failed = [&](const std::string& err_msg) {
             const std::string trunc = err_msg.substr(0, 950);
             const char* fail_vals[] = {cid.c_str(), trunc.c_str()};
@@ -349,58 +348,16 @@ void ensure_apply_positions(
                 2, nullptr, fail_vals, nullptr, nullptr, 0);
             if (fail) PQclear(fail);
         };
-        PGresult* ap_res = PQexecParams(
-            pg,
-            R"(
-            INSERT INTO cdc_catalog.apply_position
-                (catalog_id, conn_id, source_schema, source_table, kafka_topic, status)
-            VALUES ($1::bigint, $2, $3, $4, $5, 'healthy')
-            ON CONFLICT (conn_id, source_schema, source_table) DO UPDATE SET
-                catalog_id = EXCLUDED.catalog_id,
-                kafka_topic = EXCLUDED.kafka_topic,
-                status = 'healthy'::cdc_catalog.cdc_health_status,
-                updated_at = now()
-            )",
-            5, nullptr, vals, nullptr, nullptr, 0);
-        if (ap_res) {
-            const auto ap_st = PQresultStatus(ap_res);
-            if (ap_st != PGRES_COMMAND_OK && ap_st != PGRES_TUPLES_OK) {
-                const std::string ap_err = PQerrorMessage(pg);
-                PQclear(ap_res);
-                if (ap_err.find("apply_position_pkey") != std::string::npos) {
-                    const char* upd_vals[] = {
-                        conn_id.c_str(),
-                        meta.source_schema.c_str(),
-                        meta.source_table.c_str(),
-                        topic.c_str(),
-                        cid.c_str(),
-                    };
-                    PGresult* ap_upd = PQexecParams(
-                        pg,
-                        R"(
-                        UPDATE cdc_catalog.apply_position
-                        SET conn_id = $1,
-                            source_schema = $2,
-                            source_table = $3,
-                            kafka_topic = $4,
-                            status = 'healthy'::cdc_catalog.cdc_health_status,
-                            updated_at = now()
-                        WHERE catalog_id = $5::bigint
-                        )",
-                        5, nullptr, upd_vals, nullptr, nullptr, 0);
-                    if (ap_upd) {
-                        const auto upd_st = PQresultStatus(ap_upd);
-                        if (upd_st != PGRES_COMMAND_OK) {
-                            mark_ap_failed("apply_position fallback update failed: " + std::string(PQerrorMessage(pg)));
-                        }
-                        PQclear(ap_upd);
-                    }
-                } else {
-                    mark_ap_failed(ap_err);
-                    throw std::runtime_error(std::string("SQL failed: ") + ap_err + " | SQL: INSERT INTO ...");
-                }
-            }
-            PQclear(ap_res);
+        std::string ap_err;
+        if (!upsert_apply_position(
+                pg,
+                meta.catalog_id,
+                conn_id,
+                meta.source_schema,
+                meta.source_table,
+                topic,
+                &ap_err)) {
+            mark_ap_failed("apply_position upsert failed: " + ap_err);
         }
     }
 }

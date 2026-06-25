@@ -119,6 +119,15 @@ std::string to_lower(std::string s) {
     return s;
 }
 
+bool is_mssql_time_type(const std::string& mssql_type) {
+    const std::string t = to_lower(mssql_type);
+    if (t == "time" || t.rfind("time(", 0) == 0) {
+        return true;
+    }
+    return t.find("time") != std::string::npos && t.find("datetime") == std::string::npos &&
+           t.find("timestamp") == std::string::npos;
+}
+
 std::string mssql_select_expr(const MssqlColumn& col) {
     const std::string b = brack(col.name);
     const std::string t = to_lower(col.mssql_type);
@@ -128,8 +137,8 @@ std::string mssql_select_expr(const MssqlColumn& col) {
     if (t == "date") {
         return "CONVERT(VARCHAR(10), " + b + ", 23)";
     }
-    if (t == "time") {
-        return "CONVERT(VARCHAR(16), " + b + ", 114)";
+    if (is_mssql_time_type(col.mssql_type)) {
+        return "CONVERT(VARCHAR(30), " + b + ", 108)";
     }
     return b;
 }
@@ -161,7 +170,7 @@ std::string cell_as_csv(DBPROCESS* db, int col, const std::string& pg_type) {
     mssql_cell_to_char(db, col, buf, static_cast<DBINT>(sizeof(buf) - 1));
     buf[sizeof(buf) - 1] = '\0';
     std::string text = sanitize_mssql_text_for_pg(trim_mssql_text(buf));
-    if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || pg_type == "DATE") {
+    if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || pg_type == "DATE" || is_time_pg_type(pg_type)) {
         text = normalize_text_for_pg(text, pg_type);
     }
     return csv_escape(text);
@@ -1275,7 +1284,7 @@ TableLoadOutcome load_one_table(
             log_mtx,
             LogLevel::Warning,
             batch_id,
-            "table full load copied; onboard deferred (conn retry will retry kafka reset + cdc enable)",
+            "table full load copied; cdc enable deferred (daemon will retry onboard)",
             {},
             target.conn_id,
             target.source_schema,

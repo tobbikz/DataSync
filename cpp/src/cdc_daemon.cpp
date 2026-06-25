@@ -379,7 +379,12 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
 
     const int pending_onboard = count_full_load_pending_onboard(log_pg, conn_id, db_engine);
     int onboard_retry_rc = 0;
-    if (pending_onboard > 0 && !conn_full_load_busy && pending_before == 0) {
+    if (pending_onboard > 0) {
+        enable_cdc_after_full_load(log_pg, conn_id, db_engine, batch_id, false);
+    }
+    const int pending_onboard_after_heal =
+        count_full_load_pending_onboard(log_pg, conn_id, db_engine);
+    if (pending_onboard_after_heal > 0 && !conn_full_load_busy) {
         log_write(log_pg, {
             .level = LogLevel::Info,
             .component = "cdc_daemon",
@@ -390,7 +395,7 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
             .source_table = std::nullopt,
             .context = {
                 {"db_engine", db_engine},
-                {"pending_onboard", pending_onboard},
+                {"pending_onboard", pending_onboard_after_heal},
                 {"phase", "onboard_retry"},
             },
         });

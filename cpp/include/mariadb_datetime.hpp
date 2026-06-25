@@ -10,8 +10,14 @@ bool is_invalid_sql_date(const std::string& s);
 
 std::string fix_date_separators(std::string s);
 
+/** True for TIME / time / time without time zone (case-insensitive). */
+bool is_time_pg_type(const std::string& pg_type);
+
 /** SQL Server default datetime string → ISO-8601 for PostgreSQL TIMESTAMPTZ. */
 std::string mssql_datetime_to_iso(const std::string& s);
+
+/** SQL Server time / CONVERT(114) / FreeTDS dummy-date strings → PostgreSQL TIME. */
+std::string mssql_time_to_pg(const std::string& s);
 
 std::string normalize_text_for_pg(const std::string& s, const std::string& pg_type);
 

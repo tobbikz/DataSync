@@ -195,6 +195,16 @@ void ensure_apply_position_for_catalog(
     const std::string& db_engine,
     long long catalog_id);
 
+/** Idempotent apply_position row: clears stale catalog_id / object-key conflicts before insert. */
+bool upsert_apply_position(
+    PGconn* pg,
+    long long catalog_id,
+    const std::string& conn_id,
+    const std::string& source_schema,
+    const std::string& source_table,
+    const std::string& kafka_topic,
+    std::string* error_out = nullptr);
+
 struct BinlogGapRebootResult {
     bool ran{false};
     bool t0_reset{false};
@@ -222,7 +232,7 @@ bool seed_stream_capture_bookmark_if_needed(
 
 void mark_catalog_full_load_in_progress(PGconn* pg, long long catalog_id);
 
-/** Data copied; onboard_table_after_full_load sets success + cdc_enabled when Kafka reset succeeds. */
+/** Data copied; onboard_table_after_full_load sets success + cdc_enabled (kafka reset is best-effort). */
 void mark_catalog_full_load_data_ready(PGconn* pg, long long catalog_id);
 
 void mark_catalog_skipped(PGconn* pg, long long catalog_id, const std::string& reason);

@@ -511,7 +511,7 @@ bool load_one_collection(
             log_mtx,
             LogLevel::Warning,
             batch_id,
-            "table full load copied; onboard deferred (conn retry will retry kafka reset + cdc enable)",
+            "table full load copied; cdc enable deferred (daemon will retry onboard)",
             {},
             target.conn_id,
             target.source_database,

@@ -1620,6 +1620,76 @@ void log_cdc_skip_no_tables(
     });
 }
 
+bool upsert_apply_position(
+    PGconn* pg,
+    long long catalog_id,
+    const std::string& conn_id,
+    const std::string& source_schema,
+    const std::string& source_table,
+    const std::string& kafka_topic,
+    std::string* error_out) {
+    const std::string catalog_id_str = std::to_string(catalog_id);
+    const char* del_vals[] = {
+        catalog_id_str.c_str(),
+        conn_id.c_str(),
+        source_schema.c_str(),
+        source_table.c_str(),
+    };
+    pg_exec_params_simple(
+        pg,
+        R"(
+        DELETE FROM cdc_catalog.apply_position
+        WHERE catalog_id = $1::bigint
+           OR (conn_id = $2 AND source_schema = $3 AND source_table = $4 AND catalog_id <> $1::bigint)
+        )",
+        4,
+        del_vals);
+
+    const char* ins_vals[] = {
+        catalog_id_str.c_str(),
+        conn_id.c_str(),
+        source_schema.c_str(),
+        source_table.c_str(),
+        kafka_topic.c_str(),
+    };
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        INSERT INTO cdc_catalog.apply_position
+            (catalog_id, conn_id, source_schema, source_table, kafka_topic, status)
+        VALUES ($1::bigint, $2, $3, $4, $5, 'healthy')
+        )",
+        5,
+        nullptr,
+        ins_vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res) {
+        if (error_out) {
+            *error_out = "PQexecParams returned null";
+        }
+        return false;
+    }
+    const auto st = PQresultStatus(res);
+    if (st != PGRES_COMMAND_OK) {
+        if (error_out) {
+            std::string err = PQerrorMessage(pg);
+            if (const char* msg = PQresultErrorMessage(res)) {
+                if (msg[0]) {
+                    err += " | ";
+                    err += msg;
+                }
+            }
+            *error_out = err;
+        }
+        PQclear(res);
+        return false;
+    }
+    PQclear(res);
+    return true;
+}
+
 void ensure_apply_positions_for_conn(
     PGconn* pg,
     const std::string& conn_id,
@@ -1676,13 +1746,6 @@ void ensure_apply_positions_for_conn(
         const std::string pos_schema = (db_engine == "mongodb")
             ? mongo_catalog_source_schema(source_database, source_schema)
             : (db_engine == "mssql" ? source_schema : lake_schema);
-        const char* ins_vals[] = {
-            catalog_id.c_str(),
-            conn_id.c_str(),
-            pos_schema.c_str(),
-            lake_table.c_str(),
-            topic.c_str(),
-        };
         auto mark_ap_failed = [&](const std::string& err_msg) {
             const std::string trunc = err_msg.substr(0, 950);
             const char* fail_vals[] = {catalog_id.c_str(), trunc.c_str()};
@@ -1699,59 +1762,16 @@ void ensure_apply_positions_for_conn(
                 2, nullptr, fail_vals, nullptr, nullptr, 0);
             if (fail) PQclear(fail);
         };
-        PGresult* ap_res = PQexecParams(
-            pg,
-            R"(
-            INSERT INTO cdc_catalog.apply_position
-                (catalog_id, conn_id, source_schema, source_table, kafka_topic, status)
-            VALUES ($1::bigint, $2, $3, $4, $5, 'healthy')
-            ON CONFLICT (conn_id, source_schema, source_table) DO UPDATE SET
-                catalog_id = EXCLUDED.catalog_id,
-                kafka_topic = EXCLUDED.kafka_topic,
-                status = 'healthy'::cdc_catalog.cdc_health_status,
-                updated_at = now()
-            )",
-            5, nullptr, ins_vals, nullptr, nullptr, 0);
-        if (ap_res) {
-            const auto ap_st = PQresultStatus(ap_res);
-            if (ap_st != PGRES_COMMAND_OK && ap_st != PGRES_TUPLES_OK) {
-                const std::string ap_err = PQerrorMessage(pg);
-                PQclear(ap_res);
-                ap_res = nullptr;
-                if (ap_err.find("apply_position_pkey") != std::string::npos) {
-                    const char* upd_vals[] = {
-                        conn_id.c_str(),
-                        pos_schema.c_str(),
-                        lake_table.c_str(),
-                        topic.c_str(),
-                        catalog_id.c_str(),
-                    };
-                    PGresult* ap_upd = PQexecParams(
-                        pg,
-                        R"(
-                        UPDATE cdc_catalog.apply_position
-                        SET conn_id = $1,
-                            source_schema = $2,
-                            source_table = $3,
-                            kafka_topic = $4,
-                            status = 'healthy'::cdc_catalog.cdc_health_status,
-                            updated_at = now()
-                        WHERE catalog_id = $5::bigint
-                        )",
-                        5, nullptr, upd_vals, nullptr, nullptr, 0);
-                    if (ap_upd) {
-                        const auto upd_st = PQresultStatus(ap_upd);
-                        if (upd_st != PGRES_COMMAND_OK) {
-                            mark_ap_failed("apply_position fallback update failed: " + std::string(PQerrorMessage(pg)));
-                        }
-                        PQclear(ap_upd);
-                    }
-                } else {
-                    mark_ap_failed(ap_err);
-                    throw std::runtime_error(std::string("SQL failed: ") + ap_err);
-                }
-            }
-            PQclear(ap_res);
+        std::string ap_err;
+        if (!upsert_apply_position(
+                pg,
+                std::stoll(catalog_id),
+                conn_id,
+                pos_schema,
+                lake_table,
+                topic,
+                &ap_err)) {
+            mark_ap_failed("apply_position upsert failed: " + ap_err);
         }
     }
     PQclear(res);
@@ -1817,13 +1837,6 @@ void ensure_apply_position_for_catalog(
     const std::string pos_schema = (db_engine == "mongodb")
         ? mongo_catalog_source_schema(source_database, source_schema)
         : (db_engine == "mssql" ? source_schema : lake_schema);
-    const char* ins_vals[] = {
-        row_catalog_id.c_str(),
-        conn_id.c_str(),
-        pos_schema.c_str(),
-        lake_table.c_str(),
-        topic.c_str(),
-    };
     auto mark_ap_failed = [&](const std::string& err_msg) {
         const std::string trunc = err_msg.substr(0, 950);
         const char* fail_vals[] = {row_catalog_id.c_str(), trunc.c_str()};
@@ -1842,61 +1855,10 @@ void ensure_apply_position_for_catalog(
             PQclear(fail);
         }
     };
-    PGresult* ap_res = PQexecParams(
-        pg,
-        R"(
-        INSERT INTO cdc_catalog.apply_position
-            (catalog_id, conn_id, source_schema, source_table, kafka_topic, status)
-        VALUES ($1::bigint, $2, $3, $4, $5, 'healthy')
-        ON CONFLICT (conn_id, source_schema, source_table) DO UPDATE SET
-            catalog_id = EXCLUDED.catalog_id,
-            kafka_topic = EXCLUDED.kafka_topic,
-            status = 'healthy'::cdc_catalog.cdc_health_status,
-            updated_at = now()
-        )",
-        5, nullptr, ins_vals, nullptr, nullptr, 0);
-    if (ap_res) {
-        const auto ap_st = PQresultStatus(ap_res);
-        if (ap_st != PGRES_COMMAND_OK && ap_st != PGRES_TUPLES_OK) {
-            const std::string ap_err = PQerrorMessage(pg);
-            PQclear(ap_res);
-            ap_res = nullptr;
-            if (ap_err.find("apply_position_pkey") != std::string::npos) {
-                const char* upd_vals[] = {
-                    conn_id.c_str(),
-                    pos_schema.c_str(),
-                    lake_table.c_str(),
-                    topic.c_str(),
-                    row_catalog_id.c_str(),
-                };
-                PGresult* ap_upd = PQexecParams(
-                    pg,
-                    R"(
-                    UPDATE cdc_catalog.apply_position
-                    SET conn_id = $1,
-                        source_schema = $2,
-                        source_table = $3,
-                        kafka_topic = $4,
-                        status = 'healthy'::cdc_catalog.cdc_health_status,
-                        updated_at = now()
-                    WHERE catalog_id = $5::bigint
-                    )",
-                    5, nullptr, upd_vals, nullptr, nullptr, 0);
-                if (ap_upd) {
-                    const auto upd_st = PQresultStatus(ap_upd);
-                    if (upd_st != PGRES_COMMAND_OK) {
-                        mark_ap_failed("apply_position fallback update failed: " + std::string(PQerrorMessage(pg)));
-                    }
-                    PQclear(ap_upd);
-                }
-            } else {
-                mark_ap_failed(ap_err);
-                throw std::runtime_error(std::string("SQL failed: ") + ap_err);
-            }
-        }
-        if (ap_res) {
-            PQclear(ap_res);
-        }
+    std::string ap_err;
+    if (!upsert_apply_position(
+            pg, catalog_id, conn_id, pos_schema, lake_table, topic, &ap_err)) {
+        mark_ap_failed("apply_position upsert failed: " + ap_err);
     }
 }
 
@@ -2343,11 +2305,28 @@ bool onboard_table_after_full_load(
     const std::string& source_table) {
     const auto stats =
         reset_kafka_apply_after_full_load_table(pg, conn_id, db_engine, catalog_id, batch_id);
-    if (stats.errors > 0) {
-        return false;
-    }
-    return enable_cdc_after_full_load_table(
+    const bool enabled = enable_cdc_after_full_load_table(
         pg, catalog_id, batch_id, conn_id, source_schema, source_table);
+    if (stats.errors > 0) {
+        log_write(pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_catalog_onboard",
+            .message = enabled
+                ? "table full-load kafka reset had errors; cdc enabled anyway"
+                : "table full-load kafka reset had errors; cdc enable did not update catalog",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = source_schema,
+            .source_table = source_table,
+            .context = {
+                {"db_engine", db_engine},
+                {"catalog_id", catalog_id},
+                {"kafka_errors", stats.errors},
+                {"kafka_tables", stats.tables},
+            },
+        });
+    }
+    return enabled;
 }
 
 FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
@@ -2462,11 +2441,28 @@ bool onboard_conn_after_full_load(
     }
 #endif
     const auto stats = reset_kafka_apply_after_full_load(pg, conn_id, db_engine, batch_id);
+    enable_cdc_after_full_load(pg, conn_id, db_engine, batch_id, false);
+    const int pending = count_full_load_pending_onboard(pg, conn_id, db_engine);
     if (stats.errors > 0) {
-        return false;
+        log_write(pg, {
+            .level = pending > 0 ? LogLevel::Warning : LogLevel::Info,
+            .component = "cdc_catalog_onboard",
+            .message = pending > 0
+                ? "conn full-load kafka reset had errors; some tables still pending onboard"
+                : "conn full-load kafka reset had errors; cdc enabled for loaded tables",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"db_engine", db_engine},
+                {"kafka_errors", stats.errors},
+                {"kafka_tables", stats.tables},
+                {"pending_onboard", pending},
+            },
+        });
     }
-    enable_cdc_after_full_load(pg, conn_id, db_engine, batch_id, true);
-    return true;
+    return pending == 0;
 }
 
 #ifdef HAVE_RDKAFKA

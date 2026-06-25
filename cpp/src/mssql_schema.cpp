@@ -71,7 +71,7 @@ std::string mssql_to_pg_type(const std::string& data_type, int max_length, int p
     if (base == "date") {
         return "DATE";
     }
-    if (base == "time") {
+    if (base == "time" || base.rfind("time(", 0) == 0) {
         return "TIME";
     }
     if (base == "uniqueidentifier") {

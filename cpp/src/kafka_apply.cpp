@@ -452,9 +452,10 @@ std::string json_cell_csv(const json& val_in, const std::string& pg_type, bool m
         return "";
     }
     std::string s = val.is_string() ? val.get<std::string>() : val.dump();
-    if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || pg_type == "DATE") {
+    if (pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || pg_type == "DATE" || is_time_pg_type(pg_type)) {
         const std::string norm = normalize_text_for_pg(s, pg_type);
-        if ((pg_type == "DATE" || pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP") && norm.empty()) {
+        if ((pg_type == "DATE" || pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || is_time_pg_type(pg_type)) &&
+            norm.empty()) {
             return "";
         }
         s = norm;
@@ -579,6 +580,8 @@ std::map<std::string, std::string> fetch_lake_col_types(
             pg_type = "TIMESTAMP";
         } else if (udt && std::string(udt) == "date") {
             pg_type = "DATE";
+        } else if (udt && std::string(udt) == "time") {
+            pg_type = "TIME";
         } else if (udt && std::string(udt) == "bytea") {
             pg_type = "BYTEA";
         } else {

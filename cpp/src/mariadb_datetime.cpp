@@ -2,6 +2,7 @@
 
 #include "mariadb_schema.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <ctime>
 #include <iomanip>
@@ -68,6 +69,12 @@ std::string fix_date_separators(std::string s) {
     return s;
 }
 
+bool is_time_pg_type(const std::string& pg_type) {
+    std::string u = pg_type;
+    std::transform(u.begin(), u.end(), u.begin(), [](unsigned char c) { return std::toupper(c); });
+    return u == "TIME" || u.rfind("TIME(", 0) == 0;
+}
+
 namespace {
 
 int month_from_abbr(const std::string& mon) {
@@ -88,6 +95,91 @@ bool looks_like_mssql_datetime(const std::string& s) {
     }
     return std::isalpha(static_cast<unsigned char>(s[0])) && std::isalpha(static_cast<unsigned char>(s[1])) &&
            std::isalpha(static_cast<unsigned char>(s[2]));
+}
+
+std::string trim_copy(std::string s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+        s.erase(s.begin());
+    }
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+        s.pop_back();
+    }
+    return s;
+}
+
+bool looks_like_hms_time(const std::string& s) {
+    const std::size_t c1 = s.find(':');
+    if (c1 == std::string::npos || c1 == 0) {
+        return false;
+    }
+    const std::size_t c2 = s.find(':', c1 + 1);
+    if (c2 == std::string::npos || c2 <= c1 + 1) {
+        return false;
+    }
+    for (std::size_t i = 0; i < c1; ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(s[i]))) {
+            return false;
+        }
+    }
+    for (std::size_t i = c1 + 1; i < c2; ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(s[i]))) {
+            return false;
+        }
+    }
+    const std::size_t sec_end = s.find_first_of(".,", c2 + 1);
+    const std::size_t end = sec_end == std::string::npos ? s.size() : sec_end;
+    if (end <= c2 + 1) {
+        return false;
+    }
+    for (std::size_t i = c2 + 1; i < end; ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(s[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** MSSQL CONVERT style 114: hh:mi:ss:mmm(24h) */
+bool looks_like_mssql_time114(const std::string& s) {
+    const std::size_t c1 = s.find(':');
+    if (c1 == std::string::npos) {
+        return false;
+    }
+    const std::size_t c2 = s.find(':', c1 + 1);
+    if (c2 == std::string::npos) {
+        return false;
+    }
+    const std::size_t c3 = s.find(':', c2 + 1);
+    return c3 != std::string::npos && c3 > c2 + 1;
+}
+
+std::string mssql_time114_to_pg(const std::string& s) {
+    const std::size_t c1 = s.find(':');
+    const std::size_t c2 = s.find(':', c1 + 1);
+    const std::size_t c3 = s.find(':', c2 + 1);
+    if (c3 == std::string::npos) {
+        return s;
+    }
+    std::string out = s.substr(0, c3) + '.' + s.substr(c3 + 1);
+    if (out.size() > 15) {
+        out.resize(15);
+    }
+    return out;
+}
+
+std::string extract_time_from_iso_datetime(const std::string& iso) {
+    const auto space = iso.find(' ');
+    if (space == std::string::npos || space + 1 >= iso.size()) {
+        return {};
+    }
+    std::string t = iso.substr(space + 1);
+    if (const auto plus = t.find('+'); plus != std::string::npos) {
+        t = t.substr(0, plus);
+    }
+    if (const auto z = t.find('Z'); z != std::string::npos) {
+        t = t.substr(0, z);
+    }
+    return trim_copy(t);
 }
 
 }  // namespace
@@ -174,6 +266,32 @@ std::string mssql_datetime_to_iso(const std::string& raw) {
     return out.str();
 }
 
+std::string mssql_time_to_pg(const std::string& raw) {
+    const std::string s = trim_copy(raw);
+    if (s.empty()) {
+        return s;
+    }
+    if (looks_like_mssql_datetime(s)) {
+        const std::string iso = mssql_datetime_to_iso(s);
+        if (iso != s) {
+            const std::string t = extract_time_from_iso_datetime(iso);
+            if (looks_like_hms_time(t)) {
+                return t;
+            }
+        }
+    }
+    if (looks_like_mssql_time114(s)) {
+        const std::string t = mssql_time114_to_pg(s);
+        if (looks_like_hms_time(t)) {
+            return t;
+        }
+    }
+    if (looks_like_hms_time(s)) {
+        return s;
+    }
+    return raw;
+}
+
 std::string normalize_text_for_pg(const std::string& s, const std::string& pg_type) {
     if (pg_type == "DATE") {
         const std::string d = fix_date_separators(s);
@@ -205,6 +323,10 @@ std::string normalize_text_for_pg(const std::string& s, const std::string& pg_ty
         }
         return t;
     }
+    if (is_time_pg_type(pg_type)) {
+        const std::string t = mssql_time_to_pg(s);
+        return looks_like_hms_time(t) ? t : std::string{};
+    }
     if (pg_type == "BYTEA") {
         return s;
     }
@@ -224,7 +346,7 @@ std::string normalize_pg_sql_literal(const std::string& sql_lit, const std::stri
     if (sql_lit == "NULL" || sql_lit.empty()) {
         return "NULL";
     }
-    if (pg_type != "DATE" && pg_type != "TIMESTAMPTZ" && pg_type != "TIMESTAMP") {
+    if (pg_type != "DATE" && pg_type != "TIMESTAMPTZ" && pg_type != "TIMESTAMP" && !is_time_pg_type(pg_type)) {
         return sql_lit;
     }
     if (sql_lit.size() < 2 || sql_lit.front() != '\'' || sql_lit.back() != '\'') {
@@ -232,7 +354,8 @@ std::string normalize_pg_sql_literal(const std::string& sql_lit, const std::stri
     }
     const std::string inner = sql_lit.substr(1, sql_lit.size() - 2);
     const std::string norm = normalize_text_for_pg(inner, pg_type);
-    if ((pg_type == "DATE" || pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP") && norm.empty()) {
+    if ((pg_type == "DATE" || pg_type == "TIMESTAMPTZ" || pg_type == "TIMESTAMP" || is_time_pg_type(pg_type)) &&
+        norm.empty()) {
         return "NULL";
     }
     return pg_escape_literal(norm);
