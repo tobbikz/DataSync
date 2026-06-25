@@ -317,11 +317,13 @@ int sync_indexes(
             }
             cols << pg_ident(idx.columns[i]);
         }
-        const std::string unique = idx.unique ? "UNIQUE " : "";
+        // Lake tables are PARTITION BY RANGE (_dl_load_timestamp); PG rejects UNIQUE on
+        // business keys alone. Mirror source indexes as non-unique (same as mariadb_ddl_sync).
+        (void)idx.unique;
         pg_exec(
             pg,
-            "CREATE " + unique + "INDEX IF NOT EXISTS " + pg_ident(pg_index_name) + " ON " + pg_ident(pg_schema) +
-            "." + pg_ident(pg_table) + " (" + cols.str() + ")");
+            "CREATE INDEX IF NOT EXISTS " + pg_ident(pg_index_name) + " ON " + pg_ident(pg_schema) + "." +
+            pg_ident(pg_table) + " (" + cols.str() + ")");
         created += 1;
     }
     return created;

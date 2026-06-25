@@ -527,29 +527,33 @@ exec "$BIN" "$@"
 
 }
 
-# cp-kafka image runs as appuser (uid/gid 1000). Override if your image differs.
-DATASYNC_KAFKA_UID="${DATASYNC_KAFKA_UID:-1000}"
-DATASYNC_KAFKA_GID="${DATASYNC_KAFKA_GID:-1000}"
-
 ensure_kafka_data_dir() {
   local dir="${DATASYNC_KAFKA_DATA:-$ROOT/kafka-data}"
-  local uid="${DATASYNC_KAFKA_UID}"
-  local gid="${DATASYNC_KAFKA_GID}"
+  local created=0
 
-  if [[ ! -d "$dir" ]]; then
-    mkdir -p "$dir"
+  [[ -d "$dir" ]] || created=1
+
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    if command -v sudo >/dev/null 2>&1 && sudo mkdir -p "$dir" 2>/dev/null; then
+      :
+    else
+      warn "could not create ${dir}"
+      return 1
+    fi
+  fi
+
+  if [[ "$created" == "1" ]]; then
     printf '✔ created Kafka data dir: %s\n' "$dir"
   fi
 
-  # Bind mount must be writable by appuser inside cp-kafka (systemd often creates the dir as root).
-  if chown -R "${uid}:${gid}" "$dir" 2>/dev/null; then
-    :
-  elif [[ "${EUID:-$(id -u)}" -ne 0 ]] && command -v sudo >/dev/null 2>&1 \
-      && sudo chown -R "${uid}:${gid}" "$dir" 2>/dev/null; then
-    :
-  else
-    chmod 1777 "$dir" 2>/dev/null || chmod 777 "$dir" 2>/dev/null || true
-    warn "could not chown ${dir} to ${uid}:${gid} — run: sudo chown -R ${uid}:${gid} ${dir}"
+  # cp-kafka runs as appuser (uid 1000); world-writable bind mount works across systemd/podman/SELinux.
+  if ! chmod 777 "$dir" 2>/dev/null; then
+    if command -v sudo >/dev/null 2>&1 && sudo chmod 777 "$dir" 2>/dev/null; then
+      :
+    else
+      warn "could not chmod 777 ${dir}"
+      return 1
+    fi
   fi
 }
 

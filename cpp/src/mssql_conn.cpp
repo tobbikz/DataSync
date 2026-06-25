@@ -139,6 +139,24 @@ bool run_dbsql_impl(DBPROCESS* db, const std::string& sql) {
     return true;
 }
 
+void set_mssql_login_port(LOGINREC* login, std::uint16_t port) {
+#if defined(DBSETLPORT)
+    DBSETLPORT(login, static_cast<int>(port));
+#elif defined(DBSETPORT)
+    dbsetlshort(login, static_cast<int>(port), DBSETPORT);
+#else
+    (void)login;
+    (void)port;
+#endif
+}
+
+void set_mssql_login_encryption(LOGINREC* login) {
+    DBSETLENCRYPT(login, TRUE);
+#if defined(DBSETLENCRYPTION)
+    DBSETLENCRYPTION(login, "require");
+#endif
+}
+
 }  // namespace
 
 bool run_dbsql(DBPROCESS* db, const std::string& sql) {
@@ -156,24 +174,20 @@ MssqlConn::MssqlConn(const MssqlSource& src) {
     DBSETLPWD(login, src.password.c_str());
     DBSETLHOST(login, src.host.c_str());
     DBSETLAPP(login, "DataSync");
-    DBSETLENCRYPT(login, FALSE);
+    set_mssql_login_encryption(login);
+    set_mssql_login_port(login, src.port);
     DBSETLVERSION(login, DBVERSION_74);
-#ifdef DBSETLPORT
-    DBSETLPORT(login, static_cast<int>(src.port));
-#endif
 
-    const std::string server =
-#ifdef DBSETLPORT
-        src.host;
-#else
-        src.host + "," + std::to_string(src.port);
-#endif
-    handle = dbopen(login, server.c_str());
+    // dbopen must receive host/IP only — "host,port" is resolved as a freetds.conf
+    // section name and breaks TLS login (Unknown host machine name).
+    handle = dbopen(login, src.host.c_str());
     dbloginfree(login);
     if (!handle) {
+        const std::string detail =
+            g_last_mssql_dblib_error.empty() ? "dbopen returned null" : g_last_mssql_dblib_error;
         throw std::runtime_error(
             "MSSQL connect failed conn_id=" + src.conn_id + " server=" + src.host + ":" +
-            std::to_string(src.port));
+            std::to_string(src.port) + " — " + detail);
     }
 }
 

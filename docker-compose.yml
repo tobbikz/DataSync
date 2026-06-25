@@ -3,9 +3,9 @@
 # host network: daemon reaches OLTP on host (MariaDB :3306, PG :5432, etc.)
 # No MariaDB/MSSQL/Mongo server containers — only Kafka + DataSync daemon.
 # on rootful Docker and rootless Podman (no rootlessport bridge gap).
-# Kafka data: ./kafka-data (bind mount, owned 1000:1000 for cp-kafka appuser). Migration:
+# Kafka data: ./kafka-data (bind mount; install.sh creates it with mode 777). Migration:
 # ./install.sh stop, copy kafka-data/ to the new host (same CLUSTER_ID below), ./install.sh start.
-# Override path: DATASYNC_KAFKA_DATA. Override owner: DATASYNC_KAFKA_UID / DATASYNC_KAFKA_GID.
+# Override path: DATASYNC_KAFKA_DATA.
 
 name: datasync
 
