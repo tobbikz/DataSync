@@ -340,9 +340,23 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
     });
 
     const int pending_before = count_full_load_pending(log_pg, conn_id, db_engine);
+    if (pending_before > 0) {
+        try_recover_stale_full_load_lock(log_pg, conn_id, batch_id);
+        if (!full_load_subprocess_running(conn_id)) {
+            reset_full_load_in_progress_for_conn(log_pg, conn_id, db_engine);
+        }
+        if (db_engine == "mssql") {
+            clear_stale_full_load_in_progress(
+                log_pg,
+                conn_id,
+                db_engine,
+                pipeline_defaults::kMssqlFullLoadStaleInProgressMinutes);
+        }
+    }
     const bool conn_full_load_busy = full_load_conn_busy(conn_id);
+    const bool full_load_subprocess_active = full_load_subprocess_running(conn_id);
     bool full_load_spawned = false;
-    if (pending_before > 0 && !conn_full_load_busy) {
+    if (pending_before > 0 && !conn_full_load_busy && !full_load_subprocess_active) {
         full_load_spawned = true;
         log_write(log_pg, {
             .level = LogLevel::Info,
@@ -435,6 +449,7 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
             {"apply_mode", sync_apply ? "sync" : "background"},
             {"full_load_pending", pending_before},
             {"full_load_conn_busy", conn_full_load_busy},
+            {"full_load_subprocess_active", full_load_subprocess_active},
             {"full_load_spawned", full_load_spawned},
             {"errors", cycle_errors},
         },
@@ -712,6 +727,7 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
         const std::string db_engine = conn_engine(cfg, conn_id);
         clear_stale_full_load_in_progress(log_pg, conn_id, db_engine, 30);
         clear_stale_cdc_in_progress(log_pg, conn_id, db_engine);
+        try_recover_stale_full_load_lock(log_pg, conn_id, batch_id);
         log_write(log_pg, {
             .level = LogLevel::Info,
             .component = "cdc_daemon",

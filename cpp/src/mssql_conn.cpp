@@ -1,7 +1,14 @@
 #include "mssql_conn.hpp"
 
+#include "pipeline_defaults.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <climits>
 #include <mutex>
 #include <sstream>
+#include <thread>
+#include <unistd.h>
 
 std::string sanitize_mssql_text_for_pg(const std::string& in) {
     auto append_codepoint = [](std::string& out, char32_t cp) {
@@ -157,13 +164,7 @@ void set_mssql_login_encryption(LOGINREC* login) {
 #endif
 }
 
-}  // namespace
-
-bool run_dbsql(DBPROCESS* db, const std::string& sql) {
-    return run_dbsql_impl(db, sql);
-}
-
-MssqlConn::MssqlConn(const MssqlSource& src) {
+DBPROCESS* open_mssql_handle(const MssqlSource& src) {
     ensure_db_library_init();
 
     LOGINREC* login = dblogin();
@@ -178,43 +179,20 @@ MssqlConn::MssqlConn(const MssqlSource& src) {
     set_mssql_login_port(login, src.port);
     DBSETLVERSION(login, DBVERSION_74);
 
-    // dbopen must receive host/IP only — "host,port" is resolved as a freetds.conf
-    // section name and breaks TLS login (Unknown host machine name).
-    handle = dbopen(login, src.host.c_str());
+    DBPROCESS* db = dbopen(login, src.host.c_str());
     dbloginfree(login);
-    if (!handle) {
+    if (!db) {
         const std::string detail =
             g_last_mssql_dblib_error.empty() ? "dbopen returned null" : g_last_mssql_dblib_error;
         throw std::runtime_error(
             "MSSQL connect failed conn_id=" + src.conn_id + " server=" + src.host + ":" +
             std::to_string(src.port) + " — " + detail);
     }
+    return db;
 }
 
-MssqlConn::~MssqlConn() {
-    if (handle) {
-        dbclose(handle);
-    }
-}
-
-void MssqlConn::use_database(const std::string& database) {
-    const std::string db = trim_mssql_text(database);
-    if (dbuse(handle, db.c_str()) == FAIL) {
-        throw std::runtime_error("MSSQL USE failed: " + db + " — " + format_dberror(handle));
-    }
-}
-
-void MssqlConn::exec(const std::string& sql) {
-    run_dbsql(handle, sql);
-    while (true) {
-        const int r = dbresults(handle);
-        if (r == NO_MORE_RESULTS) break;
-        if (r == FAIL) throw std::runtime_error("MSSQL exec drain failed: " + format_dberror(handle));
-    }
-}
-
-MssqlQueryResult MssqlConn::query(const std::string& sql) {
-    run_dbsql(handle, sql);
+MssqlQueryResult mssql_query_impl(DBPROCESS* handle, const std::string& sql) {
+    run_dbsql_impl(handle, sql);
     if (dbresults(handle) == FAIL) {
         throw std::runtime_error("MSSQL query dbresults failed: " + format_dberror(handle));
     }
@@ -263,10 +241,130 @@ MssqlQueryResult MssqlConn::query(const std::string& sql) {
     }
     while (true) {
         const int r = dbresults(handle);
-        if (r == NO_MORE_RESULTS) break;
-        if (r == FAIL) throw std::runtime_error("MSSQL query drain failed: " + format_dberror(handle));
+        if (r == NO_MORE_RESULTS) {
+            break;
+        }
+        if (r == FAIL) {
+            throw std::runtime_error("MSSQL query drain failed: " + format_dberror(handle));
+        }
     }
     return out;
+}
+
+int mssql_retry_attempt_limit(int configured) {
+    return configured <= 0 ? INT_MAX : std::max(1, configured);
+}
+
+bool mssql_error_is_transient(const std::string& err) {
+    std::string lower = err;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+    return lower.find("timeout") != std::string::npos || lower.find("timed out") != std::string::npos ||
+           lower.find("connection") != std::string::npos || lower.find("communication link") != std::string::npos ||
+           lower.find("broken pipe") != std::string::npos || lower.find("dead") != std::string::npos ||
+           lower.find("network") != std::string::npos || lower.find("dbprocess is dead") != std::string::npos ||
+           lower.find("dbprocess dead") != std::string::npos;
+}
+
+}  // namespace
+
+void mssql_drain_results(DBPROCESS* db) {
+    if (!db) {
+        return;
+    }
+    while (true) {
+        const int rc = dbresults(db);
+        if (rc == NO_MORE_RESULTS) {
+            break;
+        }
+        if (rc == FAIL) {
+            break;
+        }
+        while (dbnextrow(db) != NO_MORE_ROWS) {
+        }
+    }
+}
+
+void mssql_sleep_retry_backoff(int attempt, const MssqlRetryOptions& opts) {
+    const int capped = std::min(attempt, 10);
+    const int delay_ms = std::min(opts.max_ms, opts.base_ms * (1 << capped));
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+}
+
+bool mssql_run_dbsql_retry(MssqlConn& conn, const std::string& sql, const MssqlRetryOptions& opts) {
+    const int attempts = mssql_retry_attempt_limit(opts.max_attempts);
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        try {
+            return run_dbsql_impl(conn.handle, sql);
+        } catch (const std::exception& ex) {
+            mssql_drain_results(conn.handle);
+            if (!mssql_error_is_transient(ex.what()) || attempt + 1 >= attempts) {
+                throw;
+            }
+            conn.reconnect();
+            mssql_sleep_retry_backoff(attempt, opts);
+        }
+    }
+    return false;
+}
+
+bool run_dbsql(DBPROCESS* db, const std::string& sql) {
+    return run_dbsql_impl(db, sql);
+}
+
+MssqlConn::MssqlConn(const MssqlSource& src) : source_(src) {
+    handle = open_mssql_handle(source_);
+}
+
+MssqlConn::~MssqlConn() {
+    if (handle) {
+        dbclose(handle);
+        handle = nullptr;
+    }
+}
+
+void MssqlConn::reconnect() {
+    if (handle) {
+        dbclose(handle);
+        handle = nullptr;
+    }
+    handle = open_mssql_handle(source_);
+    if (!current_database_.empty()) {
+        use_database(current_database_);
+    }
+}
+
+void MssqlConn::use_database(const std::string& database) {
+    const std::string db = trim_mssql_text(database);
+    if (dbuse(handle, db.c_str()) == FAIL) {
+        throw std::runtime_error("MSSQL USE failed: " + db + " — " + format_dberror(handle));
+    }
+    current_database_ = db;
+}
+
+void MssqlConn::exec(const std::string& sql) {
+    run_dbsql(handle, sql);
+    mssql_drain_results(handle);
+}
+
+MssqlQueryResult MssqlConn::query(const std::string& sql) {
+    return mssql_query_impl(handle, sql);
+}
+
+MssqlQueryResult MssqlConn::query_retry(const std::string& sql, const MssqlRetryOptions& opts) {
+    const int attempts = mssql_retry_attempt_limit(opts.max_attempts);
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        try {
+            return mssql_query_impl(handle, sql);
+        } catch (const std::exception& ex) {
+            mssql_drain_results(handle);
+            if (!mssql_error_is_transient(ex.what()) || attempt + 1 >= attempts) {
+                throw;
+            }
+            reconnect();
+            mssql_sleep_retry_backoff(attempt, opts);
+        }
+    }
+    throw std::runtime_error("MSSQL query_retry exhausted attempts");
 }
 
 #endif

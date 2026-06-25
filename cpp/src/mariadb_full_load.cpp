@@ -989,6 +989,15 @@ FullLoadRunStats run_mariadb_full_load(
          {"workers", pipeline_defaults::kFullLoadWorkers},
          {"parallel_tables", kFullLoadParallelTables}});
 
+    if (conn_id_filter && !conn_id_filter->empty()) {
+        reset_full_load_in_progress_for_conn(app_pg.raw, *conn_id_filter, "mariadb");
+        clear_stale_full_load_in_progress(
+            app_pg.raw,
+            *conn_id_filter,
+            "mariadb",
+            pipeline_defaults::kFullLoadStaleInProgressMinutes);
+    }
+
     const auto targets_all = fetch_full_load_targets(app_pg.raw);
     std::vector<CatalogTableRow> targets;
     targets.reserve(targets_all.size());

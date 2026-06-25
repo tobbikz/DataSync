@@ -6,58 +6,100 @@
 #include "mongo_full_load.hpp"
 #include "mssql_full_load.hpp"
 #include "obs_log.hpp"
+#include "pipeline_defaults.hpp"
+
+#include <dirent.h>
 
 #include <sys/wait.h>
 #include <unistd.h>
-#include <algorithm>
+
+#include <atomic>
+#include <chrono>
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <map>
 #include <memory>
-#include <mutex>
+#include <optional>
+#include <signal.h>
+#include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace {
 
-std::mutex g_conn_lock_registry_mu;
-std::map<std::string, std::shared_ptr<std::mutex>> g_conn_locks;
+struct ConnFullLoadSlot {
+    std::mutex mu;
+    std::atomic<pid_t> child_pid{-1};
+};
 
-std::shared_ptr<std::mutex> conn_full_load_mutex(const std::string& conn_id) {
+std::mutex g_conn_lock_registry_mu;
+std::map<std::string, std::shared_ptr<ConnFullLoadSlot>> g_conn_slots;
+
+std::shared_ptr<ConnFullLoadSlot> conn_full_load_slot(const std::string& conn_id) {
     std::lock_guard<std::mutex> guard(g_conn_lock_registry_mu);
-    auto& slot = g_conn_locks[conn_id];
+    auto& slot = g_conn_slots[conn_id];
     if (!slot) {
-        slot = std::make_shared<std::mutex>();
+        slot = std::make_shared<ConnFullLoadSlot>();
     }
     return slot;
 }
 
-}  // namespace
-
-bool full_load_conn_busy(const std::string& conn_id) {
-    const auto mu = conn_full_load_mutex(conn_id);
-    std::unique_lock<std::mutex> lock(*mu, std::try_to_lock);
-    return !lock.owns_lock();
-}
-
-std::optional<DaemonFullLoadOutcome> try_run_daemon_full_load_isolated(
-    const AppConfig& cfg,
-    PGconn* log_pg,
-    const std::string& conn_id,
-    const std::string& batch_id) {
-    const auto mu = conn_full_load_mutex(conn_id);
-    std::unique_lock<std::mutex> lock(*mu, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        return std::nullopt;
+bool cmdline_contains_full_load_for_conn(const std::string& conn_id) {
+    DIR* dir = opendir("/proc");
+    if (!dir) {
+        return false;
     }
-    return run_daemon_full_load_isolated(cfg, log_pg, conn_id, batch_id);
+
+    bool found = false;
+    for (dirent* ent = readdir(dir); ent != nullptr; ent = readdir(dir)) {
+        if (!ent->d_name || ent->d_name[0] < '0' || ent->d_name[0] > '9') {
+            continue;
+        }
+        const std::string cmdline_path = std::string("/proc/") + ent->d_name + "/cmdline";
+        std::ifstream in(cmdline_path, std::ios::binary);
+        if (!in) {
+            continue;
+        }
+        std::string cmdline((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (cmdline.find("full-load") == std::string::npos) {
+            continue;
+        }
+        if (cmdline.find(conn_id) != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    closedir(dir);
+    return found;
 }
 
-namespace {
+bool full_load_subprocess_alive_for_conn(const std::string& conn_id) {
+    const auto slot = conn_full_load_slot(conn_id);
+    const pid_t tracked = slot->child_pid.load();
+    if (tracked > 0 && kill(tracked, 0) == 0) {
+        return true;
+    }
+    return cmdline_contains_full_load_for_conn(conn_id);
+}
 
-int spawn_wait(const std::vector<std::string>& args) {
+struct SpawnWaitResult {
+    int exit_code{127};
+    bool timed_out{false};
+    pid_t child_pid{-1};
+};
+
+SpawnWaitResult spawn_wait_with_timeout(
+    const std::vector<std::string>& args,
+    int timeout_seconds,
+    ConnFullLoadSlot* slot) {
+    SpawnWaitResult out;
     if (args.empty()) {
-        return 127;
+        return out;
     }
+
     std::vector<char*> argv;
     argv.reserve(args.size() + 1);
     for (const auto& arg : args) {
@@ -67,21 +109,56 @@ int spawn_wait(const std::vector<std::string>& args) {
 
     const pid_t pid = fork();
     if (pid < 0) {
-        return 127;
+        return out;
     }
     if (pid == 0) {
         execvp(argv[0], argv.data());
         _exit(127);
     }
 
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        return 127;
+    out.child_pid = pid;
+    if (slot) {
+        slot->child_pid.store(pid);
     }
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(1, timeout_seconds));
+
+    for (;;) {
+        int status = 0;
+        const pid_t got = waitpid(pid, &status, WNOHANG);
+        if (got == pid) {
+            if (WIFEXITED(status)) {
+                out.exit_code = WEXITSTATUS(status);
+            } else {
+                out.exit_code = 1;
+            }
+            break;
+        }
+        if (got < 0 && errno != EINTR) {
+            break;
+        }
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            out.timed_out = true;
+            kill(pid, SIGTERM);
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            if (kill(pid, 0) == 0) {
+                kill(pid, SIGKILL);
+            }
+            int status = 0;
+            waitpid(pid, &status, 0);
+            out.exit_code = 124;
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    return 1;
+
+    if (slot) {
+        slot->child_pid.store(-1);
+    }
+    return out;
 }
 
 std::string self_binary_path() {
@@ -95,6 +172,77 @@ std::string self_binary_path() {
 }
 
 }  // namespace
+
+bool full_load_conn_busy(const std::string& conn_id) {
+    const auto slot = conn_full_load_slot(conn_id);
+    std::unique_lock<std::mutex> lock(slot->mu, std::try_to_lock);
+    return !lock.owns_lock();
+}
+
+bool full_load_subprocess_running(const std::string& conn_id) {
+    return full_load_subprocess_alive_for_conn(conn_id);
+}
+
+bool try_recover_stale_full_load_lock(
+    PGconn* log_pg,
+    const std::string& conn_id,
+    const std::string& batch_id) {
+    if (full_load_subprocess_alive_for_conn(conn_id)) {
+        return false;
+    }
+
+    const auto slot = conn_full_load_slot(conn_id);
+    const pid_t tracked = slot->child_pid.load();
+    if (tracked > 0) {
+        int status = 0;
+        waitpid(tracked, &status, WNOHANG);
+        slot->child_pid.store(-1);
+    }
+
+    std::unique_lock<std::mutex> lock(slot->mu, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        if (log_pg) {
+            log_write(log_pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_daemon",
+                .message = "full-load lock still held in-process; no live subprocess (restart daemon if stuck)",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {{"tracked_child_pid", static_cast<long long>(tracked)}},
+            });
+        }
+        return false;
+    }
+
+    slot->child_pid.store(-1);
+    if (log_pg) {
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_daemon",
+            .message = "stale full-load conn lock recovered (no live subprocess)",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+        });
+    }
+    return true;
+}
+
+std::optional<DaemonFullLoadOutcome> try_run_daemon_full_load_isolated(
+    const AppConfig& cfg,
+    PGconn* log_pg,
+    const std::string& conn_id,
+    const std::string& batch_id) {
+    const auto slot = conn_full_load_slot(conn_id);
+    std::unique_lock<std::mutex> lock(slot->mu, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return std::nullopt;
+    }
+    return run_daemon_full_load_isolated(cfg, log_pg, conn_id, batch_id);
+}
 
 int run_conn_full_load(
     const AppConfig& cfg,
@@ -130,6 +278,10 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
 
     outcome.ran = true;
 
+    if (!full_load_subprocess_running(conn_id)) {
+        reset_full_load_in_progress_for_conn(log_pg, conn_id, db_engine);
+    }
+
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_daemon",
@@ -157,7 +309,36 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
         args.push_back("--config");
         args.push_back(config_path);
     }
-    outcome.exit_code = spawn_wait(args);
+
+    const auto slot = conn_full_load_slot(conn_id);
+    const int timeout_minutes = pipeline_defaults::kFullLoadDaemonSubprocessTimeoutMinutes;
+    const SpawnWaitResult spawn = spawn_wait_with_timeout(
+        args,
+        timeout_minutes * 60,
+        slot.get());
+    outcome.exit_code = spawn.exit_code;
+
+    if (spawn.timed_out) {
+        reset_full_load_in_progress_for_conn(log_pg, conn_id, db_engine);
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_daemon",
+            .message = "daemon full-load subprocess timed out; child terminated",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"db_engine", db_engine},
+                {"timeout_minutes", timeout_minutes},
+                {"child_pid", static_cast<long long>(spawn.child_pid)},
+                {"phase", "full_load"},
+            },
+        });
+        if (outcome.exit_code == 0) {
+            outcome.exit_code = 124;
+        }
+    }
 
     outcome.pending_after = count_full_load_pending(log_pg, conn_id, db_engine);
     outcome.tables_loaded = std::max(0, outcome.pending_tables - outcome.pending_after);
@@ -189,6 +370,7 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
             {"pending_onboard", pending_onboard},
             {"tables_loaded", outcome.tables_loaded},
             {"exit_code", outcome.exit_code},
+            {"timed_out", spawn.timed_out},
             {"phase", "full_load"},
         },
     });

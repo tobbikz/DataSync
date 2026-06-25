@@ -328,9 +328,19 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
     const std::string& db_engine,
     CatalogPipeline pipeline,
     CatalogHotTier hot_tier) {
-    const char* load_filter = (pipeline == CatalogPipeline::Capture)
-        ? "(NOT needs_full_load OR capture_during_full_load = true)"
-        : "needs_full_load = false";
+    // Apply: only tables with baseline snapshot in lake.
+    // Capture: MariaDB/Mongo may stream binlog during full load (capture_during_full_load).
+    // MSSQL fn_cdc_get_all_changes scans LSN ranges — only capture tables that finished initial COPY.
+    std::string load_filter;
+    if (pipeline == CatalogPipeline::Capture) {
+        if (db_engine == "mssql") {
+            load_filter = "(NOT needs_full_load)";
+        } else {
+            load_filter = "(NOT needs_full_load OR capture_during_full_load = true)";
+        }
+    } else {
+        load_filter = "needs_full_load = false";
+    }
 
     std::ostringstream sql;
     std::vector<const char*> vals;
@@ -883,6 +893,128 @@ BinlogGapRebootResult reboot_conn_after_mariadb_binlog_gap(
     return out;
 }
 
+#ifdef HAVE_FREETDS
+
+namespace {
+
+bool conn_had_mssql_capture_baseline(PGconn* pg, const std::string& conn_id) {
+    const char* vals[] = {conn_id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT
+            EXISTS (
+                SELECT 1 FROM cdc_catalog.cdc_mssql_lsn
+                WHERE conn_id = $1
+                  AND last_start_lsn IS NOT NULL
+            ) AS has_capture,
+            EXISTS (
+                SELECT 1 FROM cdc_catalog.catalog
+                WHERE conn_id = $1
+                  AND last_full_load_at IS NOT NULL
+            ) AS has_full_load
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+        if (res) {
+            PQclear(res);
+        }
+        return false;
+    }
+    const bool ok = std::string(PQgetvalue(res, 0, 0)) == "t" || std::string(PQgetvalue(res, 0, 1)) == "t";
+    PQclear(res);
+    return ok;
+}
+
+}  // namespace
+
+BinlogGapRebootResult reboot_conn_after_mssql_cdc_gap(
+    const AppConfig& cfg,
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& batch_id) {
+    BinlogGapRebootResult out;
+    if (!conn_had_mssql_capture_baseline(pg, conn_id)) {
+        seed_mssql_cdc_lsn_for_conn(cfg, pg, conn_id, batch_id);
+        out.ran = true;
+        out.t0_reset = true;
+        log_write(pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_kafka_mssql_capture",
+            .message = "mssql cdc gap: capture T0 seeded (conn not yet baselined)",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+        });
+        return out;
+    }
+
+    seed_mssql_cdc_lsn_for_conn(cfg, pg, conn_id, batch_id);
+    out.t0_reset = true;
+
+    const char* vals[] = {conn_id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET needs_full_load = true,
+            capture_during_full_load = true,
+            cdc_enabled = true,
+            status = 'pending',
+            last_error = 'mssql cdc lsn purged: auto full-load reboot',
+            engine_meta = engine_meta - 'stream_kafka_offsets' - 'stream_bookmarked_at',
+            updated_at = now()
+        WHERE conn_id = $1
+          AND db_engine = 'mssql'
+          AND active = true
+          AND has_pk = true
+          AND status NOT IN ('skipped', 'disabled')
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res && PQresultStatus(res) == PGRES_COMMAND_OK) {
+        out.tables_flagged = std::atoi(PQcmdTuples(res));
+    }
+    if (res) {
+        PQclear(res);
+    }
+
+    out.ran = true;
+    log_write(pg, {
+        .level = LogLevel::Warning,
+        .component = "cdc_kafka_mssql_capture",
+        .message = "mssql cdc gap: capture T0 reset and tables flagged for full-load reboot",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {{"tables_flagged", out.tables_flagged}},
+    });
+    return out;
+}
+
+#else
+
+BinlogGapRebootResult reboot_conn_after_mssql_cdc_gap(
+    const AppConfig&,
+    PGconn*,
+    const std::string&,
+    const std::string&) {
+    return {};
+}
+
+#endif
+
 void enable_cdc_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
@@ -1092,6 +1224,11 @@ void mark_catalog_cdc_success(PGconn* pg, long long catalog_id) {
             R"(
             UPDATE cdc_catalog.catalog
             SET last_cdc_at = now(),
+                status = CASE
+                    WHEN status = 'success'::cdc_catalog.replication_status
+                    THEN 'pending'::cdc_catalog.replication_status
+                    ELSE status
+                END,
                 updated_at = now()
             WHERE catalog_id = $1::bigint
             )",
@@ -1201,6 +1338,26 @@ void clear_stale_full_load_in_progress(
         vals);
 }
 
+void reset_full_load_in_progress_for_conn(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine) {
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET status = 'pending',
+            updated_at = now()
+        WHERE conn_id = $1
+          AND db_engine = $2::cdc_catalog.db_engine
+          AND status = 'full_load_in_progress'
+          AND needs_full_load = true
+        )",
+        2,
+        vals);
+}
+
 void rollback_cdc_in_progress_ids(PGconn* pg, const std::set<long long>& catalog_ids) {
     for (long long catalog_id : catalog_ids) {
         if (catalog_id <= 0) {
@@ -1212,7 +1369,10 @@ void rollback_cdc_in_progress_ids(PGconn* pg, const std::set<long long>& catalog
             pg,
             R"(
             UPDATE cdc_catalog.catalog
-            SET status = 'success',
+            SET status = CASE
+                WHEN needs_full_load THEN 'pending'::cdc_catalog.replication_status
+                ELSE 'success'::cdc_catalog.replication_status
+            END,
                 updated_at = now()
             WHERE catalog_id = $1::bigint
               AND status = 'cdc_in_progress'
@@ -1231,7 +1391,10 @@ int clear_stale_cdc_in_progress(
         pg,
         R"(
         UPDATE cdc_catalog.catalog
-        SET status = 'success',
+        SET status = CASE
+            WHEN needs_full_load THEN 'pending'::cdc_catalog.replication_status
+            ELSE 'success'::cdc_catalog.replication_status
+        END,
             updated_at = now()
         WHERE conn_id = $1
           AND db_engine = $2::cdc_catalog.db_engine

@@ -1281,7 +1281,10 @@ SELECT
     status,
     (active
      AND cdc_enabled
-     AND (NOT needs_full_load OR capture_during_full_load)
+     AND (
+       (db_engine <> 'mssql' AND (NOT needs_full_load OR capture_during_full_load))
+       OR (db_engine = 'mssql' AND NOT needs_full_load)
+     )
      AND has_pk
      AND status NOT IN ('skipped', 'disabled')) AS capture_ready,
     CASE
@@ -1308,7 +1311,10 @@ SELECT
     COUNT(*) FILTER (
         WHERE active
           AND cdc_enabled
-          AND (NOT needs_full_load OR capture_during_full_load)
+          AND (
+            (db_engine <> 'mssql' AND (NOT needs_full_load OR capture_during_full_load))
+            OR (db_engine = 'mssql' AND NOT needs_full_load)
+          )
           AND has_pk
           AND status NOT IN ('skipped', 'disabled')
     ) AS capture_ready

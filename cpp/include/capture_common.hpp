@@ -207,6 +207,12 @@ BinlogGapRebootResult reboot_conn_after_mariadb_binlog_gap(
     const std::string& conn_id,
     const std::string& batch_id);
 
+BinlogGapRebootResult reboot_conn_after_mssql_cdc_gap(
+    const AppConfig& cfg,
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& batch_id);
+
 bool seed_stream_capture_bookmark_if_needed(
     PGconn* pg,
     const std::string& conn_id,
@@ -240,6 +246,12 @@ void clear_stale_full_load_in_progress(
     const std::string& conn_id,
     const std::string& db_engine,
     int stale_minutes = 30);
+
+/** Reset all in-flight full-load rows for conn (e.g. after daemon subprocess timeout). */
+void reset_full_load_in_progress_for_conn(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine);
 
 int clear_stale_cdc_in_progress(
     PGconn* pg,

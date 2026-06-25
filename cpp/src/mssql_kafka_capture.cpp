@@ -373,8 +373,22 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         fetch_capture_catalog_tables(log_pg, conn_id, worker_id, worker_count, "mssql");
     clear_stale_cdc_in_progress(log_pg, conn_id, "mssql");
     if (tables.empty()) {
-        log_cdc_skip_no_tables(
-            log_pg, "cdc_kafka_mssql_capture", "capture", batch_id, conn_id, "mssql");
+        const int pending_full_load = count_full_load_pending(log_pg, conn_id, "mssql");
+        if (pending_full_load > 0) {
+            log_write(log_pg, {
+                .level = LogLevel::Info,
+                .component = "cdc_kafka_mssql_capture",
+                .message = "mssql capture idle: tables awaiting initial full load (CDC starts after first COPY)",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {{"pending_full_load", pending_full_load}},
+            });
+        } else {
+            log_cdc_skip_no_tables(
+                log_pg, "cdc_kafka_mssql_capture", "capture", batch_id, conn_id, "mssql");
+        }
         return stats;
     }
 
@@ -424,6 +438,7 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     int skipped_bad_capture = 0;
     int lsn_recovered = 0;
     int lsn_auto_seeded = 0;
+    std::set<long long> cdc_active_catalog_ids;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(rcfg.max_seconds);
     auto last_heartbeat = std::chrono::steady_clock::now() - std::chrono::hours(24);
 
@@ -443,6 +458,31 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         }
 
         auto from_lsn = get_stored_lsn(log_pg, conn_id, tbl.source_database, tbl.source_schema, tbl.source_table);
+        if (!from_lsn.empty()) {
+            const auto min_lsn_check = fetch_min_lsn(mssql, tbl.source_database, cap);
+            if (min_lsn_check && lsn_compare(from_lsn, *min_lsn_check) < 0) {
+                const auto reboot = reboot_conn_after_mssql_cdc_gap(cfg, log_pg, conn_id, batch_id);
+                rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+                stats.errors = reboot.ran ? 0 : 1;
+                log_write(log_pg, {
+                    .level = reboot.ran ? LogLevel::Warning : LogLevel::Error,
+                    .component = "cdc_kafka_mssql_capture",
+                    .message = reboot.ran ? "mssql cdc gap reboot completed"
+                                          : "mssql cdc gap reboot failed",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = tbl.source_schema,
+                    .source_table = tbl.source_table,
+                    .context = {
+                        {"from_lsn", lsn_hex(from_lsn)},
+                        {"min_lsn", lsn_hex(*min_lsn_check)},
+                        {"t0_reset", reboot.t0_reset},
+                        {"tables_flagged", reboot.tables_flagged},
+                    },
+                });
+                return stats;
+            }
+        }
         if (from_lsn.empty()) {
             const auto min_lsn = fetch_min_lsn(mssql, tbl.source_database, cap);
             if (!min_lsn) {
@@ -491,6 +531,7 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
 
         mssql.use_database(tbl.source_database);
         mark_catalog_cdc_in_progress(log_pg, tbl.catalog_id);
+        cdc_active_catalog_ids.insert(tbl.catalog_id);
         const std::string fn = "cdc.fn_cdc_get_all_changes_" + cap;
         const std::string q = "SELECT * FROM " + fn + "(" + lsn_sql_literal(window->first) + ", " +
                               lsn_sql_literal(window->second) + ", N'all update old')";
@@ -699,17 +740,13 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     return stats;
 }
 
-bool seed_mssql_cdc_lsn_for_table_if_absent(
+bool seed_mssql_cdc_lsn_t0_for_table(
     PGconn* log_pg,
     MssqlConn& mssql,
     const std::string& conn_id,
     const std::string& database,
     const std::string& schema,
     const std::string& table) {
-    if (!get_stored_lsn(log_pg, conn_id, database, schema, table).empty()) {
-        return false;
-    }
-
     const char* vals[] = {conn_id.c_str(), database.c_str(), schema.c_str(), table.c_str()};
     PGresult* meta_res = PQexecParams(
         log_pg,
@@ -748,16 +785,25 @@ bool seed_mssql_cdc_lsn_for_table_if_absent(
 
     cdc_scan(mssql, database);
     mssql.use_database(database);
-    const auto max_rows = mssql.query("SELECT sys.fn_cdc_get_max_lsn()");
-    if (max_rows.rows.empty() || max_rows.rows[0].empty()) {
+    const auto max_lsn = fetch_max_lsn(mssql, database);
+    if (!max_lsn) {
         return false;
     }
-    const auto max_lsn = lsn_as_bytes(max_rows.rows[0][0]);
-    if (max_lsn.empty()) {
-        return false;
-    }
-    upsert_lsn(log_pg, conn_id, database, schema, table, max_lsn, {});
+    upsert_lsn(log_pg, conn_id, database, schema, table, *max_lsn, {});
     return true;
+}
+
+bool seed_mssql_cdc_lsn_for_table_if_absent(
+    PGconn* log_pg,
+    MssqlConn& mssql,
+    const std::string& conn_id,
+    const std::string& database,
+    const std::string& schema,
+    const std::string& table) {
+    if (!get_stored_lsn(log_pg, conn_id, database, schema, table).empty()) {
+        return false;
+    }
+    return seed_mssql_cdc_lsn_t0_for_table(log_pg, mssql, conn_id, database, schema, table);
 }
 
 int seed_mssql_cdc_lsn_for_conn(

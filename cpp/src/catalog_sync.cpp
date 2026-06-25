@@ -4,6 +4,7 @@
 #include "mariadb_preflight.hpp"
 #include "mongo_preflight.hpp"
 #include "mssql_conn.hpp"
+#include "mssql_preflight.hpp"
 #include "mongo_conn.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
@@ -912,21 +913,31 @@ CatalogSyncStats sync_mssql_catalog(
         {{"db_engine", "mssql"}, {"host", source.host}, {"port", source.port}, {"database", source.db_name}});
 
     MssqlConn mssql(source);
-        if (!mssql_db_filter_is_all(source.db_name)) {
-        mssql.use_database(source.db_name.empty() ? "master" : source.db_name);
-        const MssqlQueryResult cdc_flag = mssql.query(
-            "SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()");
-        const bool cdc_enabled =
-            !cdc_flag.rows.empty() && !cdc_flag.rows[0].empty() && cdc_flag.rows[0][0].text == "1";
-        if (!cdc_enabled) {
+    if (!mssql_db_filter_is_all(source.db_name)) {
+        const std::string database = source.db_name.empty() ? "master" : source.db_name;
+        const MssqlPreflightResult preflight = check_mssql_cdc_ready(mssql, database);
+        for (const auto& w : preflight.warnings) {
             log_checkpoint(
                 log_pg,
                 LogLevel::Warning,
                 batch_id,
                 source.conn_id,
-                "mssql discover skipped: database has CDC disabled",
-                {{"database", source.db_name}});
-            return {};
+                "mssql cdc preflight warning",
+                {{"detail", w}});
+        }
+        if (!preflight.ok) {
+            nlohmann::json err_ctx = nlohmann::json::array();
+            for (const auto& e : preflight.errors) {
+                err_ctx.push_back(e);
+            }
+            log_checkpoint(
+                log_pg,
+                LogLevel::Error,
+                batch_id,
+                source.conn_id,
+                "mssql cdc preflight failed",
+                {{"errors", err_ctx}});
+            throw std::runtime_error("MSSQL CDC preflight failed for " + source.conn_id);
         }
     }
 

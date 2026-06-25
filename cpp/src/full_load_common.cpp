@@ -1,5 +1,8 @@
 #include "full_load_common.hpp"
 
+#include "mariadb_schema.hpp"
+#include "pg_conn.hpp"
+
 #include <iomanip>
 #include <sstream>
 
@@ -48,6 +51,32 @@ std::string csv_escape(const std::string& value) {
     }
     out += "\"";
     return out;
+}
+
+long long lake_table_row_count(PGconn* pg, const std::string& schema, const std::string& table) {
+    const std::string sql =
+        "SELECT COUNT(*)::bigint FROM " + pg_ident(schema) + "." + pg_ident(table);
+    PGresult* res = PQexec(pg, sql.c_str());
+    long long count = -1;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        count = std::atoll(PQgetvalue(res, 0, 0));
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return count;
+}
+
+void acquire_full_load_table_lock(PGconn* pg, long long catalog_id) {
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    pg_exec_params_simple(pg, "SELECT pg_advisory_lock($1::bigint)", 1, vals);
+}
+
+void release_full_load_table_lock(PGconn* pg, long long catalog_id) {
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    pg_exec_params_simple(pg, "SELECT pg_advisory_unlock($1::bigint)", 1, vals);
 }
 
 void log(

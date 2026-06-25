@@ -2,6 +2,7 @@
 
 #include "obs_log.hpp"
 
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
@@ -15,6 +16,10 @@ long long elapsed_ms(const std::chrono::steady_clock::time_point& start);
 std::string utc_now_ts();
 std::string utc_now_date();
 std::string csv_escape(const std::string& value);
+
+long long lake_table_row_count(PGconn* pg, const std::string& schema, const std::string& table);
+void acquire_full_load_table_lock(PGconn* pg, long long catalog_id);
+void release_full_load_table_lock(PGconn* pg, long long catalog_id);
 
 void log(
     PGconn* log_pg,

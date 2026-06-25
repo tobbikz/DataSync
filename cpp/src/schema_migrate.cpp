@@ -115,7 +115,10 @@ void run_diagnostics(PGconn* pg) {
         R"(SELECT conn_id, source_schema, source_table, active, cdc_enabled,
                   needs_full_load, capture_during_full_load, has_pk, status,
                   (active AND cdc_enabled
-                   AND (NOT needs_full_load OR capture_during_full_load)
+                   AND (
+                     (db_engine <> 'mssql' AND (NOT needs_full_load OR capture_during_full_load))
+                     OR (db_engine = 'mssql' AND NOT needs_full_load)
+                   )
                    AND has_pk
                    AND status NOT IN ('skipped', 'disabled')) AS capture_ready
            FROM cdc_catalog.catalog

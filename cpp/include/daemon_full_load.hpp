@@ -27,6 +27,15 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
 /** True when another thread holds the per-conn_id full-load lock (subprocess + onboard). */
 bool full_load_conn_busy(const std::string& conn_id);
 
+/** True when a DataSync full-load subprocess for conn_id is alive (see /proc cmdline). */
+bool full_load_subprocess_running(const std::string& conn_id);
+
+/** Clear in-process lock when no full-load subprocess is alive (orphaned waiter / dead child). */
+bool try_recover_stale_full_load_lock(
+    PGconn* log_pg,
+    const std::string& conn_id,
+    const std::string& batch_id);
+
 /** Acquire conn lock; returns nullopt if another full-load/onboard is already running. */
 std::optional<DaemonFullLoadOutcome> try_run_daemon_full_load_isolated(
     const AppConfig& cfg,

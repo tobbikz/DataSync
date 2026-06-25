@@ -12,6 +12,10 @@ constexpr int kHotApplyConsumerCount = 3;
 constexpr int kCaptureWorkerCount = 1;
 constexpr int kFullLoadParallelTables = 2;
 constexpr int kFullLoadWorkers = 4;
+/** MSSQL/FreeTDS: fewer concurrent connections than MariaDB to avoid source hangs. */
+constexpr int kMssqlFullLoadParallelTables = 1;
+constexpr int kMssqlFullLoadWorkers = 2;
+constexpr int kMssqlFullLoadCopyProgressInterval = 10;
 
 // Kafka
 constexpr std::string_view kKafkaBootstrapDefault = "localhost:9092";
@@ -51,10 +55,16 @@ constexpr int kFullLoadMaxFailRetries = 5;
 constexpr int kFullLoadFailedCooldownMinutes = 240;
 constexpr int kFullLoadSourceSleepMs = 0;
 constexpr int kFullLoadStaleInProgressMinutes = 30;
+constexpr int kMssqlFullLoadStaleInProgressMinutes = 10;
+/** Max wall time for daemon fork+exec `DataSync full-load --conn-id` subprocess. */
+constexpr int kFullLoadDaemonSubprocessTimeoutMinutes = 120;
 constexpr int kLakePartitionMonthsAhead = 3;
 constexpr int kMariadbReconnectMaxAttempts = 0;
 constexpr int kMariadbReconnectBaseMs = 500;
 constexpr int kMariadbReconnectMaxMs = 60000;
+constexpr int kMssqlReconnectMaxAttempts = 0;
+constexpr int kMssqlReconnectBaseMs = 500;
+constexpr int kMssqlReconnectMaxMs = 60000;
 
 // DDL
 constexpr bool kDdlSyncColumns = true;

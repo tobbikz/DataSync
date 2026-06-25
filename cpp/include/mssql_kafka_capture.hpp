@@ -27,6 +27,15 @@ bool seed_mssql_cdc_lsn_for_table_if_absent(
     const std::string& database,
     const std::string& schema,
     const std::string& table);
+
+/** Force cdc_mssql_lsn to current max LSN (T0) when full load starts; overwrites stale positions. */
+bool seed_mssql_cdc_lsn_t0_for_table(
+    PGconn* log_pg,
+    MssqlConn& mssql,
+    const std::string& conn_id,
+    const std::string& database,
+    const std::string& schema,
+    const std::string& table);
 #endif
 
 /** Seed all catalog tables for conn; skips tables that already have LSN rows. */

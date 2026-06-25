@@ -11,6 +11,12 @@
 #include <string>
 #include <vector>
 
+struct MssqlRetryOptions {
+    int max_attempts{0};
+    int base_ms{500};
+    int max_ms{60000};
+};
+
 #ifdef HAVE_FREETDS
 
 struct MssqlCell {
@@ -36,10 +42,20 @@ struct MssqlConn {
     MssqlConn(const MssqlConn&) = delete;
     MssqlConn& operator=(const MssqlConn&) = delete;
 
+    void reconnect();
     void use_database(const std::string& database);
     void exec(const std::string& sql);
     MssqlQueryResult query(const std::string& sql);
+    MssqlQueryResult query_retry(const std::string& sql, const MssqlRetryOptions& opts);
+
+  private:
+    MssqlSource source_;
+    std::string current_database_;
 };
+
+void mssql_sleep_retry_backoff(int attempt, const MssqlRetryOptions& opts);
+void mssql_drain_results(DBPROCESS* db);
+bool mssql_run_dbsql_retry(MssqlConn& conn, const std::string& sql, const MssqlRetryOptions& opts);
 
 /** Execute literal SQL via dbcmd + dbsqlexec (safe when SQL contains '%'). */
 bool run_dbsql(DBPROCESS* db, const std::string& sql);
