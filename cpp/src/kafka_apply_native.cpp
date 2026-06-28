@@ -328,9 +328,9 @@ void ensure_apply_positions(
     const std::string& topic_prefix,
     const std::string& topic_mode,
     int topic_buckets) {
-    for (const auto& [key, meta] : meta_by_key) {
+    for (const auto& [lake_key, meta] : meta_by_key) {
         const std::string topic = topic_for_catalog_table(
-            topic_prefix, key.first, key.second, topic_mode, topic_buckets, meta.hot);
+            topic_prefix, lake_key.first, lake_key.second, topic_mode, topic_buckets, meta.hot);
         const std::string cid = std::to_string(meta.catalog_id);
         auto mark_ap_failed = [&](const std::string& err_msg) {
             const std::string trunc = err_msg.substr(0, 950);
@@ -353,8 +353,8 @@ void ensure_apply_positions(
                 pg,
                 meta.catalog_id,
                 conn_id,
-                meta.source_schema,
-                meta.source_table,
+                lake_key.first,
+                lake_key.second,
                 topic,
                 &ap_err)) {
             mark_ap_failed("apply_position upsert failed: " + ap_err);
@@ -366,12 +366,16 @@ TableKey lake_key_for_source(
     const std::map<TableKey, CatalogMeta>& meta_by_key,
     const std::string& source_schema,
     const std::string& source_table) {
+    const TableKey direct{source_schema, source_table};
+    if (meta_by_key.count(direct)) {
+        return direct;
+    }
     for (const auto& [lake_key, meta] : meta_by_key) {
         if (meta.source_schema == source_schema && meta.source_table == source_table) {
             return lake_key;
         }
     }
-    return {source_schema, source_table};
+    return direct;
 }
 
 std::set<TableKey> fetch_quarantined(

@@ -195,6 +195,18 @@ void ensure_apply_position_for_catalog(
     const std::string& db_engine,
     long long catalog_id);
 
+/** Unique (source_schema, source_table) for apply_position_object_uk — MSSQL includes database in schema. */
+struct ApplyPositionObjectKey {
+    std::string source_schema;
+    std::string source_table;
+};
+
+ApplyPositionObjectKey apply_position_object_key(
+    const std::string& db_engine,
+    const std::string& source_database,
+    const std::string& source_schema,
+    const std::string& source_table);
+
 /** Idempotent apply_position row: clears stale catalog_id / object-key conflicts before insert. */
 bool upsert_apply_position(
     PGconn* pg,

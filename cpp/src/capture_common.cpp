@@ -1620,6 +1620,25 @@ void log_cdc_skip_no_tables(
     });
 }
 
+ApplyPositionObjectKey apply_position_object_key(
+    const std::string& db_engine,
+    const std::string& source_database,
+    const std::string& source_schema,
+    const std::string& source_table) {
+    ApplyPositionObjectKey key;
+    if (db_engine == "mssql") {
+        key.source_schema = mssql_pg_schema_name(source_database, source_schema);
+        key.source_table = mssql_pg_table_name(source_table);
+    } else if (db_engine == "mongodb") {
+        key.source_schema = mongo_catalog_source_schema(source_database, source_schema);
+        key.source_table = mongo_pg_table_name(source_table);
+    } else {
+        key.source_schema = source_schema;
+        key.source_table = source_table;
+    }
+    return key;
+}
+
 bool upsert_apply_position(
     PGconn* pg,
     long long catalog_id,
@@ -1743,9 +1762,8 @@ void ensure_apply_positions_for_conn(
         }
         const std::string topic = topic_for_catalog_table(
             topic_prefix, lake_schema, lake_table, topic_mode, topic_buckets, table_hot);
-        const std::string pos_schema = (db_engine == "mongodb")
-            ? mongo_catalog_source_schema(source_database, source_schema)
-            : (db_engine == "mssql" ? source_schema : lake_schema);
+        const ApplyPositionObjectKey pos_key = apply_position_object_key(
+            db_engine, source_database, source_schema, source_table);
         auto mark_ap_failed = [&](const std::string& err_msg) {
             const std::string trunc = err_msg.substr(0, 950);
             const char* fail_vals[] = {catalog_id.c_str(), trunc.c_str()};
@@ -1767,8 +1785,8 @@ void ensure_apply_positions_for_conn(
                 pg,
                 std::stoll(catalog_id),
                 conn_id,
-                pos_schema,
-                lake_table,
+                pos_key.source_schema,
+                pos_key.source_table,
                 topic,
                 &ap_err)) {
             mark_ap_failed("apply_position upsert failed: " + ap_err);
@@ -1834,9 +1852,8 @@ void ensure_apply_position_for_catalog(
     }
     const std::string topic = topic_for_catalog_table(
         topic_prefix, lake_schema, lake_table, topic_mode, topic_buckets, table_hot);
-    const std::string pos_schema = (db_engine == "mongodb")
-        ? mongo_catalog_source_schema(source_database, source_schema)
-        : (db_engine == "mssql" ? source_schema : lake_schema);
+    const ApplyPositionObjectKey pos_key =
+        apply_position_object_key(db_engine, source_database, source_schema, source_table);
     auto mark_ap_failed = [&](const std::string& err_msg) {
         const std::string trunc = err_msg.substr(0, 950);
         const char* fail_vals[] = {row_catalog_id.c_str(), trunc.c_str()};
@@ -1857,7 +1874,13 @@ void ensure_apply_position_for_catalog(
     };
     std::string ap_err;
     if (!upsert_apply_position(
-            pg, catalog_id, conn_id, pos_schema, lake_table, topic, &ap_err)) {
+            pg,
+            catalog_id,
+            conn_id,
+            pos_key.source_schema,
+            pos_key.source_table,
+            topic,
+            &ap_err)) {
         mark_ap_failed("apply_position upsert failed: " + ap_err);
     }
 }
