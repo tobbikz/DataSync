@@ -1556,23 +1556,7 @@ bool upsert_apply_position(
     const std::string& kafka_topic,
     std::string* error_out) {
     const std::string catalog_id_str = std::to_string(catalog_id);
-    const char* del_vals[] = {
-        catalog_id_str.c_str(),
-        conn_id.c_str(),
-        source_schema.c_str(),
-        source_table.c_str(),
-    };
-    pg_exec_params_simple(
-        pg,
-        R"(
-        DELETE FROM cdc_catalog.apply_position
-        WHERE catalog_id = $1::bigint
-           OR (conn_id = $2 AND source_schema = $3 AND source_table = $4 AND catalog_id <> $1::bigint)
-        )",
-        4,
-        del_vals);
-
-    const char* ins_vals[] = {
+    const char* upsert_vals[] = {
         catalog_id_str.c_str(),
         conn_id.c_str(),
         source_schema.c_str(),
@@ -1582,13 +1566,23 @@ bool upsert_apply_position(
     PGresult* res = PQexecParams(
         pg,
         R"(
+        WITH deleted AS (
+            DELETE FROM cdc_catalog.apply_position
+            WHERE catalog_id = $1::bigint
+               OR (conn_id = $2 AND source_schema = $3 AND source_table = $4 AND catalog_id <> $1::bigint)
+        )
         INSERT INTO cdc_catalog.apply_position
             (catalog_id, conn_id, source_schema, source_table, kafka_topic, status)
-        VALUES ($1::bigint, $2, $3, $4, $5, 'healthy')
+        VALUES ($1::bigint, $2, $3, $4, $5, 'healthy'::cdc_catalog.cdc_health_status)
+        ON CONFLICT (conn_id, source_schema, source_table) DO UPDATE SET
+            catalog_id = EXCLUDED.catalog_id,
+            kafka_topic = EXCLUDED.kafka_topic,
+            status = EXCLUDED.status,
+            updated_at = now()
         )",
         5,
         nullptr,
-        ins_vals,
+        upsert_vals,
         nullptr,
         nullptr,
         0);
@@ -1629,12 +1623,20 @@ void ensure_apply_positions_for_conn(
     PGresult* res = PQexecParams(
         pg,
         R"(
-        SELECT catalog_id, source_database, source_schema, source_table, hot
-        FROM cdc_catalog.catalog
-        WHERE conn_id = $1
-          AND db_engine = $2::cdc_catalog.db_engine
-          AND active = true
-          AND has_pk = true
+        SELECT c.catalog_id, c.source_database, c.source_schema, c.source_table, c.hot
+        FROM cdc_catalog.catalog c
+        WHERE c.conn_id = $1
+          AND c.db_engine = $2::cdc_catalog.db_engine
+          AND c.active = true
+          AND c.has_pk = true
+          AND (
+            NOT c.cdc_enabled
+            OR c.needs_full_load
+            OR NOT EXISTS (
+                SELECT 1 FROM cdc_catalog.apply_position ap
+                WHERE ap.catalog_id = c.catalog_id
+            )
+          )
         )",
         2,
         nullptr,

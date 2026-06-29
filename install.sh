@@ -575,6 +575,22 @@ wait_kafka_compose() {
   return 1
 }
 
+wait_datasync_stopped() {
+  local i state
+  for i in $(seq 1 130); do
+    state="$(docker_compose ps datasync --format '{{.State}}' 2>/dev/null | head -1 || true)"
+    if [[ -z "$state" || "$state" == "exited" || "$state" == "dead" ]]; then
+      return 0
+    fi
+    if [[ "$state" != *running* && "$state" != *restarting* ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  warn "datasync container did not stop within 130s (grace period is 120s)"
+  return 1
+}
+
 run_host_discover() {
   if ! kafka_tcp_ok; then
     warn "Kafka not ready — skipping discover"
@@ -596,6 +612,8 @@ host_stack_start() {
   cd "$ROOT"
   export DATASYNC_KAFKA_DATA="${DATASYNC_KAFKA_DATA:-$ROOT/kafka-data}"
   ensure_kafka_data_dir
+  docker_compose stop datasync 2>/dev/null || true
+  wait_datasync_stopped || true
   host_build_datasync
   docker_compose up -d kafka
   wait_kafka_compose || exit 1
@@ -610,6 +628,7 @@ host_stack_stop() {
   ensure_container_runtime || exit 0
   cd "$ROOT"
   docker_compose stop datasync kafka 2>/dev/null || true
+  wait_datasync_stopped || true
 }
 
 kafka_set_topic_retention() {

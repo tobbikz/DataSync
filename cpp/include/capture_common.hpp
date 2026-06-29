@@ -207,7 +207,7 @@ ApplyPositionObjectKey apply_position_object_key(
     const std::string& source_schema,
     const std::string& source_table);
 
-/** Idempotent apply_position row: clears stale catalog_id / object-key conflicts before insert. */
+/** Idempotent apply_position row: atomic CTE delete + INSERT ON CONFLICT (object_uk). */
 bool upsert_apply_position(
     PGconn* pg,
     long long catalog_id,

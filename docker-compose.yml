@@ -68,6 +68,7 @@ services:
     volumes:
       - ./config.json:/app/config.json:ro,z
     restart: unless-stopped
+    stop_grace_period: 120s
     depends_on:
       kafka:
         condition: service_healthy
