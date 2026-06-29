@@ -1269,47 +1269,28 @@ void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string
         vals);
 }
 
-void mark_catalog_reconcile_failed(
-    PGconn* pg,
-    long long catalog_id,
-    const std::string& error,
-    bool needs_full_load) {
-    const std::string id = std::to_string(catalog_id);
-    const std::string trunc = error.substr(0, 1000);
-    const char* needs_fl = needs_full_load ? "true" : "false";
-    const char* vals[] = {id.c_str(), trunc.c_str(), needs_fl};
-    pg_exec_params_simple(
-        pg,
-        R"(
-        UPDATE cdc_catalog.catalog
-        SET status = 'failed',
-            last_error = $2,
-            last_error_at = now(),
-            needs_full_load = $3::boolean,
-            updated_at = now()
-        WHERE catalog_id = $1::bigint
-        )",
-        3,
-        vals);
-}
-
 void mark_catalog_reconcile_healed(PGconn* pg, long long catalog_id) {
     const std::string id = std::to_string(catalog_id);
     const char* vals[] = {id.c_str()};
-    if (catalog_needs_full_load(pg, catalog_id)) {
-        return;
-    }
     pg_exec_params_simple(
         pg,
         R"(
         UPDATE cdc_catalog.catalog
-        SET status = 'success',
+        SET status = CASE
+                WHEN status = 'failed'::cdc_catalog.replication_status
+                     AND last_error LIKE 'reconcile:%'
+                THEN 'success'::cdc_catalog.replication_status
+                ELSE status
+            END,
+            needs_full_load = CASE
+                WHEN last_error LIKE 'reconcile:%' THEN false
+                ELSE needs_full_load
+            END,
             last_error = NULL,
             last_error_at = NULL,
             updated_at = now()
         WHERE catalog_id = $1::bigint
           AND last_error LIKE 'reconcile:%'
-          AND NOT needs_full_load
         )",
         1,
         vals);

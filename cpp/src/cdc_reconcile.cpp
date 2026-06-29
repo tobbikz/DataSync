@@ -263,26 +263,6 @@ std::string classify_row_drift(long long source_rows, long long lake_rows) {
     return "append_zombie";
 }
 
-bool reconcile_failure_needs_full_load(const std::string& drift_kind, const std::string& row_status) {
-    if (row_status != "fail") {
-        return false;
-    }
-    return drift_kind == "source_ahead" || drift_kind == "append_zombie";
-}
-
-std::string reconcile_failure_message(
-    const std::string& drift_kind,
-    long long source_rows,
-    long long lake_rows,
-    const std::string& row_status,
-    const std::string& overall_status) {
-    std::ostringstream oss;
-    oss << "reconcile: " << drift_kind << " row_count_" << row_status
-        << " (source=" << source_rows << " lake=" << lake_rows << " delta=" << (source_rows - lake_rows)
-        << ", overall=" << overall_status << ")";
-    return oss.str();
-}
-
 std::string eval_apply_lag_status(int apply_lag_seconds, const ReconcileRuntime& cfg) {
     if (apply_lag_seconds < 0) {
         return "skip";
@@ -1379,14 +1359,9 @@ int run_reconcile_cli(
             insert_reconcile_result(
                 log_pg, run_id, row, source_rows, lake_rows, row_status, apply_meta, overall, checks);
 
-            if (overall == "fail") {
-                const bool needs_fl = reconcile_failure_needs_full_load(drift_kind, row_status);
-                mark_catalog_reconcile_failed(
-                    log_pg,
-                    row.catalog_id,
-                    reconcile_failure_message(drift_kind, source_rows, lake_rows, row_status, overall),
-                    needs_fl);
-            } else if (overall == "ok" && row_status == "ok") {
+            // Reconcile outcomes are persisted in reconciliation_result only.
+            // Do not mark catalog.status failed or needs_full_load — that blocks CDC gap recovery.
+            if (overall == "ok" && row_status == "ok") {
                 mark_catalog_reconcile_healed(log_pg, row.catalog_id);
             }
 
