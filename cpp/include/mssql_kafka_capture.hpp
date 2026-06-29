@@ -38,12 +38,13 @@ bool seed_mssql_cdc_lsn_t0_for_table(
     const std::string& table);
 #endif
 
-/** Seed all catalog tables for conn; skips tables that already have LSN rows. */
+/** Seed catalog LSN rows for conn. When force_t0, overwrite every table with current max LSN. */
 int seed_mssql_cdc_lsn_for_conn(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::string& batch_id);
+    const std::string& batch_id,
+    bool force_t0 = false);
 
 MssqlCaptureStats run_mssql_kafka_capture_slice(
     const AppConfig& cfg,

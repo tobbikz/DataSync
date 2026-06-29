@@ -1271,6 +1271,38 @@ TableLoadOutcome load_one_table(
 
     mark_catalog_success(app_pg.raw, target.catalog_id);
 
+    try {
+        if (seed_mssql_cdc_lsn_t0_for_table(
+                app_pg.raw,
+                mssql,
+                target.conn_id,
+                target.source_database,
+                target.source_schema,
+                target.source_table)) {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Info,
+                batch_id,
+                "mssql LSN T0 reset after full load",
+                {},
+                target.conn_id,
+                target.source_schema,
+                target.source_table);
+        }
+    } catch (const std::exception& ex) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Warning,
+            batch_id,
+            "mssql LSN T0 reset after full load failed",
+            {{"error", ex.what()}},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
+    }
+
     if (!onboard_table_after_full_load(
             app_pg.raw,
             target.conn_id,

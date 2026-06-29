@@ -46,8 +46,8 @@ int seed_mssql_cdc_lsn_for_conn(
     const AppConfig&,
     PGconn*,
     const std::string&,
-    const std::optional<std::string>&,
-    const std::string&) {
+    const std::string&,
+    bool) {
     return 0;
 }
 
@@ -251,41 +251,32 @@ bool recover_purged_lsn(
     return true;
 }
 
-/** When stored LSN is at/after max (typical post full-load seed), rewind to min_lsn to replay CDC window. */
-bool recover_idle_at_max_lsn(
+/** Keep idle cursor at the current CDC tip so retention cleanup cannot outrun it. */
+bool bump_lsn_to_max(
     PGconn* log_pg,
     MssqlConn& mssql,
     const std::string& conn_id,
     const CaptureCatalogTable& tbl,
-    const std::string& capture_instance,
     const std::vector<uint8_t>& from_lsn,
-    const std::string& batch_id) {
+    const std::string& batch_id,
+    const char* reason) {
     const auto max_lsn = fetch_max_lsn(mssql, tbl.source_database);
-    const auto min_lsn = fetch_min_lsn(mssql, tbl.source_database, capture_instance);
-    if (!max_lsn || !min_lsn) {
+    if (!max_lsn) {
         return false;
     }
-    if (lsn_compare(from_lsn, *max_lsn) < 0) {
-        return false;
-    }
-    if (lsn_compare(*min_lsn, *max_lsn) >= 0) {
-        return false;
-    }
-    upsert_lsn(log_pg, conn_id, tbl.source_database, tbl.source_schema, tbl.source_table, *min_lsn, {});
+    upsert_lsn(log_pg, conn_id, tbl.source_database, tbl.source_schema, tbl.source_table, *max_lsn, {});
     log_write(log_pg, {
-        .level = LogLevel::Warning,
+        .level = LogLevel::Info,
         .component = "cdc_kafka_mssql_capture",
-        .message = "mssql lsn idle at max; rewound to min_lsn for replay",
+        .message = "mssql capture lsn advanced to max_lsn",
         .batch_id = batch_id,
         .conn_id = conn_id,
         .source_schema = tbl.source_schema,
         .source_table = tbl.source_table,
         .context = {
-            {"stop_reason", "gap_detected"},
-            {"from_lsn", lsn_hex(from_lsn)},
+            {"stop_reason", reason},
+            {"from_lsn", from_lsn.empty() ? "" : lsn_hex(from_lsn)},
             {"max_lsn", lsn_hex(*max_lsn)},
-            {"min_lsn", lsn_hex(*min_lsn)},
-            {"capture_instance", capture_instance},
         },
     });
     return true;
@@ -438,6 +429,7 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     int skipped_bad_capture = 0;
     int lsn_recovered = 0;
     int lsn_auto_seeded = 0;
+    int lsn_bumped_to_max = 0;
     std::set<long long> cdc_active_catalog_ids;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(rcfg.max_seconds);
     auto last_heartbeat = std::chrono::steady_clock::now() - std::chrono::hours(24);
@@ -461,26 +453,10 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         if (!from_lsn.empty()) {
             const auto min_lsn_check = fetch_min_lsn(mssql, tbl.source_database, cap);
             if (min_lsn_check && lsn_compare(from_lsn, *min_lsn_check) < 0) {
-                const auto reboot = reboot_conn_after_mssql_cdc_gap(cfg, log_pg, conn_id, batch_id);
-                rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
-                stats.errors = reboot.ran ? 0 : 1;
-                log_write(log_pg, {
-                    .level = reboot.ran ? LogLevel::Warning : LogLevel::Error,
-                    .component = "cdc_kafka_mssql_capture",
-                    .message = reboot.ran ? "mssql cdc gap reboot completed"
-                                          : "mssql cdc gap reboot failed",
-                    .batch_id = batch_id,
-                    .conn_id = conn_id,
-                    .source_schema = tbl.source_schema,
-                    .source_table = tbl.source_table,
-                    .context = {
-                        {"from_lsn", lsn_hex(from_lsn)},
-                        {"min_lsn", lsn_hex(*min_lsn_check)},
-                        {"t0_reset", reboot.t0_reset},
-                        {"tables_flagged", reboot.tables_flagged},
-                    },
-                });
-                return stats;
+                if (recover_purged_lsn(log_pg, mssql, conn_id, tbl, cap, from_lsn, batch_id)) {
+                    from_lsn = *min_lsn_check;
+                    lsn_recovered += 1;
+                }
             }
         }
         if (from_lsn.empty()) {
@@ -506,23 +482,12 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
 
         auto window = resolve_lsn_window(mssql, tbl.source_database, cap, from_lsn);
         if (!window) {
-            if (recover_purged_lsn(log_pg, mssql, conn_id, tbl, cap, from_lsn, batch_id)) {
-                if (auto recovered = fetch_min_lsn(mssql, tbl.source_database, cap)) {
-                    from_lsn = *recovered;
-                    lsn_recovered += 1;
-                    window = resolve_lsn_window(mssql, tbl.source_database, cap, from_lsn);
-                }
-            } else if (rcfg.mssql_replay_on_idle &&
-                       recover_idle_at_max_lsn(log_pg, mssql, conn_id, tbl, cap, from_lsn, batch_id)) {
-                if (auto recovered = fetch_min_lsn(mssql, tbl.source_database, cap)) {
-                    from_lsn = *recovered;
-                    lsn_recovered += 1;
-                    window = resolve_lsn_window(mssql, tbl.source_database, cap, from_lsn);
-                }
+            if (bump_lsn_to_max(log_pg, mssql, conn_id, tbl, from_lsn, batch_id, "idle_no_window")) {
+                mark_catalog_cdc_success(log_pg, tbl.catalog_id);
+                lsn_bumped_to_max += 1;
+            } else {
+                skipped_no_window += 1;
             }
-        }
-        if (!window) {
-            skipped_no_window += 1;
             if (rcfg.idle_poll_seconds > 0 && std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::sleep_for(std::chrono::seconds(rcfg.idle_poll_seconds));
             }
@@ -539,7 +504,13 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         cdc_rows_read += static_cast<int>(result.rows.size());
         if (result.rows.empty()) {
             pending_commits.push_back(
-                {tbl.catalog_id, tbl.source_database, tbl.source_schema, tbl.source_table, {}, {}, false});
+                {tbl.catalog_id,
+                 tbl.source_database,
+                 tbl.source_schema,
+                 tbl.source_table,
+                 window->second,
+                 {},
+                 true});
             if (rcfg.idle_poll_seconds > 0 && std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::sleep_for(std::chrono::seconds(rcfg.idle_poll_seconds));
             }
@@ -733,6 +704,7 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             {"skipped_bad_capture", skipped_bad_capture},
             {"lsn_auto_seeded", lsn_auto_seeded},
             {"lsn_recovered", lsn_recovered},
+            {"lsn_bumped_to_max", lsn_bumped_to_max},
             {"duration_ms", stats.duration_ms},
         },
     });
@@ -810,7 +782,8 @@ int seed_mssql_cdc_lsn_for_conn(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::string& batch_id) {
+    const std::string& batch_id,
+    bool force_t0) {
     const MssqlSource* source = find_mssql_source(cfg, conn_id);
     if (!source) {
         return 0;
@@ -875,7 +848,7 @@ int seed_mssql_cdc_lsn_for_conn(
                 continue;
             }
 
-            if (!get_stored_lsn(log_pg, conn_id, database, schema, table).empty()) {
+            if (!force_t0 && !get_stored_lsn(log_pg, conn_id, database, schema, table).empty()) {
                 skipped += 1;
                 continue;
             }
@@ -884,19 +857,11 @@ int seed_mssql_cdc_lsn_for_conn(
                 cdc_scan(mssql, database);
                 scanned_dbs.insert(database);
             }
-            mssql.use_database(database);
-            const auto max_rows = mssql.query("SELECT sys.fn_cdc_get_max_lsn()");
-            if (max_rows.rows.empty() || max_rows.rows[0].empty()) {
+            if (seed_mssql_cdc_lsn_t0_for_table(log_pg, mssql, conn_id, database, schema, table)) {
+                seeded += 1;
+            } else {
                 skipped += 1;
-                continue;
             }
-            const auto max_lsn = lsn_as_bytes(max_rows.rows[0][0]);
-            if (max_lsn.empty()) {
-                skipped += 1;
-                continue;
-            }
-            upsert_lsn(log_pg, conn_id, database, schema, table, max_lsn, {});
-            seeded += 1;
         }
     } catch (const std::exception& ex) {
         errors += 1;
@@ -918,7 +883,7 @@ int seed_mssql_cdc_lsn_for_conn(
         .message = errors ? "mssql lsn seed completed with errors" : "mssql lsn seed completed",
         .batch_id = batch_id,
         .conn_id = conn_id,
-        .context = {{"seeded", seeded}, {"skipped", skipped}, {"errors", errors}},
+        .context = {{"seeded", seeded}, {"skipped", skipped}, {"errors", errors}, {"force_t0", force_t0}},
     });
     return errors;
 }

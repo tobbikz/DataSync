@@ -895,110 +895,37 @@ BinlogGapRebootResult reboot_conn_after_mariadb_binlog_gap(
 
 #ifdef HAVE_FREETDS
 
-namespace {
-
-bool conn_had_mssql_capture_baseline(PGconn* pg, const std::string& conn_id) {
-    const char* vals[] = {conn_id.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        SELECT
-            EXISTS (
-                SELECT 1 FROM cdc_catalog.cdc_mssql_lsn
-                WHERE conn_id = $1
-                  AND last_start_lsn IS NOT NULL
-            ) AS has_capture,
-            EXISTS (
-                SELECT 1 FROM cdc_catalog.catalog
-                WHERE conn_id = $1
-                  AND last_full_load_at IS NOT NULL
-            ) AS has_full_load
-        )",
-        1,
-        nullptr,
-        vals,
-        nullptr,
-        nullptr,
-        0);
-    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
-        if (res) {
-            PQclear(res);
-        }
-        return false;
-    }
-    const bool ok = std::string(PQgetvalue(res, 0, 0)) == "t" || std::string(PQgetvalue(res, 0, 1)) == "t";
-    PQclear(res);
-    return ok;
-}
-
-}  // namespace
-
 BinlogGapRebootResult reboot_conn_after_mssql_cdc_gap(
     const AppConfig& cfg,
     PGconn* pg,
     const std::string& conn_id,
     const std::string& batch_id) {
     BinlogGapRebootResult out;
-    if (!conn_had_mssql_capture_baseline(pg, conn_id)) {
-        seed_mssql_cdc_lsn_for_conn(cfg, pg, conn_id, batch_id);
-        out.ran = true;
-        out.t0_reset = true;
+    const int seed_errors = seed_mssql_cdc_lsn_for_conn(cfg, pg, conn_id, batch_id, true);
+    out.ran = true;
+    out.t0_reset = true;
+    out.tables_flagged = 0;
+    if (seed_errors != 0) {
         log_write(pg, {
-            .level = LogLevel::Info,
+            .level = LogLevel::Warning,
             .component = "cdc_kafka_mssql_capture",
-            .message = "mssql cdc gap: capture T0 seeded (conn not yet baselined)",
+            .message = "mssql cdc gap: forced LSN T0 refresh completed with errors",
             .batch_id = batch_id,
             .conn_id = conn_id,
             .source_schema = std::nullopt,
             .source_table = std::nullopt,
+            .context = {{"seed_errors", seed_errors}},
         });
         return out;
     }
-
-    seed_mssql_cdc_lsn_for_conn(cfg, pg, conn_id, batch_id);
-    out.t0_reset = true;
-
-    const char* vals[] = {conn_id.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        UPDATE cdc_catalog.catalog
-        SET needs_full_load = true,
-            capture_during_full_load = true,
-            cdc_enabled = true,
-            status = 'pending',
-            last_error = 'mssql cdc lsn purged: auto full-load reboot',
-            engine_meta = engine_meta - 'stream_kafka_offsets' - 'stream_bookmarked_at',
-            updated_at = now()
-        WHERE conn_id = $1
-          AND db_engine = 'mssql'
-          AND active = true
-          AND has_pk = true
-          AND status NOT IN ('skipped', 'disabled')
-        )",
-        1,
-        nullptr,
-        vals,
-        nullptr,
-        nullptr,
-        0);
-    if (res && PQresultStatus(res) == PGRES_COMMAND_OK) {
-        out.tables_flagged = std::atoi(PQcmdTuples(res));
-    }
-    if (res) {
-        PQclear(res);
-    }
-
-    out.ran = true;
     log_write(pg, {
-        .level = LogLevel::Warning,
+        .level = LogLevel::Info,
         .component = "cdc_kafka_mssql_capture",
-        .message = "mssql cdc gap: capture T0 reset and tables flagged for full-load reboot",
+        .message = "mssql cdc gap: forced LSN T0 refresh for conn (no full-load reboot)",
         .batch_id = batch_id,
         .conn_id = conn_id,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"tables_flagged", out.tables_flagged}},
     });
     return out;
 }
