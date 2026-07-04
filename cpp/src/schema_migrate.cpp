@@ -322,6 +322,7 @@ int run_schema_migrate(PGconn* log_pg, PGconn* lake_pg, const SchemaMigrateOptio
             .component = "catalog",
             .message = "migrate incremental applied",
         });
+        repair_catalog_schema(log_pg);
         validate_catalog_schema(log_pg);
     }
 
@@ -383,10 +384,51 @@ void validate_catalog_schema(PGconn* pg) {
         detail << missing[i];
     }
     throw std::runtime_error(
-        "cdc_catalog schema incomplete (missing " + std::to_string(missing.size()) +
+        "cdc_catalog schema incomplete after repair (missing " + std::to_string(missing.size()) +
         " object(s): " + detail.str() + "; tables=" + std::to_string(catalog_table_count(pg)) +
         "/" + std::to_string(kExpectedCatalogTableCount) + ", schema_version=" +
-        std::to_string(latest_schema_migration_version(pg)) + ") — run: DataSync migrate");
+        std::to_string(latest_schema_migration_version(pg)) + ")");
+}
+
+void repair_catalog_schema(PGconn* pg) {
+    if (!pg || !catalog_schema_exists(pg)) {
+        return;
+    }
+    const auto missing_before = missing_catalog_schema_objects(pg);
+    if (missing_before.empty()) {
+        return;
+    }
+    nlohmann::json missing_json = nlohmann::json::array();
+    for (const auto& item : missing_before) {
+        missing_json.push_back(item);
+    }
+    log_write(pg, {
+        .level = LogLevel::Warning,
+        .component = "catalog",
+        .message = "catalog schema repair started",
+        .context = {
+            {"missing", missing_json},
+            {"table_count", catalog_table_count(pg)},
+            {"schema_version", latest_schema_migration_version(pg)},
+        },
+    });
+    exec_sql_section(pg, prod_ops_embedded::catalog_schema_repair(), "catalog_schema_repair");
+    const auto missing_after = missing_catalog_schema_objects(pg);
+    nlohmann::json still_missing = nlohmann::json::array();
+    for (const auto& item : missing_after) {
+        still_missing.push_back(item);
+    }
+    log_write(pg, {
+        .level = missing_after.empty() ? LogLevel::Info : LogLevel::Warning,
+        .component = "catalog",
+        .message = missing_after.empty() ? "catalog schema repair completed"
+                                         : "catalog schema repair partial",
+        .context = {
+            {"repaired_count", static_cast<int>(missing_before.size() - missing_after.size())},
+            {"still_missing", still_missing},
+            {"table_count", catalog_table_count(pg)},
+        },
+    });
 }
 
 void run_startup_schema_migrate(PGconn* log_pg) {

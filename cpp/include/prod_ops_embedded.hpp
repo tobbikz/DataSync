@@ -2033,7 +2033,201 @@ BEGIN
         RAISE NOTICE 'migration 052: reconciliation table';
     END IF;
 END $$;
+
+-- Migration 053: repair 050/051/052 objects when schema_migrations rows exist without DDL.
+DO $migration053$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 53) THEN
+        CREATE TABLE IF NOT EXISTS cdc_catalog.full_load_checkpoint (
+            catalog_id bigint NOT NULL REFERENCES cdc_catalog.catalog(catalog_id) ON DELETE CASCADE,
+            worker_id integer NOT NULL DEFAULT 0,
+            batch_id text NOT NULL,
+            phase text NOT NULL,
+            last_pk jsonb,
+            rows_loaded bigint NOT NULL DEFAULT 0,
+            source_rows bigint,
+            updated_at timestamp with time zone NOT NULL DEFAULT now(),
+            PRIMARY KEY (catalog_id, worker_id),
+            CONSTRAINT full_load_checkpoint_phase_chk
+                CHECK (phase = ANY (ARRAY['truncate'::text, 'ddl'::text, 'copy'::text]))
+        );
+        CREATE INDEX IF NOT EXISTS full_load_checkpoint_updated_idx
+            ON cdc_catalog.full_load_checkpoint (updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS cdc_catalog.apply_outbox (
+            event_id text PRIMARY KEY,
+            conn_id text NOT NULL,
+            catalog_id bigint NOT NULL,
+            batch_id text NOT NULL,
+            payload jsonb NOT NULL,
+            lake_committed_at timestamptz NOT NULL DEFAULT now(),
+            audit_committed_at timestamptz
+        );
+        CREATE INDEX IF NOT EXISTS apply_outbox_pending_idx
+            ON cdc_catalog.apply_outbox (conn_id, lake_committed_at)
+            WHERE audit_committed_at IS NULL;
+
+        CREATE TABLE IF NOT EXISTS cdc_catalog.reconciliation (
+            reconciliation_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            batch_id text NOT NULL,
+            conn_id text NOT NULL,
+            catalog_id bigint NOT NULL REFERENCES cdc_catalog.catalog(catalog_id) ON DELETE CASCADE,
+            db_engine cdc_catalog.db_engine NOT NULL,
+            source_schema text NOT NULL,
+            source_table text NOT NULL,
+            checked_at timestamptz NOT NULL DEFAULT now(),
+            status text NOT NULL DEFAULT 'ok',
+            row_count_source bigint,
+            row_count_lake bigint,
+            row_count_delta bigint,
+            row_count_status text NOT NULL DEFAULT 'skip',
+            max_pk_source text,
+            max_pk_lake text,
+            max_pk_status text NOT NULL DEFAULT 'skip',
+            ts_column text,
+            max_ts_source timestamptz,
+            max_ts_lake timestamptz,
+            max_ts_lag_seconds integer,
+            max_ts_status text NOT NULL DEFAULT 'skip',
+            pipeline_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+            checks jsonb NOT NULL DEFAULT '{}'::jsonb,
+            duration_ms bigint NOT NULL DEFAULT 0,
+            error text,
+            CONSTRAINT reconciliation_status_chk
+                CHECK (status = ANY (ARRAY['ok','warn','fail','skip']::text[])),
+            CONSTRAINT reconciliation_row_count_status_chk
+                CHECK (row_count_status = ANY (ARRAY['ok','warn','fail','skip']::text[])),
+            CONSTRAINT reconciliation_max_pk_status_chk
+                CHECK (max_pk_status = ANY (ARRAY['ok','warn','fail','skip']::text[])),
+            CONSTRAINT reconciliation_max_ts_status_chk
+                CHECK (max_ts_status = ANY (ARRAY['ok','warn','fail','skip']::text[]))
+        );
+        CREATE INDEX IF NOT EXISTS reconciliation_conn_checked_idx
+            ON cdc_catalog.reconciliation (conn_id, checked_at DESC);
+        CREATE INDEX IF NOT EXISTS reconciliation_catalog_checked_idx
+            ON cdc_catalog.reconciliation (catalog_id, checked_at DESC);
+        CREATE INDEX IF NOT EXISTS reconciliation_status_checked_idx
+            ON cdc_catalog.reconciliation (status, checked_at DESC)
+            WHERE status IN ('fail', 'warn');
+
+        CREATE OR REPLACE VIEW cdc_catalog.v_reconciliation_latest AS
+        SELECT DISTINCT ON (catalog_id) *
+        FROM cdc_catalog.reconciliation
+        ORDER BY catalog_id, checked_at DESC;
+
+        CREATE OR REPLACE FUNCTION cdc_catalog.prune_reconciliation(p_retention_days integer DEFAULT 30)
+        RETURNS bigint
+        LANGUAGE sql
+        AS $prune_reconciliation$
+            WITH deleted AS (
+                DELETE FROM cdc_catalog.reconciliation
+                WHERE p_retention_days > 0
+                  AND checked_at < now() - make_interval(days => p_retention_days)
+                RETURNING 1
+            )
+            SELECT count(*)::bigint FROM deleted;
+        $prune_reconciliation$;
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (53, 'repair catalog objects 050-052 if missing');
+        RAISE NOTICE 'migration 053: catalog schema repair';
+    END IF;
+END $migration053$;
 )PO_schema_patch";
+    }
+    /** Idempotent DDL for 050/051/052 — safe when schema_migrations version rows exist without objects. */
+    inline std::string_view catalog_schema_repair() {
+        return R"PO_cat_repair(
+CREATE TABLE IF NOT EXISTS cdc_catalog.full_load_checkpoint (
+    catalog_id bigint NOT NULL REFERENCES cdc_catalog.catalog(catalog_id) ON DELETE CASCADE,
+    worker_id integer NOT NULL DEFAULT 0,
+    batch_id text NOT NULL,
+    phase text NOT NULL,
+    last_pk jsonb,
+    rows_loaded bigint NOT NULL DEFAULT 0,
+    source_rows bigint,
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    PRIMARY KEY (catalog_id, worker_id),
+    CONSTRAINT full_load_checkpoint_phase_chk
+        CHECK (phase = ANY (ARRAY['truncate'::text, 'ddl'::text, 'copy'::text))
+);
+CREATE INDEX IF NOT EXISTS full_load_checkpoint_updated_idx
+    ON cdc_catalog.full_load_checkpoint (updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS cdc_catalog.apply_outbox (
+    event_id text PRIMARY KEY,
+    conn_id text NOT NULL,
+    catalog_id bigint NOT NULL,
+    batch_id text NOT NULL,
+    payload jsonb NOT NULL,
+    lake_committed_at timestamptz NOT NULL DEFAULT now(),
+    audit_committed_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS apply_outbox_pending_idx
+    ON cdc_catalog.apply_outbox (conn_id, lake_committed_at)
+    WHERE audit_committed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS cdc_catalog.reconciliation (
+    reconciliation_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    batch_id text NOT NULL,
+    conn_id text NOT NULL,
+    catalog_id bigint NOT NULL REFERENCES cdc_catalog.catalog(catalog_id) ON DELETE CASCADE,
+    db_engine cdc_catalog.db_engine NOT NULL,
+    source_schema text NOT NULL,
+    source_table text NOT NULL,
+    checked_at timestamptz NOT NULL DEFAULT now(),
+    status text NOT NULL DEFAULT 'ok',
+    row_count_source bigint,
+    row_count_lake bigint,
+    row_count_delta bigint,
+    row_count_status text NOT NULL DEFAULT 'skip',
+    max_pk_source text,
+    max_pk_lake text,
+    max_pk_status text NOT NULL DEFAULT 'skip',
+    ts_column text,
+    max_ts_source timestamptz,
+    max_ts_lake timestamptz,
+    max_ts_lag_seconds integer,
+    max_ts_status text NOT NULL DEFAULT 'skip',
+    pipeline_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+    checks jsonb NOT NULL DEFAULT '{}'::jsonb,
+    duration_ms bigint NOT NULL DEFAULT 0,
+    error text,
+    CONSTRAINT reconciliation_status_chk
+        CHECK (status = ANY (ARRAY['ok','warn','fail','skip']::text[])),
+    CONSTRAINT reconciliation_row_count_status_chk
+        CHECK (row_count_status = ANY (ARRAY['ok','warn','fail','skip']::text[])),
+    CONSTRAINT reconciliation_max_pk_status_chk
+        CHECK (max_pk_status = ANY (ARRAY['ok','warn','fail','skip']::text[])),
+    CONSTRAINT reconciliation_max_ts_status_chk
+        CHECK (max_ts_status = ANY (ARRAY['ok','warn','fail','skip']::text[]))
+);
+CREATE INDEX IF NOT EXISTS reconciliation_conn_checked_idx
+    ON cdc_catalog.reconciliation (conn_id, checked_at DESC);
+CREATE INDEX IF NOT EXISTS reconciliation_catalog_checked_idx
+    ON cdc_catalog.reconciliation (catalog_id, checked_at DESC);
+CREATE INDEX IF NOT EXISTS reconciliation_status_checked_idx
+    ON cdc_catalog.reconciliation (status, checked_at DESC)
+    WHERE status IN ('fail', 'warn');
+
+CREATE OR REPLACE VIEW cdc_catalog.v_reconciliation_latest AS
+SELECT DISTINCT ON (catalog_id) *
+FROM cdc_catalog.reconciliation
+ORDER BY catalog_id, checked_at DESC;
+
+CREATE OR REPLACE FUNCTION cdc_catalog.prune_reconciliation(p_retention_days integer DEFAULT 30)
+RETURNS bigint
+LANGUAGE sql
+AS $prune_reconciliation$
+    WITH deleted AS (
+        DELETE FROM cdc_catalog.reconciliation
+        WHERE p_retention_days > 0
+          AND checked_at < now() - make_interval(days => p_retention_days)
+        RETURNING 1
+    )
+    SELECT count(*)::bigint FROM deleted;
+$prune_reconciliation$;
+)PO_cat_repair";
     }
     inline std::string_view monitoring_views() {
         return R"PO_monitoring_v(

@@ -28,3 +28,6 @@ std::vector<std::string> missing_catalog_schema_objects(PGconn* pg);
 
 /** Fail with actionable error if required cdc_catalog objects are absent. */
 void validate_catalog_schema(PGconn* pg);
+
+/** CREATE IF NOT EXISTS for 050/051/052 objects when version rows exist without DDL. */
+void repair_catalog_schema(PGconn* pg);
