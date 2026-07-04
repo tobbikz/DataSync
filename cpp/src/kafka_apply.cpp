@@ -91,6 +91,7 @@ struct TableHealthSnapshot {
     std::string apply_status;
     std::string apply_health_rag{"UNKNOWN"};
     long long reconcile_row_delta{0};
+    std::string reconcile_row_count_status;
     bool catalog_active{false};
     bool cdc_enabled{false};
     int seconds_since_last_apply{-1};
@@ -174,6 +175,9 @@ std::string derive_apply_health_rag(
         return "AMBER";
     }
     if (metrics.kafka_consumer_lag > 0) {
+        return "AMBER";
+    }
+    if (health.reconcile_row_count_status == "fail" || health.reconcile_row_count_status == "warn") {
         return "AMBER";
     }
     if (health.apply_status == "healthy" || health.apply_status == "ok" || health.apply_status.empty()) {
@@ -299,10 +303,13 @@ TableHealthSnapshot fetch_table_health_by_catalog_id(
                     ELSE cp.capture_lag_seconds
                 END,
                 0
-            )
+            ),
+            COALESCE(rec.row_count_delta, 0),
+            COALESCE(rec.row_count_status, '')
         FROM cdc_catalog.catalog c
         LEFT JOIN cdc_catalog.apply_position ap ON ap.catalog_id = c.catalog_id
         LEFT JOIN cdc_catalog.capture_position cp ON cp.conn_id = c.conn_id
+        LEFT JOIN cdc_catalog.v_reconciliation_latest rec ON rec.catalog_id = c.catalog_id
         LEFT JOIN LATERAL (
             SELECT GREATEST(
                 0,
@@ -353,6 +360,12 @@ TableHealthSnapshot fetch_table_health_by_catalog_id(
     out.cdc_enabled = cdc_val && cdc_val[0] == 't';
     const char* capt_val = PQgetvalue(res, 0, 5);
     out.capture_lag_seconds = capt_val ? std::atoi(capt_val) : 0;
+    if (PQgetvalue(res, 0, 6) && PQgetvalue(res, 0, 6)[0]) {
+        out.reconcile_row_delta = std::atoll(PQgetvalue(res, 0, 6));
+    }
+    if (PQgetvalue(res, 0, 7) && PQgetvalue(res, 0, 7)[0]) {
+        out.reconcile_row_count_status = PQgetvalue(res, 0, 7);
+    }
     out.is_quarantined = out.apply_status == "quarantined";
     if (out.apply_status == "stale" || out.apply_status == "lagging" || out.apply_status == "gap_detected") {
         out.is_stale = true;
@@ -360,7 +373,6 @@ TableHealthSnapshot fetch_table_health_by_catalog_id(
         out.is_stale = true;
     }
     out.apply_health_rag = derive_apply_health_rag(out, BatchStatsMetrics{}, "ok");
-    out.reconcile_row_delta = 0;
     PQclear(res);
     return out;
 }

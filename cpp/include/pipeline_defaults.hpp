@@ -87,6 +87,11 @@ constexpr std::size_t kCatalogDiscoverPageSize = 5000;
 // Apply health alerts (from apply_batch_stats / apply_health_rag — not reconcile)
 constexpr int kApplyHealthAlertLookbackMinutes = 15;
 
+// Reconcile-lite (COUNT + MAX pk + MAX ts)
+constexpr int kReconcileLiteRetentionDays = 30;
+constexpr int kReconcileLiteTsLagWarnSeconds = 60;
+constexpr int kReconcileLiteTsLagFailSeconds = 300;
+
 // RuntimeConfig keys — defaults when absent in DB
 constexpr std::size_t kFullLoadBatchSizeDefault = 50000;
 constexpr int kApplyBatchSizeDefault = 20000;

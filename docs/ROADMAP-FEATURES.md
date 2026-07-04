@@ -21,10 +21,10 @@
   ```
   Hoy `quarantine_apply_position()` existe; recovery solo vía SQL manual. Enum `rebootstrap_pending` sin uso en C++.
 
-- [ ] **Reconcile lite (lake-only / row-count sample)**
-  - Opción A: `COUNT(*)` fuente vs lake en tablas RED/AMBER → `reconciliation_result` → alimentar `reconcile_row_delta` en stats
-  - Opción B: limpiar schema `reconciliation_*` si el RAG de apply basta
-  - No volver al reconcile full con checksum PK
+- [x] **Reconcile lite** — `DataSync reconcile-lite` + tabla `cdc_catalog.reconciliation` (052)
+  ```bash
+  DataSync reconcile-lite [--conn-id ID] [--hot-only|--cold-only] [--sample-pct N]
+  ```
 
 - [ ] **Alertas externas** (fan-out desde RED/AMBER; logs siguen siendo source of truth)
   - Webhook Slack/Teams/PagerDuty, o

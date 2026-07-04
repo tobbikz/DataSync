@@ -15,6 +15,7 @@
 #include "mongo_full_load.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
+#include "reconcile_lite.hpp"
 #include "schema_migrate.hpp"
 #include "pipeline_defaults.hpp"
 
@@ -240,6 +241,7 @@ void print_usage(const char* prog) {
               << "  " << prog << " discover\n"
               << "  " << prog << " full-load [--conn-id ID] [--skip-onboard]\n"
               << "  " << prog << " onboard-pending [--conn-id ID] [--hot-only|--cold-only]\n"
+              << "  " << prog << " reconcile-lite [--conn-id ID] [--hot-only|--cold-only] [--sample-pct N]\n"
               << "  " << prog << " ddl-sync --conn-id ID [--schema S] [--table T]\n"
               << "  " << prog << " kafka-apply --conn-id ID\n"
               << "  " << prog << " capture --conn-id ID\n"
@@ -261,6 +263,7 @@ int main(int argc, char** argv) {
     bool skip_onboard = false;
     bool hot_only = false;
     bool cold_only = false;
+    int sample_pct = 100;
     bool migrate_baseline = false;
     bool migrate_lake = false;
     bool migrate_diagnostics = false;
@@ -282,6 +285,8 @@ int main(int argc, char** argv) {
             hot_only = true;
         } else if (arg == "--cold-only") {
             cold_only = true;
+        } else if (arg == "--sample-pct" && i + 1 < argc) {
+            sample_pct = std::atoi(argv[++i]);
         } else if (arg == "--baseline") {
             migrate_baseline = true;
         } else if (arg == "--lake") {
@@ -305,6 +310,7 @@ int main(int argc, char** argv) {
     if (command != "discover" && command != "full-load" && command != "ddl-sync" &&
         command != "kafka-apply" && command != "capture" &&
         command != "daemon" && command != "onboard-pending" &&
+        command != "reconcile-lite" &&
         command != "migrate") {
         print_usage(argv[0]);
         return 2;
@@ -370,6 +376,24 @@ int main(int argc, char** argv) {
                 batch_id,
                 conn_id.empty() ? std::nullopt : std::optional(conn_id),
                 tier);
+        }
+        if (command == "reconcile-lite") {
+            PgConn lake_pg(cfg.datalake.conn_string());
+            if (!lake_pg.raw) {
+                std::cerr << "reconcile-lite: datalake connection failed\n";
+                return 1;
+            }
+            const CatalogHotTier tier = hot_only ? CatalogHotTier::HotOnly
+                                                 : (cold_only ? CatalogHotTier::ColdOnly
+                                                              : CatalogHotTier::All);
+            return run_reconcile_lite(
+                cfg,
+                log_pg.raw,
+                lake_pg.raw,
+                batch_id,
+                conn_id.empty() ? std::nullopt : std::optional(conn_id),
+                tier,
+                sample_pct);
         }
         if (command == "ddl-sync") {
             return run_ddl_sync(cfg, log_pg.raw, conn_id, source_schema, source_table);

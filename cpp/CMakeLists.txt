@@ -24,6 +24,7 @@ set(DATASYNC_SOURCES
     src/mariadb_ddl_sync_run.cpp
     src/full_load_common.cpp
     src/full_load_checkpoint.cpp
+    src/reconcile_lite.cpp
     src/mariadb_full_load.cpp
     src/mariadb_binlog.cpp
     src/mariadb_binlog_cli.cpp

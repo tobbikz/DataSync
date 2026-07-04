@@ -1949,6 +1949,90 @@ BEGIN
         RAISE NOTICE 'migration 051: apply_outbox';
     END IF;
 END $$;
+
+-- Migration 052: reconcile-lite — single append-only reconciliation table + latest view.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 52) THEN
+        CREATE TABLE IF NOT EXISTS cdc_catalog.reconciliation (
+            reconciliation_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            batch_id text NOT NULL,
+            conn_id text NOT NULL,
+            catalog_id bigint NOT NULL REFERENCES cdc_catalog.catalog(catalog_id) ON DELETE CASCADE,
+            db_engine cdc_catalog.db_engine NOT NULL,
+            source_schema text NOT NULL,
+            source_table text NOT NULL,
+            checked_at timestamptz NOT NULL DEFAULT now(),
+            status text NOT NULL DEFAULT 'ok',
+            row_count_source bigint,
+            row_count_lake bigint,
+            row_count_delta bigint,
+            row_count_status text NOT NULL DEFAULT 'skip',
+            max_pk_source text,
+            max_pk_lake text,
+            max_pk_status text NOT NULL DEFAULT 'skip',
+            ts_column text,
+            max_ts_source timestamptz,
+            max_ts_lake timestamptz,
+            max_ts_lag_seconds integer,
+            max_ts_status text NOT NULL DEFAULT 'skip',
+            pipeline_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+            checks jsonb NOT NULL DEFAULT '{}'::jsonb,
+            duration_ms bigint NOT NULL DEFAULT 0,
+            error text,
+            CONSTRAINT reconciliation_status_chk
+                CHECK (status = ANY (ARRAY['ok','warn','fail','skip']::text[])),
+            CONSTRAINT reconciliation_row_count_status_chk
+                CHECK (row_count_status = ANY (ARRAY['ok','warn','fail','skip']::text[])),
+            CONSTRAINT reconciliation_max_pk_status_chk
+                CHECK (max_pk_status = ANY (ARRAY['ok','warn','fail','skip']::text[])),
+            CONSTRAINT reconciliation_max_ts_status_chk
+                CHECK (max_ts_status = ANY (ARRAY['ok','warn','fail','skip']::text[]))
+        );
+
+        CREATE INDEX IF NOT EXISTS reconciliation_conn_checked_idx
+            ON cdc_catalog.reconciliation (conn_id, checked_at DESC);
+        CREATE INDEX IF NOT EXISTS reconciliation_catalog_checked_idx
+            ON cdc_catalog.reconciliation (catalog_id, checked_at DESC);
+        CREATE INDEX IF NOT EXISTS reconciliation_status_checked_idx
+            ON cdc_catalog.reconciliation (status, checked_at DESC)
+            WHERE status IN ('fail', 'warn');
+
+        COMMENT ON TABLE cdc_catalog.reconciliation IS
+            'Append-only reconcile-lite results: COUNT, MAX(PK), MAX(ts) per table per run';
+
+        CREATE OR REPLACE VIEW cdc_catalog.v_reconciliation_latest AS
+        SELECT DISTINCT ON (catalog_id) *
+        FROM cdc_catalog.reconciliation
+        ORDER BY catalog_id, checked_at DESC;
+
+        COMMENT ON VIEW cdc_catalog.v_reconciliation_latest IS
+            'Latest reconcile-lite row per catalog_id';
+
+        CREATE OR REPLACE FUNCTION cdc_catalog.prune_reconciliation(p_retention_days integer DEFAULT 30)
+        RETURNS bigint
+        LANGUAGE sql
+        AS $$
+            WITH deleted AS (
+                DELETE FROM cdc_catalog.reconciliation
+                WHERE p_retention_days > 0
+                  AND checked_at < now() - make_interval(days => p_retention_days)
+                RETURNING 1
+            )
+            SELECT count(*)::bigint FROM deleted;
+        $$;
+
+        COMMENT ON FUNCTION cdc_catalog.prune_reconciliation(integer) IS
+            'Delete reconcile-lite rows older than retention window';
+
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.reconcile_row_delta IS
+            'source_row_count - lake_row_count from v_reconciliation_latest';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (52, 'reconcile-lite single table + v_reconciliation_latest');
+        RAISE NOTICE 'migration 052: reconciliation table';
+    END IF;
+END $$;
 )PO_schema_patch";
     }
     inline std::string_view monitoring_views() {

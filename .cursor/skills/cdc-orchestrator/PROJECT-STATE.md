@@ -37,6 +37,7 @@ Config: **`config.json`** en raíz del repo (PG DataSync + DataLake). Fuentes OL
 - [x] Mongo dev validated (full-load, stats GREEN, manual I/U/D) — **listo para onboard prod**
 - [x] **Full-load hardening (migration 050)** — TRUNCATE verified fail-closed, resumable COPY checkpoints (3 engines), row-count verify, daemon/apply isolation
 - [x] **Sprint ops (2026-07-04)** — auto-resume checkpoint, catalog pagination 10k+, `onboard-pending` por `catalog.hot`, apply health alerts, apply_outbox lake-first (051), gate estricto checkpoint+subprocess
+- [x] **Reconcile lite (052)** — tabla `reconciliation`, CLI `reconcile-lite`, COUNT/MAX pk/MAX ts, `v_reconciliation_latest`, `reconcile_row_delta` en apply stats; snapshot RR por lado + COUNT gated si `kafka_consumer_lag > 0`
 
 ## Daemon 24/7
 
@@ -56,6 +57,7 @@ Onboard manual por tier (`catalog.hot`):
 ```bash
 docker compose run --rm datasync onboard-pending --conn-id MARIADB_LOCAL --hot-only
 docker compose run --rm datasync onboard-pending --cold-only
+docker compose run --rm datasync reconcile-lite --conn-id MARIADB_LOCAL --hot-only
 ```
 
 ## Onboard (prod)
@@ -74,6 +76,7 @@ psql ... -d DataLake -f sql/031_datasync_connections.sql
 Manual full-load (opcional):
 ```bash
 ./cpp/build/DataSync full-load --tier bronze --conn-id MARIADB_LOCAL
+./cpp/build/DataSync reconcile-lite --hot-only
 ```
 
 ## Sprint reciente — P0+P1 post-auditoría ronda 2 (2025-06-11)
