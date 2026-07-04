@@ -33,6 +33,8 @@ constexpr int kCaptureProducerQueueMaxKbytes = 1048576;
 constexpr int kCaptureIdlePollSeconds = 3;
 constexpr int kCaptureQuietExitLaggingChunks = 3;
 constexpr int kCaptureHeartbeatSeconds = 60;
+/** Min age before clearing stuck cdc_in_progress rows (seconds). */
+constexpr int kCdcInProgressStaleSeconds = 300;
 constexpr int kCaptureMaxEventsDefault = 2000000;
 constexpr bool kMssqlCaptureReplayOnIdle = false;
 
@@ -58,6 +60,11 @@ constexpr int kFullLoadStaleInProgressMinutes = 30;
 constexpr int kMssqlFullLoadStaleInProgressMinutes = 10;
 /** Max wall time for daemon fork+exec `DataSync full-load --conn-id` subprocess. */
 constexpr int kFullLoadDaemonSubprocessTimeoutMinutes = 120;
+constexpr int kFullLoadTruncateMaxRetries = 3;
+constexpr int kFullLoadCopyProgressLogInterval = 10;
+constexpr bool kFullLoadRowCountVerify = true;
+constexpr long long kFullLoadRowCountVerifyLargeTableThreshold = 10000000LL;
+constexpr double kFullLoadRowCountVerifyTolerancePct = 0.0001;
 constexpr int kLakePartitionMonthsAhead = 3;
 constexpr int kMariadbReconnectMaxAttempts = 0;
 constexpr int kMariadbReconnectBaseMs = 500;
@@ -74,6 +81,11 @@ constexpr std::size_t kDdlSyncSampleSize = 1000;
 constexpr int kCatalogSyncIntervalRounds = 12;
 constexpr std::size_t kCatalogChunkSize = 500;
 constexpr int kCatalogBatchSleepMs = 200;
+constexpr std::size_t kCatalogFetchPageSize = 2000;
+constexpr std::size_t kCatalogDiscoverPageSize = 5000;
+
+// Apply health alerts (from apply_batch_stats / apply_health_rag — not reconcile)
+constexpr int kApplyHealthAlertLookbackMinutes = 15;
 
 // RuntimeConfig keys — defaults when absent in DB
 constexpr std::size_t kFullLoadBatchSizeDefault = 50000;

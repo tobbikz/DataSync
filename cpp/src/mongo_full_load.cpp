@@ -1,6 +1,7 @@
 #include "mongo_full_load.hpp"
 
 #include "capture_common.hpp"
+#include "full_load_checkpoint.hpp"
 #include "full_load_common.hpp"
 #include "lake_apply_index.hpp"
 #include "mongo_conn.hpp"
@@ -13,6 +14,8 @@
 #include "pipeline_defaults.hpp"
 
 #include <chrono>
+#include <cctype>
+#include <cstring>
 #include <exception>
 #include <iomanip>
 #include <map>
@@ -79,6 +82,57 @@ using full_load::csv_escape;
 using full_load::elapsed_ms;
 using full_load::utc_now_date;
 using full_load::utc_now_ts;
+using full_load::acquire_full_load_table_lock;
+using full_load::release_full_load_table_lock;
+
+bson_value_t* mongo_id_text_to_bson_value(const std::string& id_text) {
+    if (id_text.empty()) {
+        return nullptr;
+    }
+    auto* out = new bson_value_t();
+    if (id_text.size() == 24 &&
+        std::all_of(id_text.begin(), id_text.end(), [](unsigned char c) {
+            return std::isxdigit(c) != 0;
+        })) {
+        bson_oid_t oid;
+        bson_oid_init_from_string(&oid, id_text.c_str());
+        out->value_type = BSON_TYPE_OID;
+        std::memcpy(out->value.v_oid.bytes, oid.bytes, sizeof(oid.bytes));
+        return out;
+    }
+    out->value_type = BSON_TYPE_UTF8;
+    out->value.v_utf8.len = static_cast<int32_t>(id_text.size());
+    out->value.v_utf8.str = static_cast<char*>(bson_malloc(id_text.size() + 1));
+    std::memcpy(out->value.v_utf8.str, id_text.data(), id_text.size());
+    out->value.v_utf8.str[id_text.size()] = '\0';
+    return out;
+}
+
+std::string mongo_id_text_from_bson_value(const bson_value_t* value) {
+    if (!value) {
+        return {};
+    }
+    if (value->value_type == BSON_TYPE_OID) {
+        char hex[25];
+        bson_oid_to_string(&value->value.v_oid, hex);
+        return std::string(hex);
+    }
+    if (value->value_type == BSON_TYPE_UTF8) {
+        return std::string(value->value.v_utf8.str, static_cast<std::size_t>(value->value.v_utf8.len));
+    }
+    return {};
+}
+
+long long fetch_mongo_collection_count(mongoc_collection_t* coll) {
+    bson_t empty = BSON_INITIALIZER;
+    bson_error_t err;
+    const int64_t count = mongoc_collection_count_documents(coll, &empty, nullptr, 0, nullptr, &err);
+    bson_destroy(&empty);
+    if (count < 0) {
+        throw std::runtime_error(std::string("MongoDB count failed: ") + err.message);
+    }
+    return static_cast<long long>(count);
+}
 
 nlohmann::json bson_to_json(const bson_t* doc) {
     char* json_str = bson_as_relaxed_extended_json(doc, nullptr);
@@ -119,6 +173,13 @@ std::vector<MongoCatalogTableRow> fetch_full_load_targets(PGconn* pg) {
           AND active = true
           AND needs_full_load = true
           AND status NOT IN ('skipped', 'disabled')
+          AND (
+            status <> 'full_load_in_progress'
+            OR EXISTS (
+                SELECT 1 FROM cdc_catalog.full_load_checkpoint cp
+                WHERE cp.catalog_id = catalog.catalog_id AND cp.phase = 'copy'
+            )
+          )
         ORDER BY conn_id, source_database, source_table
         )");
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -168,13 +229,17 @@ void mark_catalog_failed(PGconn* pg, long long catalog_id, const std::string& er
 long long copy_collection_batches(
     mongoc_collection_t* coll,
     PGconn* pg,
+    PGconn* log_pg,
+    std::mutex* log_mtx,
+    const MongoCatalogTableRow& target,
     const std::string& pg_schema,
     const std::string& pg_table,
     std::vector<std::string>& all_cols,
     std::map<std::string, std::string>& pg_cols,
     std::size_t batch_size,
     int source_sleep_ms,
-    const std::string& snapshot_id) {
+    const std::string& snapshot_id,
+    full_load::CopyCheckpointContext* checkpoint_ctx = nullptr) {
     const std::string load_ts = utc_now_ts();
     const std::string load_date = utc_now_date();
 
@@ -193,6 +258,12 @@ long long copy_collection_batches(
 
     long long total_rows = 0;
     bson_value_t* last_id_value = nullptr;
+    std::string last_mongo_id_text;
+
+    if (checkpoint_ctx && !checkpoint_ctx->initial_last_pk.empty()) {
+        last_mongo_id_text = checkpoint_ctx->initial_last_pk.front();
+        last_id_value = mongo_id_text_to_bson_value(last_mongo_id_text);
+    }
 
     auto cleanup_last_id = [&]() {
         if (last_id_value) {
@@ -342,6 +413,15 @@ long long copy_collection_batches(
         }
 
         total_rows += static_cast<long long>(batch_lines.size());
+        if (last_id_value) {
+            last_mongo_id_text = mongo_id_text_from_bson_value(last_id_value);
+        }
+        if (checkpoint_ctx && !last_mongo_id_text.empty()) {
+            full_load::save_copy_batch_checkpoint(
+                *checkpoint_ctx,
+                {last_mongo_id_text},
+                total_rows);
+        }
         if (batch_lines.size() < batch_size) {
             break;
         }
@@ -375,7 +455,7 @@ bool load_one_collection(
     const std::size_t batch_size = runtime.get_size_t(
         "full_load_batch_size",
         pipeline_defaults::kFullLoadBatchSizeDefault,
-        "mariadb_load",
+        "mongo_load",
         target.conn_id);
     const int source_sleep_ms = pipeline_defaults::kFullLoadSourceSleepMs;
     const int partition_months = pipeline_defaults::kLakePartitionMonthsAhead;
@@ -445,18 +525,107 @@ bool load_one_collection(
     const std::string pg_table = mongo_pg_table_name(target.source_table);
 
     ensure_mongo_lake_table_base(lake_pg.raw, pg_schema, pg_table, pg_cols, partition_months);
-    truncate_lake_table(lake_pg.raw, pg_schema, pg_table);
 
-    log_fl(
-        log_pg,
-        log_mtx,
-        LogLevel::Info,
-        batch_id,
-        "lake table truncated",
-        {},
-        target.conn_id,
-        target.source_database,
-        target.source_table);
+    acquire_full_load_table_lock(lake_pg.raw, target.catalog_id);
+    bool lock_released = false;
+    auto release_lock = [&]() {
+        if (!lock_released) {
+            try {
+                release_full_load_table_lock(lake_pg.raw, target.catalog_id);
+            } catch (...) {
+            }
+            lock_released = true;
+        }
+    };
+
+    try {
+    std::vector<FullLoadCheckpoint> resume_checkpoints;
+    const bool resume_copy = full_load::should_resume_from_copy_checkpoint(
+        app_pg.raw,
+        lake_pg.raw,
+        target.catalog_id,
+        pg_schema,
+        pg_table,
+        resume_checkpoints);
+
+    long long source_rows = -1;
+    try {
+        source_rows = fetch_mongo_collection_count(coll);
+    } catch (const std::exception& ex) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Warning,
+            batch_id,
+            "source row count unavailable",
+            {{"error", ex.what()}},
+            target.conn_id,
+            target.source_database,
+            target.source_table);
+    }
+
+    if (resume_copy) {
+        long long checkpoint_rows = 0;
+        for (const auto& cp : resume_checkpoints) {
+            if (cp.phase == FullLoadPhase::Copy) {
+                checkpoint_rows += cp.rows_loaded;
+            }
+        }
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Info,
+            batch_id,
+            "full load resumed from checkpoint",
+            {{"checkpoint_rows", checkpoint_rows},
+             {"worker_checkpoints", static_cast<int>(resume_checkpoints.size())}},
+            target.conn_id,
+            target.source_database,
+            target.source_table);
+    } else {
+        clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
+        const auto trunc = full_load::truncate_lake_table_verified(
+            lake_pg.raw,
+            pg_schema,
+            pg_table,
+            pipeline_defaults::kFullLoadTruncateMaxRetries);
+        if (!trunc.ok) {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Error,
+                batch_id,
+                "lake table truncate failed",
+                {{"rows_after_truncate", trunc.rows_after},
+                 {"attempts", trunc.attempts},
+                 {"error", trunc.error}},
+                target.conn_id,
+                target.source_database,
+                target.source_table);
+            release_lock();
+            mark_catalog_failed(
+                app_pg.raw,
+                target.catalog_id,
+                "truncate failed: " + trunc.error);
+            return false;
+        }
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Info,
+            batch_id,
+            "lake table truncated",
+            {{"rows_after_truncate", trunc.rows_after}, {"attempts", trunc.attempts}},
+            target.conn_id,
+            target.source_database,
+            target.source_table);
+        FullLoadCheckpoint trunc_cp;
+        trunc_cp.catalog_id = target.catalog_id;
+        trunc_cp.worker_id = 0;
+        trunc_cp.batch_id = batch_id;
+        trunc_cp.phase = FullLoadPhase::Truncate;
+        save_full_load_checkpoint(app_pg.raw, trunc_cp);
+    }
 
     int columns_added = 0;
     int columns_widened = 0;
@@ -476,6 +645,18 @@ bool load_one_collection(
         target.source_database,
         target.source_table);
 
+    {
+        FullLoadCheckpoint ddl_cp;
+        ddl_cp.catalog_id = target.catalog_id;
+        ddl_cp.worker_id = 0;
+        ddl_cp.batch_id = batch_id;
+        ddl_cp.phase = FullLoadPhase::Ddl;
+        if (source_rows >= 0) {
+            ddl_cp.source_rows = source_rows;
+        }
+        save_full_load_checkpoint(app_pg.raw, ddl_cp);
+    }
+
     std::vector<std::string> all_cols = {"mongo_id"};
     for (const auto& [name, _] : pg_cols) {
         if (name != "mongo_id") {
@@ -483,20 +664,76 @@ bool load_one_collection(
         }
     }
 
+    std::mutex checkpoint_mtx;
+    full_load::CopyCheckpointContext copy_ctx;
+    copy_ctx.app_pg = app_pg.raw;
+    copy_ctx.log_pg = log_pg;
+    copy_ctx.log_mtx = log_mtx;
+    copy_ctx.catalog_id = target.catalog_id;
+    copy_ctx.worker_id = 0;
+    copy_ctx.batch_id = batch_id;
+    copy_ctx.conn_id = target.conn_id;
+    copy_ctx.source_schema = target.source_database;
+    copy_ctx.source_table = target.source_table;
+    copy_ctx.log_component = "mongo_load";
+    copy_ctx.checkpoint_mtx = &checkpoint_mtx;
+    copy_ctx.progress_log_interval = pipeline_defaults::kFullLoadCopyProgressLogInterval;
+    if (source_rows >= 0) {
+        copy_ctx.source_rows = source_rows;
+    }
+    if (resume_copy) {
+        for (const auto& cp : resume_checkpoints) {
+            if (cp.worker_id == 0 && cp.phase == FullLoadPhase::Copy) {
+                copy_ctx.initial_last_pk = last_pk_from_json(cp.last_pk);
+                break;
+            }
+        }
+    }
+
     rows_out = copy_collection_batches(
         coll,
         lake_pg.raw,
+        log_pg,
+        log_mtx,
+        target,
         pg_schema,
         pg_table,
         all_cols,
         pg_cols,
         batch_size,
         source_sleep_ms,
-        batch_id);
+        batch_id,
+        &copy_ctx);
 
     destroy_coll();
 
+    const long long lake_rows = full_load::lake_table_row_count(lake_pg.raw, pg_schema, pg_table);
+    const auto verify = full_load::verify_full_load_row_counts(source_rows, lake_rows, rows_out);
+    if (!verify.ok) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Error,
+            batch_id,
+            "full load row count verify failed",
+            {{"source_rows", verify.source_rows},
+             {"lake_rows", verify.lake_rows},
+             {"rows_loaded", rows_out},
+             {"diff", verify.diff},
+             {"message", verify.message}},
+            target.conn_id,
+            target.source_database,
+            target.source_table);
+        release_lock();
+        mark_catalog_failed(
+            app_pg.raw,
+            target.catalog_id,
+            "row count verify failed: " + verify.message);
+        return false;
+    }
+
     mark_catalog_success(app_pg.raw, target.catalog_id);
+    clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
 
     if (!onboard_table_after_full_load(
             app_pg.raw,
@@ -528,7 +765,13 @@ bool load_one_collection(
         target.conn_id,
         target.source_database,
         target.source_table);
+    release_lock();
     return true;
+    } catch (...) {
+        release_lock();
+        destroy_coll();
+        throw;
+    }
     } catch (...) {
         destroy_coll();
         throw;
@@ -563,7 +806,7 @@ FullLoadRunStats run_mongo_full_load(
         "full load started",
         {{"batch_size",
           runtime.get_size_t(
-              "full_load_batch_size", pipeline_defaults::kFullLoadBatchSizeDefault, "mariadb_load")},
+              "full_load_batch_size", pipeline_defaults::kFullLoadBatchSizeDefault, "mongo_load")},
          {"parallel_tables", kFullLoadParallelTables}});
 
     const auto targets_all = fetch_full_load_targets(app_pg.raw);
@@ -582,6 +825,7 @@ FullLoadRunStats run_mongo_full_load(
         conn_ids.insert(t.conn_id);
     }
     for (const auto& cid : conn_ids) {
+        recover_full_load_for_checkpoint_resume(app_pg.raw, cid, "mongodb", batch_id);
         clear_stale_full_load_in_progress(app_pg.raw, cid, "mongodb", 30);
     }
 
@@ -655,6 +899,7 @@ FullLoadRunStats run_mongo_full_load(
             continue;
         }
 
+        stats.conn_ids.insert(conn_id);
         const int parallel_tables = kFullLoadParallelTables;
 
         std::size_t idx = 0;

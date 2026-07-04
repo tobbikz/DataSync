@@ -1,6 +1,7 @@
 #include "mariadb_full_load.hpp"
 
 #include "capture_common.hpp"
+#include "full_load_checkpoint.hpp"
 #include "full_load_common.hpp"
 #include "lake_apply_index.hpp"
 #include "mariadb_binlog.hpp"
@@ -24,6 +25,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -74,6 +76,9 @@ using full_load::csv_escape;
 using full_load::elapsed_ms;
 using full_load::utc_now_date;
 using full_load::utc_now_ts;
+using full_load::acquire_full_load_table_lock;
+using full_load::lake_table_row_count;
+using full_load::release_full_load_table_lock;
 
 std::string format_pk_row_sample(
     MYSQL_ROW row,
@@ -192,9 +197,52 @@ PkRange pk_range_for_keyset(const PkRange& bounds) {
     return range;
 }
 
+std::string pk_sql_literal(const MariaDbColumn* col_def, const std::string& value) {
+    if (col_def && is_integer_pk_type(*col_def)) {
+        return value;
+    }
+    return sql_quote(value);
+}
+
+std::string mariadb_keyset_clause(
+    const std::vector<std::string>& pk_cols,
+    const std::vector<std::string>& last_pk_values,
+    const std::vector<MariaDbColumn>& cols) {
+    if (last_pk_values.empty()) {
+        return {};
+    }
+    auto col_def = [&](const std::string& name) -> const MariaDbColumn* {
+        for (const auto& col : cols) {
+            if (col.name == name) {
+                return &col;
+            }
+        }
+        return nullptr;
+    };
+
+    std::ostringstream clause;
+    clause << " AND (";
+    for (std::size_t depth = 0; depth < pk_cols.size(); ++depth) {
+        if (depth) {
+            clause << " OR ";
+        }
+        clause << "(";
+        for (std::size_t eq = 0; eq < depth; ++eq) {
+            clause << "`" << pk_cols[eq] << "` = "
+                   << pk_sql_literal(col_def(pk_cols[eq]), last_pk_values[eq]) << " AND ";
+        }
+        clause << "`" << pk_cols[depth] << "` > "
+               << pk_sql_literal(col_def(pk_cols[depth]), last_pk_values[depth]);
+        clause << ")";
+    }
+    clause << ")";
+    return clause.str();
+}
+
 std::string pk_range_clause(
     const std::string& pk_col,
     const PkRange& range,
+    const MariaDbColumn* col_def,
     bool upper_exclusive = true) {
     if (!range.active) {
         return {};
@@ -202,14 +250,34 @@ std::string pk_range_clause(
     std::ostringstream clause;
     if (!range.lower_inclusive.empty()) {
         clause << " AND `" << pk_col << "` >= ";
-        clause << (range.numeric ? range.lower_inclusive : sql_quote(range.lower_inclusive));
+        clause << (range.numeric ? range.lower_inclusive : pk_sql_literal(col_def, range.lower_inclusive));
     }
     if (!range.upper_exclusive.empty()) {
         clause << " AND `" << pk_col << "` "
                << (upper_exclusive ? "< " : "<= ");
-        clause << (range.numeric ? range.upper_exclusive : sql_quote(range.upper_exclusive));
+        clause << (range.numeric ? range.upper_exclusive : pk_sql_literal(col_def, range.upper_exclusive));
     }
     return clause.str();
+}
+
+long long fetch_mariadb_row_count(
+    MariaDbConn& conn,
+    const std::string& schema,
+    const std::string& table,
+    const MariaDbRetryOptions& retry) {
+    const std::string query =
+        "SELECT COUNT(*) FROM `" + schema + "`.`" + table + "`";
+    MYSQL_RES* res = mariadb_mysql_query_store_retry(conn, query, retry);
+    if (!res) {
+        return -1;
+    }
+    MYSQL_ROW row = mysql_fetch_row(res);
+    long long count = -1;
+    if (row && row[0]) {
+        count = std::atoll(row[0]);
+    }
+    mysql_free_result(res);
+    return count;
 }
 
 long long copy_rows_keyset(
@@ -223,7 +291,8 @@ long long copy_rows_keyset(
     const std::string& snapshot_id,
     const MariaDbRetryOptions& retry,
     const PkRange& pk_range = {},
-    InvalidPkSkipStats* skip_stats = nullptr) {
+    InvalidPkSkipStats* skip_stats = nullptr,
+    full_load::CopyCheckpointContext* checkpoint_ctx = nullptr) {
     const std::string load_ts = utc_now_ts();
     const std::string load_date = utc_now_date();
 
@@ -255,8 +324,21 @@ long long copy_rows_keyset(
     const std::string fq = pg_ident(target.source_schema) + "." + pg_ident(target.source_table);
     const std::string copy_sql = "COPY " + fq + " (" + copy_cols.str() + ") FROM STDIN WITH (FORMAT csv)";
 
+    const MariaDbColumn* pk_col_def = nullptr;
+    if (pk_cols.size() == 1) {
+        for (const auto& col : cols) {
+            if (col.name == pk_cols[0]) {
+                pk_col_def = &col;
+                break;
+            }
+        }
+    }
+
     long long total_rows = 0;
     std::vector<std::string> last_pk_values;
+    if (checkpoint_ctx && !checkpoint_ctx->initial_last_pk.empty()) {
+        last_pk_values = checkpoint_ctx->initial_last_pk;
+    }
 
     while (true) {
         if (g_shutdown.load()) {
@@ -266,25 +348,9 @@ long long copy_rows_keyset(
         query << "SELECT " << select_cols.str() << " FROM `" << target.source_schema << "`.`" << target.source_table
               << "` WHERE 1=1";
         if (pk_range.active && pk_cols.size() == 1) {
-            query << pk_range_clause(pk_cols[0], pk_range, true);
+            query << pk_range_clause(pk_cols[0], pk_range, pk_col_def, true);
         }
-        if (!last_pk_values.empty()) {
-            query << " AND (";
-            for (std::size_t i = 0; i < pk_cols.size(); ++i) {
-                if (i) {
-                    query << ", ";
-                }
-                query << "`" << pk_cols[i] << "`";
-            }
-            query << ") > (";
-            for (std::size_t i = 0; i < last_pk_values.size(); ++i) {
-                if (i) {
-                    query << ", ";
-                }
-                query << sql_quote(last_pk_values[i]);
-            }
-            query << ")";
-        }
+        query << mariadb_keyset_clause(pk_cols, last_pk_values, cols);
         query << " ORDER BY ";
         for (std::size_t i = 0; i < pk_cols.size(); ++i) {
             if (i) {
@@ -384,6 +450,9 @@ long long copy_rows_keyset(
         }
 
         total_rows += static_cast<long long>(batch_lines.size());
+        if (checkpoint_ctx) {
+            full_load::save_copy_batch_checkpoint(*checkpoint_ctx, last_pk_values, total_rows);
+        }
         if (batch_lines.size() < batch_size) {
             break;
         }
@@ -406,6 +475,7 @@ long long copy_rows_parallel(
     const MariaDbSource& source,
     PGconn* log_pg,
     std::mutex* log_mtx,
+    PGconn* app_pg,
     MariaDbConn& conn,
     PGconn* pg,
     const CatalogTableRow& target,
@@ -416,13 +486,55 @@ long long copy_rows_parallel(
     int workers,
     const std::string& snapshot_id,
     const MariaDbRetryOptions& retry,
-    InvalidPkSkipStats* skip_stats = nullptr) {
+    InvalidPkSkipStats* skip_stats = nullptr,
+    const std::vector<FullLoadCheckpoint>* resume_checkpoints = nullptr,
+    std::optional<long long> source_rows = std::nullopt) {
+    std::mutex checkpoint_mtx;
+    auto checkpoint_for_worker = [&](int worker_id) -> full_load::CopyCheckpointContext {
+        full_load::CopyCheckpointContext ctx;
+        ctx.app_pg = app_pg;
+        ctx.log_pg = log_pg;
+        ctx.log_mtx = log_mtx;
+        ctx.catalog_id = target.catalog_id;
+        ctx.worker_id = worker_id;
+        ctx.batch_id = snapshot_id;
+        ctx.conn_id = target.conn_id;
+        ctx.source_schema = target.source_schema;
+        ctx.source_table = target.source_table;
+        ctx.log_component = "mariadb_load";
+        ctx.source_rows = source_rows;
+        ctx.progress_log_interval = pipeline_defaults::kFullLoadCopyProgressLogInterval;
+        ctx.checkpoint_mtx = &checkpoint_mtx;
+        if (resume_checkpoints) {
+            for (const auto& cp : *resume_checkpoints) {
+                if (cp.worker_id == worker_id && cp.phase == FullLoadPhase::Copy) {
+                    ctx.initial_last_pk = last_pk_from_json(cp.last_pk);
+                    break;
+                }
+            }
+        }
+        return ctx;
+    };
+
     if (workers <= 1) {
+        auto ctx = checkpoint_for_worker(0);
         return copy_rows_keyset(
-            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {}, skip_stats);
+            conn,
+            pg,
+            target,
+            cols,
+            pk_cols,
+            batch_size,
+            source_sleep_ms,
+            snapshot_id,
+            retry,
+            {},
+            skip_stats,
+            &ctx);
     }
 
     if (pk_cols.size() != 1) {
+        auto ctx = checkpoint_for_worker(0);
         log_fl(
             log_pg,
             log_mtx,
@@ -434,7 +546,18 @@ long long copy_rows_parallel(
             target.source_schema,
             target.source_table);
         return copy_rows_keyset(
-            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {}, skip_stats);
+            conn,
+            pg,
+            target,
+            cols,
+            pk_cols,
+            batch_size,
+            source_sleep_ms,
+            snapshot_id,
+            retry,
+            {},
+            skip_stats,
+            &ctx);
     }
 
     const MariaDbColumn* pk_col_def = nullptr;
@@ -445,6 +568,7 @@ long long copy_rows_parallel(
         }
     }
     if (!pk_col_def || !is_integer_pk_type(*pk_col_def)) {
+        auto ctx = checkpoint_for_worker(0);
         log_fl(
             log_pg,
             log_mtx,
@@ -456,7 +580,18 @@ long long copy_rows_parallel(
             target.source_schema,
             target.source_table);
         return copy_rows_keyset(
-            conn, pg, target, cols, pk_cols, batch_size, source_sleep_ms, snapshot_id, retry, {}, skip_stats);
+            conn,
+            pg,
+            target,
+            cols,
+            pk_cols,
+            batch_size,
+            source_sleep_ms,
+            snapshot_id,
+            retry,
+            {},
+            skip_stats,
+            &ctx);
     }
 
     const auto bounds = fetch_integer_pk_range(conn, target, pk_cols[0], retry);
@@ -470,6 +605,7 @@ long long copy_rows_parallel(
         min_v = std::stoll(bounds->lower_inclusive);
         max_v = std::stoll(bounds->upper_exclusive);
     } catch (...) {
+        auto ctx = checkpoint_for_worker(0);
         log_fl(
             log_pg,
             log_mtx,
@@ -491,10 +627,12 @@ long long copy_rows_parallel(
             snapshot_id,
             retry,
             pk_range_for_keyset(*bounds),
-            skip_stats);
+            skip_stats,
+            &ctx);
     }
 
     if (min_v >= max_v) {
+        auto ctx = checkpoint_for_worker(0);
         return copy_rows_keyset(
             conn,
             pg,
@@ -506,7 +644,8 @@ long long copy_rows_parallel(
             snapshot_id,
             retry,
             pk_range_for_keyset(*bounds),
-            skip_stats);
+            skip_stats,
+            &ctx);
     }
 
     const unsigned long long total = static_cast<unsigned long long>(max_v) - static_cast<unsigned long long>(min_v) + 1ULL;
@@ -543,6 +682,7 @@ long long copy_rows_parallel(
 
                 MariaDbConn worker_db(source);
                 PgConn worker_pg(cfg.datalake.conn_string());
+                auto worker_ctx = checkpoint_for_worker(w);
                 row_counts[static_cast<std::size_t>(w)] = copy_rows_keyset(
                     worker_db,
                     worker_pg.raw,
@@ -554,7 +694,8 @@ long long copy_rows_parallel(
                     snapshot_id,
                     retry,
                     slice,
-                    &worker_skips[static_cast<std::size_t>(w)]);
+                    &worker_skips[static_cast<std::size_t>(w)],
+                    &worker_ctx);
             } catch (...) {
                 errors[static_cast<std::size_t>(w)] = std::current_exception();
             }
@@ -592,7 +733,14 @@ std::vector<CatalogTableRow> fetch_full_load_targets(PGconn* pg) {
         WHERE db_engine = 'mariadb'
           AND active = true
           AND needs_full_load = true
-          AND status NOT IN ('skipped', 'disabled', 'full_load_in_progress')
+          AND status NOT IN ('skipped', 'disabled')
+          AND (
+            status <> 'full_load_in_progress'
+            OR EXISTS (
+                SELECT 1 FROM cdc_catalog.full_load_checkpoint cp
+                WHERE cp.catalog_id = catalog.catalog_id AND cp.phase = 'copy'
+            )
+          )
         ORDER BY conn_id, source_schema, source_table
         )");
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -686,38 +834,95 @@ void mark_catalog_failed(
 
 enum class TableLoadOutcome { Success, Skipped, Failed };
 
-long long lake_table_row_count(PGconn* pg, const std::string& schema, const std::string& table) {
+std::vector<std::vector<std::string>> group_mariadb_tables_by_fk_level(
+    MariaDbConn& conn,
+    const std::string& schema,
+    const std::vector<std::string>& tables) {
+    std::set<std::string> table_set(tables.begin(), tables.end());
+    if (table_set.size() <= 1) {
+        return {tables};
+    }
+
+    std::string escaped_schema;
+    escaped_schema.reserve(schema.size());
+    for (char c : schema) {
+        if (c == '\'') {
+            escaped_schema += "''";
+        } else {
+            escaped_schema += c;
+        }
+    }
     const std::string sql =
-        "SELECT COUNT(*)::bigint FROM " + pg_ident(schema) + "." + pg_ident(table);
-    PGresult* res = PQexec(pg, sql.c_str());
-    long long count = -1;
-    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-        count = std::atoll(PQgetvalue(res, 0, 0));
-    }
-    if (res) {
-        PQclear(res);
-    }
-    return count;
-}
+        "SELECT DISTINCT TABLE_NAME, REFERENCED_TABLE_NAME "
+        "FROM information_schema.KEY_COLUMN_USAGE "
+        "WHERE TABLE_SCHEMA = '" +
+        escaped_schema +
+        "' AND REFERENCED_TABLE_NAME IS NOT NULL";
 
-void acquire_full_load_table_lock(PGconn* pg, long long catalog_id) {
-    const std::string id = std::to_string(catalog_id);
-    const char* vals[] = {id.c_str()};
-    pg_exec_params_simple(
-        pg,
-        "SELECT pg_advisory_lock($1::bigint)",
-        1,
-        vals);
-}
+    if (mysql_query(conn.handle, sql.c_str()) != 0) {
+        return {tables};
+    }
+    MYSQL_RES* res = mysql_store_result(conn.handle);
+    if (!res) {
+        return {tables};
+    }
 
-void release_full_load_table_lock(PGconn* pg, long long catalog_id) {
-    const std::string id = std::to_string(catalog_id);
-    const char* vals[] = {id.c_str()};
-    pg_exec_params_simple(
-        pg,
-        "SELECT pg_advisory_unlock($1::bigint)",
-        1,
-        vals);
+    std::unordered_map<std::string, int> in_degree;
+    std::unordered_map<std::string, std::vector<std::string>> dependents;
+    for (const auto& t : tables) {
+        in_degree[t] = 0;
+    }
+
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res)) != nullptr) {
+        if (!row[0] || !row[1]) {
+            continue;
+        }
+        const std::string child = row[0];
+        const std::string parent = row[1];
+        if (table_set.find(child) == table_set.end() || table_set.find(parent) == table_set.end()) {
+            continue;
+        }
+        if (child == parent) {
+            continue;
+        }
+        in_degree[child] += 1;
+        dependents[parent].push_back(child);
+    }
+    mysql_free_result(res);
+
+    std::queue<std::string> ready;
+    for (const auto& t : tables) {
+        if (in_degree[t] == 0) {
+            ready.push(t);
+        }
+    }
+
+    std::vector<std::vector<std::string>> levels;
+    std::size_t placed = 0;
+    while (!ready.empty()) {
+        const std::size_t wave = ready.size();
+        std::vector<std::string> level;
+        level.reserve(wave);
+        for (std::size_t i = 0; i < wave; ++i) {
+            const std::string current = ready.front();
+            ready.pop();
+            level.push_back(current);
+            placed += 1;
+            for (const auto& dep : dependents[current]) {
+                in_degree[dep] -= 1;
+                if (in_degree[dep] == 0) {
+                    ready.push(dep);
+                }
+            }
+        }
+        levels.push_back(std::move(level));
+    }
+
+    if (placed != tables.size()) {
+        return {tables};
+    }
+    return levels;
 }
 
 TableLoadOutcome load_one_table(
@@ -797,37 +1002,84 @@ TableLoadOutcome load_one_table(
     };
 
     try {
-    try {
-    truncate_lake_table(lake_pg.raw, target.source_schema, target.source_table);
-    } catch (const std::exception& ex) {
+    std::vector<FullLoadCheckpoint> resume_checkpoints;
+    const bool resume_copy = full_load::should_resume_from_copy_checkpoint(
+        app_pg.raw,
+        lake_pg.raw,
+        target.catalog_id,
+        target.source_schema,
+        target.source_table,
+        resume_checkpoints);
+
+    const MariaDbRetryOptions retry_pre = mariadb_retry_options(runtime, target.conn_id);
+    long long source_rows = fetch_mariadb_row_count(
+        mariadb, target.source_schema, target.source_table, retry_pre);
+
+    if (resume_copy) {
+        long long checkpoint_rows = 0;
+        for (const auto& cp : resume_checkpoints) {
+            if (cp.phase == FullLoadPhase::Copy) {
+                checkpoint_rows += cp.rows_loaded;
+            }
+        }
         log_fl(
             log_pg,
             log_mtx,
-            LogLevel::Error,
+            LogLevel::Info,
             batch_id,
-            "lake table truncate failed, aborting full load",
-            {{"error", ex.what()}},
+            "full load resumed from checkpoint",
+            {{"checkpoint_rows", checkpoint_rows},
+             {"worker_checkpoints", static_cast<int>(resume_checkpoints.size())},
+             {"source_rows", source_rows}},
             target.conn_id,
             target.source_schema,
             target.source_table);
-        release_lock();
-        mark_catalog_failed(app_pg.raw, target.catalog_id, target.conn_id, "truncate failed: " + std::string(ex.what()));
-        return TableLoadOutcome::Failed;
+    } else {
+        clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
+        const auto trunc = full_load::truncate_lake_table_verified(
+            lake_pg.raw,
+            target.source_schema,
+            target.source_table,
+            pipeline_defaults::kFullLoadTruncateMaxRetries);
+        if (!trunc.ok) {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Error,
+                batch_id,
+                "lake table truncate failed, aborting full load",
+                {{"error", trunc.error},
+                 {"rows_after_truncate", trunc.rows_after},
+                 {"attempts", trunc.attempts}},
+                target.conn_id,
+                target.source_schema,
+                target.source_table);
+            release_lock();
+            mark_catalog_failed(
+                app_pg.raw,
+                target.catalog_id,
+                target.conn_id,
+                "truncate failed: " + trunc.error);
+            return TableLoadOutcome::Failed;
+        }
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Info,
+            batch_id,
+            "lake table truncated",
+            {{"rows_after_truncate", trunc.rows_after}, {"attempts", trunc.attempts}},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
+        FullLoadCheckpoint trunc_cp;
+        trunc_cp.catalog_id = target.catalog_id;
+        trunc_cp.worker_id = 0;
+        trunc_cp.batch_id = batch_id;
+        trunc_cp.phase = FullLoadPhase::Truncate;
+        trunc_cp.source_rows = source_rows >= 0 ? std::optional<long long>(source_rows) : std::nullopt;
+        save_full_load_checkpoint(app_pg.raw, trunc_cp);
     }
-
-    const long long rows_after_truncate =
-        lake_table_row_count(lake_pg.raw, target.source_schema, target.source_table);
-
-    log_fl(
-        log_pg,
-        log_mtx,
-        rows_after_truncate == 0 ? LogLevel::Info : LogLevel::Warning,
-        batch_id,
-        rows_after_truncate == 0 ? "lake table truncated" : "lake table truncate incomplete",
-        {{"rows_after_truncate", rows_after_truncate}},
-        target.conn_id,
-        target.source_schema,
-        target.source_table);
 
     {
         try {
@@ -866,6 +1118,16 @@ TableLoadOutcome load_one_table(
         target.source_schema,
         target.source_table);
 
+    {
+        FullLoadCheckpoint ddl_cp;
+        ddl_cp.catalog_id = target.catalog_id;
+        ddl_cp.worker_id = 0;
+        ddl_cp.batch_id = batch_id;
+        ddl_cp.phase = FullLoadPhase::Ddl;
+        ddl_cp.source_rows = source_rows >= 0 ? std::optional<long long>(source_rows) : std::nullopt;
+        save_full_load_checkpoint(app_pg.raw, ddl_cp);
+    }
+
     const MariaDbRetryOptions retry = mariadb_retry_options(runtime, target.conn_id);
     InvalidPkSkipStats skip_stats;
     rows_out = copy_rows_parallel(
@@ -873,6 +1135,7 @@ TableLoadOutcome load_one_table(
         source,
         log_pg,
         log_mtx,
+        app_pg.raw,
         mariadb,
         lake_pg.raw,
         target,
@@ -883,7 +1146,9 @@ TableLoadOutcome load_one_table(
         workers,
         batch_id,
         retry,
-        &skip_stats);
+        &skip_stats,
+        resume_copy ? &resume_checkpoints : nullptr,
+        source_rows >= 0 ? std::optional<long long>(source_rows) : std::nullopt);
 
     if (skip_stats.count > 0) {
         log_fl(
@@ -898,7 +1163,35 @@ TableLoadOutcome load_one_table(
             target.source_table);
     }
 
+    const long long lake_rows =
+        full_load::lake_table_row_count(lake_pg.raw, target.source_schema, target.source_table);
+    const auto verify = full_load::verify_full_load_row_counts(source_rows, lake_rows, rows_out);
+    if (!verify.ok) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Error,
+            batch_id,
+            "full load row count verify failed",
+            {{"source_rows", verify.source_rows},
+             {"lake_rows", verify.lake_rows},
+             {"rows_loaded", rows_out},
+             {"diff", verify.diff},
+             {"message", verify.message}},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
+        release_lock();
+        mark_catalog_failed(
+            app_pg.raw,
+            target.catalog_id,
+            target.conn_id,
+            "row count verify failed: " + verify.message);
+        return TableLoadOutcome::Failed;
+    }
+
     mark_catalog_success(app_pg.raw, target.catalog_id);
+    clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
 
     if (!onboard_table_after_full_load(
             app_pg.raw,
@@ -1014,6 +1307,7 @@ FullLoadRunStats run_mariadb_full_load(
         conn_ids.insert(t.conn_id);
     }
     for (const auto& cid : conn_ids) {
+        recover_full_load_for_checkpoint_resume(app_pg.raw, cid, "mariadb", batch_id);
         const int stale_minutes =
             pipeline_defaults::kFullLoadStaleInProgressMinutes;
         clear_stale_full_load_in_progress(app_pg.raw, cid, "mariadb", stale_minutes);
@@ -1086,6 +1380,7 @@ FullLoadRunStats run_mariadb_full_load(
         }
 
         const int parallel_tables = kFullLoadParallelTables;
+        stats.conn_ids.insert(conn_id);
 
         try {
             if (capture_binlog_position_t0_if_absent(app_pg.raw, order_db.handle, conn_id)) {
@@ -1132,25 +1427,28 @@ FullLoadRunStats run_mariadb_full_load(
                 row_by_table[row.source_table] = row;
             }
 
+            const auto levels = group_mariadb_tables_by_fk_level(order_db, schema, names);
+
             log_fl(
                 log_pg,
                 nullptr,
                 LogLevel::Info,
                 batch_id,
-                "full load schema batch",
-                {{"schema", schema}, {"table_count", names.size()}, {"parallel_tables", parallel_tables}},
+                "fk load level resolved",
+                {{"schema", schema}, {"levels", levels.size()}, {"parallel_tables", parallel_tables}},
                 conn_id);
 
-            for (std::size_t batch_start = 0; batch_start < names.size();
-                 batch_start += static_cast<std::size_t>(parallel_tables)) {
-                const std::size_t batch_end =
-                    std::min(batch_start + static_cast<std::size_t>(parallel_tables), names.size());
-                std::vector<std::thread> pool;
-                pool.reserve(batch_end - batch_start);
+            for (const auto& level : levels) {
+                for (std::size_t batch_start = 0; batch_start < level.size();
+                     batch_start += static_cast<std::size_t>(parallel_tables)) {
+                    const std::size_t batch_end =
+                        std::min(batch_start + static_cast<std::size_t>(parallel_tables), level.size());
+                    std::vector<std::thread> pool;
+                    pool.reserve(batch_end - batch_start);
 
-                for (std::size_t i = batch_start; i < batch_end; ++i) {
-                    const CatalogTableRow target = row_by_table[names[i]];
-                    pool.emplace_back([&, target]() {
+                    for (std::size_t i = batch_start; i < batch_end; ++i) {
+                        const CatalogTableRow target = row_by_table[level[i]];
+                        pool.emplace_back([&, target]() {
                         long long rows = 0;
                         try {
                             const auto outcome = load_one_table(cfg, log_pg, &log_mtx, *src, target, batch_id, rows);
@@ -1180,6 +1478,7 @@ FullLoadRunStats run_mariadb_full_load(
                 for (auto& thread : pool) {
                     thread.join();
                 }
+            }
             }
         }
 

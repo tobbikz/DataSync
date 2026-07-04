@@ -1,5 +1,6 @@
 #include "capture_common.hpp"
 
+#include "connections.hpp"
 #include "pipeline_defaults.hpp"
 
 #include <atomic>
@@ -27,6 +28,7 @@ std::atomic<bool> g_shutdown{false};
 #include <chrono>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <thread>
@@ -76,6 +78,86 @@ rd_kafka_resp_err_t query_kafka_watermark_offsets_retry(
         std::this_thread::sleep_for(std::chrono::milliseconds(250 * (attempt + 1)));
     }
     return err;
+}
+
+struct KafkaAdminClient {
+    rd_kafka_t* rk{nullptr};
+    explicit KafkaAdminClient(const std::string& bootstrap) {
+        char errstr[512];
+        rd_kafka_conf_t* conf = rd_kafka_conf_new();
+        rd_kafka_conf_set(conf, "bootstrap.servers", bootstrap.c_str(), errstr, sizeof(errstr));
+        rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
+        if (!rk) {
+            rd_kafka_conf_destroy(conf);
+            throw std::runtime_error(std::string("kafka client create failed: ") + errstr);
+        }
+    }
+    ~KafkaAdminClient() {
+        if (rk) {
+            rd_kafka_destroy(rk);
+        }
+    }
+    KafkaAdminClient(const KafkaAdminClient&) = delete;
+    KafkaAdminClient& operator=(const KafkaAdminClient&) = delete;
+};
+
+void alter_consumer_group_offset(
+    rd_kafka_t* rk,
+    const std::string& consumer_group,
+    const std::string& topic,
+    int partition,
+    long long offset) {
+    rd_kafka_topic_partition_list_t* parts = rd_kafka_topic_partition_list_new(1);
+    rd_kafka_topic_partition_list_add(parts, topic.c_str(), partition)->offset = offset;
+
+    char errstr[512];
+    rd_kafka_AlterConsumerGroupOffsets_t* alter =
+        rd_kafka_AlterConsumerGroupOffsets_new(consumer_group.c_str(), parts);
+    rd_kafka_AdminOptions_t* options =
+        rd_kafka_AdminOptions_new(rk, RD_KAFKA_ADMIN_OP_ALTERCONSUMERGROUPOFFSETS);
+    if (rd_kafka_AdminOptions_set_request_timeout(options, 30000, errstr, sizeof(errstr)) !=
+        RD_KAFKA_RESP_ERR_NO_ERROR) {
+        rd_kafka_AdminOptions_destroy(options);
+        rd_kafka_AlterConsumerGroupOffsets_destroy(alter);
+        rd_kafka_topic_partition_list_destroy(parts);
+        throw std::runtime_error(std::string("admin options failed: ") + errstr);
+    }
+
+    rd_kafka_queue_t* queue = rd_kafka_queue_new(rk);
+    rd_kafka_AlterConsumerGroupOffsets(rk, &alter, 1, options, queue);
+
+    rd_kafka_event_t* event = rd_kafka_queue_poll(queue, 30000);
+
+    rd_kafka_AlterConsumerGroupOffsets_destroy(alter);
+    rd_kafka_AdminOptions_destroy(options);
+    rd_kafka_topic_partition_list_destroy(parts);
+    rd_kafka_queue_destroy(queue);
+
+    if (!event) {
+        throw std::runtime_error("kafka alter consumer group offsets timed out");
+    }
+    if (rd_kafka_event_error(event)) {
+        const std::string msg = rd_kafka_event_error_string(event);
+        rd_kafka_event_destroy(event);
+        throw std::runtime_error(std::string("kafka alter offsets failed: ") + msg);
+    }
+
+    const rd_kafka_AlterConsumerGroupOffsets_result_t* result =
+        rd_kafka_event_AlterConsumerGroupOffsets_result(event);
+    if (result) {
+        size_t group_count = 0;
+        const rd_kafka_group_result_t* const* groups =
+            rd_kafka_AlterConsumerGroupOffsets_result_groups(result, &group_count);
+        for (size_t i = 0; i < group_count; ++i) {
+            const rd_kafka_error_t* group_err = rd_kafka_group_result_error(groups[i]);
+            if (group_err) {
+                const std::string msg = rd_kafka_error_string(group_err);
+                rd_kafka_event_destroy(event);
+                throw std::runtime_error(std::string("kafka alter offsets group failed: ") + msg);
+            }
+        }
+    }
+    rd_kafka_event_destroy(event);
 }
 
 }  // namespace
@@ -404,73 +486,113 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
     }
     sql << " ORDER BY source_schema, source_table";
 
-    PGresult* res = PQexecParams(
-        pg,
-        sql.str().c_str(),
-        static_cast<int>(vals.size()),
-        nullptr,
-        vals.data(),
-        nullptr,
-        nullptr,
-        0);
-
+    const std::size_t page_size = pipeline_defaults::kCatalogFetchPageSize;
     std::vector<CaptureCatalogTable> out;
-    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (res) {
-            log_write(pg, {
-                .level = LogLevel::Error,
-                .component = pipeline == CatalogPipeline::Capture ? "cdc_kafka_capture" : "cdc_kafka_apply_cpp",
-                .message = "fetch_conn_catalog_tables query failed",
-                .batch_id = std::nullopt,
-                .conn_id = conn_id,
-                .source_schema = std::nullopt,
-                .source_table = std::nullopt,
-                .context = {
-                    {"db_engine", db_engine},
-                    {"pipeline", pipeline == CatalogPipeline::Capture ? "capture" : "apply"},
-                    {"error", PQresultErrorMessage(res)},
-                },
-            });
-            PQclear(res);
-        }
-        return out;
-    }
+    for (std::size_t page_offset = 0;; page_offset += page_size) {
+        std::ostringstream page_sql;
+        page_sql << sql.str();
+        page_sql << " LIMIT " << page_size << " OFFSET " << page_offset;
 
-    for (int i = 0; i < PQntuples(res); ++i) {
-        CaptureCatalogTable row;
-        row.catalog_id = std::atoll(PQgetvalue(res, i, 0));
-        row.conn_id = PQgetvalue(res, i, 1);
-        row.source_database = PQgetvalue(res, i, 2);
-        row.source_schema = PQgetvalue(res, i, 3);
-        row.source_table = PQgetvalue(res, i, 4);
-        row.pk_columns = PQgetvalue(res, i, 5);
-        const char* meta_txt = PQgetvalue(res, i, 6);
-        if (meta_txt && *meta_txt) {
-            try {
-                row.engine_meta = nlohmann::json::parse(meta_txt);
-            } catch (...) {
-                row.engine_meta = nlohmann::json::object();
+        PGresult* res = PQexecParams(
+            pg,
+            page_sql.str().c_str(),
+            static_cast<int>(vals.size()),
+            nullptr,
+            vals.data(),
+            nullptr,
+            nullptr,
+            0);
+
+        if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+            if (res) {
+                log_write(pg, {
+                    .level = LogLevel::Error,
+                    .component = pipeline == CatalogPipeline::Capture ? "cdc_kafka_capture" : "cdc_kafka_apply_cpp",
+                    .message = "fetch_conn_catalog_tables query failed",
+                    .batch_id = std::nullopt,
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {
+                        {"db_engine", db_engine},
+                        {"pipeline", pipeline == CatalogPipeline::Capture ? "capture" : "apply"},
+                        {"error", PQresultErrorMessage(res)},
+                        {"page_offset", static_cast<long long>(page_offset)},
+                    },
+                });
+                PQclear(res);
             }
+            return out;
         }
-        const char* hot_val = PQgetvalue(res, i, 7);
-        row.hot = hot_val && (hot_val[0] == 't' || hot_val[0] == 'T' || hot_val[0] == '1');
-        if (db_engine == "mssql") {
-            row.lake_schema = mssql_pg_schema_name(row.source_database, row.source_schema);
-            row.lake_table = mssql_pg_table_name(row.source_table);
-        } else if (db_engine == "mongodb") {
-            row.lake_schema = mongo_pg_schema_name(row.source_database);
-            row.lake_table = mongo_pg_table_name(row.source_table);
-        } else {
-            row.lake_schema = row.source_schema;
-            row.lake_table = row.source_table;
+
+        const int rows = PQntuples(res);
+        for (int i = 0; i < rows; ++i) {
+            CaptureCatalogTable row;
+            row.catalog_id = std::atoll(PQgetvalue(res, i, 0));
+            row.conn_id = PQgetvalue(res, i, 1);
+            row.source_database = PQgetvalue(res, i, 2);
+            row.source_schema = PQgetvalue(res, i, 3);
+            row.source_table = PQgetvalue(res, i, 4);
+            row.pk_columns = PQgetvalue(res, i, 5);
+            const char* meta_txt = PQgetvalue(res, i, 6);
+            if (meta_txt && *meta_txt) {
+                try {
+                    row.engine_meta = nlohmann::json::parse(meta_txt);
+                } catch (...) {
+                    row.engine_meta = nlohmann::json::object();
+                }
+            }
+            const char* hot_val = PQgetvalue(res, i, 7);
+            row.hot = hot_val && (hot_val[0] == 't' || hot_val[0] == 'T' || hot_val[0] == '1');
+            if (db_engine == "mssql") {
+                row.lake_schema = mssql_pg_schema_name(row.source_database, row.source_schema);
+                row.lake_table = mssql_pg_table_name(row.source_table);
+            } else if (db_engine == "mongodb") {
+                row.lake_schema = mongo_pg_schema_name(row.source_database);
+                row.lake_table = mongo_pg_table_name(row.source_table);
+            } else {
+                row.lake_schema = row.source_schema;
+                row.lake_table = row.source_table;
+            }
+            out.push_back(std::move(row));
         }
-        out.push_back(std::move(row));
+        PQclear(res);
+        if (rows == 0 || static_cast<std::size_t>(rows) < page_size) {
+            break;
+        }
     }
-    PQclear(res);
     return out;
 }
 
+void rotate_capture_catalog_tables(
+    std::vector<CaptureCatalogTable>& tables,
+    const std::string& conn_id) {
+    if (tables.size() <= 1) {
+        return;
+    }
+    static std::mutex rotate_mu;
+    static std::map<std::string, std::size_t> rotate_offsets;
+    std::lock_guard<std::mutex> guard(rotate_mu);
+    std::size_t& offset = rotate_offsets[conn_id];
+    const std::size_t n = tables.size();
+    offset %= n;
+    if (offset > 0) {
+        std::rotate(tables.begin(), tables.begin() + static_cast<std::ptrdiff_t>(offset), tables.end());
+    }
+    offset = (offset + 1) % n;
+}
+
 namespace {
+
+std::string catalog_hot_filter_sql(CatalogHotTier tier, const std::string& alias) {
+    if (tier == CatalogHotTier::HotOnly) {
+        return " AND " + alias + ".hot = true";
+    }
+    if (tier == CatalogHotTier::ColdOnly) {
+        return " AND " + alias + ".hot = false";
+    }
+    return "";
+}
 
 bool engine_meta_has_stream_bookmark(const std::string& engine_meta_text) {
     if (engine_meta_text.empty()) {
@@ -947,12 +1069,12 @@ void enable_cdc_after_full_load(
     const std::string& conn_id,
     const std::string& db_engine,
     const std::string& batch_id,
-    bool expect_updates) {
+    bool expect_updates,
+    CatalogHotTier hot_tier) {
     const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        UPDATE cdc_catalog.catalog
+    std::ostringstream sql;
+    sql << R"(
+        UPDATE cdc_catalog.catalog c
         SET cdc_enabled = true,
             status = 'success',
             updated_at = now()
@@ -963,7 +1085,11 @@ void enable_cdc_after_full_load(
           AND needs_full_load = false
           AND NOT cdc_enabled
           AND status = 'full_load_in_progress'
-        )",
+    )";
+    sql << catalog_hot_filter_sql(hot_tier, "c");
+    PGresult* res = PQexecParams(
+        pg,
+        sql.str().c_str(),
         2,
         nullptr,
         vals,
@@ -1196,6 +1322,89 @@ void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string
         vals);
 }
 
+void quarantine_apply_position(PGconn* pg, long long catalog_id, const std::string& reason) {
+    if (catalog_id <= 0) {
+        return;
+    }
+    const std::string id = std::to_string(catalog_id);
+    const std::string trunc = reason.substr(0, 950);
+    const char* vals[] = {id.c_str(), trunc.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.apply_position
+        SET status = 'quarantined'::cdc_catalog.cdc_health_status,
+            quarantined_at = now(),
+            quarantine_reason = $2,
+            last_error = $2,
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+          AND status IS DISTINCT FROM 'quarantined'::cdc_catalog.cdc_health_status
+        )",
+        2,
+        vals);
+}
+
+int refresh_apply_position_health(PGconn* pg, const std::string& conn_id, int staleness_seconds) {
+    if (staleness_seconds <= 0) {
+        staleness_seconds = pipeline_defaults::kApplyMaxTableStalenessSeconds;
+    }
+    const int lagging_seconds = std::max(1, staleness_seconds / 2);
+    const std::string stale = std::to_string(staleness_seconds);
+    const std::string lagging = std::to_string(lagging_seconds);
+    const char* vals[] = {conn_id.c_str(), stale.c_str(), lagging.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.apply_position ap
+        SET apply_lag_seconds = GREATEST(
+                0,
+                extract(epoch FROM (now() - ap.last_applied_at))::integer
+            ),
+            status = CASE
+                WHEN ap.status IN (
+                    'quarantined'::cdc_catalog.cdc_health_status,
+                    'failed'::cdc_catalog.cdc_health_status,
+                    'gap_detected'::cdc_catalog.cdc_health_status
+                ) THEN ap.status
+                WHEN ap.last_applied_at IS NULL THEN ap.status
+                WHEN extract(epoch FROM (now() - ap.last_applied_at)) > $2::integer
+                    THEN 'stale'::cdc_catalog.cdc_health_status
+                WHEN extract(epoch FROM (now() - ap.last_applied_at)) > $3::integer
+                    THEN 'lagging'::cdc_catalog.cdc_health_status
+                WHEN ap.status IN (
+                    'stale'::cdc_catalog.cdc_health_status,
+                    'lagging'::cdc_catalog.cdc_health_status
+                ) THEN 'healthy'::cdc_catalog.cdc_health_status
+                ELSE ap.status
+            END,
+            updated_at = now()
+        FROM cdc_catalog.catalog c
+        WHERE ap.catalog_id = c.catalog_id
+          AND c.conn_id = $1
+          AND c.active = true
+          AND c.cdc_enabled = true
+          AND c.needs_full_load = false
+        )",
+        3,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    int updated = 0;
+    if (res && PQresultStatus(res) == PGRES_COMMAND_OK) {
+        const char* n = PQcmdTuples(res);
+        if (n && n[0]) {
+            updated = std::atoi(n);
+        }
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return updated;
+}
+
 void clear_stale_full_load_in_progress(
     PGconn* pg,
     const std::string& conn_id,
@@ -1267,7 +1476,9 @@ int clear_stale_cdc_in_progress(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine) {
-    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
+    const std::string stale_sec_str =
+        std::to_string(pipeline_defaults::kCdcInProgressStaleSeconds);
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str(), stale_sec_str.c_str()};
     PGresult* res = PQexecParams(
         pg,
         R"(
@@ -1280,8 +1491,9 @@ int clear_stale_cdc_in_progress(
         WHERE conn_id = $1
           AND db_engine = $2::cdc_catalog.db_engine
           AND status = 'cdc_in_progress'
+          AND updated_at < now() - ($3::int * interval '1 second')
         )",
-        2,
+        3,
         nullptr,
         vals,
         nullptr,
@@ -1336,20 +1548,24 @@ int count_full_load_pending(
 int count_full_load_pending_onboard(
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& db_engine) {
+    const std::string& db_engine,
+    CatalogHotTier hot_tier) {
     const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
+    std::ostringstream sql;
+    sql << R"(
         SELECT COUNT(*)::int
-        FROM cdc_catalog.catalog
+        FROM cdc_catalog.catalog c
         WHERE conn_id = $1
           AND db_engine = $2::cdc_catalog.db_engine
           AND active = true
           AND needs_full_load = false
           AND NOT cdc_enabled
           AND status = 'full_load_in_progress'
-        )",
+    )";
+    sql << catalog_hot_filter_sql(hot_tier, "c");
+    PGresult* res = PQexecParams(
+        pg,
+        sql.str().c_str(),
         2,
         nullptr,
         vals,
@@ -1550,7 +1766,6 @@ bool upsert_apply_position(
         ON CONFLICT (conn_id, source_schema, source_table) DO UPDATE SET
             catalog_id = EXCLUDED.catalog_id,
             kafka_topic = EXCLUDED.kafka_topic,
-            status = EXCLUDED.status,
             updated_at = now()
         )",
         5,
@@ -1776,6 +1991,18 @@ struct OnboardApplyRow {
     int partition;
 };
 
+static bool pg_exec_ok(PGconn* pg, const char* sql) {
+    PGresult* res = PQexec(pg, sql);
+    const bool ok = res && PQresultStatus(res) == PGRES_COMMAND_OK;
+    if (res) {
+        PQclear(res);
+    }
+    return ok;
+}
+
+// Best-effort multi-step onboard: reset Kafka apply offsets for every consumer group,
+// update apply_position/catalog, prune dedup audit rows. Steps are not atomic with
+// Kafka — partial failure leaves tables in full_load_in_progress until a later retry.
 static FullLoadKafkaResetStats execute_kafka_onboard_reset(
     PGconn* pg,
     const std::string& conn_id,
@@ -1865,6 +2092,11 @@ static FullLoadKafkaResetStats execute_kafka_onboard_reset(
         PQclear(stream_res);
     }
 
+    // One admin client per reset batch; sequential AlterConsumerGroupOffsets (parallel
+    // admin calls risk broker overload without correctness benefit). topic/partition pairs
+    // are deduped in unique_topics above.
+    KafkaAdminClient admin(bootstrap);
+
     std::map<std::pair<std::string, int>, long long> topic_offsets;
     for (const auto& topic_key : unique_topics) {
         const auto& topic = topic_key.first;
@@ -1874,28 +2106,42 @@ static FullLoadKafkaResetStats execute_kafka_onboard_reset(
         bool reset_ok = false;
         for (int attempt = 0; attempt < 3; ++attempt) {
             try {
+                long long commit_offset = 0;
+                long long stored_offset = -1;
+                if (use_bookmark) {
+                    commit_offset = bookmark_it->second;
+                    stored_offset = std::max<int64_t>(0, commit_offset - 1);
+                } else {
+                    int64_t low = 0;
+                    int64_t high = 0;
+                    const rd_kafka_resp_err_t wm_err = query_kafka_watermark_offsets_retry(
+                        admin.rk, topic.c_str(), partition, &low, &high, 15000, 12);
+                    if (wm_err == RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION) {
+                        stored_offset = -1;
+                    } else if (wm_err != RD_KAFKA_RESP_ERR_NO_ERROR) {
+                        throw std::runtime_error(
+                            std::string("watermark query failed: ") + rd_kafka_err2str(wm_err));
+                    } else {
+                        commit_offset = high;
+                        stored_offset = std::max<int64_t>(0, high - 1);
+                    }
+                }
+                if (stored_offset < 0) {
+                    throw std::runtime_error("unknown kafka partition for offset reset");
+                }
+
                 for (int w = 0; w < apply_workers; ++w) {
                     const std::string consumer_group =
                         kafka_apply_consumer_group(conn_id, w, apply_workers, false);
-                    const long long stored_offset =
-                        use_bookmark
-                            ? reset_apply_consumer_offset(
-                                  bootstrap, consumer_group, topic, partition, bookmark_it->second)
-                            : reset_apply_offset_to_end(bootstrap, consumer_group, topic, partition);
-                    if (w == 0 && stored_offset >= 0) {
-                        topic_offsets.emplace(topic_key, stored_offset);
-                    }
+                    alter_consumer_group_offset(
+                        admin.rk, consumer_group, topic, partition, commit_offset);
                 }
                 for (int w = 0; w < pipeline_defaults::kHotApplyConsumerCount; ++w) {
                     const std::string hot_group = kafka_apply_consumer_group(
                         conn_id, w, pipeline_defaults::kHotApplyConsumerCount, true);
-                    if (use_bookmark) {
-                        reset_apply_consumer_offset(
-                            bootstrap, hot_group, topic, partition, bookmark_it->second);
-                    } else {
-                        reset_apply_offset_to_end(bootstrap, hot_group, topic, partition);
-                    }
+                    alter_consumer_group_offset(admin.rk, hot_group, topic, partition, commit_offset);
                 }
+                topic_offsets.emplace(topic_key, stored_offset);
                 stats.topics_reset += 1;
                 reset_ok = true;
                 break;
@@ -1943,6 +2189,21 @@ static FullLoadKafkaResetStats execute_kafka_onboard_reset(
             });
             return stats;
         }
+    }
+
+    if (!pg_exec_ok(pg, "BEGIN")) {
+        stats.errors += 1;
+        log_write(pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_catalog_onboard",
+            .message = "full-load kafka reset catalog tx begin failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"db_engine", db_engine}},
+        });
+        return stats;
     }
 
     for (const auto& row : rows) {
@@ -2022,8 +2283,44 @@ static FullLoadKafkaResetStats execute_kafka_onboard_reset(
             },
         });
     }
+
+    if (stats.errors > 0) {
+        pg_exec_ok(pg, "ROLLBACK");
+        return stats;
+    }
+    if (!pg_exec_ok(pg, "COMMIT")) {
+        stats.errors += 1;
+        pg_exec_ok(pg, "ROLLBACK");
+        log_write(pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_catalog_onboard",
+            .message = "full-load kafka reset catalog tx commit failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"db_engine", db_engine}},
+        });
+        return stats;
+    }
 #else
     (void)bootstrap;
+    stats.errors = stats.tables > 0 ? stats.tables : 1;
+    log_write(pg, {
+        .level = LogLevel::Error,
+        .component = "cdc_catalog_onboard",
+        .message = "full-load kafka reset unavailable: librdkafka not compiled",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"db_engine", db_engine},
+            {"tables", stats.tables},
+            {"single_table", single_catalog_id.has_value()},
+        },
+    });
+    return stats;
 #endif
 
     if (stats.errors > 0) {
@@ -2239,7 +2536,8 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine,
-    const std::string& batch_id) {
+    const std::string& batch_id,
+    CatalogHotTier hot_tier) {
     FullLoadKafkaResetStats stats;
 
     const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
@@ -2247,9 +2545,8 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
     ensure_apply_positions_for_conn(pg, conn_id, db_engine);
 
     const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
+    std::ostringstream sql;
+    sql << R"(
         SELECT ap.catalog_id, ap.source_schema, ap.source_table, ap.kafka_topic, ap.kafka_partition
         FROM cdc_catalog.apply_position ap
         JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
@@ -2259,8 +2556,12 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
           AND c.needs_full_load = false
           AND NOT c.cdc_enabled
           AND c.status = 'full_load_in_progress'
-        ORDER BY ap.source_schema, ap.source_table
-        )",
+    )";
+    sql << catalog_hot_filter_sql(hot_tier, "c");
+    sql << " ORDER BY ap.source_schema, ap.source_table";
+    PGresult* res = PQexecParams(
+        pg,
+        sql.str().c_str(),
         2,
         nullptr,
         vals,
@@ -2335,7 +2636,8 @@ bool onboard_conn_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine,
-    const std::string& batch_id) {
+    const std::string& batch_id,
+    CatalogHotTier hot_tier) {
 #ifdef HAVE_FREETDS
     if (db_engine == "mssql") {
         seed_mssql_cdc_lsn_for_conn(cfg, pg, conn_id, batch_id);
@@ -2346,9 +2648,9 @@ bool onboard_conn_after_full_load(
         seed_mongo_cdc_resume_for_conn(cfg, pg, conn_id, batch_id);
     }
 #endif
-    const auto stats = reset_kafka_apply_after_full_load(pg, conn_id, db_engine, batch_id);
-    enable_cdc_after_full_load(pg, conn_id, db_engine, batch_id, false);
-    const int pending = count_full_load_pending_onboard(pg, conn_id, db_engine);
+    const auto stats = reset_kafka_apply_after_full_load(pg, conn_id, db_engine, batch_id, hot_tier);
+    enable_cdc_after_full_load(pg, conn_id, db_engine, batch_id, false, hot_tier);
+    const int pending = count_full_load_pending_onboard(pg, conn_id, db_engine, CatalogHotTier::All);
     if (stats.errors > 0) {
         log_write(pg, {
             .level = pending > 0 ? LogLevel::Warning : LogLevel::Info,
@@ -2371,6 +2673,90 @@ bool onboard_conn_after_full_load(
     return pending == 0;
 }
 
+std::vector<std::string> list_conn_ids_pending_onboard(PGconn* pg, CatalogHotTier hot_tier) {
+    std::ostringstream sql;
+    sql << R"(
+        SELECT DISTINCT conn_id
+        FROM cdc_catalog.catalog c
+        WHERE active = true
+          AND needs_full_load = false
+          AND NOT cdc_enabled
+          AND status = 'full_load_in_progress'
+    )";
+    sql << catalog_hot_filter_sql(hot_tier, "c");
+    sql << " ORDER BY conn_id";
+
+    PGresult* res = PQexec(pg, sql.str().c_str());
+    std::vector<std::string> out;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK) {
+        for (int i = 0; i < PQntuples(res); ++i) {
+            const char* cid = PQgetvalue(res, i, 0);
+            if (cid && *cid) {
+                out.emplace_back(cid);
+            }
+        }
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return out;
+}
+
+int run_onboard_pending(
+    const AppConfig& cfg,
+    PGconn* pg,
+    const std::string& batch_id,
+    const std::optional<std::string>& conn_id_filter,
+    CatalogHotTier hot_tier) {
+    const char* tier_label =
+        hot_tier == CatalogHotTier::HotOnly ? "hot"
+                                            : (hot_tier == CatalogHotTier::ColdOnly ? "cold" : "all");
+    log_write(pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_catalog_onboard",
+        .message = "onboard-pending started",
+        .batch_id = batch_id,
+        .conn_id = conn_id_filter,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {{"tier", tier_label}},
+    });
+
+    std::vector<std::string> conn_ids;
+    if (conn_id_filter && !conn_id_filter->empty()) {
+        conn_ids.push_back(*conn_id_filter);
+    } else {
+        conn_ids = list_conn_ids_pending_onboard(pg, hot_tier);
+    }
+
+    int failures = 0;
+    int conn_ok = 0;
+    for (const auto& cid : conn_ids) {
+        if (!onboard_conn_after_full_load(cfg, pg, cid, conn_engine(cfg, cid), batch_id, hot_tier)) {
+            failures += 1;
+        } else {
+            conn_ok += 1;
+        }
+    }
+
+    log_write(pg, {
+        .level = failures > 0 ? LogLevel::Warning : LogLevel::Info,
+        .component = "cdc_catalog_onboard",
+        .message = failures > 0 ? "onboard-pending completed with errors" : "onboard-pending completed",
+        .batch_id = batch_id,
+        .conn_id = conn_id_filter,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"tier", tier_label},
+            {"conn_count", static_cast<int>(conn_ids.size())},
+            {"conn_ok", conn_ok},
+            {"failures", failures},
+        },
+    });
+    return failures > 0 ? 1 : 0;
+}
+
 #ifdef HAVE_RDKAFKA
 
 long long reset_apply_offset_to_end(
@@ -2378,83 +2764,21 @@ long long reset_apply_offset_to_end(
     const std::string& consumer_group,
     const std::string& topic,
     int partition) {
-    char errstr[512];
-    rd_kafka_conf_t* conf = rd_kafka_conf_new();
-    rd_kafka_conf_set(conf, "bootstrap.servers", bootstrap.c_str(), errstr, sizeof(errstr));
-
-    rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
-    if (!rk) {
-        rd_kafka_conf_destroy(conf);
-        throw std::runtime_error(std::string("kafka client create failed: ") + errstr);
-    }
+    KafkaAdminClient admin(bootstrap);
 
     int64_t low = 0;
     int64_t high = 0;
     rd_kafka_resp_err_t err =
-        query_kafka_watermark_offsets_retry(rk, topic.c_str(), partition, &low, &high, 15000, 12);
+        query_kafka_watermark_offsets_retry(admin.rk, topic.c_str(), partition, &low, &high, 15000, 12);
     if (err == RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION) {
-        rd_kafka_destroy(rk);
         return -1;
     }
     if (err != RD_KAFKA_RESP_ERR_NO_ERROR) {
-        rd_kafka_destroy(rk);
         throw std::runtime_error(std::string("watermark query failed: ") + rd_kafka_err2str(err));
     }
 
-    const long long new_offset = std::max<int64_t>(0, high - 1);
-    rd_kafka_topic_partition_list_t* parts = rd_kafka_topic_partition_list_new(1);
-    rd_kafka_topic_partition_list_add(parts, topic.c_str(), partition)->offset = high;
-
-    rd_kafka_AlterConsumerGroupOffsets_t* alter =
-        rd_kafka_AlterConsumerGroupOffsets_new(consumer_group.c_str(), parts);
-    rd_kafka_AdminOptions_t* options =
-        rd_kafka_AdminOptions_new(rk, RD_KAFKA_ADMIN_OP_ALTERCONSUMERGROUPOFFSETS);
-    if (rd_kafka_AdminOptions_set_request_timeout(options, 30000, errstr, sizeof(errstr)) != RD_KAFKA_RESP_ERR_NO_ERROR) {
-        rd_kafka_AdminOptions_destroy(options);
-        rd_kafka_AlterConsumerGroupOffsets_destroy(alter);
-        rd_kafka_topic_partition_list_destroy(parts);
-        rd_kafka_destroy(rk);
-        throw std::runtime_error(std::string("admin options failed: ") + errstr);
-    }
-
-    rd_kafka_queue_t* queue = rd_kafka_queue_new(rk);
-    rd_kafka_AlterConsumerGroupOffsets(rk, &alter, 1, options, queue);
-
-    rd_kafka_event_t* event = rd_kafka_queue_poll(queue, 30000);
-
-    rd_kafka_AlterConsumerGroupOffsets_destroy(alter);
-    rd_kafka_AdminOptions_destroy(options);
-    rd_kafka_topic_partition_list_destroy(parts);
-    rd_kafka_queue_destroy(queue);
-    rd_kafka_destroy(rk);
-
-    if (!event) {
-        throw std::runtime_error("kafka alter consumer group offsets timed out");
-    }
-    if (rd_kafka_event_error(event)) {
-        const std::string msg = rd_kafka_event_error_string(event);
-        rd_kafka_event_destroy(event);
-        throw std::runtime_error(std::string("kafka alter offsets failed: ") + msg);
-    }
-
-    const rd_kafka_AlterConsumerGroupOffsets_result_t* result =
-        rd_kafka_event_AlterConsumerGroupOffsets_result(event);
-    if (result) {
-        size_t group_count = 0;
-        const rd_kafka_group_result_t* const* groups =
-            rd_kafka_AlterConsumerGroupOffsets_result_groups(result, &group_count);
-        for (size_t i = 0; i < group_count; ++i) {
-            const rd_kafka_error_t* group_err = rd_kafka_group_result_error(groups[i]);
-            if (group_err) {
-                const std::string msg = rd_kafka_error_string(group_err);
-                rd_kafka_event_destroy(event);
-                throw std::runtime_error(std::string("kafka alter offsets group failed: ") + msg);
-            }
-        }
-    }
-    rd_kafka_event_destroy(event);
-
-    return new_offset;
+    alter_consumer_group_offset(admin.rk, consumer_group, topic, partition, high);
+    return std::max<int64_t>(0, high - 1);
 }
 
 long long reset_apply_consumer_offset(
@@ -2463,71 +2787,9 @@ long long reset_apply_consumer_offset(
     const std::string& topic,
     int partition,
     long long offset) {
-    char errstr[512];
-    rd_kafka_conf_t* conf = rd_kafka_conf_new();
-    rd_kafka_conf_set(conf, "bootstrap.servers", bootstrap.c_str(), errstr, sizeof(errstr));
-
-    rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
-    if (!rk) {
-        rd_kafka_conf_destroy(conf);
-        throw std::runtime_error(std::string("kafka client create failed: ") + errstr);
-    }
-
-    const long long new_offset = std::max<int64_t>(0, offset - 1);
-    rd_kafka_topic_partition_list_t* parts = rd_kafka_topic_partition_list_new(1);
-    rd_kafka_topic_partition_list_add(parts, topic.c_str(), partition)->offset = offset;
-
-    rd_kafka_AlterConsumerGroupOffsets_t* alter =
-        rd_kafka_AlterConsumerGroupOffsets_new(consumer_group.c_str(), parts);
-    rd_kafka_AdminOptions_t* options =
-        rd_kafka_AdminOptions_new(rk, RD_KAFKA_ADMIN_OP_ALTERCONSUMERGROUPOFFSETS);
-    if (rd_kafka_AdminOptions_set_request_timeout(options, 30000, errstr, sizeof(errstr)) !=
-        RD_KAFKA_RESP_ERR_NO_ERROR) {
-        rd_kafka_AdminOptions_destroy(options);
-        rd_kafka_AlterConsumerGroupOffsets_destroy(alter);
-        rd_kafka_topic_partition_list_destroy(parts);
-        rd_kafka_destroy(rk);
-        throw std::runtime_error(std::string("admin options failed: ") + errstr);
-    }
-
-    rd_kafka_queue_t* queue = rd_kafka_queue_new(rk);
-    rd_kafka_AlterConsumerGroupOffsets(rk, &alter, 1, options, queue);
-
-    rd_kafka_event_t* event = rd_kafka_queue_poll(queue, 30000);
-
-    rd_kafka_AlterConsumerGroupOffsets_destroy(alter);
-    rd_kafka_AdminOptions_destroy(options);
-    rd_kafka_topic_partition_list_destroy(parts);
-    rd_kafka_queue_destroy(queue);
-    rd_kafka_destroy(rk);
-
-    if (!event) {
-        throw std::runtime_error("kafka alter consumer group offsets timed out");
-    }
-    if (rd_kafka_event_error(event)) {
-        const std::string msg = rd_kafka_event_error_string(event);
-        rd_kafka_event_destroy(event);
-        throw std::runtime_error(std::string("kafka alter offsets failed: ") + msg);
-    }
-
-    const rd_kafka_AlterConsumerGroupOffsets_result_t* result =
-        rd_kafka_event_AlterConsumerGroupOffsets_result(event);
-    if (result) {
-        size_t group_count = 0;
-        const rd_kafka_group_result_t* const* groups =
-            rd_kafka_AlterConsumerGroupOffsets_result_groups(result, &group_count);
-        for (size_t i = 0; i < group_count; ++i) {
-            const rd_kafka_error_t* group_err = rd_kafka_group_result_error(groups[i]);
-            if (group_err) {
-                const std::string msg = rd_kafka_error_string(group_err);
-                rd_kafka_event_destroy(event);
-                throw std::runtime_error(std::string("kafka alter offsets group failed: ") + msg);
-            }
-        }
-    }
-    rd_kafka_event_destroy(event);
-
-    return new_offset;
+    KafkaAdminClient admin(bootstrap);
+    alter_consumer_group_offset(admin.rk, consumer_group, topic, partition, offset);
+    return std::max<int64_t>(0, offset - 1);
 }
 
 void ensure_capture_kafka_topics(
@@ -2679,7 +2941,7 @@ long long reset_apply_offset_to_end(
     const std::string&,
     const std::string&,
     int) {
-    return 0;
+    throw std::runtime_error("librdkafka not available: reset_apply_offset_to_end");
 }
 
 long long reset_apply_consumer_offset(
@@ -2688,7 +2950,7 @@ long long reset_apply_consumer_offset(
     const std::string&,
     int,
     long long) {
-    return 0;
+    throw std::runtime_error("librdkafka not available: reset_apply_consumer_offset");
 }
 
 void ensure_kafka_topics_exist(

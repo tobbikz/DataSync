@@ -35,6 +35,23 @@ struct TableSliceState {
     long long kafka_consumer_lag{0};
 };
 
+/** Per-table flush accumulator — merged into single apply_batch_stats row at slice end. */
+struct SliceFlushStats {
+    long long inserts{0};
+    long long updates{0};
+    long long deletes{0};
+    long long duration_ms{0};
+    std::string kafka_topic;
+    int kafka_partition{-1};
+    long long kafka_offset{-1};
+    int parse_skipped{0};
+    int dropped_unrecoverable{0};
+    int dedup_skipped{0};
+    int events_seen_in_slice{0};
+    nlohmann::json context = nlohmann::json::object();
+    bool has_flush{false};
+};
+
 struct ApplyBatchOptions {
     bool audit_enabled{true};
     std::string source_system{"MariaDB"};
@@ -49,6 +66,8 @@ struct ApplyBatchOptions {
     const std::map<std::pair<std::string, std::string>, int>* parse_skipped_by_table{nullptr};
     /** Optional: per-table dropped_unrecoverable (mutated by apply_events_batch). */
     std::map<std::pair<std::string, std::string>, int>* dropped_unrecoverable_by_table{nullptr};
+    /** Optional: per-table flush stats (lake key) — written once at slice finalize. */
+    std::map<std::pair<std::string, std::string>, SliceFlushStats>* slice_flush_stats{nullptr};
     /** Lake schema|table → catalog.hot (batch sizing / synchronous_commit). */
     std::map<std::pair<std::string, std::string>, bool> table_hot;
 };
@@ -56,6 +75,7 @@ struct ApplyBatchOptions {
 struct SliceLagTableState {
     long long table_lag{0};
     long long partition_lag{0};
+    bool lag_scan_complete{false};
     int events_seen_in_slice{0};
     int events_applied_in_slice{0};
     bool inactive{true};
@@ -64,7 +84,7 @@ struct SliceLagTableState {
     long long kafka_offset{-1};
 };
 
-/** End-of-slice lag heartbeat row per catalog table (authoritative kafka_consumer_lag). */
+/** Single apply_batch_stats row per table per slice (flush metrics + lag scan). */
 void record_slice_table_lag_stats(
     PGconn* app_pg,
     const std::string& conn_id,
@@ -73,6 +93,7 @@ void record_slice_table_lag_stats(
     const std::string& source_schema,
     const std::string& source_table,
     const SliceLagTableState& state,
+    const SliceFlushStats* flush_stats,
     int apply_staleness_seconds,
     int apply_inactive_seconds);
 

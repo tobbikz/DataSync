@@ -5,6 +5,7 @@
 #include "config.hpp"
 #include "connections.hpp"
 #include "daemon_full_load.hpp"
+#include "full_load_checkpoint.hpp"
 #include "kafka_apply.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
@@ -220,6 +221,21 @@ void spawn_apply_worker_pool(
 }
 
 void ensure_apply_worker_loops(const AppConfig& cfg, const std::vector<std::string>& conn_ids) {
+    {
+        std::unordered_set<std::string> valid;
+        for (const auto& conn_id : conn_ids) {
+            valid.insert(conn_id + ":cold");
+            valid.insert(conn_id + ":hot");
+        }
+        std::lock_guard<std::mutex> lock(g_apply_workers_mu);
+        for (auto it = g_apply_workers_spawned.begin(); it != g_apply_workers_spawned.end();) {
+            if (!valid.count(*it)) {
+                it = g_apply_workers_spawned.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     const AppConfig worker_cfg = snapshot_app_config(cfg);
     int cold_workers = pipeline_defaults::kApplyWorkerCount;
     try {
@@ -323,7 +339,68 @@ void spawn_daemon_full_load_background(
     g_background_threads.push_back(std::move(t));
 }
 
-int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_id, bool sync_apply) {
+void scan_apply_health_alerts(PGconn* pg, const std::string& batch_id) {
+    const int lookback = pipeline_defaults::kApplyHealthAlertLookbackMinutes;
+    const std::string lookback_str = std::to_string(lookback);
+    const char* vals[] = {lookback_str.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT DISTINCT ON (conn_id, source_schema, source_table)
+            conn_id,
+            source_schema,
+            source_table,
+            apply_health_rag,
+            health_reason,
+            kafka_consumer_lag,
+            is_stale,
+            logged_at
+        FROM cdc_catalog.apply_batch_stats
+        WHERE apply_health_rag IN ('RED', 'AMBER')
+          AND logged_at >= now() - ($1::int * interval '1 minute')
+        ORDER BY conn_id, source_schema, source_table, logged_at DESC
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        return;
+    }
+
+    for (int i = 0; i < PQntuples(res); ++i) {
+        const std::string rag = PQgetvalue(res, i, 3);
+        log_write(pg, {
+            .level = rag == "RED" ? LogLevel::Error : LogLevel::Warning,
+            .component = "cdc_kafka_health",
+            .message = rag == "RED" ? "apply health RED" : "apply health AMBER",
+            .batch_id = batch_id,
+            .conn_id = PQgetvalue(res, i, 0),
+            .source_schema = PQgetvalue(res, i, 1),
+            .source_table = PQgetvalue(res, i, 2),
+            .context = {
+                {"apply_health_rag", rag},
+                {"health_reason", PQgetisnull(res, i, 4) ? "" : PQgetvalue(res, i, 4)},
+                {"kafka_consumer_lag", PQgetisnull(res, i, 5) ? 0 : std::atoll(PQgetvalue(res, i, 5))},
+                {"is_stale", PQgetisnull(res, i, 6) ? false : (PQgetvalue(res, i, 6)[0] == 't')},
+                {"lookback_minutes", lookback},
+            },
+        });
+    }
+    PQclear(res);
+}
+
+int run_one_cycle(
+    const AppConfig& cfg,
+    PGconn* log_pg,
+    const std::string& conn_id,
+    bool sync_apply,
+    int daemon_round) {
     const std::string batch_id = make_batch_id();
     const std::string db_engine = conn_engine(cfg, conn_id);
 
@@ -341,6 +418,7 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
     const int pending_before = count_full_load_pending(log_pg, conn_id, db_engine);
     if (pending_before > 0) {
         try_recover_stale_full_load_lock(log_pg, conn_id, batch_id);
+        recover_full_load_for_checkpoint_resume(log_pg, conn_id, db_engine, batch_id);
         if (!full_load_subprocess_running(conn_id)) {
             reset_full_load_in_progress_for_conn(log_pg, conn_id, db_engine);
         }
@@ -354,6 +432,7 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
     }
     const bool conn_full_load_busy = full_load_conn_busy(conn_id);
     const bool full_load_subprocess_active = full_load_subprocess_running(conn_id);
+    const bool cdc_gate_active = full_load_gate_blocks_cdc(log_pg, conn_id);
     bool full_load_spawned = false;
     if (pending_before > 0 && !conn_full_load_busy && !full_load_subprocess_active) {
         full_load_spawned = true;
@@ -378,12 +457,7 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
 
     const int pending_onboard = count_full_load_pending_onboard(log_pg, conn_id, db_engine);
     int onboard_retry_rc = 0;
-    if (pending_onboard > 0) {
-        enable_cdc_after_full_load(log_pg, conn_id, db_engine, batch_id, false);
-    }
-    const int pending_onboard_after_heal =
-        count_full_load_pending_onboard(log_pg, conn_id, db_engine);
-    if (pending_onboard_after_heal > 0 && !conn_full_load_busy) {
+    if (pending_onboard > 0 && !conn_full_load_busy && !cdc_gate_active) {
         log_write(log_pg, {
             .level = LogLevel::Info,
             .component = "cdc_daemon",
@@ -394,20 +468,75 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
             .source_table = std::nullopt,
             .context = {
                 {"db_engine", db_engine},
-                {"pending_onboard", pending_onboard_after_heal},
+                {"pending_onboard", pending_onboard},
                 {"phase", "onboard_retry"},
             },
         });
         if (!onboard_conn_after_full_load(cfg, log_pg, conn_id, db_engine, batch_id)) {
             onboard_retry_rc = 1;
         }
+    } else if (pending_onboard > 0 && cdc_gate_active) {
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_daemon",
+            .message = "onboard deferred: full load gate active",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"db_engine", db_engine},
+                {"pending_onboard", pending_onboard},
+                {"phase", "full_load_gate"},
+            },
+        });
     }
 
-    const PreApplyCycleResult pre = run_pre_apply_cycle(cfg, log_pg, conn_id, batch_id);
+    if (cdc_gate_active) {
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_daemon",
+            .message = full_load_subprocess_active
+                ? "pre-apply deferred: full load subprocess active"
+                : "pre-apply deferred: full load copy checkpoint active",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"db_engine", db_engine},
+                {"phase", "full_load_gate"},
+                {"full_load_subprocess_active", full_load_subprocess_active},
+                {"copy_checkpoint_active", cdc_gate_active && !full_load_subprocess_active},
+            },
+        });
+    }
+    const PreApplyCycleResult pre =
+        cdc_gate_active
+            ? PreApplyCycleResult{}
+            : run_pre_apply_cycle(cfg, log_pg, conn_id, batch_id, daemon_round);
     const int pre_rc = pre.errors > 0 ? 1 : 0;
     int apply_rc = 0;
-    if (sync_apply) {
+    if (sync_apply && !cdc_gate_active) {
         apply_rc = run_apply_workers(cfg, conn_id);
+    } else if (sync_apply && cdc_gate_active) {
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_daemon",
+            .message = full_load_subprocess_active
+                ? "apply deferred: full load subprocess active"
+                : "apply deferred: full load copy checkpoint active",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"db_engine", db_engine},
+                {"phase", "full_load_gate"},
+                {"full_load_subprocess_active", full_load_subprocess_active},
+                {"copy_checkpoint_active", cdc_gate_active && !full_load_subprocess_active},
+            },
+        });
     }
     int cycle_errors = (pre_rc != 0 ? 1 : 0) + (apply_rc != 0 ? 1 : 0) + onboard_retry_rc;
 
@@ -454,6 +583,7 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
             {"full_load_pending", pending_before},
             {"full_load_conn_busy", conn_full_load_busy},
             {"full_load_subprocess_active", full_load_subprocess_active},
+            {"cdc_gate_active", cdc_gate_active},
             {"full_load_spawned", full_load_spawned},
             {"errors", cycle_errors},
         },
@@ -465,12 +595,12 @@ int run_one_cycle(const AppConfig& cfg, PGconn* log_pg, const std::string& conn_
 int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::string>& conn_ids, bool sync_apply) {
     std::atomic<int> failures{0};
     const std::string round_batch_id = make_batch_id();
+    const int round = g_catalog_sync_round.fetch_add(1) + 1;
 
     {
         PgConn catalog_pg(cfg.datasync.conn_string());
         if (catalog_pg.raw) {
             const int sync_every = pipeline_defaults::kCatalogSyncIntervalRounds;
-            const int round = g_catalog_sync_round.fetch_add(1) + 1;
             const bool do_sync = sync_every <= 1 || round == 1 || (round % sync_every) == 0;
             if (do_sync) {
                 if (sync_all_catalogs(cfg, catalog_pg.raw, round_batch_id) != 0) {
@@ -491,6 +621,27 @@ int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::strin
             }
             try {
                 const std::string db_engine = conn_engine(cfg, conn_id);
+                if (full_load_gate_blocks_cdc(capture_pg.raw, conn_id)) {
+                    const bool subprocess = full_load_subprocess_running(conn_id);
+                    log_write(capture_pg.raw, {
+                        .level = LogLevel::Info,
+                        .component = "cdc_daemon",
+                        .message = subprocess
+                            ? "capture deferred: full load subprocess active"
+                            : "capture deferred: full load copy checkpoint active",
+                        .batch_id = round_batch_id,
+                        .conn_id = conn_id,
+                        .source_schema = std::nullopt,
+                        .source_table = std::nullopt,
+                        .context = {
+                            {"db_engine", db_engine},
+                            {"phase", "full_load_gate"},
+                            {"full_load_subprocess_active", subprocess},
+                            {"copy_checkpoint_active", !subprocess},
+                        },
+                    });
+                    return;
+                }
                 const int cleared = clear_stale_cdc_in_progress(capture_pg.raw, conn_id, db_engine);
                 if (cleared > 0) {
                     log_write(capture_pg.raw, {
@@ -538,6 +689,12 @@ int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::strin
         }
     }
 
+    for (auto& thread : capture_threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
     std::vector<std::thread> threads;
     threads.reserve(conn_ids.size());
 
@@ -550,7 +707,7 @@ int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::strin
                     return;
                 }
                 try {
-                    if (run_one_cycle(cfg, pg.raw, conn_id, sync_apply) != 0) {
+                    if (run_one_cycle(cfg, pg.raw, conn_id, sync_apply, round) != 0) {
                         failures.fetch_add(1);
                     }
                 } catch (const std::exception& ex) {
@@ -577,16 +734,19 @@ int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::strin
         }
     }
 
-    for (auto& thread : capture_threads) {
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
     for (auto& thread : threads) {
         if (thread.joinable()) {
             thread.join();
         }
     }
+
+    {
+        PgConn health_pg(cfg.datasync.conn_string());
+        if (health_pg.raw) {
+            scan_apply_health_alerts(health_pg.raw, round_batch_id);
+        }
+    }
+
     return failures.load() > 0 ? 1 : 0;
 }
 
@@ -858,8 +1018,5 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
         .context = {{"cycles", cycles}, {"once", once}, {"had_errors", exit_code != 0}},
     });
 
-    if (once && exit_code != 0) {
-        return exit_code;
-    }
-    return 0;
+    return exit_code;
 }

@@ -4,6 +4,7 @@
 
 #include <libpq-fe.h>
 #include <optional>
+#include <set>
 #include <string>
 
 struct FullLoadRunStats {
@@ -12,6 +13,7 @@ struct FullLoadRunStats {
     int tables_skipped{0};
     int tables_failed{0};
     long long total_rows{0};
+    std::set<std::string> conn_ids;
 };
 
 /** Exit 0 when nothing failed, or at least one table succeeded; 1 only when every processed table failed. */

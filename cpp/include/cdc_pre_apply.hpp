@@ -23,4 +23,5 @@ PreApplyCycleResult run_pre_apply_cycle(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::string& batch_id);
+    const std::string& batch_id,
+    int daemon_round = 1);

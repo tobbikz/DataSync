@@ -219,32 +219,56 @@ std::optional<std::vector<uint8_t>> fetch_min_lsn(
     return min_lsn;
 }
 
-/** When stored LSN is before CDC retention min, rewind to min and log gap_detected (no full-load). */
+/** When stored LSN is before CDC retention min, flag full-load reboot (no silent rewind). */
 bool recover_purged_lsn(
     PGconn* log_pg,
-    MssqlConn& mssql,
     const std::string& conn_id,
     const CaptureCatalogTable& tbl,
     const std::string& capture_instance,
     const std::vector<uint8_t>& from_lsn,
+    const std::vector<uint8_t>& min_lsn,
     const std::string& batch_id) {
-    const auto min_lsn = fetch_min_lsn(mssql, tbl.source_database, capture_instance);
-    if (!min_lsn || lsn_compare(from_lsn, *min_lsn) >= 0) {
+    if (min_lsn.empty() || lsn_compare(from_lsn, min_lsn) >= 0) {
         return false;
     }
-    upsert_lsn(log_pg, conn_id, tbl.source_database, tbl.source_schema, tbl.source_table, *min_lsn, {});
+    const std::string catalog_id = std::to_string(tbl.catalog_id);
+    const char* vals[] = {catalog_id.c_str()};
+    PGresult* res = PQexecParams(
+        log_pg,
+        R"(
+        UPDATE cdc_catalog.catalog
+        SET needs_full_load = true,
+            capture_during_full_load = true,
+            cdc_enabled = true,
+            status = 'pending'::cdc_catalog.replication_status,
+            last_error = 'cdc lsn purged: auto full-load reboot',
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+          AND active = true
+          AND has_pk = true
+          AND status NOT IN ('skipped', 'disabled')
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res) {
+        PQclear(res);
+    }
     log_write(log_pg, {
         .level = LogLevel::Warning,
         .component = "cdc_kafka_mssql_capture",
-        .message = "mssql lsn purged; rewound to min_lsn",
+        .message = "mssql lsn purged; table flagged for full-load reboot",
         .batch_id = batch_id,
         .conn_id = conn_id,
         .source_schema = tbl.source_schema,
         .source_table = tbl.source_table,
         .context = {
-            {"stop_reason", "lsn_purged"},
+            {"stop_reason", "gap_detected"},
             {"from_lsn", lsn_hex(from_lsn)},
-            {"min_lsn", lsn_hex(*min_lsn)},
+            {"min_lsn", lsn_hex(min_lsn)},
             {"capture_instance", capture_instance},
         },
     });
@@ -360,8 +384,9 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             {"topic_prefix", rcfg.topic_prefix},
         },
     });
-    const auto tables =
+    auto tables =
         fetch_capture_catalog_tables(log_pg, conn_id, worker_id, worker_count, "mssql");
+    rotate_capture_catalog_tables(tables, conn_id);
     clear_stale_cdc_in_progress(log_pg, conn_id, "mssql");
     if (tables.empty()) {
         const int pending_full_load = count_full_load_pending(log_pg, conn_id, "mssql");
@@ -430,6 +455,7 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     int lsn_recovered = 0;
     int lsn_auto_seeded = 0;
     int lsn_bumped_to_max = 0;
+    bool conn_lsn_gap_rebooted = false;
     std::set<long long> cdc_active_catalog_ids;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(rcfg.max_seconds);
     auto last_heartbeat = std::chrono::steady_clock::now() - std::chrono::hours(24);
@@ -453,9 +479,14 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         if (!from_lsn.empty()) {
             const auto min_lsn_check = fetch_min_lsn(mssql, tbl.source_database, cap);
             if (min_lsn_check && lsn_compare(from_lsn, *min_lsn_check) < 0) {
-                if (recover_purged_lsn(log_pg, mssql, conn_id, tbl, cap, from_lsn, batch_id)) {
-                    from_lsn = *min_lsn_check;
+                if (recover_purged_lsn(
+                        log_pg, conn_id, tbl, cap, from_lsn, *min_lsn_check, batch_id)) {
+                    if (!conn_lsn_gap_rebooted) {
+                        reboot_conn_after_mssql_cdc_gap(cfg, log_pg, conn_id, batch_id);
+                        conn_lsn_gap_rebooted = true;
+                    }
                     lsn_recovered += 1;
+                    continue;
                 }
             }
         }
@@ -590,14 +621,15 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
                 log_write(log_pg, {
                     .level = LogLevel::Error,
                     .component = "cdc_kafka_mssql_capture",
-                    .message = "mssql capture row skipped: kafka produce failed",
+                    .message = "mssql capture kafka produce failed; aborting slice",
                     .batch_id = batch_id,
                     .conn_id = conn_id,
                     .source_schema = tbl.lake_schema,
                     .source_table = tbl.lake_table,
                     .context = {{"error", ex.what()}, {"topic", topic}, {"op", op}},
                 });
-                continue;
+                rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+                throw;
             }
             published += 1;
             last_heartbeat = std::chrono::steady_clock::now();

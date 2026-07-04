@@ -269,7 +269,7 @@ CREATE TABLE cdc_catalog.apply_batch_stats (
     is_stale boolean DEFAULT false NOT NULL,
     is_inactive boolean DEFAULT false NOT NULL,
     is_quarantined boolean DEFAULT false NOT NULL,
-    reconciliation_rag text DEFAULT 'UNKNOWN'::text NOT NULL,
+    apply_health_rag text DEFAULT 'UNKNOWN'::text NOT NULL,
     apply_lag_seconds integer DEFAULT 0 NOT NULL,
     apply_position_status text,
     events_seen_in_slice integer DEFAULT 0 NOT NULL,
@@ -281,8 +281,14 @@ CREATE TABLE cdc_catalog.apply_batch_stats (
     dedup_skipped integer DEFAULT 0 NOT NULL,
     parse_skipped bigint DEFAULT 0 NOT NULL,
     dropped_unrecoverable bigint DEFAULT 0 NOT NULL,
-    semaphore text GENERATED ALWAYS AS (reconciliation_rag) STORED,
-    CONSTRAINT apply_batch_stats_reconciliation_rag_chk CHECK ((reconciliation_rag = ANY (ARRAY['GREEN'::text, 'AMBER'::text, 'RED'::text, 'UNKNOWN'::text])))
+    seconds_since_last_apply integer DEFAULT '-1'::integer NOT NULL,
+    kafka_partition_lag bigint,
+    lag_scan_complete boolean DEFAULT false NOT NULL,
+    slice_kind text DEFAULT 'flush'::text NOT NULL,
+    event_loss_status text DEFAULT 'ok'::text NOT NULL,
+    health_reason text DEFAULT 'healthy'::text NOT NULL,
+    semaphore text GENERATED ALWAYS AS (apply_health_rag) STORED,
+    CONSTRAINT apply_batch_stats_apply_health_rag_chk CHECK ((apply_health_rag = ANY (ARRAY['GREEN'::text, 'AMBER'::text, 'RED'::text, 'UNKNOWN'::text])))
 );
 
 
@@ -311,7 +317,7 @@ COMMENT ON COLUMN cdc_catalog.apply_batch_stats.is_inactive IS 'No CDC events se
 -- Name: COLUMN apply_batch_stats.reconciliation_rag; Type: COMMENT; Schema: cdc_catalog; Owner: -
 --
 
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.reconciliation_rag IS 'Latest reconcile: ok→GREEN, warn→AMBER, fail→RED';
+COMMENT ON COLUMN cdc_catalog.apply_batch_stats.apply_health_rag IS 'Apply health RAG: GREEN/AMBER/RED/UNKNOWN from apply_position + slice metrics';
 
 
 --
@@ -346,7 +352,7 @@ COMMENT ON COLUMN cdc_catalog.apply_batch_stats.dedup_skipped IS 'Kafka events s
 -- Name: COLUMN apply_batch_stats.semaphore; Type: COMMENT; Schema: cdc_catalog; Owner: -
 --
 
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.semaphore IS 'GREEN/AMBER/RED mirror of reconciliation_rag (latest reconcile)';
+COMMENT ON COLUMN cdc_catalog.apply_batch_stats.semaphore IS 'GREEN/AMBER/RED mirror of apply_health_rag';
 
 
 --
@@ -1000,7 +1006,7 @@ CREATE INDEX apply_batch_stats_logged_at_idx ON cdc_catalog.apply_batch_stats US
 -- Name: apply_batch_stats_rag_idx; Type: INDEX; Schema: cdc_catalog; Owner: -
 --
 
-CREATE INDEX apply_batch_stats_rag_idx ON cdc_catalog.apply_batch_stats USING btree (conn_id, reconciliation_rag, logged_at DESC);
+CREATE INDEX apply_batch_stats_health_rag_idx ON cdc_catalog.apply_batch_stats USING btree (conn_id, apply_health_rag, logged_at DESC);
 
 
 --
@@ -1759,13 +1765,14 @@ BEGIN
         IF to_regclass('cdc_catalog.reconciliation_run') IS NOT NULL THEN
             ALTER TABLE cdc_catalog.reconciliation_run
                 DROP CONSTRAINT IF EXISTS reconciliation_run_mode_check;
-            ALTER TABLE cdc_catalog.reconciliation_run
-                ADD CONSTRAINT reconciliation_run_mode_check
-                CHECK (reconcile_mode = 'lake'::text);
 
             UPDATE cdc_catalog.reconciliation_run
             SET reconcile_mode = 'lake'
             WHERE reconcile_mode IS DISTINCT FROM 'lake';
+
+            ALTER TABLE cdc_catalog.reconciliation_run
+                ADD CONSTRAINT reconciliation_run_mode_check
+                CHECK (reconcile_mode = 'lake'::text);
 
             COMMENT ON TABLE cdc_catalog.reconciliation_run IS
                 'Legacy reconcile CLI run header (removed by migration 046)';
@@ -1811,15 +1818,172 @@ BEGIN
         RAISE NOTICE 'migration 046: reconcile tables dropped';
     END IF;
 END $$;
+
+-- Migration 047: apply_batch_stats post-reconcile health columns.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 47) THEN
+        ALTER TABLE cdc_catalog.apply_batch_stats
+            ADD COLUMN IF NOT EXISTS seconds_since_last_apply integer NOT NULL DEFAULT -1,
+            ADD COLUMN IF NOT EXISTS kafka_partition_lag bigint,
+            ADD COLUMN IF NOT EXISTS lag_scan_complete boolean NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS slice_kind text NOT NULL DEFAULT 'flush',
+            ADD COLUMN IF NOT EXISTS event_loss_status text NOT NULL DEFAULT 'ok',
+            ADD COLUMN IF NOT EXISTS health_reason text NOT NULL DEFAULT 'healthy';
+
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.seconds_since_last_apply IS
+            'Seconds since apply_position.last_applied_at at slice time (-1 if unknown)';
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.kafka_partition_lag IS
+            'Partition high watermark minus consumed offset (not table-exact)';
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.lag_scan_complete IS
+            'True when exact table lag scan finished without message cap truncation';
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.slice_kind IS
+            'flush = per-table lake write; slice_finalize = end-of-slice lag heartbeat';
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.event_loss_status IS
+            'ok | warn (parse_skipped) | fail (dropped_unrecoverable)';
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.health_reason IS
+            'Primary apply-health signal: healthy, kafka_backlog, parse_skipped, apply_stale, etc.';
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.reconciliation_rag IS
+            'Apply health RAG: GREEN/AMBER/RED/UNKNOWN (derived from apply_position + slice metrics)';
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.reconcile_row_delta IS
+            'Deprecated — always 0 after reconcile removal';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (47, 'apply_batch_stats post-reconcile health columns');
+        RAISE NOTICE 'migration 047: apply_batch_stats health columns';
+    END IF;
+END $$;
+
+-- Migration 048: rename reconciliation_rag → apply_health_rag (post-reconcile semantics).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 48) THEN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'cdc_catalog'
+              AND table_name = 'apply_batch_stats'
+              AND column_name = 'reconciliation_rag'
+        ) THEN
+            ALTER TABLE cdc_catalog.apply_batch_stats DROP COLUMN IF EXISTS semaphore;
+            ALTER TABLE cdc_catalog.apply_batch_stats
+                RENAME COLUMN reconciliation_rag TO apply_health_rag;
+            ALTER TABLE cdc_catalog.apply_batch_stats
+                DROP CONSTRAINT IF EXISTS apply_batch_stats_reconciliation_rag_chk;
+            ALTER TABLE cdc_catalog.apply_batch_stats
+                ADD CONSTRAINT apply_batch_stats_apply_health_rag_chk
+                CHECK (apply_health_rag = ANY (ARRAY['GREEN','AMBER','RED','UNKNOWN']::text[]));
+            ALTER TABLE cdc_catalog.apply_batch_stats
+                ADD COLUMN semaphore text GENERATED ALWAYS AS (apply_health_rag) STORED;
+            DROP INDEX IF EXISTS cdc_catalog.apply_batch_stats_rag_idx;
+            CREATE INDEX IF NOT EXISTS apply_batch_stats_health_rag_idx
+                ON cdc_catalog.apply_batch_stats (conn_id, apply_health_rag, logged_at DESC);
+        END IF;
+
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.apply_health_rag IS
+            'Apply health RAG: GREEN/AMBER/RED/UNKNOWN from apply_position + slice metrics';
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.semaphore IS
+            'GREEN/AMBER/RED mirror of apply_health_rag';
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.slice_kind IS
+            'slice = unified per-table row (flush metrics + lag scan at slice end)';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (48, 'rename reconciliation_rag to apply_health_rag');
+        RAISE NOTICE 'migration 048: apply_health_rag rename';
+    END IF;
+END $$;
+
+-- Migration 050: full_load_checkpoint for resumable COPY + progress tracking.
+-- (Version 49 was capture_during_full_load on legacy DBs — do not reuse.)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 50) THEN
+        CREATE TABLE IF NOT EXISTS cdc_catalog.full_load_checkpoint (
+            catalog_id bigint NOT NULL REFERENCES cdc_catalog.catalog(catalog_id) ON DELETE CASCADE,
+            worker_id integer NOT NULL DEFAULT 0,
+            batch_id text NOT NULL,
+            phase text NOT NULL,
+            last_pk jsonb,
+            rows_loaded bigint NOT NULL DEFAULT 0,
+            source_rows bigint,
+            updated_at timestamp with time zone NOT NULL DEFAULT now(),
+            PRIMARY KEY (catalog_id, worker_id),
+            CONSTRAINT full_load_checkpoint_phase_chk
+                CHECK (phase = ANY (ARRAY['truncate'::text, 'ddl'::text, 'copy'::text]))
+        );
+
+        CREATE INDEX IF NOT EXISTS full_load_checkpoint_updated_idx
+            ON cdc_catalog.full_load_checkpoint (updated_at DESC);
+
+        COMMENT ON TABLE cdc_catalog.full_load_checkpoint IS
+            'Per-table (and per parallel worker) full-load resume checkpoint';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (50, 'full_load_checkpoint resumable COPY');
+        RAISE NOTICE 'migration 050: full_load_checkpoint';
+    END IF;
+END $$;
+
+-- Migration 051: apply_outbox — lake-first commit; audit retry without re-applying lake.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 51) THEN
+        CREATE TABLE IF NOT EXISTS cdc_catalog.apply_outbox (
+            event_id text PRIMARY KEY,
+            conn_id text NOT NULL,
+            catalog_id bigint NOT NULL,
+            batch_id text NOT NULL,
+            payload jsonb NOT NULL,
+            lake_committed_at timestamptz NOT NULL DEFAULT now(),
+            audit_committed_at timestamptz
+        );
+
+        CREATE INDEX IF NOT EXISTS apply_outbox_pending_idx
+            ON cdc_catalog.apply_outbox (conn_id, lake_committed_at)
+            WHERE audit_committed_at IS NULL;
+
+        COMMENT ON TABLE cdc_catalog.apply_outbox IS
+            'Pending catalog audit after lake COMMIT; drained before apply slices';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (51, 'apply_outbox lake-first audit retry');
+        RAISE NOTICE 'migration 051: apply_outbox';
+    END IF;
+END $$;
 )PO_schema_patch";
     }
     inline std::string_view monitoring_views() {
         return R"PO_monitoring_v(
+-- Ensure apply_health_rag column exists before (re)creating views.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'cdc_catalog'
+          AND table_name = 'apply_batch_stats'
+          AND column_name = 'reconciliation_rag'
+    ) THEN
+        ALTER TABLE cdc_catalog.apply_batch_stats DROP COLUMN IF EXISTS semaphore;
+        ALTER TABLE cdc_catalog.apply_batch_stats
+            RENAME COLUMN reconciliation_rag TO apply_health_rag;
+        ALTER TABLE cdc_catalog.apply_batch_stats
+            DROP CONSTRAINT IF EXISTS apply_batch_stats_reconciliation_rag_chk;
+        ALTER TABLE cdc_catalog.apply_batch_stats
+            ADD CONSTRAINT apply_batch_stats_apply_health_rag_chk
+            CHECK (apply_health_rag = ANY (ARRAY['GREEN','AMBER','RED','UNKNOWN']::text[]));
+        ALTER TABLE cdc_catalog.apply_batch_stats
+            ADD COLUMN IF NOT EXISTS semaphore text GENERATED ALWAYS AS (apply_health_rag) STORED;
+        DROP INDEX IF EXISTS cdc_catalog.apply_batch_stats_rag_idx;
+        CREATE INDEX IF NOT EXISTS apply_batch_stats_health_rag_idx
+            ON cdc_catalog.apply_batch_stats (conn_id, apply_health_rag, logged_at DESC);
+    END IF;
+END $$;
+
 -- Drop dependent views first (CREATE OR REPLACE cannot rename columns e.g. service_tier -> events_total).
 DROP VIEW IF EXISTS cdc_catalog.v_kafka_consumer;
 DROP VIEW IF EXISTS cdc_catalog.v_apply_latest;
 DROP VIEW IF EXISTS cdc_catalog.v_apply_stale;
 DROP VIEW IF EXISTS cdc_catalog.v_cdc_pipeline_summary;
+DROP VIEW IF EXISTS cdc_catalog.v_full_load_progress;
 
 CREATE VIEW cdc_catalog.v_apply_latest AS
 SELECT DISTINCT ON (conn_id, source_schema, source_table)
@@ -1839,16 +2003,98 @@ SELECT DISTINCT ON (conn_id, source_schema, source_table)
     kafka_partition,
     kafka_offset,
     kafka_consumer_lag,
+    kafka_partition_lag,
+    lag_scan_complete,
     apply_lag_seconds,
+    seconds_since_last_apply,
     is_stale,
     is_inactive,
-    reconciliation_rag,
+    apply_health_rag,
+    health_reason,
+    event_loss_status,
+    slice_kind,
     dedup_skipped,
     parse_skipped,
     dropped_unrecoverable,
+    capture_lag_seconds,
     logged_at
 FROM cdc_catalog.apply_batch_stats
 ORDER BY conn_id, source_schema, source_table, logged_at DESC;
+
+CREATE VIEW cdc_catalog.v_apply_stale AS
+SELECT
+    ap.catalog_id,
+    ap.conn_id,
+    ap.source_schema,
+    ap.source_table,
+    ap.last_applied_at,
+    ap.apply_lag_seconds,
+    ap.status,
+    ap.quarantined_at,
+    ap.last_error,
+    (now() - ap.last_applied_at) AS lag_interval,
+    latest.is_stale,
+    latest.seconds_since_last_apply,
+    latest.apply_health_rag,
+    latest.health_reason,
+    latest.kafka_consumer_lag
+FROM cdc_catalog.apply_position ap
+JOIN cdc_catalog.catalog c USING (catalog_id)
+LEFT JOIN cdc_catalog.v_apply_latest latest
+    ON latest.conn_id = ap.conn_id
+   AND latest.source_schema = ap.source_schema
+   AND latest.source_table = ap.source_table
+WHERE c.active = true
+  AND c.cdc_enabled = true
+  AND c.needs_full_load = false
+  AND (
+      latest.is_stale = true
+      OR latest.apply_health_rag IN ('AMBER', 'RED')
+      OR latest.event_loss_status = 'fail'
+      OR ap.status = ANY (ARRAY['stale','lagging','gap_detected','quarantined','failed']::cdc_catalog.cdc_health_status[])
+  );
+
+CREATE VIEW cdc_catalog.v_cdc_pipeline_summary AS
+SELECT
+    c.conn_id,
+    c.db_engine,
+    count(*) FILTER (WHERE c.active AND c.cdc_enabled AND NOT c.needs_full_load) AS cdc_ready,
+    count(*) FILTER (WHERE latest.apply_health_rag = 'GREEN') AS apply_green,
+    count(*) FILTER (WHERE latest.apply_health_rag = 'AMBER') AS apply_amber,
+    count(*) FILTER (WHERE latest.apply_health_rag = 'RED') AS apply_red,
+    count(*) FILTER (WHERE latest.apply_health_rag = 'UNKNOWN') AS apply_unknown,
+    count(*) FILTER (WHERE latest.is_stale) AS apply_stale,
+    count(*) FILTER (WHERE latest.event_loss_status = 'fail') AS event_loss_fail,
+    max(latest.kafka_consumer_lag) AS max_kafka_consumer_lag,
+    max(latest.capture_lag_seconds) AS max_capture_lag_seconds
+FROM cdc_catalog.catalog c
+LEFT JOIN cdc_catalog.v_apply_latest latest
+    ON latest.conn_id = c.conn_id
+   AND latest.source_schema = c.source_schema
+   AND latest.source_table = c.source_table
+WHERE c.active = true
+GROUP BY c.conn_id, c.db_engine;
+
+CREATE VIEW cdc_catalog.v_full_load_progress AS
+SELECT
+    c.catalog_id,
+    c.conn_id,
+    c.db_engine,
+    c.source_schema,
+    c.source_table,
+    c.status,
+    c.needs_full_load,
+    cp.worker_id,
+    cp.batch_id AS checkpoint_batch_id,
+    cp.phase AS checkpoint_phase,
+    cp.rows_loaded AS checkpoint_rows_loaded,
+    cp.source_rows AS checkpoint_source_rows,
+    cp.last_pk AS checkpoint_last_pk,
+    cp.updated_at AS checkpoint_updated_at
+FROM cdc_catalog.catalog c
+LEFT JOIN cdc_catalog.full_load_checkpoint cp ON cp.catalog_id = c.catalog_id
+WHERE c.active = true
+  AND (c.needs_full_load = true OR c.status = 'full_load_in_progress' OR cp.catalog_id IS NOT NULL);
 
 CREATE VIEW cdc_catalog.v_kafka_consumer AS
 SELECT
@@ -1862,11 +2108,15 @@ SELECT
     ap.apply_lag_seconds,
     ap.status AS apply_position_status,
     latest.kafka_consumer_lag,
+    latest.kafka_partition_lag,
     latest.events_total AS last_slice_events,
     latest.logged_at AS last_apply_at,
     latest.is_inactive,
     latest.is_stale,
-    latest.reconciliation_rag
+    latest.apply_health_rag,
+    latest.health_reason,
+    latest.event_loss_status,
+    latest.slice_kind
 FROM cdc_catalog.apply_position ap
 JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
 LEFT JOIN cdc_catalog.v_apply_latest latest
@@ -1874,7 +2124,9 @@ LEFT JOIN cdc_catalog.v_apply_latest latest
    AND latest.source_schema = ap.source_schema
    AND latest.source_table = ap.source_table;
 
-COMMENT ON VIEW cdc_catalog.v_apply_latest IS 'Latest apply_batch_stats row per table (replaces manual apply_batch_stats ORDER BY logged_at)';
+COMMENT ON VIEW cdc_catalog.v_apply_latest IS 'Latest apply_batch_stats row per table (replaces manual apply_batch_stats ORDER BY logged_at DESC)';
+COMMENT ON VIEW cdc_catalog.v_apply_stale IS 'Tables with elevated apply lag, stale flag, or AMBER/RED health from apply_batch_stats';
+COMMENT ON VIEW cdc_catalog.v_cdc_pipeline_summary IS 'Per conn_id + db_engine: RAG counts from v_apply_latest (all engines)';
 COMMENT ON VIEW cdc_catalog.v_kafka_consumer IS 'Per-table apply offset + last-known Kafka consumer lag (no docker exec)';
 )PO_monitoring_v";
     }

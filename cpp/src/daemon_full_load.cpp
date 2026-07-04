@@ -2,11 +2,14 @@
 
 #include "capture_common.hpp"
 #include "config.hpp"
+#include "full_load_checkpoint.hpp"
 #include "mariadb_full_load.hpp"
 #include "mongo_full_load.hpp"
 #include "mssql_full_load.hpp"
 #include "obs_log.hpp"
+#include "pg_conn.hpp"
 #include "pipeline_defaults.hpp"
+#include "runtime_config.hpp"
 
 #include <dirent.h>
 
@@ -64,11 +67,29 @@ bool cmdline_contains_full_load_for_conn(const std::string& conn_id) {
             continue;
         }
         std::string cmdline((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        if (cmdline.find("full-load") == std::string::npos) {
-            continue;
+        std::vector<std::string> args;
+        args.reserve(8);
+        for (std::size_t i = 0; i < cmdline.size();) {
+            const std::size_t start = i;
+            while (i < cmdline.size() && cmdline[i] != '\0') {
+                ++i;
+            }
+            if (start < i) {
+                args.emplace_back(cmdline.data() + start, i - start);
+            }
+            ++i;
         }
-        if (cmdline.find(conn_id) != std::string::npos) {
-            found = true;
+        bool seen_full_load = false;
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            if (args[i] == "full-load") {
+                seen_full_load = true;
+            }
+            if (seen_full_load && args[i] == "--conn-id" && i + 1 < args.size() && args[i + 1] == conn_id) {
+                found = true;
+                break;
+            }
+        }
+        if (found) {
             break;
         }
     }
@@ -181,6 +202,16 @@ bool full_load_conn_busy(const std::string& conn_id) {
 
 bool full_load_subprocess_running(const std::string& conn_id) {
     return full_load_subprocess_alive_for_conn(conn_id);
+}
+
+bool full_load_gate_blocks_cdc(PGconn* pg, const std::string& conn_id) {
+    if (full_load_subprocess_running(conn_id)) {
+        return true;
+    }
+    if (pg != nullptr && conn_has_active_copy_checkpoints(pg, conn_id)) {
+        return true;
+    }
+    return false;
 }
 
 bool try_recover_stale_full_load_lock(
@@ -311,7 +342,12 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
     }
 
     const auto slot = conn_full_load_slot(conn_id);
-    const int timeout_minutes = pipeline_defaults::kFullLoadDaemonSubprocessTimeoutMinutes;
+    RuntimeConfig runtime;
+    runtime.reload(log_pg);
+    const int timeout_minutes = runtime.get_int(
+        "full_load_daemon_timeout_minutes",
+        pipeline_defaults::kFullLoadDaemonSubprocessTimeoutMinutes,
+        "global");
     const SpawnWaitResult spawn = spawn_wait_with_timeout(
         args,
         timeout_minutes * 60,

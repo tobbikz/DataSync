@@ -33,13 +33,15 @@ int sync_mssql_columns_for_conn(
     PGconn* log_pg,
     RuntimeConfig& runtime,
     const std::string& conn_id,
-    const std::string& batch_id) {
+    const std::string& batch_id,
+    int daemon_round) {
     (void)runtime;
     const MssqlSource* source = find_mssql_source(cfg, conn_id);
     if (!source) {
         return 0;
     }
-    const char* vals[] = {conn_id.c_str()};
+    const std::string round_str = std::to_string(daemon_round);
+    const char* vals[] = {conn_id.c_str(), round_str.c_str()};
     PGresult* res = PQexecParams(
         log_pg,
         R"(
@@ -47,8 +49,9 @@ int sync_mssql_columns_for_conn(
         FROM cdc_catalog.catalog
         WHERE conn_id = $1 AND db_engine = 'mssql' AND active = true
           AND cdc_enabled = true
+          AND (last_error IS NOT NULL OR (catalog_id % 20) = ($2::bigint % 20))
         )",
-        1,
+        2,
         nullptr,
         vals,
         nullptr,
@@ -102,6 +105,7 @@ int sync_mssql_columns_for_conn(
             .source_table = std::nullopt,
             .context = {{"error", ex.what()}},
         });
+        return -1;
     }
     return synced;
 }
@@ -113,7 +117,8 @@ int sync_mongo_columns_for_conn(
     PGconn* log_pg,
     RuntimeConfig& runtime,
     const std::string& conn_id,
-    const std::string& batch_id) {
+    const std::string& batch_id,
+    int daemon_round) {
     const MongoSource* source = find_mongo_source(cfg, conn_id);
     if (!source) {
         return 0;
@@ -122,7 +127,8 @@ int sync_mongo_columns_for_conn(
         return 0;
     }
 
-    const char* vals[] = {conn_id.c_str()};
+    const std::string round_str = std::to_string(daemon_round);
+    const char* vals[] = {conn_id.c_str(), round_str.c_str()};
     PGresult* res = PQexecParams(
         log_pg,
         R"(
@@ -130,8 +136,9 @@ int sync_mongo_columns_for_conn(
         FROM cdc_catalog.catalog
         WHERE conn_id = $1 AND db_engine = 'mongodb' AND active = true
           AND cdc_enabled = true
+          AND (last_error IS NOT NULL OR (catalog_id % 20) = ($2::bigint % 20))
         )",
-        1,
+        2,
         nullptr,
         vals,
         nullptr,
@@ -198,18 +205,24 @@ PreApplyCycleResult run_mssql_pre_apply(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::string& batch_id) {
+    const std::string& batch_id,
+    int daemon_round) {
     PreApplyCycleResult result;
     result.payload = {
         {"batch_id", batch_id},
         {"conn_id", conn_id},
         {"db_engine", "mssql"},
+        {"daemon_round", daemon_round},
+        {"ddl_sync_mode", "incremental"},
     };
 
 #ifdef HAVE_FREETDS
     RuntimeConfig runtime;
-    const int ddl_synced = sync_mssql_columns_for_conn(cfg, log_pg, runtime, conn_id, batch_id);
-    if (ddl_synced > 0) {
+    const int ddl_synced =
+        sync_mssql_columns_for_conn(cfg, log_pg, runtime, conn_id, batch_id, daemon_round);
+    if (ddl_synced < 0) {
+        result.errors += 1;
+    } else if (ddl_synced > 0) {
         result.payload["ddl_sync"] = {{"tables", ddl_synced}};
     }
 #endif
@@ -220,20 +233,38 @@ PreApplyCycleResult run_mongo_pre_apply(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::string& batch_id) {
+    const std::string& batch_id,
+    int daemon_round) {
     PreApplyCycleResult result;
     result.payload = {
         {"batch_id", batch_id},
         {"conn_id", conn_id},
         {"db_engine", "mongodb"},
+        {"daemon_round", daemon_round},
+        {"ddl_sync_mode", "incremental"},
     };
 
 #ifdef HAVE_MONGOC
     RuntimeConfig runtime;
     runtime.reload(log_pg);
-    const int ddl_synced = sync_mongo_columns_for_conn(cfg, log_pg, runtime, conn_id, batch_id);
-    if (ddl_synced > 0) {
-        result.payload["ddl_sync"] = {{"tables", ddl_synced}};
+    try {
+        const int ddl_synced =
+            sync_mongo_columns_for_conn(cfg, log_pg, runtime, conn_id, batch_id, daemon_round);
+        if (ddl_synced > 0) {
+            result.payload["ddl_sync"] = {{"tables", ddl_synced}};
+        }
+    } catch (const std::exception& ex) {
+        result.errors += 1;
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_kafka_mongo_ddl",
+            .message = "mongo pre-apply ddl sync failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"error", ex.what()}},
+        });
     }
 #endif
     return result;
@@ -338,7 +369,8 @@ PreApplyCycleResult run_pre_apply_cycle(
     const AppConfig& cfg,
     PGconn* log_pg,
     const std::string& conn_id,
-    const std::string& batch_id) {
+    const std::string& batch_id,
+    int daemon_round) {
     const auto cycle_start = std::chrono::steady_clock::now();
     const std::string db_engine = conn_engine(cfg, conn_id);
 
@@ -350,19 +382,25 @@ PreApplyCycleResult run_pre_apply_cycle(
         .conn_id = conn_id,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"db_engine", db_engine}, {"phase", "pre_apply"}},
+        .context = {
+            {"db_engine", db_engine},
+            {"phase", "pre_apply"},
+            {"daemon_round", daemon_round},
+            {"ddl_sync_mode", "incremental"},
+        },
     });
 
     PreApplyCycleResult result;
     if (db_engine == "mssql") {
-        result = run_mssql_pre_apply(cfg, log_pg, conn_id, batch_id);
+        result = run_mssql_pre_apply(cfg, log_pg, conn_id, batch_id, daemon_round);
     } else if (db_engine == "mongodb") {
-        result = run_mongo_pre_apply(cfg, log_pg, conn_id, batch_id);
+        result = run_mongo_pre_apply(cfg, log_pg, conn_id, batch_id, daemon_round);
     } else {
         result.payload = {
             {"batch_id", batch_id},
             {"conn_id", conn_id},
             {"db_engine", "mariadb"},
+            {"daemon_round", daemon_round},
         };
     }
 

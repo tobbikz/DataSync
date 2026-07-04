@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-/** Non-unique mirror apply index: dl_mir_{schema}_{table}_pk (truncated to 63 chars). */
+/** Non-unique mirror apply index: dl_mir_{schema}_{table}_pk (hash suffix if > 63 chars). */
 std::string mirror_apply_pk_index_name(const std::string& schema, const std::string& table);
 
 /** CREATE INDEX IF NOT EXISTS on lake business PK columns (idempotent per process). */

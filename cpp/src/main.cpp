@@ -26,6 +26,7 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -162,6 +163,16 @@ int run_full_load(
         full_load_process_exit_code(mongo_stats) != 0) {
         return 1;
     }
+    if (!skip_onboard) {
+        std::set<std::string> affected_conn_ids = mariadb_stats.conn_ids;
+        affected_conn_ids.insert(mssql_stats.conn_ids.begin(), mssql_stats.conn_ids.end());
+        affected_conn_ids.insert(mongo_stats.conn_ids.begin(), mongo_stats.conn_ids.end());
+        for (const auto& cid : affected_conn_ids) {
+            if (!onboard_conn_after_full_load(cfg, log_pg, cid, conn_engine(cfg, cid), batch_id)) {
+                return 1;
+            }
+        }
+    }
     return 0;
 }
 
@@ -228,6 +239,7 @@ void print_usage(const char* prog) {
     std::cerr << "Usage:\n"
               << "  " << prog << " discover\n"
               << "  " << prog << " full-load [--conn-id ID] [--skip-onboard]\n"
+              << "  " << prog << " onboard-pending [--conn-id ID] [--hot-only|--cold-only]\n"
               << "  " << prog << " ddl-sync --conn-id ID [--schema S] [--table T]\n"
               << "  " << prog << " kafka-apply --conn-id ID\n"
               << "  " << prog << " capture --conn-id ID\n"
@@ -247,6 +259,8 @@ int main(int argc, char** argv) {
     std::optional<std::string> source_table;
     bool once = false;
     bool skip_onboard = false;
+    bool hot_only = false;
+    bool cold_only = false;
     bool migrate_baseline = false;
     bool migrate_lake = false;
     bool migrate_diagnostics = false;
@@ -264,6 +278,10 @@ int main(int argc, char** argv) {
             once = true;
         } else if (arg == "--skip-onboard") {
             skip_onboard = true;
+        } else if (arg == "--hot-only") {
+            hot_only = true;
+        } else if (arg == "--cold-only") {
+            cold_only = true;
         } else if (arg == "--baseline") {
             migrate_baseline = true;
         } else if (arg == "--lake") {
@@ -286,9 +304,14 @@ int main(int argc, char** argv) {
 
     if (command != "discover" && command != "full-load" && command != "ddl-sync" &&
         command != "kafka-apply" && command != "capture" &&
-        command != "daemon" &&
+        command != "daemon" && command != "onboard-pending" &&
         command != "migrate") {
         print_usage(argv[0]);
+        return 2;
+    }
+
+    if (hot_only && cold_only) {
+        std::cerr << "use only one of --hot-only or --cold-only\n";
         return 2;
     }
 
@@ -336,6 +359,17 @@ int main(int argc, char** argv) {
                 batch_id,
                 conn_id.empty() ? std::nullopt : std::optional(conn_id),
                 skip_onboard);
+        }
+        if (command == "onboard-pending") {
+            const CatalogHotTier tier = hot_only ? CatalogHotTier::HotOnly
+                                                 : (cold_only ? CatalogHotTier::ColdOnly
+                                                              : CatalogHotTier::All);
+            return run_onboard_pending(
+                cfg,
+                log_pg.raw,
+                batch_id,
+                conn_id.empty() ? std::nullopt : std::optional(conn_id),
+                tier);
         }
         if (command == "ddl-sync") {
             return run_ddl_sync(cfg, log_pg.raw, conn_id, source_schema, source_table);

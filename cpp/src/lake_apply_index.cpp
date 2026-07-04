@@ -63,7 +63,12 @@ void resolve_lake_table_names(
 std::string mirror_apply_pk_index_name(const std::string& schema, const std::string& table) {
     std::string idx_name = "dl_mir_" + schema + "_" + table + "_pk";
     if (idx_name.size() > 63) {
-        idx_name.resize(63);
+        const auto hash = std::hash<std::string>{}(idx_name);
+        std::ostringstream suffix;
+        suffix << std::hex << (hash & 0xFFFFFFFF);
+        const std::string suffix_str = suffix.str();
+        idx_name.resize(63 - suffix_str.size() - 1);
+        idx_name += "_" + suffix_str;
     }
     return idx_name;
 }

@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -98,6 +99,11 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
     CatalogPipeline pipeline,
     CatalogHotTier hot_tier = CatalogHotTier::All);
 
+/** Round-robin table order per conn so capture slices visit different tables first. */
+void rotate_capture_catalog_tables(
+    std::vector<CaptureCatalogTable>& tables,
+    const std::string& conn_id);
+
 /** Topic prefix is always conn_id (not runtime_config). */
 inline std::string topic_prefix_for_conn(const std::string& conn_id) {
     if (conn_id.empty()) {
@@ -179,7 +185,8 @@ void enable_cdc_after_full_load(
     const std::string& conn_id,
     const std::string& db_engine,
     const std::string& batch_id,
-    bool expect_updates = false);
+    bool expect_updates = false,
+    CatalogHotTier hot_tier = CatalogHotTier::All);
 
 bool enable_cdc_after_full_load_table(
     PGconn* pg,
@@ -255,6 +262,12 @@ void mark_catalog_cdc_success(PGconn* pg, long long catalog_id);
 
 void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string& error);
 
+/** Set apply_position.status=quarantined (skips further apply until manual reset). */
+void quarantine_apply_position(PGconn* pg, long long catalog_id, const std::string& reason);
+
+/** Refresh apply_position lag seconds and stale/lagging status from last_applied_at. */
+int refresh_apply_position_health(PGconn* pg, const std::string& conn_id, int staleness_seconds);
+
 void clear_stale_full_load_in_progress(
     PGconn* pg,
     const std::string& conn_id,
@@ -283,7 +296,8 @@ int count_full_load_pending(
 int count_full_load_pending_onboard(
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& db_engine);
+    const std::string& db_engine,
+    CatalogHotTier hot_tier = CatalogHotTier::All);
 
 struct ApplySkipReasonCounts {
     int active_total{0};
@@ -310,7 +324,8 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine,
-    const std::string& batch_id);
+    const std::string& batch_id,
+    CatalogHotTier hot_tier = CatalogHotTier::All);
 
 FullLoadKafkaResetStats reset_kafka_apply_after_full_load_table(
     PGconn* pg,
@@ -334,4 +349,14 @@ bool onboard_conn_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine,
-    const std::string& batch_id);
+    const std::string& batch_id,
+    CatalogHotTier hot_tier = CatalogHotTier::All);
+
+std::vector<std::string> list_conn_ids_pending_onboard(PGconn* pg, CatalogHotTier hot_tier);
+
+int run_onboard_pending(
+    const AppConfig& cfg,
+    PGconn* pg,
+    const std::string& batch_id,
+    const std::optional<std::string>& conn_id_filter,
+    CatalogHotTier hot_tier);

@@ -171,35 +171,46 @@ std::string escape_mysql_literal(MYSQL* mysql, const std::string& value) {
 }
 
 std::vector<CatalogObjectKey> fetch_mariadb_objects(MYSQL* mysql, const std::string& schema_filter) {
-    std::ostringstream sql;
-    sql << R"(
+    std::ostringstream base_sql;
+    base_sql << R"(
         SELECT table_schema, table_name
         FROM information_schema.tables
         WHERE table_schema NOT IN ('information_schema', 'performance_schema', 'sys', 'mysql')
           AND table_type = 'BASE TABLE'
     )";
     if (!schema_filter.empty()) {
-        sql << " AND table_schema = '" << escape_mysql_literal(mysql, schema_filter) << "'";
+        base_sql << " AND table_schema = '" << escape_mysql_literal(mysql, schema_filter) << "'";
     }
-    sql << " ORDER BY table_schema, table_name";
-
-    if (mysql_query(mysql, sql.str().c_str()) != 0) {
-        throw std::runtime_error(std::string("MariaDB table scan failed: ") + mysql_error(mysql));
-    }
-
-    MYSQL_RES* res = mysql_store_result(mysql);
-    if (!res) {
-        throw std::runtime_error(std::string("MariaDB store_result failed: ") + mysql_error(mysql));
-    }
+    base_sql << " ORDER BY table_schema, table_name";
 
     std::vector<CatalogObjectKey> out;
-    MYSQL_ROW row;
-    while ((row = mysql_fetch_row(res)) != nullptr) {
-        if (row[0] && row[1]) {
-            out.push_back({"", row[0], row[1]});
+    const std::size_t page_size = pipeline_defaults::kCatalogDiscoverPageSize;
+    for (std::size_t offset = 0;; offset += page_size) {
+        std::ostringstream sql;
+        sql << base_sql.str() << " LIMIT " << page_size << " OFFSET " << offset;
+
+        if (mysql_query(mysql, sql.str().c_str()) != 0) {
+            throw std::runtime_error(std::string("MariaDB table scan failed: ") + mysql_error(mysql));
+        }
+
+        MYSQL_RES* res = mysql_store_result(mysql);
+        if (!res) {
+            throw std::runtime_error(std::string("MariaDB store_result failed: ") + mysql_error(mysql));
+        }
+
+        std::size_t page_rows = 0;
+        MYSQL_ROW row;
+        while ((row = mysql_fetch_row(res)) != nullptr) {
+            ++page_rows;
+            if (row[0] && row[1]) {
+                out.push_back({"", row[0], row[1]});
+            }
+        }
+        mysql_free_result(res);
+        if (page_rows == 0 || page_rows < page_size) {
+            break;
         }
     }
-    mysql_free_result(res);
     return out;
 }
 

@@ -30,6 +30,9 @@ bool full_load_conn_busy(const std::string& conn_id);
 /** True when a DataSync full-load subprocess for conn_id is alive (see /proc cmdline). */
 bool full_load_subprocess_running(const std::string& conn_id);
 
+/** Defer capture/apply/onboard while full-load subprocess or copy checkpoint is active. */
+bool full_load_gate_blocks_cdc(PGconn* pg, const std::string& conn_id);
+
 /** Clear in-process lock when no full-load subprocess is alive (orphaned waiter / dead child). */
 bool try_recover_stale_full_load_lock(
     PGconn* log_pg,

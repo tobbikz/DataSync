@@ -118,9 +118,16 @@ KafkaProducer::~KafkaProducer() {
     }
 #ifdef HAVE_RDKAFKA
     if (impl_->body.producer) {
-        const int remaining = rd_kafka_flush(impl_->body.producer, 5000);
+        constexpr int kDestructorFlushMs = 30000;
+        int remaining = rd_kafka_flush(impl_->body.producer, kDestructorFlushMs);
         if (remaining > 0) {
-            std::cerr << "KafkaProducer destructor: " << remaining << " message(s) remain after flush\n";
+            remaining = rd_kafka_flush(impl_->body.producer, kDestructorFlushMs);
+        }
+        if (remaining > 0) {
+            const int pending = impl_->body.pending.load();
+            std::cerr << "KafkaProducer destructor: flush incomplete after "
+                      << (kDestructorFlushMs * 2) << "ms; rd_kafka_flush remaining="
+                      << remaining << " pending_callbacks=" << pending << "\n";
         }
         rd_kafka_destroy(impl_->body.producer);
     }

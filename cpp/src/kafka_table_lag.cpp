@@ -175,9 +175,6 @@ TableLagScanResult compute_exact_table_kafka_lag(
     rd_kafka_destroy(rk);
 
     out.table_lag = table_count;
-    if (!out.scan_complete && table_count == 0 && out.partition_lag > 0) {
-        out.scan_complete = true;
-    }
     return out;
 }
 

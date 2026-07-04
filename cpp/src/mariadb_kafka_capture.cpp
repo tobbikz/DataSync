@@ -128,6 +128,49 @@ std::vector<std::string> fetch_table_columns(MYSQL* mysql, const std::string& sc
     return cols;
 }
 
+std::map<TableKey, std::vector<std::string>> fetch_tables_columns(
+    MYSQL* mysql,
+    const std::set<TableKey>& tables) {
+    std::map<TableKey, std::vector<std::string>> out;
+    if (tables.empty()) {
+        return out;
+    }
+    auto esc = [mysql](const std::string& val) {
+        std::string buf(val.size() * 2 + 1, '\0');
+        const unsigned long len =
+            mysql_real_escape_string(mysql, buf.data(), val.c_str(), static_cast<unsigned long>(val.size()));
+        buf.resize(len);
+        return buf;
+    };
+    std::ostringstream sql;
+    sql << "SELECT table_schema, table_name, column_name FROM information_schema.columns WHERE ";
+    bool first = true;
+    for (const auto& key : tables) {
+        if (!first) {
+            sql << " OR ";
+        }
+        first = false;
+        sql << "(table_schema='" << esc(key.first) << "' AND table_name='" << esc(key.second) << "')";
+    }
+    sql << " ORDER BY table_schema, table_name, ordinal_position";
+    if (mysql_query(mysql, sql.str().c_str()) != 0) {
+        throw std::runtime_error(std::string("MariaDB batch columns query failed: ") + mysql_error(mysql));
+    }
+    MYSQL_RES* res = mysql_store_result(mysql);
+    if (!res) {
+        return out;
+    }
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res)) != nullptr) {
+        if (!row[0] || !row[1] || !row[2]) {
+            continue;
+        }
+        out[{row[0], row[1]}].emplace_back(row[2]);
+    }
+    mysql_free_result(res);
+    return out;
+}
+
 std::string mariadb_server_uuid(MYSQL* mysql) {
     try {
         const std::string uuid = mariadb_scalar(mysql, "SELECT @@server_uuid");
@@ -355,13 +398,16 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     });
 
     std::set<long long> cdc_active_catalog_ids;
+    std::set<long long> cdc_in_progress_ids;
 
     try {
     MariaDbConn mariadb(*source);
     touch_capture_position_slice(log_pg, conn_id);
-    std::map<std::pair<std::string, std::string>, std::vector<std::string>> col_cache;
+    const auto col_cache = fetch_tables_columns(mariadb.handle, wanted);
     for (const auto& key : wanted) {
-        col_cache[key] = fetch_table_columns(mariadb.handle, key.first, key.second);
+        const long long cid = catalog_id_by_table.at(key);
+        mark_catalog_cdc_in_progress(log_pg, cid);
+        cdc_in_progress_ids.insert(cid);
     }
 
     std::vector<std::pair<std::string, std::string>> table_pairs;
@@ -625,9 +671,9 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             producer.produce(topic, msg_key, event.to_kafka_dict().dump(), kafka_partition);
         } catch (const std::exception& ex) {
             log_write(log_pg, {
-                .level = LogLevel::Warning,
+                .level = LogLevel::Error,
                 .component = "cdc_kafka_capture",
-                .message = "capture row skipped: kafka publish failed",
+                .message = "capture kafka produce failed; aborting slice",
                 .batch_id = batch_id,
                 .conn_id = conn_id,
                 .source_schema = key.first,
@@ -639,7 +685,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                     {"binlog_table", table},
                 },
             });
-            return;
+            throw;
         }
         if (!first_kafka_publish_logged) {
             first_kafka_publish_logged = true;
@@ -853,7 +899,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 const std::string cli_err = chunk.stderr_tail.substr(0, 2000);
                 if (is_mariadb_binlog_purged_error(cli_err)) {
                     const auto reboot = reboot_conn_after_mariadb_binlog_gap(log_pg, mariadb.handle, conn_id, batch_id);
-                    rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+                    rollback_cdc_in_progress_ids(log_pg, cdc_in_progress_ids);
                     stats.errors = reboot.ran ? 0 : 1;
                     return stats;
                 }
@@ -922,12 +968,23 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             live_uuid,
             "failed",
             "kafka publish failed: " + err_detail.substr(0, 2000));
-        rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+        rollback_cdc_in_progress_ids(log_pg, cdc_in_progress_ids);
         throw std::runtime_error("kafka publish failed: " + err_detail);
     }
 
     for (long long catalog_id : cdc_active_catalog_ids) {
         mark_catalog_cdc_success(log_pg, catalog_id);
+    }
+    {
+        std::set<long long> idle_in_progress;
+        for (long long cid : cdc_in_progress_ids) {
+            if (!cdc_active_catalog_ids.count(cid)) {
+                idle_in_progress.insert(cid);
+            }
+        }
+        if (!idle_in_progress.empty()) {
+            rollback_cdc_in_progress_ids(log_pg, idle_in_progress);
+        }
     }
     const MasterBinlogStatus master_end = fetch_master_binlog_status(mariadb.handle);
     const BinlogPosition cursor_end{read_stats.last_file, read_stats.last_position};
@@ -1028,7 +1085,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             MariaDbConn recovery_conn(*source);
             const auto reboot =
                 reboot_conn_after_mariadb_binlog_gap(log_pg, recovery_conn.handle, conn_id, batch_id);
-            rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+            rollback_cdc_in_progress_ids(log_pg, cdc_in_progress_ids);
             stats.errors = reboot.ran ? 0 : 1;
             log_write(log_pg, {
                 .level = reboot.ran ? LogLevel::Warning : LogLevel::Error,
@@ -1047,7 +1104,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             });
             return stats;
         }
-        rollback_cdc_in_progress_ids(log_pg, cdc_active_catalog_ids);
+        rollback_cdc_in_progress_ids(log_pg, cdc_in_progress_ids);
         mark_capture_position_failed(log_pg, conn_id, ex.what());
         log_write(log_pg, {
             .level = LogLevel::Error,

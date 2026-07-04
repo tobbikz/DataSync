@@ -221,8 +221,9 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
             {"topic_prefix", rcfg.topic_prefix},
         },
     });
-    const auto collections =
+    auto collections =
         fetch_capture_catalog_tables(log_pg, conn_id, worker_id, worker_count, "mongodb");
+    rotate_capture_catalog_tables(collections, conn_id);
     clear_stale_cdc_in_progress(log_pg, conn_id, "mongodb");
     if (collections.empty()) {
         log_cdc_skip_no_tables(
@@ -448,14 +449,15 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
                 log_write(log_pg, {
                     .level = LogLevel::Error,
                     .component = "cdc_kafka_mongo_capture",
-                    .message = "mongo capture row skipped: kafka produce failed",
+                    .message = "mongo capture kafka produce failed; aborting slice",
                     .batch_id = batch_id,
                     .conn_id = conn_id,
                     .source_schema = coll.lake_schema,
                     .source_table = coll.lake_table,
                     .context = {{"error", ex.what()}, {"topic", topic}, {"op", op}},
                 });
-                continue;
+                rollback_cdc_in_progress_ids(log_pg, {coll.catalog_id});
+                throw;
             }
             published += 1;
         }

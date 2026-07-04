@@ -47,6 +47,7 @@ using kafka_apply_detail::fetch_apply_cursors_for_tables;
 using kafka_apply_detail::kafka_payload_matches_table;
 using kafka_apply_detail::parse_kafka_message_json;
 using kafka_apply_detail::record_slice_table_lag_stats;
+using kafka_apply_detail::SliceFlushStats;
 using kafka_apply_detail::SliceLagTableState;
 using kafka_table_lag::compute_exact_table_kafka_lag;
 using kafka_table_lag::compute_kafka_partition_lag;
@@ -99,7 +100,7 @@ void rebalance_cb(rd_kafka_t* rk, rd_kafka_resp_err_t err,
         if (ctx) {
             log_write(ctx->log_pg, {
                 .level = LogLevel::Warning,
-                .component = "cdc_kafka_apply_cpp",
+                .component = "cdc_kafka_apply",
                 .message = "kafka partitions revoked, committed offsets",
                 .batch_id = ctx->batch_id,
                 .conn_id = ctx->conn_id,
@@ -114,7 +115,7 @@ void rebalance_cb(rd_kafka_t* rk, rd_kafka_resp_err_t err,
         if (ctx) {
             log_write(ctx->log_pg, {
                 .level = LogLevel::Info,
-                .component = "cdc_kafka_apply_cpp",
+                .component = "cdc_kafka_apply",
                 .message = "kafka partitions assigned",
                 .batch_id = ctx->batch_id,
                 .conn_id = ctx->conn_id,
@@ -192,6 +193,7 @@ void account_lag_message(
             continue;
         }
         tracker.on_message_seen(lake_key, offset);
+        break;
     }
 }
 
@@ -246,6 +248,9 @@ void finalize_slice_table_lag(
     const std::map<TableKey, int>& applied_by_table,
     const std::vector<ApplyEvent>& pending_batch,
     TableLagTracker& tracker,
+    const std::map<TableKey, SliceFlushStats>& slice_flush_stats,
+    const std::map<TableKey, int>& parse_skipped_by_table,
+    const std::map<TableKey, int>& dropped_unrecoverable_by_table,
     int apply_staleness_seconds,
     int apply_inactive_seconds,
     int scan_timeout_ms) {
@@ -262,26 +267,46 @@ void finalize_slice_table_lag(
         }
 
         const long long tracked = tracker.unresolved(lake_key);
+        const bool run_exact_scan = state.events_seen_in_slice > 0 || tracked > 0;
         if (!state.kafka_topic.empty() && state.kafka_partition >= 0 && state.kafka_offset >= 0) {
             state.partition_lag = compute_kafka_partition_lag(
                 rk, state.kafka_topic, state.kafka_partition, state.kafka_offset);
-            const auto scan = compute_exact_table_kafka_lag(
-                bootstrap,
-                state.kafka_topic,
-                state.kafka_partition,
-                state.kafka_offset,
-                lake_key.first,
-                lake_key.second,
-                db_engine,
-                scan_timeout_ms,
-                pipeline_defaults::kTableLagScanMaxMessagesDefault);
-            state.table_lag = scan.table_lag;
-            if (scan.partition_lag >= 0) {
-                state.partition_lag = scan.partition_lag;
+            if (run_exact_scan) {
+                const auto scan = compute_exact_table_kafka_lag(
+                    bootstrap,
+                    state.kafka_topic,
+                    state.kafka_partition,
+                    state.kafka_offset,
+                    lake_key.first,
+                    lake_key.second,
+                    db_engine,
+                    scan_timeout_ms,
+                    pipeline_defaults::kTableLagScanMaxMessagesDefault);
+                state.table_lag = scan.table_lag;
+                state.lag_scan_complete = scan.scan_complete;
+                if (scan.partition_lag >= 0) {
+                    state.partition_lag = scan.partition_lag;
+                }
+            } else {
+                state.table_lag = state.partition_lag;
+                state.lag_scan_complete = true;
             }
         } else {
             state.table_lag = tracked;
         }
+
+        SliceFlushStats merged;
+        if (const auto fit = slice_flush_stats.find(lake_key); fit != slice_flush_stats.end()) {
+            merged = fit->second;
+        }
+        if (const auto ps = parse_skipped_by_table.find(lake_key); ps != parse_skipped_by_table.end()) {
+            merged.parse_skipped = ps->second;
+        }
+        if (const auto dr = dropped_unrecoverable_by_table.find(lake_key);
+            dr != dropped_unrecoverable_by_table.end()) {
+            merged.dropped_unrecoverable = dr->second;
+        }
+        merged.events_seen_in_slice = state.events_seen_in_slice;
 
         record_slice_table_lag_stats(
             app_pg,
@@ -291,6 +316,7 @@ void finalize_slice_table_lag(
             meta.source_schema,
             meta.source_table,
             state,
+            &merged,
             apply_staleness_seconds,
             apply_inactive_seconds);
     }
@@ -439,6 +465,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
     const std::map<TableKey, int>& seen_by_table,
     const std::map<TableKey, int>& parse_skipped_by_table,
     std::map<TableKey, int>* dropped_unrecoverable_by_table,
+    std::map<TableKey, SliceFlushStats>* slice_flush_stats,
     const std::map<TableKey, CatalogMeta>& meta_by_key,
     const std::string& source_system = "MariaDB",
     const std::string& db_engine = "mariadb",
@@ -494,7 +521,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
     if (to_apply.empty()) {
         log_write(app_pg, {
             .level = LogLevel::Info,
-            .component = "cdc_kafka_apply_cpp",
+            .component = "cdc_kafka_apply",
             .message = "apply batch dedup only",
             .batch_id = batch_id,
             .conn_id = conn_id,
@@ -511,7 +538,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
 
     log_write(app_pg, {
         .level = LogLevel::Info,
-        .component = "cdc_kafka_apply_cpp",
+        .component = "cdc_kafka_apply",
         .message = "apply batch flushing to lake",
         .batch_id = batch_id,
         .conn_id = conn_id,
@@ -541,6 +568,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
         }
         options.parse_skipped_by_table = &parse_skipped_by_table;
         options.dropped_unrecoverable_by_table = dropped_unrecoverable_by_table;
+        options.slice_flush_stats = slice_flush_stats;
         for (const auto& [lake_key, catalog_meta] : meta_by_key) {
             options.table_hot[lake_key] = catalog_meta.hot;
         }
@@ -603,7 +631,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
             if (dropped_unrecoverable > 0) {
                 log_write(app_pg, {
                     .level = LogLevel::Warning,
-                    .component = "cdc_kafka_apply_cpp",
+                    .component = "cdc_kafka_apply",
                     .message = "apply dropped unrecoverable failed events",
                     .batch_id = batch_id,
                     .conn_id = conn_id,
@@ -617,7 +645,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
         if (batch_table_errors > 0) {
             log_write(app_pg, {
                 .level = applied_n > 0 ? LogLevel::Warning : LogLevel::Error,
-                .component = "cdc_kafka_apply_cpp",
+                .component = "cdc_kafka_apply",
                 .message = applied_n > 0 ? "apply batch partial flush"
                                          : "apply batch flush failed",
                 .batch_id = batch_id,
@@ -640,7 +668,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
 
         log_write(app_pg, {
             .level = LogLevel::Info,
-            .component = "cdc_kafka_apply_cpp",
+            .component = "cdc_kafka_apply",
             .message = "lake batch committed",
             .batch_id = batch_id,
             .conn_id = conn_id,
@@ -684,7 +712,7 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
         }
         log_write(app_pg, {
             .level = LogLevel::Error,
-            .component = "cdc_kafka_apply_cpp",
+            .component = "cdc_kafka_apply",
             .message = "apply batch flush exception",
             .batch_id = batch_id,
             .conn_id = conn_id,
@@ -732,7 +760,7 @@ int run_kafka_apply_native_cli(
     const KafkaBootstrapResolved kafka_boot = resolve_kafka_bootstrap();
     log_write(log_pg, {
         .level = LogLevel::Info,
-        .component = "cdc_kafka_apply_cpp",
+        .component = "cdc_kafka_apply",
         .message = "kafka-apply started",
         .batch_id = batch_id,
         .conn_id = conn_id,
@@ -766,7 +794,7 @@ int run_kafka_apply_native_cli(
         if (idx_stats.indexes_created > 0 || idx_stats.errors > 0) {
             log_write(log_pg, {
                 .level = idx_stats.errors > 0 ? LogLevel::Warning : LogLevel::Info,
-                .component = "cdc_kafka_apply_cpp",
+                .component = "cdc_kafka_apply",
                 .message = "mirror apply PK index backfill",
                 .batch_id = batch_id,
                 .conn_id = conn_id,
@@ -834,7 +862,7 @@ int run_kafka_apply_native_cli(
     if (worker_count > 1 && topic_partitions % worker_count != 0) {
         log_write(log_pg, {
             .level = LogLevel::Warning,
-            .component = "cdc_kafka_apply_cpp",
+            .component = "cdc_kafka_apply",
             .message = "kafka topic_partitions not divisible by worker_count; shard routing may skew",
             .batch_id = batch_id,
             .conn_id = conn_id,
@@ -866,7 +894,7 @@ int run_kafka_apply_native_cli(
 
     log_write(log_pg, {
         .level = LogLevel::Info,
-        .component = "cdc_kafka_apply_cpp",
+        .component = "cdc_kafka_apply",
         .message = "apply tables selected",
         .batch_id = batch_id,
         .conn_id = conn_id,
@@ -900,7 +928,7 @@ int run_kafka_apply_native_cli(
     if (pruned > 0) {
         log_write(log_pg, {
             .level = LogLevel::Info,
-            .component = "cdc_kafka_apply_cpp",
+            .component = "cdc_kafka_apply",
             .message = "pruned applied_events audit rows",
             .batch_id = batch_id,
             .conn_id = conn_id,
@@ -914,7 +942,7 @@ int run_kafka_apply_native_cli(
     if (stats_pruned > 0) {
         log_write(log_pg, {
             .level = LogLevel::Info,
-            .component = "cdc_kafka_apply_cpp",
+            .component = "cdc_kafka_apply",
             .message = "pruned apply_batch_stats rows",
             .batch_id = batch_id,
             .conn_id = conn_id,
@@ -925,6 +953,18 @@ int run_kafka_apply_native_cli(
     }
 
     ensure_apply_positions(app_pg.raw, meta_by_key, conn_id, topic_prefix, topic_mode, topic_buckets);
+
+    const int health_refreshed = refresh_apply_position_health(app_pg.raw, conn_id, staleness);
+    if (health_refreshed > 0) {
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "cdc_kafka_apply",
+            .message = "apply_position health refreshed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .context = {{"tables_updated", health_refreshed}, {"staleness_seconds", staleness}},
+        });
+    }
 
     std::set<TableKey> quarantined = fetch_quarantined(app_pg.raw, conn_id, meta_by_key);
 
@@ -943,7 +983,7 @@ int run_kafka_apply_native_cli(
     } catch (const std::exception& ex) {
         log_write(log_pg, {
             .level = LogLevel::Error,
-            .component = "cdc_kafka_apply_cpp",
+            .component = "cdc_kafka_apply",
             .message = "kafka ensure topics failed",
             .batch_id = batch_id,
             .conn_id = conn_id,
@@ -986,7 +1026,7 @@ int run_kafka_apply_native_cli(
     if (!rk) {
         log_write(log_pg, {
             .level = LogLevel::Error,
-            .component = "cdc_kafka_apply_cpp",
+            .component = "cdc_kafka_apply",
             .message = "kafka consumer create failed",
             .batch_id = batch_id,
             .conn_id = conn_id,
@@ -1012,7 +1052,7 @@ int run_kafka_apply_native_cli(
     if (sub_err) {
         log_write(log_pg, {
             .level = LogLevel::Error,
-            .component = "cdc_kafka_apply_cpp",
+            .component = "cdc_kafka_apply",
             .message = "kafka subscribe failed",
             .batch_id = batch_id,
             .conn_id = conn_id,
@@ -1030,7 +1070,7 @@ int run_kafka_apply_native_cli(
 
     log_write(log_pg, {
         .level = LogLevel::Info,
-        .component = "cdc_kafka_apply_cpp",
+        .component = "cdc_kafka_apply",
         .message = "kafka consumer subscribed",
         .batch_id = batch_id,
         .conn_id = conn_id,
@@ -1066,6 +1106,7 @@ int run_kafka_apply_native_cli(
     std::map<TableKey, int> applied_by_table;
     std::map<TableKey, int> parse_skipped_by_table;
     std::map<TableKey, int> dropped_unrecoverable_by_table;
+    std::map<TableKey, SliceFlushStats> slice_flush_stats;
     std::map<std::pair<std::string, int>, long long> last_offsets;
 
     long long events_seen = 0;
@@ -1078,7 +1119,6 @@ int run_kafka_apply_native_cli(
     int empty_polls = 0;
     bool first_kafka_message_logged = false;
     long long kafka_poll_progress_last = 0;
-    std::map<std::pair<std::string, int>, long long> skipped_parse_offsets;
     std::map<std::pair<std::string, int>, long long> skipped_shard_offsets;
     std::vector<ApplyEvent> pending_batch;
 
@@ -1109,6 +1149,7 @@ int run_kafka_apply_native_cli(
                     seen_by_table,
                     parse_skipped_by_table,
                     &dropped_unrecoverable_by_table,
+                    &slice_flush_stats,
                     meta_by_key,
                     source_system,
                     db_engine,
@@ -1129,7 +1170,7 @@ int run_kafka_apply_native_cli(
                             clear_stale_cdc_in_progress(app_pg.raw, conn_id, db_engine);
                         log_write(log_pg, {
                             .level = LogLevel::Error,
-                            .component = "cdc_kafka_apply_cpp",
+                            .component = "cdc_kafka_apply",
                             .message = "apply batch flush failed after retries",
                             .batch_id = batch_id,
                             .conn_id = conn_id,
@@ -1146,7 +1187,7 @@ int run_kafka_apply_native_cli(
                     } catch (const std::exception& clear_ex) {
                         log_write(log_pg, {
                             .level = LogLevel::Error,
-                            .component = "cdc_kafka_apply_cpp",
+                            .component = "cdc_kafka_apply",
                             .message = "apply batch flush failed after retries",
                             .batch_id = batch_id,
                             .conn_id = conn_id,
@@ -1179,7 +1220,7 @@ int run_kafka_apply_native_cli(
                         loop_exited_early = true;
                         log_write(log_pg, {
                             .level = LogLevel::Info,
-                            .component = "cdc_kafka_apply_cpp",
+                            .component = "cdc_kafka_apply",
                             .message = "kafka poll idle no messages",
                             .batch_id = batch_id,
                             .conn_id = conn_id,
@@ -1252,7 +1293,7 @@ int run_kafka_apply_native_cli(
                 first_kafka_message_logged = true;
                 log_write(log_pg, {
                     .level = LogLevel::Info,
-                    .component = "cdc_kafka_apply_cpp",
+                    .component = "cdc_kafka_apply",
                     .message = "kafka first message received",
                     .batch_id = batch_id,
                     .conn_id = conn_id,
@@ -1274,7 +1315,7 @@ int run_kafka_apply_native_cli(
                     ? static_cast<double>(events_seen) / (elapsed_ms / 1000.0) : 0.0;
                 log_write(log_pg, {
                     .level = LogLevel::Info,
-                    .component = "cdc_kafka_apply_cpp",
+                    .component = "cdc_kafka_apply",
                     .message = "kafka poll progress",
                     .batch_id = batch_id,
                     .conn_id = conn_id,
@@ -1296,15 +1337,10 @@ int run_kafka_apply_native_cli(
             const json probe = kafka_apply_detail::parse_kafka_message_json(payload);
             if (probe.is_discarded() || !probe.is_object()) {
                 parse_skipped += 1;
-                auto tp = std::make_pair(topic, partition);
-                auto sit = skipped_parse_offsets.find(tp);
-                if (sit == skipped_parse_offsets.end() || offset > sit->second) {
-                    skipped_parse_offsets[tp] = offset;
-                }
                 if (parse_skipped <= 10) {
                     log_write(log_pg, {
                         .level = LogLevel::Warning,
-                        .component = "cdc_kafka_apply_cpp",
+                        .component = "cdc_kafka_apply",
                         .message = "kafka message parse skipped",
                         .batch_id = batch_id,
                         .conn_id = conn_id,
@@ -1370,7 +1406,7 @@ int run_kafka_apply_native_cli(
                 if (parse_skipped <= 10) {
                     log_write(log_pg, {
                         .level = LogLevel::Warning,
-                        .component = "cdc_kafka_apply_cpp",
+                        .component = "cdc_kafka_apply",
                         .message = "kafka payload parse skipped",
                         .batch_id = batch_id,
                         .conn_id = conn_id,
@@ -1391,7 +1427,7 @@ int run_kafka_apply_native_cli(
             if (events_applied == 0 && pending_batch.empty() && seen_by_table[key] == 0) {
                 log_write(log_pg, {
                     .level = LogLevel::Info,
-                    .component = "cdc_kafka_apply_cpp",
+                    .component = "cdc_kafka_apply",
                     .message = "kafka message parsed for table",
                     .batch_id = batch_id,
                     .conn_id = conn_id,
@@ -1417,12 +1453,6 @@ int run_kafka_apply_native_cli(
 
         flush_batch();
 
-        if (!skipped_parse_offsets.empty()) {
-            commit_kafka_offsets(rk, skipped_parse_offsets);
-            for (const auto& [tp, offset] : skipped_parse_offsets) {
-                last_offsets[tp] = std::max(last_offsets[tp], offset);
-            }
-        }
         if (!skipped_shard_offsets.empty()) {
             commit_kafka_offsets(rk, skipped_shard_offsets);
             for (const auto& [tp, offset] : skipped_shard_offsets) {
@@ -1447,6 +1477,7 @@ int run_kafka_apply_native_cli(
             lag_tracker,
             lag_seen_offsets,
             empty_poll_quiet);
+        refresh_apply_position_health(app_pg.raw, conn_id, staleness);
         finalize_slice_table_lag(
             app_pg.raw,
             rk,
@@ -1459,6 +1490,9 @@ int run_kafka_apply_native_cli(
             applied_by_table,
             pending_batch,
             lag_tracker,
+            slice_flush_stats,
+            parse_skipped_by_table,
+            dropped_unrecoverable_by_table,
             staleness,
             inactive_seconds,
             table_lag_scan_timeout_ms);
@@ -1476,7 +1510,7 @@ int run_kafka_apply_native_cli(
 
         log_write(log_pg, {
             .level = (errors > 0 || parse_skipped > 0) ? LogLevel::Warning : LogLevel::Info,
-            .component = "cdc_kafka_apply_cpp",
+            .component = "cdc_kafka_apply",
             .message = errors > 0 ? "kafka-apply completed with errors"
                 : (parse_skipped > 0 ? "kafka-apply completed with parse skips" : "kafka-apply completed"),
             .batch_id = batch_id,
@@ -1498,7 +1532,7 @@ int run_kafka_apply_native_cli(
     } catch (const std::exception& ex) {
         log_write(log_pg, {
             .level = LogLevel::Error,
-            .component = "cdc_kafka_apply_cpp",
+            .component = "cdc_kafka_apply",
             .message = "kafka-apply failed",
             .batch_id = batch_id,
             .conn_id = conn_id,
@@ -1527,7 +1561,7 @@ int run_kafka_apply_native_cli(
         if (cleared > 0) {
             log_write(log_pg, {
                 .level = LogLevel::Info,
-                .component = "cdc_kafka_apply_cpp",
+                .component = "cdc_kafka_apply",
                 .message = "stale cdc_in_progress cleared after apply slice",
                 .batch_id = batch_id,
                 .conn_id = conn_id,

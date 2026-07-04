@@ -1,6 +1,7 @@
 #include "mssql_full_load.hpp"
 
 #include "capture_common.hpp"
+#include "full_load_checkpoint.hpp"
 #include "full_load_common.hpp"
 #include "lake_apply_index.hpp"
 #include "mariadb_datetime.hpp"
@@ -396,7 +397,8 @@ long long copy_rows_keyset(
     const std::string& snapshot_id,
     const MssqlRetryOptions& retry,
     const PkRange& pk_range = {},
-    InvalidPkSkipStats* skip_stats = nullptr) {
+    InvalidPkSkipStats* skip_stats = nullptr,
+    full_load::CopyCheckpointContext* checkpoint_ctx = nullptr) {
     const std::string load_ts = utc_now_ts();
     const std::string load_date = utc_now_date();
 
@@ -440,6 +442,9 @@ long long copy_rows_keyset(
 
     long long total_rows = 0;
     std::vector<std::string> last_pk_values;
+    if (checkpoint_ctx && !checkpoint_ctx->initial_last_pk.empty()) {
+        last_pk_values = checkpoint_ctx->initial_last_pk;
+    }
     int batch_num = 0;
     const int progress_interval = pipeline_defaults::kMssqlFullLoadCopyProgressInterval;
     bool copy_started_logged = false;
@@ -563,6 +568,9 @@ long long copy_rows_keyset(
         }
 
         total_rows += static_cast<long long>(batch_lines.size());
+        if (checkpoint_ctx) {
+            full_load::save_copy_batch_checkpoint(*checkpoint_ctx, last_pk_values, total_rows);
+        }
         batch_num += 1;
         if (batch_num == 1 || batch_num % progress_interval == 0) {
             log_fl(
@@ -596,11 +604,30 @@ long long copy_rows_keyset(
     return total_rows;
 }
 
+long long fetch_mssql_row_count(
+    MssqlConn& mssql,
+    const std::string& schema,
+    const std::string& table,
+    const MssqlRetryOptions& retry) {
+    const std::string sql =
+        "SELECT COUNT(*) FROM [" + schema + "].[" + table + "]";
+    const auto result = mssql.query_retry(sql, retry);
+    if (result.rows.empty() || result.rows.front().empty()) {
+        return -1;
+    }
+    try {
+        return std::stoll(result.rows.front().front().text);
+    } catch (...) {
+        return -1;
+    }
+}
+
 long long copy_rows_parallel(
     const AppConfig& cfg,
     const MssqlSource& source,
     PGconn* log_pg,
     std::mutex* log_mtx,
+    PGconn* app_pg,
     MssqlConn& mssql,
     PGconn* pg,
     const MssqlCatalogTableRow& target,
@@ -613,8 +640,38 @@ long long copy_rows_parallel(
     int workers,
     const std::string& snapshot_id,
     const MssqlRetryOptions& retry,
-    InvalidPkSkipStats* skip_stats = nullptr) {
+    InvalidPkSkipStats* skip_stats = nullptr,
+    const std::vector<FullLoadCheckpoint>* resume_checkpoints = nullptr,
+    std::optional<long long> source_rows = std::nullopt) {
+    std::mutex checkpoint_mtx;
+    auto checkpoint_for_worker = [&](int worker_id) -> full_load::CopyCheckpointContext {
+        full_load::CopyCheckpointContext ctx;
+        ctx.app_pg = app_pg;
+        ctx.log_pg = log_pg;
+        ctx.log_mtx = log_mtx;
+        ctx.catalog_id = target.catalog_id;
+        ctx.worker_id = worker_id;
+        ctx.batch_id = snapshot_id;
+        ctx.conn_id = target.conn_id;
+        ctx.source_schema = target.source_schema;
+        ctx.source_table = target.source_table;
+        ctx.log_component = "mssql_load";
+        ctx.source_rows = source_rows;
+        ctx.checkpoint_mtx = &checkpoint_mtx;
+        ctx.progress_log_interval = pipeline_defaults::kFullLoadCopyProgressLogInterval;
+        if (resume_checkpoints) {
+            for (const auto& cp : *resume_checkpoints) {
+                if (cp.worker_id == worker_id && cp.phase == FullLoadPhase::Copy) {
+                    ctx.initial_last_pk = last_pk_from_json(cp.last_pk);
+                    break;
+                }
+            }
+        }
+        return ctx;
+    };
+
     if (workers <= 1) {
+        auto ctx = checkpoint_for_worker(0);
         return copy_rows_keyset(
             mssql,
             pg,
@@ -630,7 +687,8 @@ long long copy_rows_parallel(
             snapshot_id,
             retry,
             {},
-            skip_stats);
+            skip_stats,
+            &ctx);
     }
 
     if (pk_cols.size() != 1) {
@@ -644,6 +702,7 @@ long long copy_rows_parallel(
             target.conn_id,
             target.source_schema,
             target.source_table);
+        auto ctx = checkpoint_for_worker(0);
         return copy_rows_keyset(
             mssql,
             pg,
@@ -659,7 +718,8 @@ long long copy_rows_parallel(
             snapshot_id,
             retry,
             {},
-            skip_stats);
+            skip_stats,
+            &ctx);
     }
 
     const MssqlColumn* pk_col_def = nullptr;
@@ -680,6 +740,7 @@ long long copy_rows_parallel(
             target.conn_id,
             target.source_schema,
             target.source_table);
+        auto ctx = checkpoint_for_worker(0);
         return copy_rows_keyset(
             mssql,
             pg,
@@ -695,7 +756,8 @@ long long copy_rows_parallel(
             snapshot_id,
             retry,
             {},
-            skip_stats);
+            skip_stats,
+            &ctx);
     }
 
     log_fl(
@@ -740,6 +802,7 @@ long long copy_rows_parallel(
             target.conn_id,
             target.source_schema,
             target.source_table);
+        auto ctx = checkpoint_for_worker(0);
         return copy_rows_keyset(
             mssql,
             pg,
@@ -755,7 +818,8 @@ long long copy_rows_parallel(
             snapshot_id,
             retry,
             pk_range_for_keyset(*bounds),
-            skip_stats);
+            skip_stats,
+            &ctx);
     }
 
     log_fl(
@@ -770,6 +834,7 @@ long long copy_rows_parallel(
         target.source_table);
 
     if (min_v >= max_v) {
+        auto ctx = checkpoint_for_worker(0);
         return copy_rows_keyset(
             mssql,
             pg,
@@ -785,7 +850,8 @@ long long copy_rows_parallel(
             snapshot_id,
             retry,
             pk_range_for_keyset(*bounds),
-            skip_stats);
+            skip_stats,
+            &ctx);
     }
 
     const unsigned long long total =
@@ -831,6 +897,7 @@ long long copy_rows_parallel(
                 MssqlConn worker_mssql(source);
                 worker_mssql.use_database(target.source_database);
                 PgConn worker_lake(cfg.datalake.conn_string());
+                auto ctx = checkpoint_for_worker(w);
                 row_counts[static_cast<std::size_t>(w)] = copy_rows_keyset(
                     worker_mssql,
                     worker_lake.raw,
@@ -846,7 +913,8 @@ long long copy_rows_parallel(
                     snapshot_id,
                     retry,
                     slice,
-                    &worker_skips[static_cast<std::size_t>(w)]);
+                    &worker_skips[static_cast<std::size_t>(w)],
+                    &ctx);
             } catch (...) {
                 errors[static_cast<std::size_t>(w)] = std::current_exception();
             }
@@ -963,7 +1031,14 @@ std::vector<MssqlCatalogTableRow> fetch_full_load_targets(PGconn* pg) {
         WHERE db_engine = 'mssql'
           AND active = true
           AND needs_full_load = true
-          AND status NOT IN ('skipped', 'disabled', 'full_load_in_progress')
+          AND status NOT IN ('skipped', 'disabled')
+          AND (
+            status <> 'full_load_in_progress'
+            OR EXISTS (
+                SELECT 1 FROM cdc_catalog.full_load_checkpoint cp
+                WHERE cp.catalog_id = catalog.catalog_id AND cp.phase = 'copy'
+            )
+          )
         ORDER BY conn_id, source_database, source_schema, source_table
         )");
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -1157,36 +1232,82 @@ TableLoadOutcome load_one_table(
     };
 
     try {
-    try {
-    truncate_lake_table(lake_pg.raw, pg_schema, pg_table);
-    } catch (const std::exception& ex) {
+    std::vector<FullLoadCheckpoint> resume_checkpoints;
+    const bool resume_copy = full_load::should_resume_from_copy_checkpoint(
+        app_pg.raw,
+        lake_pg.raw,
+        target.catalog_id,
+        pg_schema,
+        pg_table,
+        resume_checkpoints);
+
+    const MssqlRetryOptions retry_pre = mssql_retry_options(runtime, target.conn_id);
+    const long long source_rows =
+        fetch_mssql_row_count(mssql, target.source_schema, target.source_table, retry_pre);
+
+    if (resume_copy) {
+        long long checkpoint_rows = 0;
+        for (const auto& cp : resume_checkpoints) {
+            if (cp.phase == FullLoadPhase::Copy) {
+                checkpoint_rows += cp.rows_loaded;
+            }
+        }
         log_fl(
             log_pg,
             log_mtx,
-            LogLevel::Error,
+            LogLevel::Info,
             batch_id,
-            "lake table truncate failed, aborting full load",
-            {{"error", ex.what()}},
+            "full load resumed from checkpoint",
+            {{"checkpoint_rows", checkpoint_rows},
+             {"worker_checkpoints", static_cast<int>(resume_checkpoints.size())}},
             target.conn_id,
             target.source_schema,
             target.source_table);
-        release_lock();
-        mark_catalog_failed(app_pg.raw, target.catalog_id, target.conn_id, "truncate failed: " + std::string(ex.what()));
-        return TableLoadOutcome::Failed;
+    } else {
+        clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
+        const auto trunc = full_load::truncate_lake_table_verified(
+            lake_pg.raw,
+            pg_schema,
+            pg_table,
+            pipeline_defaults::kFullLoadTruncateMaxRetries);
+        if (!trunc.ok) {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Error,
+                batch_id,
+                "lake table truncate failed, aborting full load",
+                {{"error", trunc.error},
+                 {"rows_after_truncate", trunc.rows_after},
+                 {"attempts", trunc.attempts}},
+                target.conn_id,
+                target.source_schema,
+                target.source_table);
+            release_lock();
+            mark_catalog_failed(
+                app_pg.raw,
+                target.catalog_id,
+                target.conn_id,
+                "truncate failed: " + trunc.error);
+            return TableLoadOutcome::Failed;
+        }
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Info,
+            batch_id,
+            "lake table truncated",
+            {{"rows_after_truncate", trunc.rows_after}, {"attempts", trunc.attempts}},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
+        FullLoadCheckpoint trunc_cp;
+        trunc_cp.catalog_id = target.catalog_id;
+        trunc_cp.worker_id = 0;
+        trunc_cp.batch_id = batch_id;
+        trunc_cp.phase = FullLoadPhase::Truncate;
+        save_full_load_checkpoint(app_pg.raw, trunc_cp);
     }
-
-    const long long rows_after_truncate = lake_table_row_count(lake_pg.raw, pg_schema, pg_table);
-
-    log_fl(
-        log_pg,
-        log_mtx,
-        rows_after_truncate == 0 ? LogLevel::Info : LogLevel::Warning,
-        batch_id,
-        rows_after_truncate == 0 ? "lake table truncated" : "lake table truncate incomplete",
-        {{"rows_after_truncate", rows_after_truncate}},
-        target.conn_id,
-        target.source_schema,
-        target.source_table);
 
     {
         try {
@@ -1235,6 +1356,18 @@ TableLoadOutcome load_one_table(
         target.source_schema,
         target.source_table);
 
+    {
+        FullLoadCheckpoint ddl_cp;
+        ddl_cp.catalog_id = target.catalog_id;
+        ddl_cp.worker_id = 0;
+        ddl_cp.batch_id = batch_id;
+        ddl_cp.phase = FullLoadPhase::Ddl;
+        if (source_rows >= 0) {
+            ddl_cp.source_rows = source_rows;
+        }
+        save_full_load_checkpoint(app_pg.raw, ddl_cp);
+    }
+
     const MssqlRetryOptions retry = mssql_retry_options(runtime, target.conn_id);
     InvalidPkSkipStats skip_stats;
     rows_out = copy_rows_parallel(
@@ -1242,6 +1375,7 @@ TableLoadOutcome load_one_table(
         source,
         log_pg,
         log_mtx,
+        app_pg.raw,
         mssql,
         lake_pg.raw,
         target,
@@ -1254,7 +1388,9 @@ TableLoadOutcome load_one_table(
         workers,
         batch_id,
         retry,
-        &skip_stats);
+        &skip_stats,
+        resume_copy ? &resume_checkpoints : nullptr,
+        source_rows >= 0 ? std::optional<long long>(source_rows) : std::nullopt);
 
     if (skip_stats.count > 0) {
         log_fl(
@@ -1269,7 +1405,34 @@ TableLoadOutcome load_one_table(
             target.source_table);
     }
 
+    const long long lake_rows = full_load::lake_table_row_count(lake_pg.raw, pg_schema, pg_table);
+    const auto verify = full_load::verify_full_load_row_counts(source_rows, lake_rows, rows_out);
+    if (!verify.ok) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Error,
+            batch_id,
+            "full load row count verify failed",
+            {{"source_rows", verify.source_rows},
+             {"lake_rows", verify.lake_rows},
+             {"rows_loaded", rows_out},
+             {"diff", verify.diff},
+             {"message", verify.message}},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
+        release_lock();
+        mark_catalog_failed(
+            app_pg.raw,
+            target.catalog_id,
+            target.conn_id,
+            "row count verify failed: " + verify.message);
+        return TableLoadOutcome::Failed;
+    }
+
     mark_catalog_success(app_pg.raw, target.catalog_id);
+    clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
 
     try {
         if (seed_mssql_cdc_lsn_t0_for_table(
@@ -1421,6 +1584,7 @@ FullLoadRunStats run_mssql_full_load(
         conn_ids.insert(t.conn_id);
     }
     for (const auto& cid : conn_ids) {
+        recover_full_load_for_checkpoint_resume(app_pg.raw, cid, "mssql", batch_id);
         clear_stale_full_load_in_progress(
             app_pg.raw, cid, "mssql", pipeline_defaults::kMssqlFullLoadStaleInProgressMinutes);
     }
@@ -1518,6 +1682,8 @@ FullLoadRunStats run_mssql_full_load(
                 conn_id);
             continue;
         }
+
+        stats.conn_ids.insert(conn_id);
 
         try {
             const int seeded = seed_mssql_cdc_lsn_for_conn(cfg, log_pg, conn_id, batch_id);
