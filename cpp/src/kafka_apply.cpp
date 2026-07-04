@@ -1109,7 +1109,7 @@ void insert_apply_batch_stats(
             $19::integer, $20, $21::integer, $22::boolean, $23::boolean,
             $24::integer, $25::bigint, $26::bigint,
             $27::integer, $28::bigint, $29::bigint,
-            NULLIF($30, '-1')::integer, NULLIF($31, '')::bigint, $32::boolean,
+            $30::integer, NULLIF($31, '')::bigint, $32::boolean,
             $33, $34, $35,
             $36::jsonb
         )
