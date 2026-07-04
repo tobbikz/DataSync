@@ -2149,7 +2149,7 @@ CREATE TABLE IF NOT EXISTS cdc_catalog.full_load_checkpoint (
     updated_at timestamp with time zone NOT NULL DEFAULT now(),
     PRIMARY KEY (catalog_id, worker_id),
     CONSTRAINT full_load_checkpoint_phase_chk
-        CHECK (phase = ANY (ARRAY['truncate'::text, 'ddl'::text, 'copy'::text))
+        CHECK (phase = ANY (ARRAY['truncate'::text, 'ddl'::text, 'copy'::text]))
 );
 CREATE INDEX IF NOT EXISTS full_load_checkpoint_updated_idx
     ON cdc_catalog.full_load_checkpoint (updated_at DESC);
@@ -2256,11 +2256,11 @@ BEGIN
     END IF;
 END $$;
 
--- Drop dependent views first (CREATE OR REPLACE cannot rename columns e.g. service_tier -> events_total).
+-- Drop dependent views first (leaf views before v_apply_latest).
 DROP VIEW IF EXISTS cdc_catalog.v_kafka_consumer;
-DROP VIEW IF EXISTS cdc_catalog.v_apply_latest;
-DROP VIEW IF EXISTS cdc_catalog.v_apply_stale;
 DROP VIEW IF EXISTS cdc_catalog.v_cdc_pipeline_summary;
+DROP VIEW IF EXISTS cdc_catalog.v_apply_stale;
+DROP VIEW IF EXISTS cdc_catalog.v_apply_latest;
 DROP VIEW IF EXISTS cdc_catalog.v_full_load_progress;
 
 CREATE VIEW cdc_catalog.v_apply_latest AS
