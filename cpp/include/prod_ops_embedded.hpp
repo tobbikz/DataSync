@@ -2012,7 +2012,7 @@ BEGIN
         CREATE OR REPLACE FUNCTION cdc_catalog.prune_reconciliation(p_retention_days integer DEFAULT 30)
         RETURNS bigint
         LANGUAGE sql
-        AS $$
+        AS $prune_reconciliation$
             WITH deleted AS (
                 DELETE FROM cdc_catalog.reconciliation
                 WHERE p_retention_days > 0
@@ -2020,7 +2020,7 @@ BEGIN
                 RETURNING 1
             )
             SELECT count(*)::bigint FROM deleted;
-        $$;
+        $prune_reconciliation$;
 
         COMMENT ON FUNCTION cdc_catalog.prune_reconciliation(integer) IS
             'Delete reconcile-lite rows older than retention window';
