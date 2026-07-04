@@ -9,8 +9,79 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 namespace {
+
+constexpr const char* kRequiredCatalogTables[] = {
+    "apply_batch_stats",
+    "apply_outbox",
+    "apply_position",
+    "capture_position",
+    "catalog",
+    "cdc_applied_events",
+    "cdc_mongo_resume",
+    "cdc_mssql_lsn",
+    "connections",
+    "full_load_checkpoint",
+    "logs",
+    "reconciliation",
+    "runtime_config",
+    "schema_migrations",
+};
+
+constexpr const char* kRequiredCatalogViews[] = {
+    "v_apply_latest",
+    "v_reconciliation_latest",
+};
+
+bool regclass_exists(PGconn* pg, const std::string& qualified_name) {
+    const char* vals[] = {qualified_name.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        "SELECT to_regclass($1) IS NOT NULL",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    bool ok = false;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        const char* val = PQgetvalue(res, 0, 0);
+        ok = val && val[0] == 't';
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return ok;
+}
+
+int catalog_table_count(PGconn* pg) {
+    PGresult* res = PQexec(
+        pg,
+        "SELECT count(*)::integer FROM pg_tables WHERE schemaname = 'cdc_catalog'");
+    int count = -1;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        count = std::atoi(PQgetvalue(res, 0, 0));
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return count;
+}
+
+int latest_schema_migration_version(PGconn* pg) {
+    PGresult* res = PQexec(pg, "SELECT COALESCE(max(version), 0)::integer FROM cdc_catalog.schema_migrations");
+    int version = -1;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        version = std::atoi(PQgetvalue(res, 0, 0));
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return version;
+}
 
 void ensure_schema_migrations_table(PGconn* pg) {
     pg_exec(
@@ -251,6 +322,7 @@ int run_schema_migrate(PGconn* log_pg, PGconn* lake_pg, const SchemaMigrateOptio
             .component = "catalog",
             .message = "migrate incremental applied",
         });
+        validate_catalog_schema(log_pg);
     }
 
     if (options.diagnostics) {
@@ -267,10 +339,65 @@ int run_schema_migrate(PGconn* log_pg, PGconn* lake_pg, const SchemaMigrateOptio
     return 0;
 }
 
+std::vector<std::string> missing_catalog_schema_objects(PGconn* pg) {
+    std::vector<std::string> missing;
+    if (!pg) {
+        missing.emplace_back("cdc_catalog (no connection)");
+        return missing;
+    }
+    for (const char* table : kRequiredCatalogTables) {
+        const std::string name = std::string("cdc_catalog.") + table;
+        if (!regclass_exists(pg, name)) {
+            missing.push_back("table:" + std::string(table));
+        }
+    }
+    for (const char* view : kRequiredCatalogViews) {
+        const std::string name = std::string("cdc_catalog.") + view;
+        if (!regclass_exists(pg, name)) {
+            missing.push_back("view:" + std::string(view));
+        }
+    }
+    return missing;
+}
+
+void validate_catalog_schema(PGconn* pg) {
+    const auto missing = missing_catalog_schema_objects(pg);
+    if (missing.empty()) {
+        log_write(pg, {
+            .level = LogLevel::Info,
+            .component = "catalog",
+            .message = "catalog schema validated",
+            .context = {
+                {"table_count", catalog_table_count(pg)},
+                {"expected_tables", kExpectedCatalogTableCount},
+                {"schema_version", latest_schema_migration_version(pg)},
+            },
+        });
+        return;
+    }
+    std::ostringstream detail;
+    for (std::size_t i = 0; i < missing.size(); ++i) {
+        if (i > 0) {
+            detail << ", ";
+        }
+        detail << missing[i];
+    }
+    throw std::runtime_error(
+        "cdc_catalog schema incomplete (missing " + std::to_string(missing.size()) +
+        " object(s): " + detail.str() + "; tables=" + std::to_string(catalog_table_count(pg)) +
+        "/" + std::to_string(kExpectedCatalogTableCount) + ", schema_version=" +
+        std::to_string(latest_schema_migration_version(pg)) + ") — run: DataSync migrate");
+}
+
 void run_startup_schema_migrate(PGconn* log_pg) {
     if (!log_pg || !catalog_schema_exists(log_pg)) {
         return;
     }
+    log_write(log_pg, {
+        .level = LogLevel::Info,
+        .component = "catalog",
+        .message = "startup schema migrate started",
+    });
     SchemaMigrateOptions opts;
     opts.incremental = true;
     try {

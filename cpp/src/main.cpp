@@ -339,6 +339,10 @@ int main(int argc, char** argv) {
         PgConn log_pg(cfg.datasync.conn_string());
         reload_connections(log_pg.raw, cfg);
 
+        if (command != "migrate" && catalog_schema_exists(log_pg.raw)) {
+            run_startup_schema_migrate(log_pg.raw);
+        }
+
         if (command == "discover") {
             return run_discover(cfg, log_pg.raw, batch_id);
         }
