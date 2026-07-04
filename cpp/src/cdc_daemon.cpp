@@ -2,7 +2,6 @@
 #include "capture_common.hpp"
 #include "catalog_sync.hpp"
 #include "cdc_pre_apply.hpp"
-#include "cdc_reconcile.hpp"
 #include "config.hpp"
 #include "connections.hpp"
 #include "daemon_full_load.hpp"
@@ -674,22 +673,12 @@ std::vector<std::string> wait_for_daemon_connections(PGconn* log_pg, AppConfig& 
 }
 
 void run_daemon_incremental_migrate(PGconn* log_pg) {
-    if (!catalog_schema_exists(log_pg)) {
-        log_write(log_pg, {
-            .level = LogLevel::Warning,
-            .component = "cdc_daemon",
-            .message = "daemon schema migrate skipped: cdc_catalog missing",
-        });
-        return;
-    }
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "cdc_daemon",
         .message = "daemon schema migrate started",
     });
-    SchemaMigrateOptions opts;
-    opts.incremental = true;
-    (void)run_schema_migrate(log_pg, nullptr, opts);
+    run_startup_schema_migrate(log_pg);
 }
 
 }  // namespace
@@ -763,7 +752,6 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
             {"kafka_bootstrap", kafka.bootstrap},
             {"kafka_bootstrap_source", kafka.source},
             {"topic_prefix_mode", "conn_id"},
-            {"reconcile_embedded", true},
             {"apply_mode", once ? "sync" : "background"},
         },
     });
@@ -798,18 +786,6 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
                 }
             } catch (...) {
             }
-        }
-    });
-
-    const AppConfig reconcile_cfg = snapshot_app_config(cfg);
-    std::thread reconcile_thread([reconcile_cfg]() {
-        try {
-            PgConn pg(reconcile_cfg.datasync.conn_string());
-            if (!pg.raw) {
-                return;
-            }
-            (void)run_reconcile_loop(reconcile_cfg, pg.raw, false, &g_shutdown);
-        } catch (const std::exception&) {
         }
     });
 
@@ -868,9 +844,6 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
 
     if (startup_full_load_thread.joinable()) {
         startup_full_load_thread.join();
-    }
-    if (reconcile_thread.joinable()) {
-        reconcile_thread.join();
     }
     join_background_threads();
 

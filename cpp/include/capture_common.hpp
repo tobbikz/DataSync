@@ -255,9 +255,6 @@ void mark_catalog_cdc_success(PGconn* pg, long long catalog_id);
 
 void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string& error);
 
-/** Clears legacy reconcile:* errors from catalog when a table passes reconcile again. */
-void mark_catalog_reconcile_healed(PGconn* pg, long long catalog_id);
-
 void clear_stale_full_load_in_progress(
     PGconn* pg,
     const std::string& conn_id,

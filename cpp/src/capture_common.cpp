@@ -1196,33 +1196,6 @@ void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string
         vals);
 }
 
-void mark_catalog_reconcile_healed(PGconn* pg, long long catalog_id) {
-    const std::string id = std::to_string(catalog_id);
-    const char* vals[] = {id.c_str()};
-    pg_exec_params_simple(
-        pg,
-        R"(
-        UPDATE cdc_catalog.catalog
-        SET status = CASE
-                WHEN status = 'failed'::cdc_catalog.replication_status
-                     AND last_error LIKE 'reconcile:%'
-                THEN 'success'::cdc_catalog.replication_status
-                ELSE status
-            END,
-            needs_full_load = CASE
-                WHEN last_error LIKE 'reconcile:%' THEN false
-                ELSE needs_full_load
-            END,
-            last_error = NULL,
-            last_error_at = NULL,
-            updated_at = now()
-        WHERE catalog_id = $1::bigint
-          AND last_error LIKE 'reconcile:%'
-        )",
-        1,
-        vals);
-}
-
 void clear_stale_full_load_in_progress(
     PGconn* pg,
     const std::string& conn_id,

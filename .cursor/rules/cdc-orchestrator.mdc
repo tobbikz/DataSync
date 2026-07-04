@@ -80,9 +80,8 @@ Run DEV + QA **in parallel** only for independent work. Delegation prompt must i
 | Pipeline | Entrypoint |
 |----------|------------|
 | CDC | `python -m cdc_kafka daemon --tier {hot\|gold\|silver\|bronze}` |
-| Reconcile | `reconcile-loop` / `run_reconciliation.sh --daemon` — **`reconcile_interval_hours` default 4** en `runtime_config` |
 
 ## Current state (sync PROJECT-STATE after changes)
 
-- Daemon + reconcile desacoplados vía `cdc_kafka reconcile` / `reconcile-loop` (legacy Airflow reconcile eliminado)
+- Reconcile pipeline removed; semaphore/RAG derived from apply health only
 - Next: migración catálogo prod por tier

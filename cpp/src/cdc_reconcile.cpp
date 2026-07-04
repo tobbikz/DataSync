@@ -1,5 +1,7 @@
 #include "cdc_reconcile.hpp"
 
+#include "reconcile_enrichments.hpp"
+#include "schema_migrate.hpp"
 #include "capture_common.hpp"
 #include "config.hpp"
 #include "kafka_topics.hpp"
@@ -32,6 +34,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <functional>
 #include <iomanip>
 #include <memory>
 #include <optional>
@@ -95,22 +98,83 @@ ReconcileRuntime load_reconcile_runtime(RuntimeConfig& runtime, PGconn* pg, cons
     return cfg;
 }
 
-struct CatalogReconcileRow {
-    long long catalog_id{0};
-    std::string conn_id;
-    std::string db_engine;
-    std::string source_database;
-    std::string source_schema;
-    std::string source_table;
-    std::string lake_schema;
-    std::string lake_table;
-    std::string pk_columns;
-    std::string catalog_status;
-    bool active{true};
-    bool cdc_enabled{true};
-    bool needs_full_load{false};
-    bool has_pk{true};
-};
+std::optional<std::string> fetch_max_ts_lake(
+    PGconn* pg,
+    const CatalogReconcileRow& row,
+    const std::string& column) {
+    const std::string fq =
+        pg_ident(row.lake_schema) + "." + pg_ident(row.lake_table);
+    const std::string sql = "SELECT MAX(" + pg_ident(column) + ")::text FROM " + fq;
+    PGresult* res = PQexec(pg, sql.c_str());
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) < 1) {
+        if (res) {
+            PQclear(res);
+        }
+        return std::nullopt;
+    }
+    if (PQgetisnull(res, 0, 0)) {
+        PQclear(res);
+        return std::nullopt;
+    }
+    const char* val = PQgetvalue(res, 0, 0);
+    std::string out = val ? val : "";
+    PQclear(res);
+    return out.empty() ? std::nullopt : std::optional<std::string>(out);
+}
+
+std::optional<std::string> fetch_max_ts_mariadb(
+    MYSQL* mysql,
+    const CatalogReconcileRow& row,
+    const std::string& column) {
+    auto esc_id = [](const std::string& id) {
+        std::string out;
+        for (char c : id) {
+            out += (c == '`') ? "``" : std::string(1, c);
+        }
+        return out;
+    };
+    std::ostringstream sql;
+    sql << "SELECT MAX(`" << esc_id(column) << "`) FROM `" << esc_id(row.source_schema) << "`.`"
+        << esc_id(row.source_table) << "`";
+    if (mysql_query(mysql, sql.str().c_str()) != 0) {
+        return std::nullopt;
+    }
+    MYSQL_RES* res = mysql_store_result(mysql);
+    if (!res) {
+        return std::nullopt;
+    }
+    MYSQL_ROW r = mysql_fetch_row(res);
+    std::optional<std::string> out;
+    if (r && r[0]) {
+        out = r[0];
+    }
+    mysql_free_result(res);
+    return out;
+}
+
+int mariadb_column_count(MYSQL* mysql, const std::string& schema, const std::string& table) {
+    auto esc_id = [](const std::string& id) {
+        std::string out;
+        for (char c : id) {
+            out += (c == '`') ? "``" : std::string(1, c);
+        }
+        return out;
+    };
+    std::ostringstream sql;
+    sql << "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='" << esc_id(schema)
+        << "' AND table_name='" << esc_id(table) << "'";
+    if (mysql_query(mysql, sql.str().c_str()) != 0) {
+        return -1;
+    }
+    MYSQL_RES* res = mysql_store_result(mysql);
+    if (!res) {
+        return -1;
+    }
+    MYSQL_ROW r = mysql_fetch_row(res);
+    const int count = r && r[0] ? std::atoi(r[0]) : -1;
+    mysql_free_result(res);
+    return count;
+}
 
 std::optional<std::string> reconcile_catalog_skip_reason(const CatalogReconcileRow& row) {
     if (!row.active) {
@@ -150,6 +214,312 @@ void populate_lake_keys(CatalogReconcileRow& row) {
     }
 }
 
+/** Advisory lock namespace — avoids collision with full-load locks keyed by catalog_id. */
+constexpr long long kReconcileAdvisoryLockPrefix = 0x5243524E00000000LL;
+
+long long reconcile_conn_advisory_key(const std::string& conn_id) {
+    const std::hash<std::string> hasher;
+    const unsigned long long mix = hasher(std::string("reconcile:") + conn_id);
+    return kReconcileAdvisoryLockPrefix
+           | static_cast<long long>(mix & 0x0000FFFFFFFFFFFFULL);
+}
+
+bool try_acquire_reconcile_conn_lock(PGconn* pg, long long key) {
+    const std::string key_str = std::to_string(key);
+    const char* vals[] = {key_str.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        "SELECT pg_try_advisory_lock($1::bigint)",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) < 1) {
+        if (res) {
+            PQclear(res);
+        }
+        return false;
+    }
+    const bool acquired = PQgetvalue(res, 0, 0)[0] == 't';
+    PQclear(res);
+    return acquired;
+}
+
+/** Block until reconcile advisory lock is acquired (retry every 5s). */
+bool acquire_reconcile_conn_lock(
+    PGconn* pg,
+    const std::string& conn_id,
+    long long* key_out,
+    std::atomic<bool>* shutdown) {
+    const long long key = reconcile_conn_advisory_key(conn_id);
+    while (true) {
+        if (shutdown && shutdown->load()) {
+            return false;
+        }
+        if (try_acquire_reconcile_conn_lock(pg, key)) {
+            if (key_out) {
+                *key_out = key;
+            }
+            return true;
+        }
+        for (int i = 0; i < 5; ++i) {
+            if (shutdown && shutdown->load()) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+}
+
+/** Block until full reconcile-loop advisory lock is acquired. */
+bool acquire_reconcile_loop_lock(PGconn* pg, long long* key_out, std::atomic<bool>* shutdown) {
+    const long long key = pipeline_defaults::kReconcileLoopAdvisoryLockKey;
+    while (true) {
+        if (shutdown && shutdown->load()) {
+            return false;
+        }
+        if (try_acquire_reconcile_conn_lock(pg, key)) {
+            if (key_out) {
+                *key_out = key;
+            }
+            return true;
+        }
+        for (int i = 0; i < 5; ++i) {
+            if (shutdown && shutdown->load()) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+}
+
+void release_reconcile_conn_lock(PGconn* pg, long long key) {
+    const std::string key_str = std::to_string(key);
+    const char* vals[] = {key_str.c_str()};
+    pg_exec_params_simple(pg, "SELECT pg_advisory_unlock($1::bigint)", 1, vals);
+}
+
+struct ReconcileConnLockGuard {
+    PGconn* pg{nullptr};
+    long long key{0};
+    bool held{false};
+
+    ReconcileConnLockGuard(PGconn* pg_in, long long key_in) : pg(pg_in), key(key_in), held(true) {}
+
+    ~ReconcileConnLockGuard() {
+        if (held && pg) {
+            release_reconcile_conn_lock(pg, key);
+        }
+    }
+
+    ReconcileConnLockGuard(const ReconcileConnLockGuard&) = delete;
+    ReconcileConnLockGuard& operator=(const ReconcileConnLockGuard&) = delete;
+};
+
+struct ResumableCycleRun {
+    long long run_id{0};
+    std::string batch_id;
+    std::string reconcile_mode;
+    nlohmann::json completed_conns{nlohmann::json::array()};
+};
+
+/** Fail stale cycle runs (keep results). Remove legacy per-conn running rows only. */
+void cleanup_reconcile_runs_at_cycle_start(PGconn* pg) {
+    const std::string stale_hours =
+        std::to_string(pipeline_defaults::kReconcileCycleStaleAgeHours);
+    const char* stale_vals[] = {
+        pipeline_defaults::kReconcileCycleConnId,
+        stale_hours.c_str()};
+    PGresult* stale_res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.reconciliation_run
+        SET status = 'fail',
+            finished_at = COALESCE(finished_at, now()),
+            context = COALESCE(context, '{}'::jsonb)
+                    || jsonb_build_object('aborted_stale', true, 'scope', 'cycle')
+        WHERE conn_id = $1
+          AND status = 'running'
+          AND started_at < now() - ($2::int || ' hours')::interval
+        )",
+        2,
+        nullptr,
+        stale_vals,
+        nullptr,
+        nullptr,
+        0);
+    if (stale_res) {
+        PQclear(stale_res);
+    }
+
+    const char* legacy_vals[] = {pipeline_defaults::kReconcileCycleConnId};
+    PGresult* legacy_res = PQexecParams(
+        pg,
+        R"(
+        DELETE FROM cdc_catalog.reconciliation_run
+        WHERE status = 'running'
+          AND conn_id <> $1
+        )",
+        1,
+        nullptr,
+        legacy_vals,
+        nullptr,
+        nullptr,
+        0);
+    if (legacy_res) {
+        PQclear(legacy_res);
+    }
+}
+
+/** Return in-progress cycle run to resume after daemon restart (never DELETE running *). */
+std::optional<ResumableCycleRun> find_resumable_cycle_run(PGconn* pg) {
+    const char* vals[] = {pipeline_defaults::kReconcileCycleConnId};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT run_id, batch_id, COALESCE(reconcile_mode, 'full') AS reconcile_mode,
+               COALESCE(context, '{}'::jsonb) AS context
+        FROM cdc_catalog.reconciliation_run
+        WHERE conn_id = $1
+          AND status = 'running'
+        ORDER BY run_id DESC
+        LIMIT 1
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+        if (res) {
+            PQclear(res);
+        }
+        return std::nullopt;
+    }
+
+    ResumableCycleRun out;
+    out.run_id = std::atoll(PQgetvalue(res, 0, 0));
+    const char* batch = PQgetvalue(res, 0, 1);
+    out.batch_id = batch ? batch : "";
+    const char* mode = PQgetvalue(res, 0, 2);
+    out.reconcile_mode = mode && mode[0] ? mode : pipeline_defaults::kReconcileModeLake;
+    if (out.reconcile_mode == pipeline_defaults::kReconcileModeFull) {
+        out.reconcile_mode = pipeline_defaults::kReconcileModeLake;
+    }
+    try {
+        const char* ctx = PQgetvalue(res, 0, 3);
+        const auto context = nlohmann::json::parse(ctx ? ctx : "{}");
+        if (context.contains("completed_conns") && context["completed_conns"].is_array()) {
+            out.completed_conns = context["completed_conns"];
+        }
+    } catch (...) {
+    }
+    PQclear(res);
+    if (out.run_id <= 0 || out.batch_id.empty()) {
+        return std::nullopt;
+    }
+    return out;
+}
+
+bool completed_conns_contains(const nlohmann::json& completed_conns, const std::string& conn_id) {
+    if (!completed_conns.is_array()) {
+        return false;
+    }
+    for (const auto& entry : completed_conns) {
+        if (entry.is_string() && entry.get<std::string>() == conn_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct CycleStatusDecision {
+    std::string status{"ok"};
+    std::string strict_status{"ok"};
+    bool sla_met{false};
+    double ok_rate{0.0};
+    int actionable_tables{0};
+};
+
+/** Cycle status with optional SLA pass (ok_rate on actionable = checked - skip). */
+CycleStatusDecision eval_cycle_run_status(
+    bool cycle_interrupted,
+    int cycle_exit,
+    int tables_checked,
+    int tables_ok,
+    int tables_warn,
+    int tables_fail,
+    int tables_skip) {
+    CycleStatusDecision out;
+    out.actionable_tables = std::max(0, tables_checked - tables_skip);
+    if (out.actionable_tables > 0) {
+        out.ok_rate = static_cast<double>(tables_ok) / static_cast<double>(out.actionable_tables);
+    } else if (tables_checked > 0) {
+        out.actionable_tables = tables_checked;
+        out.ok_rate = static_cast<double>(tables_ok) / static_cast<double>(tables_checked);
+    }
+
+    if (cycle_interrupted || cycle_exit != 0) {
+        out.strict_status = "fail";
+        out.status = "fail";
+        return out;
+    }
+
+    if (tables_fail > 0) {
+        out.strict_status = "fail";
+    } else if (tables_warn > 0) {
+        out.strict_status = "warn";
+    } else {
+        out.strict_status = "ok";
+    }
+
+    const double pass = pipeline_defaults::kReconcileCycleOkRatePass;
+    out.sla_met = out.ok_rate >= pass;
+
+    if (tables_fail == 0 && tables_warn == 0) {
+        out.status = "ok";
+        out.sla_met = true;
+        return out;
+    }
+
+    if (tables_fail == 0 && tables_warn > 0) {
+        out.status = "warn";
+        return out;
+    }
+
+    // Residual FAIL rows: pass cycle when OK rate meets SLA (e.g. >= 97% actionable).
+    if (out.sla_met) {
+        out.status = "ok";
+    } else {
+        out.status = "fail";
+    }
+    return out;
+}
+
+/** Drop orphan runs for conn_id (legacy CLI). Caller must hold the reconcile advisory lock. */
+void abort_orphan_reconcile_runs(PGconn* pg, const std::string& conn_id) {
+    const char* vals[] = {conn_id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        DELETE FROM cdc_catalog.reconciliation_run
+        WHERE conn_id = $1
+          AND status = 'running'
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res) {
+        PQclear(res);
+    }
+}
+
 void abort_stale_reconcile_runs(PGconn* pg, const std::string& conn_id) {
     const char* vals[] = {conn_id.c_str()};
     PGresult* res = PQexecParams(
@@ -158,7 +528,8 @@ void abort_stale_reconcile_runs(PGconn* pg, const std::string& conn_id) {
         UPDATE cdc_catalog.reconciliation_run
         SET status = 'fail',
             finished_at = COALESCE(finished_at, now()),
-            context = context || jsonb_build_object('aborted_stale', true)
+            context = COALESCE(context, '{}'::jsonb)
+                    || jsonb_build_object('aborted_stale', true)
         WHERE conn_id = $1
           AND status = 'running'
           AND started_at < now() - interval '2 hours'
@@ -172,6 +543,102 @@ void abort_stale_reconcile_runs(PGconn* pg, const std::string& conn_id) {
     if (res) {
         PQclear(res);
     }
+}
+
+void refresh_reconcile_run_progress(
+    PGconn* pg,
+    long long run_id,
+    const nlohmann::json& patch_context) {
+    const std::string run_id_str = std::to_string(run_id);
+    const std::string patch_json = patch_context.dump();
+    const char* vals[] = {patch_json.c_str(), run_id_str.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        WITH stats AS (
+            SELECT
+                COUNT(*)::int AS checked,
+                COUNT(*) FILTER (WHERE status = 'ok')::int AS ok,
+                COUNT(*) FILTER (WHERE status = 'warn')::int AS warn,
+                COUNT(*) FILTER (WHERE status = 'fail')::int AS fail,
+                COUNT(*) FILTER (WHERE status = 'skip')::int AS skip
+            FROM cdc_catalog.reconciliation_result
+            WHERE run_id = $2::bigint
+        )
+        UPDATE cdc_catalog.reconciliation_run run
+        SET tables_checked = stats.checked,
+            tables_ok = stats.ok,
+            tables_warn = stats.warn,
+            tables_fail = stats.fail,
+            context = (
+                CASE
+                    WHEN jsonb_typeof(COALESCE(run.context, '{}'::jsonb)) = 'object'
+                    THEN COALESCE(run.context, '{}'::jsonb)
+                    ELSE '{}'::jsonb
+                END
+            ) || $1::jsonb || jsonb_build_object('tables_skip', stats.skip)
+        FROM stats
+        WHERE run.run_id = $2::bigint
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res) {
+        PQclear(res);
+    }
+}
+
+int count_catalog_tables(PGconn* pg, const std::optional<std::string>& conn_id) {
+    if (conn_id && !conn_id->empty()) {
+        const char* vals[] = {conn_id->c_str()};
+        PGresult* res = PQexecParams(
+            pg,
+            "SELECT COUNT(*)::int FROM cdc_catalog.catalog WHERE conn_id = $1",
+            1,
+            nullptr,
+            vals,
+            nullptr,
+            nullptr,
+            0);
+        int count = 0;
+        if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+            count = std::atoi(PQgetvalue(res, 0, 0));
+        }
+        if (res) {
+            PQclear(res);
+        }
+        return count;
+    }
+    PGresult* res = PQexec(pg, "SELECT COUNT(*)::int FROM cdc_catalog.catalog");
+    int count = 0;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        count = std::atoi(PQgetvalue(res, 0, 0));
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return count;
+}
+
+int count_total_stale_tables(PGconn* pg) {
+    PGresult* res = PQexec(
+        pg,
+        R"(
+        SELECT COUNT(*)::int
+        FROM cdc_catalog.v_apply_stale v
+        JOIN cdc_catalog.catalog c ON c.catalog_id = v.catalog_id
+        )");
+    int count = 0;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        count = std::atoi(PQgetvalue(res, 0, 0));
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return count;
 }
 
 std::string mssql_brack(const std::string& name) {
@@ -321,6 +788,26 @@ std::string cap_pk_checksum_for_overall(const std::string& row_status, bool pk_m
     return "fail";
 }
 
+// Per-table MSSQL LSN can look stale on quiet tables; never let capture alone drive overall
+// warn/fail when row counts did not fail and apply is not failing (mirrors cap_kafka_for_overall).
+std::string cap_capture_for_overall(
+    const std::string& row_status,
+    const std::string& apply_lag_status,
+    const std::string& capture_status) {
+    if (capture_status == "skip") {
+        return "skip";
+    }
+    if (row_status == "skip") {
+        return "skip";
+    }
+    if (row_status != "fail" && apply_lag_status != "fail") {
+        if (capture_status == "fail" || capture_status == "warn") {
+            return "ok";
+        }
+    }
+    return capture_status;
+}
+
 std::string eval_capture_lag_status(int capture_lag_seconds, const ReconcileRuntime& cfg) {
     if (capture_lag_seconds < 0) {
         return "skip";
@@ -341,7 +828,8 @@ std::vector<CatalogReconcileRow> fetch_reconcile_catalog(
     std::ostringstream sql;
     sql << R"(
         SELECT catalog_id, conn_id, db_engine::text, source_database, source_schema, source_table,
-               pk_columns, status::text, active, cdc_enabled, needs_full_load, has_pk
+               pk_columns, status::text, active, cdc_enabled, needs_full_load, has_pk,
+               hot, COALESCE(last_error, ''), COALESCE(engine_meta::text, '{}')
         FROM cdc_catalog.catalog
         WHERE conn_id = $1
         ORDER BY source_schema, source_table
@@ -382,6 +870,9 @@ std::vector<CatalogReconcileRow> fetch_reconcile_catalog(
         row.cdc_enabled = !PQgetisnull(res, i, 9) && PQgetvalue(res, i, 9)[0] == 't';
         row.needs_full_load = !PQgetisnull(res, i, 10) && PQgetvalue(res, i, 10)[0] == 't';
         row.has_pk = !PQgetisnull(res, i, 11) && PQgetvalue(res, i, 11)[0] == 't';
+        row.hot = !PQgetisnull(res, i, 12) && PQgetvalue(res, i, 12)[0] == 't';
+        row.last_error = PQgetvalue(res, i, 13) ? PQgetvalue(res, i, 13) : "";
+        row.engine_meta_json = PQgetvalue(res, i, 14) ? PQgetvalue(res, i, 14) : "{}";
         populate_lake_keys(row);
         rows.push_back(std::move(row));
     }
@@ -504,19 +995,29 @@ struct ApplyMeta {
     long long kafka_offset{-1};
 };
 
-struct TableKafkaLagSnapshot {
+struct LatestApplyBatchSlice {
     long long table_lag{-1};
     bool is_inactive{false};
+    bool is_stale{false};
+    long long parse_skipped{0};
+    long long dropped_unrecoverable{0};
+    std::optional<long long> reconcile_row_delta;
 };
 
-TableKafkaLagSnapshot fetch_latest_table_kafka_lag(PGconn* pg, long long catalog_id) {
-    TableKafkaLagSnapshot out;
+LatestApplyBatchSlice fetch_latest_apply_batch_slice(PGconn* pg, long long catalog_id) {
+    LatestApplyBatchSlice out;
     const std::string cid = std::to_string(catalog_id);
     const char* vals[] = {cid.c_str()};
     PGresult* res = PQexecParams(
         pg,
         R"(
-        SELECT kafka_consumer_lag, is_inactive
+        SELECT
+            kafka_consumer_lag,
+            is_inactive,
+            is_stale,
+            COALESCE(parse_skipped, 0),
+            COALESCE(dropped_unrecoverable, 0),
+            reconcile_row_delta
         FROM cdc_catalog.apply_batch_stats
         WHERE catalog_id = $1::bigint
         ORDER BY logged_at DESC
@@ -539,6 +1040,18 @@ TableKafkaLagSnapshot fetch_latest_table_kafka_lag(PGconn* pg, long long catalog
     }
     if (!PQgetisnull(res, 0, 1)) {
         out.is_inactive = (PQgetvalue(res, 0, 1)[0] == 't');
+    }
+    if (!PQgetisnull(res, 0, 2)) {
+        out.is_stale = (PQgetvalue(res, 0, 2)[0] == 't');
+    }
+    if (!PQgetisnull(res, 0, 3)) {
+        out.parse_skipped = std::atoll(PQgetvalue(res, 0, 3));
+    }
+    if (!PQgetisnull(res, 0, 4)) {
+        out.dropped_unrecoverable = std::atoll(PQgetvalue(res, 0, 4));
+    }
+    if (!PQgetisnull(res, 0, 5)) {
+        out.reconcile_row_delta = std::atoll(PQgetvalue(res, 0, 5));
     }
     PQclear(res);
     return out;
@@ -766,7 +1279,13 @@ void finish_reconcile_run(
             tables_warn = $4::int,
             tables_fail = $5::int,
             stale_tables = $6::int,
-            context = COALESCE(context, '{}'::jsonb) || $7::jsonb
+            context = (
+                CASE
+                    WHEN jsonb_typeof(COALESCE(context, '{}'::jsonb)) = 'object'
+                    THEN COALESCE(context, '{}'::jsonb)
+                    ELSE '{}'::jsonb
+                END
+            ) || $7::jsonb
         WHERE run_id = $8::bigint
         )",
         8,
@@ -825,7 +1344,7 @@ void insert_reconcile_result(
             NULLIF($6, '')::bigint, NULLIF($7, '')::bigint, NULLIF($8, '')::bigint, $9,
             NULLIF($10, '')::int, $11, $12, $13::jsonb
         )
-        ON CONFLICT (run_id, source_schema, source_table) DO UPDATE SET
+        ON CONFLICT (run_id, conn_id, source_schema, source_table) DO UPDATE SET
             source_row_count = EXCLUDED.source_row_count,
             lake_row_count = EXCLUDED.lake_row_count,
             row_count_delta = EXCLUDED.row_count_delta,
@@ -876,7 +1395,8 @@ std::optional<bool> pk_checksum_match_mariadb(
     MYSQL* mysql,
     PGconn* lake_pg,
     const CatalogReconcileRow& row,
-    int sample_size) {
+    int sample_size,
+    bool random_sample = false) {
     if (sample_size <= 0) {
         return std::nullopt;
     }
@@ -900,7 +1420,7 @@ std::optional<bool> pk_checksum_match_mariadb(
     }
     std::ostringstream src_sql;
     src_sql << "SELECT " << order_by.str() << " FROM `" << esc_id(row.source_schema) << "`.`" << esc_id(row.source_table)
-            << "` ORDER BY " << order_by.str() << " LIMIT " << sample_size;
+            << "` ORDER BY " << (random_sample ? "RAND()" : order_by.str()) << " LIMIT " << sample_size;
     if (mysql_query(mysql, src_sql.str().c_str()) != 0) {
         return std::nullopt;
     }
@@ -934,7 +1454,8 @@ std::optional<bool> pk_checksum_match_mariadb(
     }
     std::ostringstream lake_sql;
     lake_sql << "SELECT " << lake_cols.str() << " FROM " << pg_ident(row.lake_schema) << "."
-             << pg_ident(row.lake_table) << " ORDER BY " << lake_order.str() << " LIMIT " << sample_size;
+             << pg_ident(row.lake_table) << " ORDER BY "
+             << (random_sample ? "RANDOM()" : lake_order.str()) << " LIMIT " << sample_size;
     PGresult* lake_res = PQexec(lake_pg, lake_sql.str().c_str());
     if (!lake_res || PQresultStatus(lake_res) != PGRES_TUPLES_OK) {
         if (lake_res) {
@@ -1102,8 +1623,11 @@ std::optional<bool> pk_checksum_match_mongo(
 int run_reconcile_cli(
     const AppConfig& cfg,
     PGconn* log_pg,
-    const std::string& conn_id) {
-    const std::string batch_id = make_batch_id();
+    const std::string& conn_id,
+    std::atomic<bool>* shutdown,
+    const ReconcileCycleScope* cycle) {
+    const bool cycle_mode = cycle != nullptr && cycle->run_id >= 0;
+    const std::string batch_id = cycle_mode ? cycle->batch_id : make_batch_id();
     const std::string db_engine = conn_engine(cfg, conn_id);
 
     RuntimeConfig runtime;
@@ -1112,12 +1636,12 @@ int run_reconcile_cli(
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "reconcile",
-        .message = "reconcile started",
+        .message = cycle_mode ? "reconcile conn started (cycle)" : "reconcile started",
         .batch_id = batch_id,
         .conn_id = conn_id,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"db_engine", db_engine}, {"enabled", rcfg.enabled}},
+        .context = {{"db_engine", db_engine}, {"enabled", rcfg.enabled}, {"cycle_mode", cycle_mode}},
     });
 
     if (!rcfg.enabled) {
@@ -1133,72 +1657,56 @@ int run_reconcile_cli(
         return 0;
     }
 
+    std::optional<ReconcileConnLockGuard> reconcile_lock;
+    if (!cycle_mode) {
+        long long reconcile_lock_key = 0;
+        if (!acquire_reconcile_conn_lock(log_pg, conn_id, &reconcile_lock_key, shutdown)) {
+            log_write(log_pg, {
+                .level = LogLevel::Info,
+                .component = "reconcile",
+                .message = "reconcile skipped: shutdown before advisory lock acquired",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+            });
+            return 0;
+        }
+        reconcile_lock.emplace(log_pg, reconcile_lock_key);
+        abort_stale_reconcile_runs(log_pg, conn_id);
+        abort_orphan_reconcile_runs(log_pg, conn_id);
+    }
+
     const int max_tables = rcfg.max_tables > 0 ? rcfg.max_tables : 0;
-    abort_stale_reconcile_runs(log_pg, conn_id);
     const auto tables = fetch_reconcile_catalog(log_pg, conn_id, max_tables);
     const int stale_tables = count_stale_tables(log_pg, conn_id);
-    constexpr const char* kReconcileMode = "full";
-    const bool pk_sample = rcfg.pk_sample_size > 0;
+    const std::string kReconcileMode = pipeline_defaults::kReconcileModeLake;
+    const bool pipeline_lake_mode = true;
+    const bool pk_sample = false;
 
-    const long long run_id = insert_reconcile_run(
-        log_pg,
-        batch_id,
-        conn_id,
-        kReconcileMode,
-        {{"db_engine", db_engine},
-         {"mode", kReconcileMode},
-         {"tables_planned", static_cast<int>(tables.size())},
-         {"catalog_tables_total", static_cast<int>(tables.size())},
-         {"stale_tables", stale_tables}});
+    long long run_id = cycle_mode ? cycle->run_id : 0;
+    if (!cycle_mode) {
+        run_id = insert_reconcile_run(
+            log_pg,
+            batch_id,
+            conn_id,
+            kReconcileMode,
+            {{"db_engine", db_engine},
+             {"mode", kReconcileMode},
+             {"scope", "conn"},
+             {"tables_planned", static_cast<int>(tables.size())},
+             {"catalog_tables_total", static_cast<int>(tables.size())},
+             {"stale_tables", stale_tables}});
+    }
 
     PgConn lake_pg(cfg.datalake.conn_string());
-
-#ifdef HAVE_RDKAFKA
-    std::unique_ptr<KafkaLagProbe> kafka_probe;
-    const std::string kafka_bootstrap = resolve_kafka_bootstrap().bootstrap;
-    try {
-        kafka_probe = std::make_unique<KafkaLagProbe>(kafka_bootstrap);
-    } catch (...) {
-        kafka_probe.reset();
-    }
-#endif
-
-    std::optional<MariaDbConn> mariadb;
-    if (db_engine == "mariadb") {
-        const MariaDbSource* source = find_mariadb_source(cfg, conn_id);
-        if (!source) {
-            throw std::runtime_error("MariaDB source not found: " + conn_id);
-        }
-        mariadb.emplace(*source);
-    }
-
-#ifdef HAVE_FREETDS
-    std::optional<MssqlConn> mssql;
-    if (db_engine == "mssql") {
-        const MssqlSource* source = find_mssql_source(cfg, conn_id);
-        if (!source) {
-            throw std::runtime_error("MSSQL source not found: " + conn_id);
-        }
-        mssql.emplace(*source);
-    }
-#endif
-
-#ifdef HAVE_MONGOC
-    std::optional<MongoConn> mongo;
-    if (db_engine == "mongodb") {
-        const MongoSource* source = find_mongo_source(cfg, conn_id);
-        if (!source) {
-            throw std::runtime_error("MongoDB source not found: " + conn_id);
-        }
-        mongo.emplace(*source);
-    }
-#endif
 
     int tables_ok = 0;
     int tables_warn = 0;
     int tables_fail = 0;
     int tables_skip = 0;
     int table_errors = 0;
+    int tables_processed = 0;
 
     for (const auto& row : tables) {
         runtime.reload(log_pg);
@@ -1215,74 +1723,103 @@ int run_reconcile_cli(
                 insert_reconcile_result(
                     log_pg, run_id, row, -1, -1, "skip", ApplyMeta{}, "skip", checks);
                 tables_skip += 1;
+                if (cycle_mode) {
+                    tables_processed += 1;
+                    if (tables_processed % pipeline_defaults::kReconcileProgressRefreshEveryNTables == 0) {
+                        refresh_reconcile_run_progress(
+                            log_pg, run_id, {{"current_conn", conn_id}});
+                    }
+                }
                 continue;
             }
 
-            long long source_rows = -1;
-            if (db_engine == "mariadb" && mariadb) {
-                source_rows = mariadb_table_count(mariadb->handle, row.source_schema, row.source_table);
-#ifdef HAVE_FREETDS
-            } else if (db_engine == "mssql" && mssql) {
-                source_rows =
-                    mssql_table_count(*mssql, row.source_database, row.source_schema, row.source_table);
-#endif
-#ifdef HAVE_MONGOC
-            } else if (db_engine == "mongodb" && mongo) {
-                source_rows = mongo_collection_count(*mongo, row.source_database, row.source_table);
-#endif
-            }
-
-            const long long lake_rows = pg_table_count(lake_pg.raw, row.lake_schema, row.lake_table);
-            const std::string row_status = eval_row_count_status(source_rows, lake_rows, rcfg);
-            const std::string drift_kind = classify_row_drift(source_rows, lake_rows);
+            const auto table_t0 = std::chrono::steady_clock::now();
             const ApplyMeta apply_meta = fetch_apply_meta(log_pg, row.catalog_id);
+            const LatestApplyBatchSlice batch_slice =
+                fetch_latest_apply_batch_slice(log_pg, row.catalog_id);
             const std::string lag_status = eval_apply_lag_status(apply_meta.apply_lag_seconds, rcfg);
+            const bool apply_inactive_table =
+                is_apply_inactive_table(apply_meta, rcfg.apply_inactive_seconds);
+            const auto prev_snapshot =
+                reconcile_enrichments::fetch_prev_reconcile_snapshot(log_pg, row.catalog_id);
+            const auto events_7d = reconcile_enrichments::fetch_apply_events_aggregate(
+                log_pg,
+                row.catalog_id,
+                pipeline_defaults::kReconcileEventsLookbackSeconds);
+            const auto tier_decision = reconcile_enrichments::eval_reconcile_tier(
+                row, apply_inactive_table, events_7d.has_flow, prev_snapshot);
+
+            long long source_rows = -1;
+            long long lake_rows = -1;
+            std::string row_status = tier_decision.skip_row_count ? "ok" : "skip";
+            std::string drift_kind = tier_decision.skip_row_count ? "none" : "pipeline_only";
+
+            const bool has_recent_apply_flow = events_7d.has_flow;
             const int capture_lag_seconds = fetch_capture_lag_seconds(log_pg, conn_id, db_engine, row);
-            const std::string capture_status = eval_capture_lag_status(capture_lag_seconds, rcfg);
-            std::string overall = status_rank(status_rank(row_status, lag_status), capture_status);
+
+            std::string capture_status_raw;
+            std::optional<std::string> capture_skip_reason;
+            if (apply_inactive_table && row_status == "ok") {
+                capture_status_raw = "skip";
+                capture_skip_reason = "capture_stale_idle_table";
+            } else {
+                capture_status_raw = eval_capture_lag_status(capture_lag_seconds, rcfg);
+                if (has_recent_apply_flow && row_status == "ok" && lag_status == "ok" &&
+                    (capture_status_raw == "warn" || capture_status_raw == "fail")) {
+                    capture_skip_reason = "capture_stale_with_recent_apply_flow";
+                }
+            }
+            const std::string capture_for_overall =
+                cap_capture_for_overall(row_status, lag_status, capture_status_raw);
+            std::string overall = status_rank(status_rank(row_status, lag_status), capture_for_overall);
+            if (apply_meta.apply_status == "quarantined") {
+                overall = status_rank(overall, "fail");
+            }
 
             nlohmann::json checks = nlohmann::json::object();
             checks["reconcile_mode"] = kReconcileMode;
+            checks["pipeline_lake_only"] = pipeline_lake_mode;
+            checks["metadata_only_reconcile"] = true;
             checks["capture_lag_seconds"] = capture_lag_seconds;
-            checks["capture_lag_status"] = capture_status;
+            checks["capture_lag_status"] = capture_status_raw;
+            checks["capture_lag_status_raw"] = capture_status_raw;
+            checks["capture_lag_status_overall"] = capture_for_overall;
             checks["row_count_status"] = row_status;
             checks["apply_lag_status"] = lag_status;
             checks["drift_kind"] = drift_kind;
+            checks["seconds_since_last_apply"] = apply_meta.seconds_since_last_apply;
+            checks["apply_inactive_table"] = apply_inactive_table;
+            checks["reconcile_tier"] = tier_decision.tier;
+            if (!tier_decision.skip_reason.empty()) {
+                checks["reconcile_tier_skip_reason"] = tier_decision.skip_reason;
+            }
+            if (capture_skip_reason) {
+                checks["capture_lag_skip_reason"] = *capture_skip_reason;
+            }
+            if (pipeline_lake_mode) {
+                checks["row_count_scope"] = "pipeline_only";
+            }
+            if (source_rows >= 0) {
+                checks["source_row_count"] = source_rows;
+            }
+            if (lake_rows >= 0) {
+                checks["lake_row_count"] = lake_rows;
+            }
             if (source_rows >= 0 && lake_rows >= 0) {
                 checks["row_count_delta"] = source_rows - lake_rows;
+            }
+            if (!row.last_error.empty()) {
+                checks["catalog_last_error"] = row.last_error;
             }
 
             bool kafka_inactive_table = false;
 #ifdef HAVE_RDKAFKA
             long long kafka_lag_probe = -1;
             long long kafka_partition_lag_probe = -1;
-            const TableKafkaLagSnapshot table_lag_snap = fetch_latest_table_kafka_lag(log_pg, row.catalog_id);
-            if (table_lag_snap.table_lag >= 0) {
-                kafka_lag_probe = table_lag_snap.table_lag;
-            } else if (
-                !apply_meta.kafka_topic.empty() && apply_meta.kafka_partition >= 0 &&
-                apply_meta.kafka_offset >= 0) {
-                const auto scan = kafka_table_lag::compute_exact_table_kafka_lag(
-                    kafka_bootstrap,
-                    apply_meta.kafka_topic,
-                    apply_meta.kafka_partition,
-                    apply_meta.kafka_offset,
-                    row.lake_schema,
-                    row.lake_table,
-                    db_engine,
-                    pipeline_defaults::kTableLagScanTimeoutMsDefault,
-                    pipeline_defaults::kTableLagScanMaxMessagesDefault);
-                kafka_lag_probe = scan.table_lag;
-                kafka_partition_lag_probe = scan.partition_lag;
-            } else if (kafka_probe && !apply_meta.kafka_topic.empty() && apply_meta.kafka_offset >= 0) {
-                kafka_partition_lag_probe = compute_kafka_consumer_lag(
-                    kafka_probe->rk,
-                    apply_meta.kafka_topic,
-                    apply_meta.kafka_partition,
-                    apply_meta.kafka_offset);
+            if (batch_slice.table_lag >= 0) {
+                kafka_lag_probe = batch_slice.table_lag;
             }
-            kafka_inactive_table = table_lag_snap.is_inactive ||
-                is_apply_inactive_table(apply_meta, rcfg.apply_inactive_seconds);
+            kafka_inactive_table = batch_slice.is_inactive || apply_inactive_table;
             const std::string kafka_status_raw = kafka_inactive_table
                 ? "skip"
                 : eval_kafka_lag_status(kafka_lag_probe, rcfg);
@@ -1291,10 +1828,10 @@ int run_reconcile_cli(
             checks["kafka_consumer_lag"] = kafka_inactive_table ? 0 : kafka_lag_probe;
             checks["kafka_consumer_lag_probe"] = kafka_lag_probe;
             checks["kafka_partition_lag_probe"] = kafka_partition_lag_probe;
-            checks["kafka_lag_kind"] = table_lag_snap.table_lag >= 0 ? "table_exact" : "scan_fallback";
+            checks["kafka_lag_kind"] = batch_slice.table_lag >= 0 ? "table_exact" : "metadata_missing";
             checks["kafka_inactive_table"] = kafka_inactive_table;
             if (kafka_inactive_table) {
-                checks["kafka_lag_skip_reason"] = table_lag_snap.is_inactive
+                checks["kafka_lag_skip_reason"] = batch_slice.is_inactive
                     ? "inactive_table_slice"
                     : "inactive_table_no_recent_apply";
             }
@@ -1304,16 +1841,38 @@ int run_reconcile_cli(
             checks["kafka_topic"] = apply_meta.kafka_topic;
             checks["kafka_partition"] = apply_meta.kafka_partition;
             checks["kafka_offset"] = apply_meta.kafka_offset;
-            checks["seconds_since_last_apply"] = apply_meta.seconds_since_last_apply;
             overall = status_rank(overall, kafka_for_overall);
 #else
             checks["kafka_consumer_lag"] = nullptr;
 #endif
 
+            const std::string event_loss_status = reconcile_enrichments::eval_event_loss_status(
+                batch_slice.parse_skipped, batch_slice.dropped_unrecoverable);
+            const std::string slice_stale_status = reconcile_enrichments::eval_slice_stale_status(
+                batch_slice.is_stale, apply_meta.apply_status, lag_status);
+            checks["parse_skipped"] = batch_slice.parse_skipped;
+            checks["dropped_unrecoverable"] = batch_slice.dropped_unrecoverable;
+            checks["event_loss_status"] = event_loss_status;
+            checks["slice_is_stale"] = batch_slice.is_stale;
+            checks["slice_stale_status"] = slice_stale_status;
+            if (batch_slice.reconcile_row_delta) {
+                checks["hist_reconcile_row_delta"] = *batch_slice.reconcile_row_delta;
+            }
+            const bool apply_position_unhealthy =
+                apply_meta.apply_status == "stale" || apply_meta.apply_status == "lagging" ||
+                apply_meta.apply_status == "gap_detected" || apply_meta.apply_status == "failed" ||
+                apply_meta.apply_status == "quarantined" || lag_status == "fail" ||
+                lag_status == "warn";
+            checks["slice_stale_apply_position_confirm"] =
+                batch_slice.is_stale && apply_position_unhealthy;
+            overall = status_rank(overall, event_loss_status);
+            overall = status_rank(overall, slice_stale_status);
+
+            bool static_gap_candidate = false;
             {
                 const bool pipeline_healthy =
-                    lag_status != "fail" && capture_status != "fail";
-                const bool static_gap_candidate =
+                    lag_status != "fail" && capture_for_overall != "fail";
+                static_gap_candidate =
                     pipeline_healthy && row_status == "fail" &&
                     (drift_kind == "source_ahead" || drift_kind == "append_zombie");
                 checks["static_gap_detected"] = static_gap_candidate;
@@ -1322,38 +1881,85 @@ int run_reconcile_cli(
                 }
             }
 
-            if (pk_sample && db_engine == "mariadb" && mariadb) {
-                const auto pk_match = pk_checksum_match_mariadb(
-                    mariadb->handle, lake_pg.raw, row, rcfg.pk_sample_size);
-                if (pk_match) {
-                    checks["pk_checksum_match"] = *pk_match;
-                    const std::string pk_for_overall =
-                        cap_pk_checksum_for_overall(row_status, *pk_match);
-                    checks["pk_checksum_status_overall"] = pk_for_overall;
-                    overall = status_rank(overall, pk_for_overall);
-                }
-#ifdef HAVE_FREETDS
-            } else if (pk_sample && db_engine == "mssql" && mssql) {
-                const auto pk_match = pk_checksum_match_mssql(*mssql, lake_pg.raw, row, rcfg.pk_sample_size);
-                if (pk_match) {
-                    checks["pk_checksum_match"] = *pk_match;
-                    const std::string pk_for_overall =
-                        cap_pk_checksum_for_overall(row_status, *pk_match);
-                    checks["pk_checksum_status_overall"] = pk_for_overall;
-                    overall = status_rank(overall, pk_for_overall);
-                }
+            FreshnessInput freshness_in;
+
+            auto enrichment = reconcile_enrichments::build_enrichment_bundle(
+                log_pg,
+                lake_pg.raw,
+                row,
+                rcfg.row_warn_abs_tolerance,
+                pipeline_defaults::kReconcileFreshnessLagWarnMinutes,
+                pipeline_defaults::kReconcileFreshnessLagFailMinutes,
+                pipeline_defaults::kReconcileEventsLookbackSeconds,
+                freshness_in,
+                source_rows,
+                lake_rows,
+                row_status,
+                drift_kind,
+                lag_status,
+                apply_meta.apply_status,
+                overall,
+                apply_inactive_table,
+                static_gap_candidate,
+                !row.last_error.empty());
+            reconcile_enrichments::apply_enrichment_to_checks(checks, enrichment);
+
+            if (enrichment.timing_skew_suspected && row_status == "warn") {
+                overall = status_rank(status_rank("ok", lag_status), capture_for_overall);
+#ifdef HAVE_RDKAFKA
+                overall = status_rank(overall, kafka_for_overall);
 #endif
-#ifdef HAVE_MONGOC
-            } else if (pk_sample && db_engine == "mongodb" && mongo) {
-                const auto pk_match = pk_checksum_match_mongo(*mongo, lake_pg.raw, row, rcfg.pk_sample_size);
-                if (pk_match) {
-                    checks["pk_checksum_match"] = *pk_match;
-                    const std::string pk_for_overall =
-                        cap_pk_checksum_for_overall(row_status, *pk_match);
-                    checks["pk_checksum_status_overall"] = pk_for_overall;
-                    overall = status_rank(overall, pk_for_overall);
+                checks["row_count_status_effective"] = "ok";
+                checks["reconcile_timing_skew_downgraded"] = true;
+            }
+            if (enrichment.freshness.status == "fail") {
+                overall = status_rank(overall, "fail");
+            } else if (enrichment.freshness.status == "warn") {
+                overall = status_rank(overall, "warn");
+            }
+            if (prev_snapshot && !prev_snapshot->status.empty()) {
+                checks["status_flipped"] = prev_snapshot->status != overall;
+            }
+            checks["overall_status"] = overall;
+            const long long abs_delta_final =
+                source_rows >= 0 && lake_rows >= 0 ? std::llabs(source_rows - lake_rows) : 0;
+            checks["recommended_action"] = reconcile_enrichments::derive_recommended_action(
+                overall,
+                row_status,
+                drift_kind,
+                abs_delta_final,
+                checks.value("suggest_full_load", false),
+                apply_meta.apply_status == "quarantined");
+            if (event_loss_status == "fail") {
+                checks["semaphore_reason"] = "dropped_unrecoverable";
+                checks["recommended_action"] = "investigate_pipeline";
+            } else if (event_loss_status == "warn") {
+                checks["semaphore_reason"] = "parse_skipped";
+            } else if (slice_stale_status == "fail") {
+                checks["semaphore_reason"] = "slice_stale_confirmed";
+                if (checks["recommended_action"] == "none") {
+                    checks["recommended_action"] = "investigate_pipeline";
                 }
-#endif
+            } else if (batch_slice.is_stale && slice_stale_status == "warn") {
+                checks["semaphore_reason"] = "slice_stale";
+            }
+            checks["root_cause_label"] = reconcile_enrichments::derive_root_cause_label(
+                overall,
+                row_status,
+                drift_kind,
+                checks.value("semaphore_reason", std::string{}),
+                static_gap_candidate,
+                enrichment.timing_skew_suspected,
+                apply_meta.apply_status == "quarantined",
+                event_loss_status,
+                slice_stale_status);
+
+            const auto table_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now() - table_t0)
+                                      .count();
+            checks["table_duration_ms"] = table_ms;
+            if (cycle_mode && cycle && cycle->table_timings_ms) {
+                reconcile_enrichments::append_table_timing_ms(*cycle->table_timings_ms, table_ms);
             }
 
             insert_reconcile_result(
@@ -1392,7 +1998,8 @@ int run_reconcile_cli(
                     {"apply_lag_seconds", apply_meta.apply_lag_seconds},
                     {"apply_lag_status", lag_status},
                     {"capture_lag_seconds", capture_lag_seconds},
-                    {"capture_lag_status", capture_status},
+                    {"capture_lag_status", capture_status_raw},
+                    {"capture_lag_status_overall", capture_for_overall},
                     {"reconcile_mode", kReconcileMode},
                     {"kafka_consumer_lag", checks.value("kafka_consumer_lag", nlohmann::json())},
                     {"kafka_lag_status", checks.value("kafka_lag_status", nlohmann::json("skip"))},
@@ -1411,6 +2018,16 @@ int run_reconcile_cli(
                 .context = {{"error", ex.what()}},
             });
         }
+
+        if (cycle_mode) {
+            tables_processed += 1;
+            if (tables_processed % pipeline_defaults::kReconcileProgressRefreshEveryNTables == 0) {
+                refresh_reconcile_run_progress(
+                    log_pg,
+                    run_id,
+                    {{"current_conn", conn_id}});
+            }
+        }
     }
 
     std::string run_status = "ok";
@@ -1420,25 +2037,29 @@ int run_reconcile_cli(
         run_status = "warn";
     }
 
-    finish_reconcile_run(
-        log_pg,
-        run_id,
-        run_status,
-        static_cast<int>(tables.size()),
-        tables_ok,
-        tables_warn,
-        tables_fail,
-        stale_tables,
-        {{"table_errors", table_errors},
-         {"tables_skip", tables_skip},
-         {"db_engine", db_engine},
-         {"mode", kReconcileMode},
-         {"catalog_tables_total", static_cast<int>(tables.size())}});
+    if (!cycle_mode) {
+        finish_reconcile_run(
+            log_pg,
+            run_id,
+            run_status,
+            static_cast<int>(tables.size()),
+            tables_ok,
+            tables_warn,
+            tables_fail,
+            stale_tables,
+            {{"table_errors", table_errors},
+             {"tables_skip", tables_skip},
+             {"db_engine", db_engine},
+             {"mode", kReconcileMode},
+             {"scope", "conn"},
+             {"catalog_tables_total", static_cast<int>(tables.size())}});
+    }
 
     log_write(log_pg, {
         .level = run_status == "fail" ? LogLevel::Warning : LogLevel::Info,
         .component = "reconcile",
-        .message = run_status == "fail" ? "reconcile completed with errors" : "reconcile completed",
+        .message = run_status == "fail" ? "reconcile conn completed with errors"
+                                        : "reconcile conn completed",
         .batch_id = batch_id,
         .conn_id = conn_id,
         .source_schema = std::nullopt,
@@ -1446,6 +2067,7 @@ int run_reconcile_cli(
         .context = {
             {"run_id", run_id},
             {"mode", kReconcileMode},
+            {"scope", cycle_mode ? "cycle" : "conn"},
             {"status", run_status},
             {"tables_checked", static_cast<int>(tables.size())},
             {"tables_ok", tables_ok},
@@ -1465,6 +2087,8 @@ int run_reconcile_loop(
     PGconn* log_pg,
     bool once,
     std::atomic<bool>* external_shutdown) {
+    run_startup_schema_migrate(log_pg);
+
     std::atomic<bool>* shutdown = external_shutdown ? external_shutdown : &g_reconcile_shutdown;
     if (!external_shutdown) {
         std::signal(SIGINT, on_reconcile_signal);
@@ -1501,27 +2125,263 @@ int run_reconcile_loop(
 
     while (!shutdown->load()) {
         runtime.reload(log_pg);
+
+        long long loop_lock_key = 0;
+        if (!acquire_reconcile_loop_lock(log_pg, &loop_lock_key, shutdown)) {
+            break;
+        }
+        ReconcileConnLockGuard loop_lock(log_pg, loop_lock_key);
+
+        cleanup_reconcile_runs_at_cycle_start(log_pg);
+
+        nlohmann::json conn_ids_json = nlohmann::json::array();
         for (const auto& conn_id : conn_ids) {
+            conn_ids_json.push_back(conn_id);
+        }
+
+        const int catalog_total = count_catalog_tables(log_pg, std::nullopt);
+        const int stale_total = count_total_stale_tables(log_pg);
+        nlohmann::json completed_conns = nlohmann::json::array();
+
+        std::string cycle_reconcile_mode = pipeline_defaults::kReconcileModeLake;
+
+        long long cycle_run_id = 0;
+        std::string batch_id;
+        bool cycle_resumed = false;
+        if (const auto resumable = find_resumable_cycle_run(log_pg)) {
+            cycle_run_id = resumable->run_id;
+            batch_id = resumable->batch_id;
+            completed_conns = resumable->completed_conns;
+            if (!resumable->reconcile_mode.empty() &&
+                resumable->reconcile_mode == pipeline_defaults::kReconcileModeLake) {
+                cycle_reconcile_mode = resumable->reconcile_mode;
+            }
+            cycle_resumed = true;
+            refresh_reconcile_run_progress(
+                log_pg,
+                cycle_run_id,
+                {{"resumed", true},
+                 {"catalog_tables_total", catalog_total},
+                 {"stale_tables", stale_total},
+                 {"conn_count", static_cast<int>(conn_ids.size())},
+                 {"conn_ids", conn_ids_json},
+                 {"completed_conns", completed_conns}});
+            log_write(log_pg, {
+                .level = LogLevel::Info,
+                .component = "reconcile",
+                .message = "reconcile cycle resumed",
+                .batch_id = batch_id,
+                .conn_id = std::nullopt,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"run_id", cycle_run_id},
+                    {"completed_conns", completed_conns},
+                    {"result_count_pending", true},
+                },
+            });
+        } else {
+            batch_id = make_batch_id();
+            cycle_run_id = insert_reconcile_run(
+                log_pg,
+                batch_id,
+                pipeline_defaults::kReconcileCycleConnId,
+                cycle_reconcile_mode,
+                {{"mode", cycle_reconcile_mode},
+                 {"scope", "cycle"},
+                 {"conn_count", static_cast<int>(conn_ids.size())},
+                 {"conn_ids", conn_ids_json},
+                 {"catalog_tables_total", catalog_total},
+                 {"stale_tables", stale_total},
+                 {"completed_conns", completed_conns}});
+        }
+
+        int cycle_exit = 0;
+        bool cycle_interrupted = false;
+        const auto cycle_t0 = std::chrono::steady_clock::now();
+        std::vector<long long> cycle_table_timings;
+
+        for (const auto& conn_id : conn_ids) {
+            if (completed_conns_contains(completed_conns, conn_id)) {
+                continue;
+            }
             if (shutdown->load()) {
+                cycle_interrupted = true;
                 break;
             }
+
+            refresh_reconcile_run_progress(
+                log_pg,
+                cycle_run_id,
+                {{"current_conn", conn_id},
+                 {"completed_conns", completed_conns}});
+
+            ReconcileCycleScope cycle_scope{
+                cycle_run_id,
+                batch_id,
+                &cycle_table_timings,
+                cycle_reconcile_mode};
             try {
-                run_reconcile_cli(cfg, log_pg, conn_id);
+                const int conn_rc = run_reconcile_cli(cfg, log_pg, conn_id, shutdown, &cycle_scope);
+                if (conn_rc != 0) {
+                    cycle_exit = 1;
+                }
             } catch (const std::exception& ex) {
+                cycle_exit = 1;
                 log_write(log_pg, {
                     .level = LogLevel::Error,
                     .component = "reconcile",
                     .message = "reconcile-loop conn failed",
-                    .batch_id = make_batch_id(),
+                    .batch_id = batch_id,
                     .conn_id = conn_id,
                     .source_schema = std::nullopt,
                     .source_table = std::nullopt,
-                    .context = {{"error", ex.what()}},
+                    .context = {{"error", ex.what()}, {"run_id", cycle_run_id}},
                 });
             }
+
+            completed_conns.push_back(conn_id);
+            refresh_reconcile_run_progress(
+                log_pg,
+                cycle_run_id,
+                {{"current_conn", nullptr},
+                 {"completed_conns", completed_conns}});
         }
 
-        if (once) {
+        refresh_reconcile_run_progress(log_pg, cycle_run_id, {});
+
+        const std::string cycle_run_id_str = std::to_string(cycle_run_id);
+        const char* stats_vals[] = {cycle_run_id_str.c_str()};
+        PGresult* stats_res = PQexecParams(
+            log_pg,
+            R"(
+            SELECT tables_checked, tables_ok, tables_warn, tables_fail, stale_tables,
+                   COALESCE((context->>'tables_skip')::int, 0) AS tables_skip
+            FROM cdc_catalog.reconciliation_run
+            WHERE run_id = $1::bigint
+            )",
+            1,
+            nullptr,
+            stats_vals,
+            nullptr,
+            nullptr,
+            0);
+        int tables_checked = 0;
+        int tables_ok = 0;
+        int tables_warn = 0;
+        int tables_fail = 0;
+        int stale_tables = stale_total;
+        int tables_skip = 0;
+        if (stats_res && PQresultStatus(stats_res) == PGRES_TUPLES_OK && PQntuples(stats_res) > 0) {
+            tables_checked = std::atoi(PQgetvalue(stats_res, 0, 0));
+            tables_ok = std::atoi(PQgetvalue(stats_res, 0, 1));
+            tables_warn = std::atoi(PQgetvalue(stats_res, 0, 2));
+            tables_fail = std::atoi(PQgetvalue(stats_res, 0, 3));
+            stale_tables = std::atoi(PQgetvalue(stats_res, 0, 4));
+            tables_skip = std::atoi(PQgetvalue(stats_res, 0, 5));
+        }
+        if (stats_res) {
+            PQclear(stats_res);
+        }
+
+        std::string cycle_status = "ok";
+        const auto cycle_decision = eval_cycle_run_status(
+            cycle_interrupted,
+            cycle_exit,
+            tables_checked,
+            tables_ok,
+            tables_warn,
+            tables_fail,
+            tables_skip);
+        cycle_status = cycle_decision.status;
+
+        if (cycle_interrupted) {
+            refresh_reconcile_run_progress(
+                log_pg,
+                cycle_run_id,
+                {{"interrupted", true},
+                 {"completed_conns", completed_conns},
+                 {"conn_ids", conn_ids_json},
+                 {"resumed", cycle_resumed}});
+            log_write(log_pg, {
+                .level = LogLevel::Info,
+                .component = "reconcile",
+                .message = "reconcile cycle interrupted, will resume on next start",
+                .batch_id = batch_id,
+                .conn_id = std::nullopt,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"run_id", cycle_run_id},
+                    {"scope", "cycle"},
+                    {"tables_checked", tables_checked},
+                    {"completed_conns", completed_conns},
+                },
+            });
+        } else {
+            const long long cycle_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                    std::chrono::steady_clock::now() - cycle_t0)
+                                                    .count();
+            const nlohmann::json cycle_sla =
+                reconcile_enrichments::build_cycle_sla_json(cycle_table_timings, cycle_duration_ms);
+            reconcile_enrichments::upsert_daily_snapshots(log_pg, cycle_run_id);
+
+            finish_reconcile_run(
+                log_pg,
+                cycle_run_id,
+                cycle_status,
+                tables_checked,
+                tables_ok,
+                tables_warn,
+                tables_fail,
+                stale_tables,
+                {{"mode", "full"},
+                 {"scope", "cycle"},
+                 {"conn_count", static_cast<int>(conn_ids.size())},
+                 {"conn_ids", conn_ids_json},
+                 {"completed_conns", completed_conns},
+                 {"tables_skip", tables_skip},
+                 {"interrupted", false},
+                 {"resumed", cycle_resumed},
+                 {"cycle_sla", cycle_sla},
+                 {"cycle_status", cycle_status},
+                 {"cycle_strict_status", cycle_decision.strict_status},
+                 {"cycle_ok_rate", cycle_decision.ok_rate},
+                 {"cycle_actionable_tables", cycle_decision.actionable_tables},
+                 {"cycle_sla_threshold", pipeline_defaults::kReconcileCycleOkRatePass},
+                 {"cycle_sla_met", cycle_decision.sla_met},
+                 {"cycle_status_sla_adjusted",
+                  cycle_decision.strict_status != cycle_decision.status}});
+
+            log_write(log_pg, {
+                .level = cycle_status == "fail" ? LogLevel::Warning : LogLevel::Info,
+                .component = "reconcile",
+                .message = cycle_decision.strict_status != cycle_decision.status
+                    ? "reconcile cycle completed (SLA pass with residual fail tables)"
+                    : cycle_status == "fail" ? "reconcile cycle completed with errors"
+                                               : "reconcile cycle completed",
+                .batch_id = batch_id,
+                .conn_id = std::nullopt,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"run_id", cycle_run_id},
+                    {"scope", "cycle"},
+                    {"status", cycle_status},
+                    {"tables_checked", tables_checked},
+                    {"tables_ok", tables_ok},
+                    {"tables_warn", tables_warn},
+                    {"tables_fail", tables_fail},
+                    {"tables_skip", tables_skip},
+                    {"interrupted", false},
+                },
+            });
+        }
+
+        loop_lock.held = false;
+        release_reconcile_conn_lock(log_pg, loop_lock_key);
+
+        if (once || shutdown->load()) {
             break;
         }
         const int interval_hours =

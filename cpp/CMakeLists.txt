@@ -40,7 +40,6 @@ set(DATASYNC_SOURCES
     src/mssql_kafka_capture.cpp
     src/mongo_kafka_capture.cpp
     src/cdc_pre_apply.cpp
-    src/cdc_reconcile.cpp
     src/cdc_daemon.cpp
     src/daemon_full_load.cpp
     src/mssql_lake.cpp

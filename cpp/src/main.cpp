@@ -1,7 +1,6 @@
 #include "catalog_sync.hpp"
 #include "capture_common.hpp"
 #include "cdc_daemon.hpp"
-#include "cdc_reconcile.hpp"
 #include "config.hpp"
 #include "connections.hpp"
 #include "daemon_full_load.hpp"
@@ -232,8 +231,6 @@ void print_usage(const char* prog) {
               << "  " << prog << " ddl-sync --conn-id ID [--schema S] [--table T]\n"
               << "  " << prog << " kafka-apply --conn-id ID\n"
               << "  " << prog << " capture --conn-id ID\n"
-              << "  " << prog << " reconcile --conn-id ID\n"
-              << "  " << prog << " reconcile-loop [--once]\n"
               << "  " << prog << " migrate [--baseline] [--lake] [--diagnostics]\n"
               << "  " << prog << " daemon [--once]\n"
               << "  " << prog << " [--config PATH] <command> ...\n"
@@ -289,13 +286,13 @@ int main(int argc, char** argv) {
 
     if (command != "discover" && command != "full-load" && command != "ddl-sync" &&
         command != "kafka-apply" && command != "capture" &&
-        command != "reconcile" && command != "reconcile-loop" && command != "daemon" &&
+        command != "daemon" &&
         command != "migrate") {
         print_usage(argv[0]);
         return 2;
     }
 
-    if ((command == "kafka-apply" || command == "ddl-sync" || command == "capture" || command == "reconcile") &&
+    if ((command == "kafka-apply" || command == "ddl-sync" || command == "capture") &&
         conn_id.empty()) {
         std::cerr << command << " requires --conn-id\n";
         print_usage(argv[0]);
@@ -379,18 +376,6 @@ int main(int argc, char** argv) {
         }
         if (command == "capture") {
             return run_capture_cli(cfg, log_pg.raw, conn_id, 0, kCaptureWorkerCount);
-        }
-        if (command == "reconcile") {
-            RuntimeConfig runtime;
-            runtime.reload(log_pg.raw);
-            run_log_retention(log_pg.raw, runtime, batch_id, "reconcile");
-            return run_reconcile_cli(cfg, log_pg.raw, conn_id);
-        }
-        if (command == "reconcile-loop") {
-            RuntimeConfig runtime;
-            runtime.reload(log_pg.raw);
-            run_log_retention(log_pg.raw, runtime, batch_id, "reconcile");
-            return run_reconcile_loop(cfg, log_pg.raw, once);
         }
         if (command == "daemon") {
             return run_cdc_daemon(cfg, log_pg.raw, once);

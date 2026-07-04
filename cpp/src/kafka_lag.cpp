@@ -13,7 +13,7 @@ KafkaLagProbe::KafkaLagProbe(const std::string& bootstrap_servers) {
         rd_kafka_conf_destroy(conf);
         throw std::runtime_error(std::string("Kafka lag probe config: ") + errstr);
     }
-    if (rd_kafka_conf_set(conf, "group.id", "datasync-reconcile-lag-probe", errstr, sizeof(errstr)) !=
+    if (rd_kafka_conf_set(conf, "group.id", "datasync-kafka-lag-probe", errstr, sizeof(errstr)) !=
         RD_KAFKA_CONF_OK) {
         rd_kafka_conf_destroy(conf);
         throw std::runtime_error(std::string("Kafka lag probe group.id: ") + errstr);

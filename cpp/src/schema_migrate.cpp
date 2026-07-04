@@ -134,11 +134,11 @@ void run_diagnostics(PGconn* pg) {
     log_query_rows(
         pg,
         "recent_capture_logs",
-        R"(SELECT created_at, level, component, message, conn_id
+        R"(SELECT logged_at, level, component, message, conn_id
            FROM cdc_catalog.logs
            WHERE component IN ('cdc_kafka_capture', 'cdc_daemon', 'cdc_kafka_apply_cpp')
-             AND created_at > now() - interval '6 hours'
-           ORDER BY created_at DESC LIMIT 20)");
+             AND logged_at > now() - interval '6 hours'
+           ORDER BY logged_at DESC LIMIT 20)");
 
     log_write(pg, {
         .level = LogLevel::Info,
@@ -234,6 +234,7 @@ int run_schema_migrate(PGconn* log_pg, PGconn* lake_pg, const SchemaMigrateOptio
             .message = "migrate applying incremental",
         });
         exec_sql_section(log_pg, prod_ops_embedded::datasync_incremental(), "datasync_incremental");
+        exec_sql_section(log_pg, prod_ops_embedded::schema_patches(), "schema_patches");
         try {
             exec_sql_section(log_pg, prod_ops_embedded::monitoring_views(), "monitoring_views");
         } catch (const std::exception& ex) {
@@ -264,4 +265,23 @@ int run_schema_migrate(PGconn* log_pg, PGconn* lake_pg, const SchemaMigrateOptio
         .context = {{"steps", steps}},
     });
     return 0;
+}
+
+void run_startup_schema_migrate(PGconn* log_pg) {
+    if (!log_pg || !catalog_schema_exists(log_pg)) {
+        return;
+    }
+    SchemaMigrateOptions opts;
+    opts.incremental = true;
+    try {
+        (void)run_schema_migrate(log_pg, nullptr, opts);
+    } catch (const std::exception& ex) {
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "catalog",
+            .message = "startup schema migrate failed",
+            .context = {{"error", ex.what()}},
+        });
+        throw;
+    }
 }

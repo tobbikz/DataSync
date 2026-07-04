@@ -107,15 +107,15 @@ std::string table_state_key(const std::string& schema, const std::string& table)
     return schema + "|" + table;
 }
 
-std::string reconciliation_status_to_rag(const std::string& status) {
-    if (status == "ok") {
-        return "GREEN";
+std::string apply_status_to_rag(const std::string& status, bool is_stale, bool is_quarantined) {
+    if (is_quarantined || status == "failed" || status == "gap_detected" || status == "quarantined") {
+        return "RED";
     }
-    if (status == "warn") {
+    if (is_stale || status == "stale" || status == "lagging") {
         return "AMBER";
     }
-    if (status == "fail") {
-        return "RED";
+    if (status == "ok" || status.empty()) {
+        return "GREEN";
     }
     return "UNKNOWN";
 }
@@ -141,8 +141,6 @@ TableHealthSnapshot fetch_table_health_by_catalog_id(
             extract(epoch FROM (now() - ap.last_applied_at))::integer,
             c.active,
             c.cdc_enabled,
-            COALESCE(rag.status, 'skip') AS reconcile_status,
-            COALESCE(rag.row_count_delta, 0),
             COALESCE(
                 CASE
                     WHEN c.db_engine = 'mssql' THEN mssql_lag.lag_seconds
@@ -177,17 +175,6 @@ TableHealthSnapshot fetch_table_health_by_catalog_id(
               AND r.database = c.source_database
               AND r.collection = c.source_table
         ) mongo_lag ON true
-        LEFT JOIN LATERAL (
-            SELECT rr.status, rr.row_count_delta
-            FROM cdc_catalog.reconciliation_result rr
-            JOIN cdc_catalog.reconciliation_run rn ON rn.run_id = rr.run_id
-            WHERE rr.conn_id = c.conn_id
-              AND rr.source_schema = COALESCE(NULLIF(c.source_schema, ''), c.source_database)
-              AND rr.source_table = c.source_table
-              AND rn.finished_at IS NOT NULL
-            ORDER BY rn.finished_at DESC
-            LIMIT 1
-        ) rag ON true
         WHERE c.catalog_id = $1::bigint
         )",
         1,
@@ -213,12 +200,7 @@ TableHealthSnapshot fetch_table_health_by_catalog_id(
     out.catalog_active = active_val && active_val[0] == 't';
     const char* cdc_val = PQgetvalue(res, 0, 4);
     out.cdc_enabled = cdc_val && cdc_val[0] == 't';
-    const char* rag_val = PQgetvalue(res, 0, 5);
-    out.reconciliation_rag = reconciliation_status_to_rag(rag_val ? rag_val : "");
-    if (PQgetvalue(res, 0, 6) && PQgetvalue(res, 0, 6)[0]) {
-        out.reconcile_row_delta = std::atoll(PQgetvalue(res, 0, 6));
-    }
-    const char* capt_val = PQgetvalue(res, 0, 7);
+    const char* capt_val = PQgetvalue(res, 0, 5);
     out.capture_lag_seconds = capt_val ? std::atoi(capt_val) : 0;
     out.is_quarantined = out.apply_status == "quarantined";
     if (out.apply_status == "stale" || out.apply_status == "lagging" || out.apply_status == "gap_detected") {
@@ -226,6 +208,8 @@ TableHealthSnapshot fetch_table_health_by_catalog_id(
     } else if (out.seconds_since_last_apply >= 0 && out.seconds_since_last_apply > staleness_seconds) {
         out.is_stale = true;
     }
+    out.reconciliation_rag = apply_status_to_rag(out.apply_status, out.is_stale, out.is_quarantined);
+    out.reconcile_row_delta = 0;
     PQclear(res);
     return out;
 }

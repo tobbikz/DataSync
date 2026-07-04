@@ -75,23 +75,6 @@ constexpr int kCatalogSyncIntervalRounds = 12;
 constexpr std::size_t kCatalogChunkSize = 500;
 constexpr int kCatalogBatchSleepMs = 200;
 
-// Reconcile
-constexpr int kReconcileRowAbsTolerance = 50;
-constexpr double kReconcileRowPctTolerance = 0.01;
-constexpr int kReconcileRowWarnAbsTolerance = 10;
-constexpr double kReconcileRowWarnPctTolerance = 0.005;
-constexpr long long kReconcileLargeTableMinRows = 100000;
-constexpr int kReconcileLargeTableAbsCap = 5000;
-constexpr int kReconcileApplyLagWarnSeconds = 600;
-constexpr int kReconcileApplyLagFailSeconds = 1800;
-constexpr int kReconcilePkSampleSize = 100;
-constexpr int kReconcileMaxTables = 0;
-constexpr bool kReconcileEnabled = true;
-constexpr long long kReconcileKafkaLagWarn = 100;
-constexpr long long kReconcileKafkaLagFail = 10000;
-constexpr int kReconcileCaptureLagWarnSeconds = 300;
-constexpr int kReconcileCaptureLagFailSeconds = 900;
-
 // RuntimeConfig keys — defaults when absent in DB
 constexpr std::size_t kFullLoadBatchSizeDefault = 50000;
 constexpr int kApplyBatchSizeDefault = 20000;
@@ -110,7 +93,6 @@ constexpr int kTableLagScanTimeoutMsDefault = 120000;
 constexpr long long kTableLagScanMaxMessagesDefault = 0;
 /** End-of-slice lag-only drain polls after main apply loop. */
 constexpr int kApplyLagDrainQuietPollsDefault = 5;
-constexpr int kReconcileIntervalHoursDefault = 4;
 constexpr int kLogsRetentionDaysDefault = 7;
 constexpr int kAppliedEventsRetentionDaysDefault = 7;
 

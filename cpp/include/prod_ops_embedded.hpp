@@ -670,7 +670,7 @@ CREATE TABLE cdc_catalog.reconciliation_result (
 -- Name: TABLE reconciliation_result; Type: COMMENT; Schema: cdc_catalog; Owner: -
 --
 
-COMMENT ON TABLE cdc_catalog.reconciliation_result IS 'Per-table reconciliation: row counts (full mode), apply/capture/Kafka pipeline lag, optional PK sample checksum in checks JSON';
+COMMENT ON TABLE cdc_catalog.reconciliation_result IS 'Per-table pipeline reconcile: apply/capture/Kafka lag from cdc_catalog metadata';
 
 
 --
@@ -685,6 +685,44 @@ ALTER TABLE cdc_catalog.reconciliation_result ALTER COLUMN result_id ADD GENERAT
     NO MAXVALUE
     CACHE 1
 );
+
+
+--
+-- Name: reconciliation_result_daily; Type: TABLE; Schema: cdc_catalog; Owner: -
+--
+
+CREATE TABLE cdc_catalog.reconciliation_result_daily (
+    snapshot_date date NOT NULL,
+    catalog_id bigint NOT NULL,
+    conn_id text NOT NULL,
+    source_schema text NOT NULL,
+    source_table text NOT NULL,
+    status text NOT NULL,
+    row_count_delta bigint,
+    drift_kind text,
+    semaphore_reason text,
+    recommended_action text,
+    source_row_count bigint,
+    lake_row_count bigint,
+    run_id bigint NOT NULL,
+    checks jsonb DEFAULT '{}'::jsonb NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: reconciliation_result_daily reconciliation_result_daily_pkey; Type: CONSTRAINT; Schema: cdc_catalog; Owner: -
+--
+
+ALTER TABLE ONLY cdc_catalog.reconciliation_result_daily
+    ADD CONSTRAINT reconciliation_result_daily_pkey PRIMARY KEY (snapshot_date, catalog_id);
+
+
+--
+-- Name: reconciliation_result_daily_conn_idx; Type: INDEX; Schema: cdc_catalog; Owner: -
+--
+
+CREATE INDEX reconciliation_result_daily_conn_idx ON cdc_catalog.reconciliation_result_daily USING btree (conn_id, status, snapshot_date DESC);
 
 
 --
@@ -703,14 +741,14 @@ CREATE TABLE cdc_catalog.reconciliation_run (
     tables_warn integer DEFAULT 0 NOT NULL,
     tables_fail integer DEFAULT 0 NOT NULL,
     stale_tables integer DEFAULT 0 NOT NULL,
-    reconcile_mode text DEFAULT 'full'::text NOT NULL,
+    reconcile_mode text DEFAULT 'lake'::text NOT NULL,
     context jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT reconciliation_run_status_check CHECK ((status = ANY (ARRAY['running'::text, 'ok'::text, 'warn'::text, 'fail'::text]))),
-    CONSTRAINT reconciliation_run_mode_check CHECK ((reconcile_mode = 'full'::text))
+    CONSTRAINT reconciliation_run_mode_check CHECK ((reconcile_mode = 'lake'::text))
 );
 
 
-COMMENT ON TABLE cdc_catalog.reconciliation_run IS 'One row per reconcile CLI run (full: row count + PK checksum + lag).';
+COMMENT ON TABLE cdc_catalog.reconciliation_run IS 'One row per reconcile CLI run (lake: pipeline metadata only, no OLTP).';
 
 
 --
@@ -914,11 +952,11 @@ ALTER TABLE ONLY cdc_catalog.reconciliation_result
 
 
 --
--- Name: reconciliation_result reconciliation_result_run_table_uk; Type: CONSTRAINT; Schema: cdc_catalog; Owner: -
+-- Name: reconciliation_result reconciliation_result_run_conn_table_uk; Type: CONSTRAINT; Schema: cdc_catalog; Owner: -
 --
 
 ALTER TABLE ONLY cdc_catalog.reconciliation_result
-    ADD CONSTRAINT reconciliation_result_run_table_uk UNIQUE (run_id, source_schema, source_table);
+    ADD CONSTRAINT reconciliation_result_run_conn_table_uk UNIQUE (run_id, conn_id, source_schema, source_table);
 
 
 --
@@ -1187,16 +1225,18 @@ DROP FUNCTION IF EXISTS cdc_catalog.refresh_pipeline_health_live(
 
 DROP TABLE IF EXISTS cdc_catalog.pipeline_health;
 
--- Migration 002: canonical runtime_config (5 global rows) + one-time reconcile history reset.
+-- Migration 002: canonical runtime_config + one-time reconcile history reset (legacy).
 -- All other tuning: cpp/include/pipeline_defaults.hpp. Kafka bootstrap: KAFKA_BOOTSTRAP env.
 
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 2) THEN
-        TRUNCATE cdc_catalog.reconciliation_run RESTART IDENTITY CASCADE;
+        IF to_regclass('cdc_catalog.reconciliation_run') IS NOT NULL THEN
+            TRUNCATE cdc_catalog.reconciliation_run RESTART IDENTITY CASCADE;
+        END IF;
         INSERT INTO cdc_catalog.schema_migrations (version, description)
-        VALUES (2, 'canonical runtime_config; reconciliation_run history reset');
-        RAISE NOTICE 'migration 002: reconciliation_run truncated';
+        VALUES (2, 'canonical runtime_config; reconciliation_run history reset (legacy)');
+        RAISE NOTICE 'migration 002: reconciliation_run truncated (if present)';
     END IF;
 END $$;
 
@@ -1237,7 +1277,6 @@ DELETE FROM cdc_catalog.runtime_config
 WHERE (config_key, component, COALESCE(conn_id, '')) NOT IN (
     ('full_load_batch_size',          'mariadb_load',        ''),
     ('apply_batch_size',              'cdc_kafka_apply',     ''),
-    ('reconcile_interval_hours',      'cdc_kafka_reconcile', ''),
     ('logs_retention_days',           'global',              ''),
     ('applied_events_retention_days', 'cdc_kafka_apply',     '')
 );
@@ -1246,7 +1285,6 @@ INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_v
 VALUES
     ('full_load_batch_size',          'mariadb_load',        '', '50000'::jsonb, 'MariaDB full-load COPY batch size'),
     ('apply_batch_size',              'cdc_kafka_apply',     '', '20000'::jsonb, 'Apply batch before flush'),
-    ('reconcile_interval_hours',      'cdc_kafka_reconcile', '', '4'::jsonb, 'Hours between reconcile-loop runs'),
     ('logs_retention_days',           'global',              '', '7'::jsonb, 'Purge cdc_catalog.logs retention'),
     ('applied_events_retention_days', 'cdc_kafka_apply',     '', '7'::jsonb, 'Dedup audit retention')
 ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
@@ -1332,22 +1370,32 @@ SELECT created_at, level, component, message, conn_id, context
 FROM cdc_catalog.logs
 WHERE component IN ('cdc_kafka_capture', 'cdc_kafka_daemon', 'cdc_kafka_apply_cpp')
   AND (message ILIKE '%skip%' OR message ILIKE '%capture%')
-  AND created_at > now() - interval '6 hours'
-ORDER BY created_at DESC
+  AND logged_at > now() - interval '6 hours'
+ORDER BY logged_at DESC
 LIMIT 20;
+)PO_diagnostics";
+    }
+    inline std::string_view schema_patches() {
+        return R"PO_schema_patch(
 
--- Migration 003: Add reconcile_mode column to reconciliation_run for full vs light visibility.
-ALTER TABLE cdc_catalog.reconciliation_run
-    ADD COLUMN IF NOT EXISTS reconcile_mode text NOT NULL DEFAULT 'full';
+-- Migration 003 (legacy): reconcile_mode on reconciliation_run — skipped when table absent.
+DO $$
+BEGIN
+    IF to_regclass('cdc_catalog.reconciliation_run') IS NOT NULL THEN
+        ALTER TABLE cdc_catalog.reconciliation_run
+            ADD COLUMN IF NOT EXISTS reconcile_mode text NOT NULL DEFAULT 'full';
 
-ALTER TABLE cdc_catalog.reconciliation_run
-    DROP CONSTRAINT IF EXISTS reconciliation_run_mode_check;
+        ALTER TABLE cdc_catalog.reconciliation_run
+            DROP CONSTRAINT IF EXISTS reconciliation_run_mode_check;
 
-ALTER TABLE cdc_catalog.reconciliation_run
-    ADD CONSTRAINT reconciliation_run_mode_check
-        CHECK (reconcile_mode = 'full'::text);
+        ALTER TABLE cdc_catalog.reconciliation_run
+            ADD CONSTRAINT reconciliation_run_mode_check
+                CHECK (reconcile_mode = 'full'::text);
 
-COMMENT ON TABLE cdc_catalog.reconciliation_run IS 'One row per reconcile CLI run (full: row count + PK checksum + lag).';
+        COMMENT ON TABLE cdc_catalog.reconciliation_run IS
+            'Legacy reconcile CLI run header (removed — table dropped by migration 046)';
+    END IF;
+END $$;
 
 -- Migration 004: apply observability columns on existing deployments.
 ALTER TABLE cdc_catalog.apply_batch_stats
@@ -1373,8 +1421,12 @@ BEGIN
         DROP INDEX IF EXISTS cdc_catalog.catalog_active_cdc_idx;
         DROP INDEX IF EXISTS cdc_catalog.catalog_needs_full_load_idx;
         ALTER TABLE cdc_catalog.apply_batch_stats DROP COLUMN IF EXISTS service_tier;
-        ALTER TABLE cdc_catalog.reconciliation_run DROP COLUMN IF EXISTS service_tier;
-        ALTER TABLE cdc_catalog.reconciliation_result DROP COLUMN IF EXISTS service_tier;
+        IF to_regclass('cdc_catalog.reconciliation_run') IS NOT NULL THEN
+            ALTER TABLE cdc_catalog.reconciliation_run DROP COLUMN IF EXISTS service_tier;
+        END IF;
+        IF to_regclass('cdc_catalog.reconciliation_result') IS NOT NULL THEN
+            ALTER TABLE cdc_catalog.reconciliation_result DROP COLUMN IF EXISTS service_tier;
+        END IF;
         ALTER TABLE cdc_catalog.cdc_run_fairness_metrics DROP COLUMN IF EXISTS service_tier;
         ALTER TABLE cdc_catalog.catalog DROP COLUMN IF EXISTS service_tier;
         CREATE INDEX IF NOT EXISTS catalog_active_cdc_idx
@@ -1430,24 +1482,26 @@ BEGIN
     END IF;
 END $$;
 
--- Migration 036: reconcile full only (also applied via DataSync migrate + sql/036_*.sql).
+-- Migration 036 (legacy): reconcile full only — noop when reconcile tables absent.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 36) THEN
-        ALTER TABLE cdc_catalog.reconciliation_run
-            DROP CONSTRAINT IF EXISTS reconciliation_run_mode_check;
-        ALTER TABLE cdc_catalog.reconciliation_run
-            ADD CONSTRAINT reconciliation_run_mode_check
-            CHECK (reconcile_mode = 'full'::text);
+        IF to_regclass('cdc_catalog.reconciliation_run') IS NOT NULL THEN
+            ALTER TABLE cdc_catalog.reconciliation_run
+                DROP CONSTRAINT IF EXISTS reconciliation_run_mode_check;
+            ALTER TABLE cdc_catalog.reconciliation_run
+                ADD CONSTRAINT reconciliation_run_mode_check
+                CHECK (reconcile_mode = 'full'::text);
+            UPDATE cdc_catalog.reconciliation_run
+            SET reconcile_mode = 'full'
+            WHERE reconcile_mode IS DISTINCT FROM 'full';
+        END IF;
         DELETE FROM cdc_catalog.runtime_config
         WHERE component = 'cdc_kafka_reconcile'
           AND config_key IN ('reconcile_mode', 'reconcile_full_interval_hours');
-        UPDATE cdc_catalog.reconciliation_run
-        SET reconcile_mode = 'full'
-        WHERE reconcile_mode IS DISTINCT FROM 'full';
         INSERT INTO cdc_catalog.schema_migrations (version, description)
-        VALUES (36, 'reconcile full only; drop light/auto runtime keys');
-        RAISE NOTICE 'migration 036: reconcile full only';
+        VALUES (36, 'reconcile full only (legacy; noop after 046)');
+        RAISE NOTICE 'migration 036: reconcile full only (legacy)';
     END IF;
 END $$;
 
@@ -1532,7 +1586,6 @@ BEGIN
            OR (config_key, component, COALESCE(conn_id, '')) NOT IN (
                 ('full_load_batch_size',          'mariadb_load',        ''),
                 ('apply_batch_size',              'cdc_kafka_apply',     ''),
-                ('reconcile_interval_hours',      'cdc_kafka_reconcile', ''),
                 ('logs_retention_days',           'global',              ''),
                 ('applied_events_retention_days', 'cdc_kafka_apply',     '')
            );
@@ -1541,7 +1594,6 @@ BEGIN
         VALUES
             ('full_load_batch_size',          'mariadb_load',        '', '50000'::jsonb, 'MariaDB full-load COPY batch size'),
             ('apply_batch_size',              'cdc_kafka_apply',     '', '20000'::jsonb, 'Apply batch before flush'),
-            ('reconcile_interval_hours',      'cdc_kafka_reconcile', '', '4'::jsonb, 'Hours between reconcile-loop runs'),
             ('logs_retention_days',           'global',              '', '7'::jsonb, 'Purge cdc_catalog.logs retention'),
             ('applied_events_retention_days', 'cdc_kafka_apply',     '', '7'::jsonb, 'Dedup audit retention')
         ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
@@ -1631,7 +1683,135 @@ BEGIN
         RAISE NOTICE 'migration 042: mirror apply PK indexes + chunked deletes';
     END IF;
 END $$;
-)PO_diagnostics";
+
+-- Migration 043 (legacy): reconcile enrichments — noop when reconcile tables absent.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 43) THEN
+        IF to_regclass('cdc_catalog.reconciliation_result') IS NOT NULL THEN
+            ALTER TABLE cdc_catalog.reconciliation_result
+                DROP CONSTRAINT IF EXISTS reconciliation_result_run_table_uk;
+            ALTER TABLE cdc_catalog.reconciliation_result
+                ADD CONSTRAINT reconciliation_result_run_conn_table_uk
+                UNIQUE (run_id, conn_id, source_schema, source_table);
+        END IF;
+
+        IF to_regclass('cdc_catalog.reconciliation_result_daily') IS NULL
+           AND to_regclass('cdc_catalog.reconciliation_result') IS NOT NULL THEN
+            CREATE TABLE cdc_catalog.reconciliation_result_daily (
+                snapshot_date date NOT NULL,
+                catalog_id bigint NOT NULL,
+                conn_id text NOT NULL,
+                source_schema text NOT NULL,
+                source_table text NOT NULL,
+                status text NOT NULL,
+                row_count_delta bigint,
+                drift_kind text,
+                semaphore_reason text,
+                recommended_action text,
+                source_row_count bigint,
+                lake_row_count bigint,
+                run_id bigint NOT NULL,
+                checks jsonb DEFAULT '{}'::jsonb NOT NULL,
+                updated_at timestamp with time zone DEFAULT now() NOT NULL,
+                PRIMARY KEY (snapshot_date, catalog_id)
+            );
+
+            CREATE INDEX reconciliation_result_daily_conn_idx
+                ON cdc_catalog.reconciliation_result_daily (conn_id, status, snapshot_date DESC);
+
+            COMMENT ON TABLE cdc_catalog.reconciliation_result_daily IS
+                'Legacy daily reconcile snapshot (removed by migration 046)';
+        END IF;
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (43, 'reconcile enrichments (legacy; noop after 046)');
+        RAISE NOTICE 'migration 043: reconcile enrichments (legacy)';
+    END IF;
+END $$;
+
+-- Migration 044 (legacy): reconcile lake mode — noop when reconcile tables absent.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 44) THEN
+        IF to_regclass('cdc_catalog.reconciliation_run') IS NOT NULL THEN
+            ALTER TABLE cdc_catalog.reconciliation_run
+                DROP CONSTRAINT IF EXISTS reconciliation_run_mode_check;
+            ALTER TABLE cdc_catalog.reconciliation_run
+                ADD CONSTRAINT reconciliation_run_mode_check
+                CHECK (reconcile_mode = ANY (ARRAY['full'::text, 'lake'::text]));
+        END IF;
+
+        DELETE FROM cdc_catalog.runtime_config
+        WHERE component = 'cdc_kafka_reconcile'
+          AND config_key = 'reconcile_cycle_mode';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (44, 'reconcile lake mode (legacy; noop after 046)');
+        RAISE NOTICE 'migration 044: reconcile lake mode (legacy)';
+    END IF;
+END $$;
+
+-- Migration 045 (legacy): reconcile lake-only — noop when reconcile tables absent.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 45) THEN
+        IF to_regclass('cdc_catalog.reconciliation_run') IS NOT NULL THEN
+            ALTER TABLE cdc_catalog.reconciliation_run
+                DROP CONSTRAINT IF EXISTS reconciliation_run_mode_check;
+            ALTER TABLE cdc_catalog.reconciliation_run
+                ADD CONSTRAINT reconciliation_run_mode_check
+                CHECK (reconcile_mode = 'lake'::text);
+
+            UPDATE cdc_catalog.reconciliation_run
+            SET reconcile_mode = 'lake'
+            WHERE reconcile_mode IS DISTINCT FROM 'lake';
+
+            COMMENT ON TABLE cdc_catalog.reconciliation_run IS
+                'Legacy reconcile CLI run header (removed by migration 046)';
+        END IF;
+
+        IF to_regclass('cdc_catalog.reconciliation_result') IS NOT NULL THEN
+            COMMENT ON TABLE cdc_catalog.reconciliation_result IS
+                'Legacy per-table reconcile result (removed by migration 046)';
+        END IF;
+
+        DELETE FROM cdc_catalog.runtime_config
+        WHERE component = 'cdc_kafka_reconcile';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (45, 'reconcile lake-only (legacy; noop after 046)');
+        RAISE NOTICE 'migration 045: reconcile lake-only (legacy)';
+    END IF;
+END $$;
+
+-- Migration 046: drop reconcile pipeline tables (C++ reconcile job removed).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 46) THEN
+        DROP TABLE IF EXISTS cdc_catalog.reconciliation_result CASCADE;
+        DROP TABLE IF EXISTS cdc_catalog.reconciliation_result_daily CASCADE;
+        DROP TABLE IF EXISTS cdc_catalog.reconciliation_run CASCADE;
+
+        DELETE FROM cdc_catalog.runtime_config
+        WHERE component = 'cdc_kafka_reconcile'
+           OR config_key LIKE 'reconcile%';
+
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.reconciliation_rag IS
+            'Apply health RAG from apply_position status (GREEN/AMBER/RED/UNKNOWN)';
+
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.reconcile_row_delta IS
+            'Legacy column; always 0 after reconcile removal';
+
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.semaphore IS
+            'GREEN/AMBER/RED mirror of reconciliation_rag (apply health)';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (46, 'drop reconcile tables; apply-health-only CDC pipeline');
+        RAISE NOTICE 'migration 046: reconcile tables dropped';
+    END IF;
+END $$;
+)PO_schema_patch";
     }
     inline std::string_view monitoring_views() {
         return R"PO_monitoring_v(

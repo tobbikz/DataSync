@@ -34,7 +34,6 @@ DDL + seeds: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate` (migrati
 |-----|-----------|---------|
 | `full_load_batch_size` | mariadb_load | 50000 |
 | `apply_batch_size` | cdc_kafka_apply | 20000 |
-| `reconcile_interval_hours` | cdc_kafka_reconcile | 4 |
 | `logs_retention_days` | global | 7 |
 | `applied_events_retention_days` | cdc_kafka_apply | 7 |
 
