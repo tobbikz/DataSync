@@ -361,6 +361,39 @@ void touch_capture_position_slice(PGconn* pg, const std::string& conn_id) {
     }
 }
 
+void note_capture_position_deferred(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& reason) {
+    const std::string err = reason.size() > 2000 ? reason.substr(0, 2000) : reason;
+    const char* vals[] = {conn_id.c_str(), err.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.capture_position
+        SET last_error = $2,
+            updated_at = now(),
+            status = CASE
+                WHEN status IN (
+                    'failed'::cdc_catalog.cdc_health_status,
+                    'quarantined'::cdc_catalog.cdc_health_status,
+                    'gap_detected'::cdc_catalog.cdc_health_status
+                ) THEN status
+                ELSE 'healthy'::cdc_catalog.cdc_health_status
+            END
+        WHERE conn_id = $1
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res) {
+        PQclear(res);
+    }
+}
+
 void mark_capture_position_failed(PGconn* pg, const std::string& conn_id, const std::string& error) {
     const std::string err = error.size() > 2000 ? error.substr(0, 2000) : error;
     const char* vals[] = {conn_id.c_str(), err.c_str()};
@@ -382,6 +415,64 @@ void mark_capture_position_failed(PGconn* pg, const std::string& conn_id, const 
     if (res) {
         PQclear(res);
     }
+}
+
+int refresh_capture_position_health(PGconn* pg, int staleness_seconds) {
+    if (staleness_seconds <= 0) {
+        staleness_seconds = pipeline_defaults::kCaptureHealthAlertStaleSeconds;
+    }
+    const std::string stale = std::to_string(staleness_seconds);
+    const char* vals[] = {stale.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.capture_position cp
+        SET capture_lag_seconds = CASE
+                WHEN cp.status IN (
+                    'failed'::cdc_catalog.cdc_health_status,
+                    'quarantined'::cdc_catalog.cdc_health_status,
+                    'gap_detected'::cdc_catalog.cdc_health_status
+                ) THEN cp.capture_lag_seconds
+                WHEN extract(epoch FROM (now() - cp.updated_at)) > $1::integer
+                    THEN cp.capture_lag_seconds
+                WHEN cp.status = 'stale'::cdc_catalog.cdc_health_status
+                    THEN cp.capture_lag_seconds
+                ELSE GREATEST(
+                    0,
+                    extract(epoch FROM (now() - COALESCE(cp.last_event_ts, cp.updated_at)))::integer
+                )
+            END,
+            status = CASE
+                WHEN cp.status IN (
+                    'failed'::cdc_catalog.cdc_health_status,
+                    'quarantined'::cdc_catalog.cdc_health_status,
+                    'gap_detected'::cdc_catalog.cdc_health_status
+                ) THEN cp.status
+                WHEN extract(epoch FROM (now() - cp.updated_at)) > $1::integer
+                    THEN 'stale'::cdc_catalog.cdc_health_status
+                WHEN cp.status = 'stale'::cdc_catalog.cdc_health_status
+                    THEN 'healthy'::cdc_catalog.cdc_health_status
+                ELSE cp.status
+            END
+        WHERE cp.updated_at IS NOT NULL
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    int updated = 0;
+    if (res && PQresultStatus(res) == PGRES_COMMAND_OK) {
+        const char* n = PQcmdTuples(res);
+        if (n && n[0]) {
+            updated = std::atoi(n);
+        }
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return updated;
 }
 
 std::vector<std::string> split_pk_columns(const std::string& pk_columns) {
@@ -757,9 +848,6 @@ bool seed_stream_capture_bookmark_if_needed(
     const bool table_hot = hot_raw && (hot_raw[0] == 't' || hot_raw[0] == 'T' || hot_raw[0] == '1');
     const std::string engine_meta_text = emt ? emt : "";
     PQclear(res);
-    if (!streaming) {
-        return false;
-    }
     if (engine_meta_has_stream_bookmark(engine_meta_text)) {
         return true;
     }
@@ -891,7 +979,8 @@ bool seed_stream_capture_bookmark_if_needed(
     log_write(pg, {
         .level = LogLevel::Info,
         .component = "cdc_catalog_onboard",
-        .message = "stream capture bookmark seeded before full load",
+        .message = streaming ? "stream capture bookmark seeded before full load"
+                             : "full-load kafka skip snapshot seeded (high watermark at FL start)",
         .batch_id = batch_id.empty() ? std::nullopt : std::make_optional(batch_id),
         .conn_id = conn_id,
         .source_schema = source_schema,
@@ -900,6 +989,7 @@ bool seed_stream_capture_bookmark_if_needed(
             {"catalog_id", catalog_id},
             {"topic", topic},
             {"kafka_bootstrap", kafka.bootstrap},
+            {"capture_during_full_load", streaming},
             {"stream_kafka_offsets", partition_offsets},
         },
     });
@@ -1991,6 +2081,91 @@ struct OnboardApplyRow {
     int partition;
 };
 
+/** Fresh apply_batch_stats row after FL kafka skip — UI reads lag=0 immediately (no stale slice). */
+static void record_full_load_kafka_skip_stats(
+    PGconn* pg,
+    const std::string& batch_id,
+    const std::string& conn_id,
+    const std::vector<OnboardApplyRow>& rows,
+    const std::map<std::pair<std::string, int>, long long>& topic_offsets) {
+    for (const auto& row : rows) {
+        const auto topic_key = std::make_pair(row.topic, row.partition);
+        const auto it = topic_offsets.find(topic_key);
+        if (it == topic_offsets.end()) {
+            continue;
+        }
+        const std::string catalog_id = std::to_string(row.catalog_id);
+        const std::string partition = std::to_string(row.partition);
+        const std::string offset = std::to_string(it->second);
+        const char* vals[] = {
+            batch_id.c_str(),
+            conn_id.c_str(),
+            catalog_id.c_str(),
+            row.schema.c_str(),
+            row.table.c_str(),
+            row.topic.c_str(),
+            partition.c_str(),
+            offset.c_str(),
+        };
+        pg_exec_params_simple(
+            pg,
+            R"(
+            INSERT INTO cdc_catalog.apply_batch_stats (
+                batch_id, conn_id, catalog_id, source_schema, source_table,
+                events_inserts, events_updates, events_deletes, events_total,
+                duration_ms, events_per_minute, kafka_topic, kafka_partition, kafka_offset,
+                is_stale, is_inactive, is_quarantined, apply_health_rag,
+                apply_lag_seconds, apply_position_status, events_seen_in_slice,
+                catalog_active, cdc_enabled,
+                capture_lag_seconds, kafka_consumer_lag, reconcile_row_delta,
+                dedup_skipped, parse_skipped, dropped_unrecoverable,
+                seconds_since_last_apply, kafka_partition_lag, lag_scan_complete,
+                slice_kind, event_loss_status, health_reason,
+                context
+            ) VALUES (
+                $1, $2, $3::bigint, $4, $5,
+                0, 0, 0, 0,
+                0, 0, $6, $7::integer, $8::bigint,
+                false, true, false, 'GREEN',
+                0, 'healthy', 0,
+                true, false,
+                0, 0, 0,
+                0, 0, 0,
+                0, 0, true,
+                'full_load_skip', 'ok', 'full_load_kafka_skip',
+                '{"lag_kind":"full_load_skip","kafka_partition_lag":0}'::jsonb
+            )
+            )",
+            8,
+            vals);
+    }
+}
+
+static void clear_full_load_kafka_bookmarks(
+    PGconn* pg, const std::vector<OnboardApplyRow>& rows) {
+    for (const auto& row : rows) {
+        const std::string catalog_id = std::to_string(row.catalog_id);
+        const char* vals[] = {catalog_id.c_str()};
+        PGresult* clr = PQexecParams(
+            pg,
+            R"(
+            UPDATE cdc_catalog.catalog
+            SET engine_meta = engine_meta - 'stream_kafka_offsets' - 'stream_bookmarked_at',
+                updated_at = now()
+            WHERE catalog_id = $1::bigint
+            )",
+            1,
+            nullptr,
+            vals,
+            nullptr,
+            nullptr,
+            0);
+        if (clr) {
+            PQclear(clr);
+        }
+    }
+}
+
 static bool pg_exec_ok(PGconn* pg, const char* sql) {
     PGresult* res = PQexec(pg, sql);
     const bool ok = res && PQresultStatus(res) == PGRES_COMMAND_OK;
@@ -2243,31 +2418,6 @@ static FullLoadKafkaResetStats execute_kafka_onboard_reset(
     }
 
     if (!stream_catalog_ids.empty()) {
-        for (long long catalog_id : stream_catalog_ids) {
-            const std::string cid = std::to_string(catalog_id);
-            const char* clr_vals[] = {cid.c_str()};
-            PGresult* clr = PQexecParams(
-                pg,
-                R"(
-                UPDATE cdc_catalog.catalog
-                SET capture_during_full_load = false,
-                    engine_meta = engine_meta - 'stream_kafka_offsets' - 'stream_bookmarked_at',
-                    updated_at = now()
-                WHERE catalog_id = $1::bigint
-                )",
-                1,
-                nullptr,
-                clr_vals,
-                nullptr,
-                nullptr,
-                0);
-            if (!clr || PQresultStatus(clr) != PGRES_COMMAND_OK) {
-                stats.errors += 1;
-            }
-            if (clr) {
-                PQclear(clr);
-            }
-        }
         log_write(pg, {
             .level = LogLevel::Info,
             .component = "cdc_catalog_onboard",
@@ -2303,6 +2453,45 @@ static FullLoadKafkaResetStats execute_kafka_onboard_reset(
         });
         return stats;
     }
+
+    clear_full_load_kafka_bookmarks(pg, rows);
+    for (long long catalog_id : stream_catalog_ids) {
+        const std::string cid = std::to_string(catalog_id);
+        const char* clr_vals[] = {cid.c_str()};
+        PGresult* clr = PQexecParams(
+            pg,
+            R"(
+            UPDATE cdc_catalog.catalog
+            SET capture_during_full_load = false,
+                updated_at = now()
+            WHERE catalog_id = $1::bigint
+            )",
+            1,
+            nullptr,
+            clr_vals,
+            nullptr,
+            nullptr,
+            0);
+        if (clr) {
+            PQclear(clr);
+        }
+    }
+    record_full_load_kafka_skip_stats(pg, batch_id, conn_id, rows, topic_offsets);
+    log_write(pg, {
+        .level = LogLevel::Info,
+        .component = "cdc_catalog_onboard",
+        .message = "full-load kafka skip applied (consumer offset at high watermark; lag snapshot zeroed)",
+        .batch_id = batch_id,
+        .conn_id = conn_id,
+        .source_schema = std::nullopt,
+        .source_table = std::nullopt,
+        .context = {
+            {"tables", stats.tables},
+            {"topics_reset", stats.topics_reset},
+            {"stream_replay_tables", static_cast<int>(stream_catalog_ids.size())},
+            {"single_table", single_catalog_id.has_value()},
+        },
+    });
 #else
     (void)bootstrap;
     stats.errors = stats.tables > 0 ? stats.tables : 1;
@@ -2508,6 +2697,23 @@ bool onboard_table_after_full_load(
     const std::string& source_table) {
     const auto stats =
         reset_kafka_apply_after_full_load_table(pg, conn_id, db_engine, catalog_id, batch_id);
+    if (stats.errors > 0 && stats.topics_reset == 0) {
+        log_write(pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_catalog_onboard",
+            .message = "table full-load kafka skip failed; cdc enable deferred",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = source_schema,
+            .source_table = source_table,
+            .context = {
+                {"db_engine", db_engine},
+                {"catalog_id", catalog_id},
+                {"kafka_errors", stats.errors},
+            },
+        });
+        return false;
+    }
     const bool enabled = enable_cdc_after_full_load_table(
         pg, catalog_id, batch_id, conn_id, source_schema, source_table);
     if (stats.errors > 0) {

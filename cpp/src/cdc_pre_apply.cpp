@@ -305,6 +305,7 @@ int run_conn_capture_slice(
             errors = stats.errors;
         } catch (const std::exception& ex) {
             errors = 1;
+            mark_capture_position_failed(log_pg, conn_id, ex.what());
             log_write(log_pg, {
                 .level = LogLevel::Error,
                 .component = "cdc_kafka_mssql_capture",
@@ -322,6 +323,7 @@ int run_conn_capture_slice(
             errors = stats.errors;
         } catch (const std::exception& ex) {
             errors = 1;
+            mark_capture_position_failed(log_pg, conn_id, ex.what());
             log_write(log_pg, {
                 .level = LogLevel::Error,
                 .component = "cdc_kafka_mongo_capture",
@@ -339,6 +341,7 @@ int run_conn_capture_slice(
             errors = stats.errors;
         } catch (const std::exception& ex) {
             errors = 1;
+            mark_capture_position_failed(log_pg, conn_id, ex.what());
             log_write(log_pg, {
                 .level = LogLevel::Error,
                 .component = "cdc_kafka_capture",
@@ -350,6 +353,10 @@ int run_conn_capture_slice(
                 .context = {{"error", ex.what()}},
             });
         }
+    }
+
+    if (errors > 0 && db_engine == "mariadb") {
+        mark_capture_position_failed(log_pg, conn_id, "conn capture completed with errors");
     }
 
     log_write(log_pg, {

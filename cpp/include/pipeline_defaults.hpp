@@ -5,8 +5,8 @@
 
 namespace pipeline_defaults {
 
-// Worker / parallelism (hardcoded)
-constexpr int kApplyWorkerCount = 8;
+// Worker / parallelism (hardcoded; override via runtime_config apply_worker_count)
+constexpr int kApplyWorkerCount = 12;
 /** Dedicated apply consumers per conn for catalog.hot tables (per_table Kafka topic). */
 constexpr int kHotApplyConsumerCount = 3;
 constexpr int kCaptureWorkerCount = 1;
@@ -22,7 +22,7 @@ constexpr std::string_view kKafkaBootstrapDefault = "localhost:9092";
 constexpr std::string_view kKafkaConsumerGroupPrefix = "datalake-cdc-apply";
 constexpr std::string_view kKafkaTopicMode = "bucketed";
 constexpr int kKafkaTopicBuckets = 64;
-/** Must be a multiple of kApplyWorkerCount and kHotApplyConsumerCount for partition sharding. */
+/** Must divide evenly by kApplyWorkerCount and kHotApplyConsumerCount (24 = 12 cold × 2, 24 = 3 hot × 8). */
 constexpr int kKafkaTopicPartitions = 24;
 
 // Capture producer / slice
@@ -86,6 +86,14 @@ constexpr std::size_t kCatalogDiscoverPageSize = 5000;
 
 // Apply health alerts (from apply_batch_stats / apply_health_rag — not reconcile)
 constexpr int kApplyHealthAlertLookbackMinutes = 15;
+/** Exact table kafka_consumer_lag at/above this → apply_health_rag AMBER (kafka_backlog). */
+constexpr long long kKafkaConsumerLagWarnMessages = 1000;
+/** Exact table kafka_consumer_lag at/above this → apply_health_rag RED (kafka_backlog_critical). */
+constexpr long long kKafkaConsumerLagRedMessages = 50000;
+
+// Capture health alerts (capture_position.updated_at staleness)
+constexpr int kCaptureHealthAlertStaleSeconds = 300;
+constexpr int kCaptureHealthAlertFailSeconds = 3600;
 
 // Reconcile-lite (COUNT + MAX pk + MAX ts)
 constexpr int kReconcileLiteRetentionDays = 30;

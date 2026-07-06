@@ -1217,7 +1217,7 @@ ALTER TABLE cdc_catalog.catalog
     ADD COLUMN IF NOT EXISTS capture_during_full_load boolean NOT NULL DEFAULT false;
 
 COMMENT ON COLUMN cdc_catalog.catalog.capture_during_full_load IS
-    'When true with needs_full_load: capture publishes to Kafka; apply waits until full load completes then replays from stream bookmark in engine_meta.';
+    'When true with needs_full_load: capture publishes to Kafka during COPY; apply waits then replays from stream bookmark. When false: capture pauses during COPY; on FL complete apply offsets jump to Kafka high watermark (skip pre-FL backlog).';
 
 -- Remove pipeline_health dashboard (unused). Observability: apply_batch_stats + logs.
 
@@ -1842,7 +1842,7 @@ BEGIN
         COMMENT ON COLUMN cdc_catalog.apply_batch_stats.event_loss_status IS
             'ok | warn (parse_skipped) | fail (dropped_unrecoverable)';
         COMMENT ON COLUMN cdc_catalog.apply_batch_stats.health_reason IS
-            'Primary apply-health signal: healthy, kafka_backlog, parse_skipped, apply_stale, etc.';
+            'Primary apply-health signal: healthy, kafka_backlog (>=1k msgs), kafka_backlog_critical (>=50k), parse_skipped, apply_stale, etc.';
         COMMENT ON COLUMN cdc_catalog.apply_batch_stats.reconciliation_rag IS
             'Apply health RAG: GREEN/AMBER/RED/UNKNOWN (derived from apply_position + slice metrics)';
         COMMENT ON COLUMN cdc_catalog.apply_batch_stats.reconcile_row_delta IS
@@ -2133,6 +2133,25 @@ BEGIN
         RAISE NOTICE 'migration 053: catalog schema repair';
     END IF;
 END $migration053$;
+
+-- Migration 054: cold-path apply workers 8 -> 12 (24 kafka partitions / 12 workers / 3 hot).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 54) THEN
+        INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
+        VALUES
+            ('apply_worker_count', 'cdc_kafka_apply', '', '12'::jsonb,
+             'Cold-path apply worker threads per connection (must divide kafka_topic_partitions evenly)')
+        ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
+            config_value = EXCLUDED.config_value,
+            description  = EXCLUDED.description,
+            updated_at   = now();
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (54, 'apply throughput: cold-path apply_worker_count 8 -> 12');
+        RAISE NOTICE 'migration 054: apply_worker_count -> 12';
+    END IF;
+END $$;
 )PO_schema_patch";
     }
     /** Idempotent DDL for 050/051/052 — safe when schema_migrations version rows exist without objects. */

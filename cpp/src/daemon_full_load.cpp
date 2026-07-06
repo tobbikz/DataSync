@@ -204,7 +204,9 @@ bool full_load_subprocess_running(const std::string& conn_id) {
     return full_load_subprocess_alive_for_conn(conn_id);
 }
 
-bool full_load_gate_blocks_cdc(PGconn* pg, const std::string& conn_id) {
+namespace {
+
+bool legacy_full_load_gate_blocks(PGconn* pg, const std::string& conn_id) {
     if (full_load_subprocess_running(conn_id)) {
         return true;
     }
@@ -212,6 +214,200 @@ bool full_load_gate_blocks_cdc(PGconn* pg, const std::string& conn_id) {
         return true;
     }
     return false;
+}
+
+}  // namespace
+
+std::string conn_db_engine_from_pg(PGconn* pg, const std::string& conn_id) {
+    if (!pg || conn_id.empty()) {
+        return "";
+    }
+    const char* vals[] = {conn_id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT db_engine::text
+        FROM cdc_catalog.connections
+        WHERE alias = $1
+        LIMIT 1
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    std::string engine;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        const char* v = PQgetvalue(res, 0, 0);
+        if (v && v[0]) {
+            engine = v;
+        }
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return engine;
+}
+
+CaptureBranchCounts count_capture_branch_tables(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine) {
+    CaptureBranchCounts out;
+    if (!pg || conn_id.empty() || db_engine.empty()) {
+        return out;
+    }
+    const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT
+            COUNT(*) FILTER (
+                WHERE c.active = true
+                  AND c.cdc_enabled = true
+                  AND c.has_pk = true
+                  AND NOT c.needs_full_load
+                  AND c.status NOT IN ('skipped', 'disabled')
+            )::int AS main_branch,
+            COUNT(*) FILTER (
+                WHERE c.active = true
+                  AND c.cdc_enabled = true
+                  AND c.has_pk = true
+                  AND c.needs_full_load = true
+                  AND c.capture_during_full_load = true
+                  AND c.status NOT IN ('skipped', 'disabled')
+            )::int AS stream_branch
+        FROM cdc_catalog.catalog c
+        WHERE c.conn_id = $1
+          AND c.db_engine = $2::cdc_catalog.db_engine
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        const char* main_val = PQgetvalue(res, 0, 0);
+        const char* stream_val = PQgetvalue(res, 0, 1);
+        out.main_branch = main_val ? std::atoi(main_val) : 0;
+        out.stream_branch = stream_val ? std::atoi(stream_val) : 0;
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return out;
+}
+
+bool full_load_gate_blocks_capture(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& db_engine) {
+    const CaptureBranchCounts branches = count_capture_branch_tables(pg, conn_id, db_engine);
+    if (branches.main_branch > 0 || branches.stream_branch > 0) {
+        return false;
+    }
+    return legacy_full_load_gate_blocks(pg, conn_id);
+}
+
+bool full_load_gate_blocks_onboard(PGconn* pg, const std::string& conn_id) {
+    return legacy_full_load_gate_blocks(pg, conn_id);
+}
+
+bool full_load_gate_blocks_cdc(PGconn* pg, const std::string& conn_id) {
+    return full_load_gate_blocks_onboard(pg, conn_id);
+}
+
+int clear_stale_copy_checkpoints_blocking_cdc(
+    PGconn* pg,
+    const std::string& conn_id,
+    int stale_minutes,
+    const std::string& batch_id) {
+    if (!pg || conn_id.empty()) {
+        return 0;
+    }
+    if (full_load_subprocess_running(conn_id)) {
+        return 0;
+    }
+    if (stale_minutes <= 0) {
+        stale_minutes = pipeline_defaults::kFullLoadStaleInProgressMinutes;
+    }
+    const std::string mins = std::to_string(stale_minutes);
+    const char* vals[] = {conn_id.c_str(), mins.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        WITH stale AS (
+            SELECT cp.catalog_id, cp.worker_id, c.source_schema, c.source_table, c.status::text AS catalog_status
+            FROM cdc_catalog.full_load_checkpoint cp
+            JOIN cdc_catalog.catalog c ON c.catalog_id = cp.catalog_id
+            WHERE c.conn_id = $1
+              AND cp.phase = 'copy'
+              AND (
+                  c.status <> 'full_load_in_progress'::cdc_catalog.replication_status
+                  OR cp.updated_at < now() - make_interval(mins => $2::int)
+              )
+        ),
+        deleted AS (
+            DELETE FROM cdc_catalog.full_load_checkpoint cp
+            USING stale s
+            WHERE cp.catalog_id = s.catalog_id
+              AND cp.worker_id = s.worker_id
+            RETURNING s.catalog_id, s.worker_id, s.source_schema, s.source_table, s.catalog_status
+        ),
+        reset AS (
+            UPDATE cdc_catalog.catalog c
+            SET status = 'pending',
+                updated_at = now()
+            FROM deleted d
+            WHERE c.catalog_id = d.catalog_id
+              AND c.status = 'full_load_in_progress'::cdc_catalog.replication_status
+            RETURNING c.catalog_id
+        )
+        SELECT d.catalog_id, d.worker_id, d.source_schema, d.source_table, d.catalog_status
+        FROM deleted d
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    int cleared = 0;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK) {
+        cleared = PQntuples(res);
+        if (cleared > 0) {
+            nlohmann::json sample = nlohmann::json::array();
+            for (int i = 0; i < cleared && i < 10; ++i) {
+                sample.push_back({
+                    {"catalog_id", std::atoll(PQgetvalue(res, i, 0))},
+                    {"worker_id", std::atoi(PQgetvalue(res, i, 1))},
+                    {"source_schema", PQgetvalue(res, i, 2)},
+                    {"source_table", PQgetvalue(res, i, 3)},
+                    {"catalog_status", PQgetvalue(res, i, 4)},
+                });
+            }
+            log_write(pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_daemon",
+                .message = "stale copy checkpoint cleared; CDC gate unblocked",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"checkpoints_cleared", cleared},
+                    {"stale_minutes", stale_minutes},
+                    {"sample", sample},
+                },
+            });
+        }
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return cleared;
 }
 
 bool try_recover_stale_full_load_lock(

@@ -61,8 +61,17 @@ void bump_capture_heartbeat_pg(PGconn* pg, const std::string& conn_id, const std
 /** MariaDB: touch capture_position.updated_at at slice start (monitoring liveness). */
 void touch_capture_position_slice(PGconn* pg, const std::string& conn_id);
 
+/**
+ * MariaDB: expected deferral (full-load gate) — refresh heartbeat without marking failed.
+ * Clears false "capture inactive" when capture is intentionally paused.
+ */
+void note_capture_position_deferred(PGconn* pg, const std::string& conn_id, const std::string& reason);
+
 /** MariaDB: record failed capture slice — status + last_error + updated_at. */
 void mark_capture_position_failed(PGconn* pg, const std::string& conn_id, const std::string& error);
+
+/** Refresh capture_position lag seconds and stale status from updated_at / last_event_ts. */
+int refresh_capture_position_health(PGconn* pg, int staleness_seconds);
 
 CaptureRuntimeConfig load_mariadb_capture_runtime(
     RuntimeConfig& runtime,
@@ -248,6 +257,8 @@ bool seed_stream_capture_bookmark_if_needed(
     long long catalog_id,
     const std::string& db_engine,
     const std::string& batch_id);
+
+/** Seeds high-watermark snapshot in engine_meta before every full load (stream + non-stream). */
 
 void mark_catalog_full_load_in_progress(PGconn* pg, long long catalog_id);
 

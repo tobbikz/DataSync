@@ -122,6 +122,22 @@ std::string eval_event_loss_status(long long parse_skipped, long long dropped_un
     return "ok";
 }
 
+enum class KafkaLagSeverity { kNone, kWarn, kCritical };
+
+/** Inactive/quiet slices and lag below warn threshold do not affect RAG (hub-aligned). */
+KafkaLagSeverity kafka_consumer_lag_severity(long long lag, bool is_inactive) {
+    if (is_inactive || lag <= 0) {
+        return KafkaLagSeverity::kNone;
+    }
+    if (lag >= pipeline_defaults::kKafkaConsumerLagRedMessages) {
+        return KafkaLagSeverity::kCritical;
+    }
+    if (lag >= pipeline_defaults::kKafkaConsumerLagWarnMessages) {
+        return KafkaLagSeverity::kWarn;
+    }
+    return KafkaLagSeverity::kNone;
+}
+
 std::string derive_health_reason(
     const TableHealthSnapshot& health,
     const BatchStatsMetrics& metrics,
@@ -145,7 +161,11 @@ std::string derive_health_reason(
     if (health.is_stale || health.apply_status == "stale" || health.apply_status == "lagging") {
         return "apply_stale";
     }
-    if (metrics.kafka_consumer_lag > 0) {
+    const KafkaLagSeverity lag_sev = kafka_consumer_lag_severity(metrics.kafka_consumer_lag, is_inactive);
+    if (lag_sev == KafkaLagSeverity::kCritical) {
+        return "kafka_backlog_critical";
+    }
+    if (lag_sev == KafkaLagSeverity::kWarn) {
         return "kafka_backlog";
     }
     if (health.capture_lag_seconds > 300) {
@@ -160,12 +180,17 @@ std::string derive_health_reason(
 std::string derive_apply_health_rag(
     const TableHealthSnapshot& health,
     const BatchStatsMetrics& metrics,
-    const std::string& event_loss_status) {
+    const std::string& event_loss_status,
+    bool is_inactive = false) {
     if (health.is_quarantined || health.apply_status == "failed" ||
         health.apply_status == "gap_detected" || health.apply_status == "quarantined") {
         return "RED";
     }
     if (event_loss_status == "fail" || metrics.dropped_unrecoverable > 0) {
+        return "RED";
+    }
+    const KafkaLagSeverity lag_sev = kafka_consumer_lag_severity(metrics.kafka_consumer_lag, is_inactive);
+    if (lag_sev == KafkaLagSeverity::kCritical) {
         return "RED";
     }
     if (health.is_stale || health.apply_status == "stale" || health.apply_status == "lagging") {
@@ -174,7 +199,7 @@ std::string derive_apply_health_rag(
     if (event_loss_status == "warn" || metrics.parse_skipped > 0) {
         return "AMBER";
     }
-    if (metrics.kafka_consumer_lag > 0) {
+    if (lag_sev == KafkaLagSeverity::kWarn) {
         return "AMBER";
     }
     if (health.reconcile_row_count_status == "fail" || health.reconcile_row_count_status == "warn") {
@@ -1019,7 +1044,7 @@ void insert_apply_batch_stats(
     const long long total = counts.inserts + counts.updates + counts.deletes;
     const long long epm = events_per_minute(total, duration_ms);
     const std::string event_loss = eval_event_loss_status(metrics.parse_skipped, metrics.dropped_unrecoverable);
-    const std::string rag = derive_apply_health_rag(health, metrics, event_loss);
+    const std::string rag = derive_apply_health_rag(health, metrics, event_loss, is_inactive);
     const std::string reason = extras.health_reason.empty()
                                    ? derive_health_reason(health, metrics, event_loss, is_inactive)
                                    : extras.health_reason;
