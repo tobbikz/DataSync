@@ -51,6 +51,7 @@ set(DATASYNC_SOURCES
     src/runtime_config.cpp
     src/schema_migrate.cpp
     src/obs_log.cpp
+    src/retention_maintenance.cpp
 )
 
 find_path(FREETDS_INCLUDE_DIR NAMES sybdb.h)

@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Runtime config (cdc_catalog.runtime_config)
 
-Tunables en **`cdc_catalog.runtime_config`** — **solo 5 filas canónicas**. Todo lo demás está en `cpp/include/pipeline_defaults.hpp`. `config.json` = **credentials only**.
+Tunables en **`cdc_catalog.runtime_config`** — keys listadas abajo (hot-reload). Todo lo demás está en `cpp/include/pipeline_defaults.hpp`. `config.json` = **credentials only**. **No** re-seed en cada restart: seeds en `schema_patches` migrations 038/040/054/055/056 solamente.
 
 ## Rules
 
@@ -19,23 +19,31 @@ Workers, Kafka topic mode/buckets/partitions, capture producer queue, reconcile 
 
 | Constant | Value |
 |----------|-------|
-| `kApplyWorkerCount` | 4 |
+| `kApplyWorkerCount` | 12 |
 | `kCaptureWorkerCount` | 1 |
 | `kFullLoadParallelTables` | 2 |
 | `kFullLoadWorkers` | 4 |
 | `kKafkaTopicMode` | bucketed |
 | `kKafkaTopicBuckets` | 64 |
 
-DDL + seeds: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate` (migration 002 + 038 → **5 rows**).
+DDL + seeds: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate` (`schema_patches` migrations 038/040/054/055/056).
 
-## Canonical keys (only these in runtime_config)
+## Canonical keys (runtime_config)
 
 | Key | Component | Default |
 |-----|-----------|---------|
 | `full_load_batch_size` | mariadb_load | 50000 |
 | `apply_batch_size` | cdc_kafka_apply | 20000 |
+| `apply_worker_count` | cdc_kafka_apply | 12 |
 | `logs_retention_days` | global | 7 |
 | `applied_events_retention_days` | cdc_kafka_apply | 7 |
+| `apply_batch_stats_retention_days` | global | 30 |
+| `apply_batch_stats_prune_batch_size` | global | 5000 |
+| `apply_batch_stats_prune_max_batches` | global | 500 |
+| `applied_events_prune_batch_size` | global | 5000 |
+| `applied_events_prune_max_batches` | global | 200 |
+
+**Retention prune:** `apply_batch_stats` / `cdc_applied_events` are pruned **once per day at 03:00 America/Costa_Rica** by `cdc_daemon` (`retention_maintenance.cpp`), not at apply worker startup. Advisory lock `90420055001`.
 
 ## Kafka bootstrap / consumer group
 

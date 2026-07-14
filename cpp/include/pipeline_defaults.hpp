@@ -46,6 +46,13 @@ constexpr int kApplyEmptyPollQuietThreshold = 3;
 constexpr int kApplyMaxTableStalenessSeconds = 900;
 constexpr int kApplyInactiveSeconds = 3600;
 constexpr int kApplyBatchStatsRetentionDays = 30;
+/** Scheduled retention prune: local hour (America/Costa_Rica) — 03:00 CST. */
+constexpr int kRetentionMaintenanceLocalHour = 3;
+constexpr int kRetentionMaintenanceAdvisoryLockKey = 90420055001;
+constexpr int kApplyBatchStatsPruneBatchSizeDefault = 5000;
+constexpr int kApplyBatchStatsPruneMaxBatchesDefault = 500;
+constexpr int kAppliedEventsPruneBatchSizeDefault = 5000;
+constexpr int kAppliedEventsPruneMaxBatchesDefault = 200;
 constexpr bool kApplyDedupEnabled = true;
 constexpr bool kApplyAuditEnabled = true;
 constexpr int kApplyQueuedMinMessages = 100000;

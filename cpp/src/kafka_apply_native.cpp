@@ -322,31 +322,6 @@ void finalize_slice_table_lag(
     }
 }
 
-long long prune_by_retention_fn(PGconn* pg, const char* fn_sql, int retention_days) {
-    if (retention_days <= 0) {
-        return 0;
-    }
-    const std::string days = std::to_string(retention_days);
-    const char* vals[] = {days.c_str()};
-    PGresult* res = PQexecParams(pg, fn_sql, 1, nullptr, vals, nullptr, nullptr, 0);
-    long long pruned = 0;
-    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-        pruned = std::atoll(PQgetvalue(res, 0, 0));
-    }
-    if (res) {
-        PQclear(res);
-    }
-    return pruned;
-}
-
-long long prune_applied_events(PGconn* pg, int retention_days) {
-    return prune_by_retention_fn(pg, "SELECT cdc_catalog.prune_applied_events($1::integer)", retention_days);
-}
-
-long long prune_apply_batch_stats(PGconn* pg, int retention_days) {
-    return prune_by_retention_fn(pg, "SELECT cdc_catalog.prune_apply_batch_stats($1::integer)", retention_days);
-}
-
 void ensure_apply_positions(
     PGconn* pg,
     const std::map<TableKey, CatalogMeta>& meta_by_key,
@@ -844,12 +819,6 @@ int run_kafka_apply_native_cli(
               "apply_batch_size", pipeline_defaults::kApplyBatchSizeDefault, "cdc_kafka_apply", conn_id);
     const int staleness = pipeline_defaults::kApplyMaxTableStalenessSeconds;
     const int inactive_seconds = pipeline_defaults::kApplyInactiveSeconds;
-    const int applied_retention = runtime.get_int(
-        "applied_events_retention_days",
-        pipeline_defaults::kAppliedEventsRetentionDaysDefault,
-        "cdc_kafka_apply",
-        conn_id);
-    const int stats_retention = pipeline_defaults::kApplyBatchStatsRetentionDays;
     const bool dedup_enabled = pipeline_defaults::kApplyDedupEnabled;
     const bool audit_enabled = pipeline_defaults::kApplyAuditEnabled;
     const int queued_min_messages = pipeline_defaults::kApplyQueuedMinMessages;
@@ -922,34 +891,6 @@ int run_kafka_apply_native_cli(
         wanted.insert(key);
         table_pairs.push_back(key);
         pk_by_table[key] = split_pk_columns(meta.pk_columns);
-    }
-
-    const long long pruned = prune_applied_events(app_pg.raw, applied_retention);
-    if (pruned > 0) {
-        log_write(log_pg, {
-            .level = LogLevel::Info,
-            .component = "cdc_kafka_apply",
-            .message = "pruned applied_events audit rows",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {{"deleted", pruned}, {"retention_days", applied_retention}},
-        });
-    }
-
-    const long long stats_pruned = prune_apply_batch_stats(app_pg.raw, stats_retention);
-    if (stats_pruned > 0) {
-        log_write(log_pg, {
-            .level = LogLevel::Info,
-            .component = "cdc_kafka_apply",
-            .message = "pruned apply_batch_stats rows",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {{"deleted", stats_pruned}, {"retention_days", stats_retention}},
-        });
     }
 
     ensure_apply_positions(app_pg.raw, meta_by_key, conn_id, topic_prefix, topic_mode, topic_buckets);

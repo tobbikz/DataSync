@@ -9,6 +9,7 @@
 #include "kafka_apply.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
+#include "retention_maintenance.hpp"
 #include "runtime_config.hpp"
 #include "pipeline_defaults.hpp"
 
@@ -1113,6 +1114,7 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
         }
 
         runtime.reload(log_pg);
+        maybe_run_scheduled_retention_maintenance(log_pg, runtime);
         sleep_interruptible(round_idle_seconds(cfg.cdc));
 
         cycles += 1;

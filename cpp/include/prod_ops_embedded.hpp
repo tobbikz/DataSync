@@ -1231,8 +1231,8 @@ DROP FUNCTION IF EXISTS cdc_catalog.refresh_pipeline_health_live(
 
 DROP TABLE IF EXISTS cdc_catalog.pipeline_health;
 
--- Migration 002: canonical runtime_config + one-time reconcile history reset (legacy).
--- All other tuning: cpp/include/pipeline_defaults.hpp. Kafka bootstrap: KAFKA_BOOTSTRAP env.
+-- Migration 002: one-time reconcile history reset (legacy).
+-- runtime_config seeds: schema_patches migrations 038/040/054/055/056 (not re-run here).
 
 DO $$
 BEGIN
@@ -1241,68 +1241,10 @@ BEGIN
             TRUNCATE cdc_catalog.reconciliation_run RESTART IDENTITY CASCADE;
         END IF;
         INSERT INTO cdc_catalog.schema_migrations (version, description)
-        VALUES (2, 'canonical runtime_config; reconciliation_run history reset (legacy)');
+        VALUES (2, 'reconciliation_run history reset (legacy)');
         RAISE NOTICE 'migration 002: reconciliation_run truncated (if present)';
     END IF;
 END $$;
-
-DELETE FROM cdc_catalog.runtime_config
-WHERE component = 'cdc_kafka_health'
-   OR (config_key, component) IN (
-        ('debezium_topic_prefix', 'cdc_kafka_apply'),
-        ('debezium_connect_url', 'cdc_kafka_health'),
-        ('debezium_connector_name', 'cdc_kafka_health'),
-        ('capture_topic_prefix', 'cdc_kafka_capture'),
-        ('kafka_topic_prefix', 'cdc_kafka_apply'),
-        ('capture_binlog_mode', 'cdc_kafka_capture')
-    )
-   OR (config_key = 'cdc_apply_batch_size' AND component = 'mariadb_cdc')
-   OR (config_key, component) IN (
-        ('apply_max_seconds', 'cdc_kafka_apply'),
-        ('capture_max_seconds', 'cdc_kafka_capture'),
-        ('apply_append_only', 'cdc_kafka_apply'),
-        ('apply_exit_on_targets_met', 'cdc_kafka_apply'),
-        ('apply_empty_poll_quiet_threshold', 'cdc_kafka_apply'),
-        ('apply_catchup_enabled', 'cdc_kafka_apply'),
-        ('apply_catchup_kafka_messages', 'cdc_kafka_apply'),
-        ('apply_catchup_lag_seconds', 'cdc_kafka_apply'),
-        ('apply_catchup_max_tables', 'cdc_kafka_apply'),
-        ('apply_catchup_min_kafka_messages', 'cdc_kafka_apply'),
-        ('apply_worker_count', 'cdc_kafka_apply'),
-        ('apply_process_rss_cap_mb', 'cdc_kafka_apply'),
-        ('full_load_parallel_tables', 'mariadb_load'),
-        ('kafka_purge_consumed_enabled', 'cdc_kafka_apply'),
-        ('kafka_purge_consumed_interval_seconds', 'cdc_kafka_apply'),
-        ('kafka_purge_consumed_max_lag', 'cdc_kafka_apply'),
-        ('kafka_purge_consumed_min_deletable_offsets', 'cdc_kafka_apply'),
-        ('kafka_topic_partitions', 'cdc_kafka_capture'),
-        ('kafka_topic_partitions', 'cdc_kafka_apply')
-    );
-
-DELETE FROM cdc_catalog.runtime_config
-WHERE (config_key, component, COALESCE(conn_id, '')) NOT IN (
-    ('full_load_batch_size',          'mariadb_load',        ''),
-    ('apply_batch_size',              'cdc_kafka_apply',     ''),
-    ('logs_retention_days',           'global',              ''),
-    ('applied_events_retention_days', 'cdc_kafka_apply',     '')
-);
-
-INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
-VALUES
-    ('full_load_batch_size',          'mariadb_load',        '', '50000'::jsonb, 'MariaDB full-load COPY batch size'),
-    ('apply_batch_size',              'cdc_kafka_apply',     '', '20000'::jsonb, 'Apply batch before flush'),
-    ('logs_retention_days',           'global',              '', '7'::jsonb, 'Purge cdc_catalog.logs retention'),
-    ('applied_events_retention_days', 'cdc_kafka_apply',     '', '7'::jsonb, 'Dedup audit retention')
-ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
-    config_value = EXCLUDED.config_value,
-    description  = EXCLUDED.description,
-    updated_at   = now();
-
-\echo '=== runtime_config canonical (expect 5 rows) ==='
-SELECT COUNT(*) AS runtime_config_rows FROM cdc_catalog.runtime_config;
-SELECT config_key, component, config_value
-FROM cdc_catalog.runtime_config
-ORDER BY component, config_key;
 )PO_datasync_inc";
     }
     inline std::string_view diagnostics() {
@@ -2152,6 +2094,188 @@ BEGIN
         RAISE NOTICE 'migration 054: apply_worker_count -> 12';
     END IF;
 END $$;
+
+-- Migration 055: batched retention prune (daemon 03:00 CST); workers no longer run monolithic DELETE at startup.
+DO $migration055$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 55) THEN
+        CREATE OR REPLACE FUNCTION cdc_catalog.prune_apply_batch_stats_batched(
+            p_retention_days integer DEFAULT 30,
+            p_batch_size integer DEFAULT 5000,
+            p_max_batches integer DEFAULT 500
+        ) RETURNS bigint
+        LANGUAGE plpgsql
+        AS $prune_abs_batched$
+        DECLARE
+            total_deleted bigint := 0;
+            batch_deleted bigint;
+            batches_done integer := 0;
+            cutoff timestamptz;
+        BEGIN
+            IF p_retention_days IS NULL OR p_retention_days < 1
+               OR p_batch_size IS NULL OR p_batch_size < 1
+               OR p_max_batches IS NULL OR p_max_batches < 1 THEN
+                RETURN 0;
+            END IF;
+            cutoff := now() - make_interval(days => p_retention_days);
+            LOOP
+                WITH doomed AS (
+                    SELECT stat_id
+                    FROM cdc_catalog.apply_batch_stats
+                    WHERE logged_at < cutoff
+                    ORDER BY stat_id
+                    LIMIT p_batch_size
+                    FOR UPDATE SKIP LOCKED
+                )
+                DELETE FROM cdc_catalog.apply_batch_stats t
+                USING doomed d
+                WHERE t.stat_id = d.stat_id;
+                GET DIAGNOSTICS batch_deleted = ROW_COUNT;
+                total_deleted := total_deleted + batch_deleted;
+                batches_done := batches_done + 1;
+                EXIT WHEN batch_deleted = 0 OR batches_done >= p_max_batches;
+            END LOOP;
+            RETURN total_deleted;
+        END;
+        $prune_abs_batched$;
+
+        CREATE OR REPLACE FUNCTION cdc_catalog.prune_applied_events_batched(
+            p_retention_days integer DEFAULT 7,
+            p_batch_size integer DEFAULT 5000,
+            p_max_batches integer DEFAULT 200
+        ) RETURNS bigint
+        LANGUAGE plpgsql
+        AS $prune_ae_batched$
+        DECLARE
+            total_deleted bigint := 0;
+            batch_deleted bigint;
+            batches_done integer := 0;
+            cutoff timestamptz;
+        BEGIN
+            IF p_retention_days IS NULL OR p_retention_days < 1
+               OR p_batch_size IS NULL OR p_batch_size < 1
+               OR p_max_batches IS NULL OR p_max_batches < 1 THEN
+                RETURN 0;
+            END IF;
+            cutoff := now() - make_interval(days => p_retention_days);
+            LOOP
+                WITH doomed AS (
+                    SELECT event_id
+                    FROM cdc_catalog.cdc_applied_events
+                    WHERE applied_at < cutoff
+                    ORDER BY event_id
+                    LIMIT p_batch_size
+                    FOR UPDATE SKIP LOCKED
+                )
+                DELETE FROM cdc_catalog.cdc_applied_events t
+                USING doomed d
+                WHERE t.event_id = d.event_id;
+                GET DIAGNOSTICS batch_deleted = ROW_COUNT;
+                total_deleted := total_deleted + batch_deleted;
+                batches_done := batches_done + 1;
+                EXIT WHEN batch_deleted = 0 OR batches_done >= p_max_batches;
+            END LOOP;
+            RETURN total_deleted;
+        END;
+        $prune_ae_batched$;
+
+        COMMENT ON FUNCTION cdc_catalog.prune_apply_batch_stats_batched(integer, integer, integer) IS
+            'Batched delete of apply_batch_stats older than retention; used by daemon maintenance window only.';
+        COMMENT ON FUNCTION cdc_catalog.prune_applied_events_batched(integer, integer, integer) IS
+            'Batched delete of cdc_applied_events older than retention; used by daemon maintenance window only.';
+
+        INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
+        VALUES
+            ('apply_batch_stats_retention_days', 'global', '', '30'::jsonb,
+             'Retention days for apply_batch_stats batched prune'),
+            ('apply_batch_stats_prune_batch_size', 'global', '', '5000'::jsonb,
+             'Rows per DELETE batch for apply_batch_stats prune'),
+            ('apply_batch_stats_prune_max_batches', 'global', '', '500'::jsonb,
+             'Max DELETE batches per nightly apply_batch_stats prune run'),
+            ('applied_events_prune_batch_size', 'global', '', '5000'::jsonb,
+             'Rows per DELETE batch for cdc_applied_events prune'),
+            ('applied_events_prune_max_batches', 'global', '', '200'::jsonb,
+             'Max DELETE batches per nightly cdc_applied_events prune run'),
+            ('retention_maintenance_last_run_date', 'global', '', '""'::jsonb,
+             'Last America/Costa_Rica date batched retention prune completed (YYYY-MM-DD)')
+        ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
+            config_value = EXCLUDED.config_value,
+            description  = EXCLUDED.description,
+            updated_at   = now();
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (55, 'batched retention prune functions; remove worker startup DELETE storm');
+        RAISE NOTICE 'migration 055: batched retention prune';
+    END IF;
+END $migration055$;
+
+-- Migration 056: stop per-restart runtime_config wipe; seed tunable keys once (preserve operator overrides).
+DO $migration056$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 56) THEN
+        DELETE FROM cdc_catalog.runtime_config
+        WHERE component = 'cdc_kafka_health'
+           OR (config_key, component) IN (
+                ('debezium_topic_prefix', 'cdc_kafka_apply'),
+                ('debezium_connect_url', 'cdc_kafka_health'),
+                ('debezium_connector_name', 'cdc_kafka_health'),
+                ('capture_topic_prefix', 'cdc_kafka_capture'),
+                ('kafka_topic_prefix', 'cdc_kafka_apply'),
+                ('capture_binlog_mode', 'cdc_kafka_capture')
+            )
+           OR (config_key = 'cdc_apply_batch_size' AND component = 'mariadb_cdc')
+           OR (config_key, component) IN (
+                ('apply_max_seconds', 'cdc_kafka_apply'),
+                ('capture_max_seconds', 'cdc_kafka_capture'),
+                ('apply_append_only', 'cdc_kafka_apply'),
+                ('apply_exit_on_targets_met', 'cdc_kafka_apply'),
+                ('apply_empty_poll_quiet_threshold', 'cdc_kafka_apply'),
+                ('apply_catchup_enabled', 'cdc_kafka_apply'),
+                ('apply_catchup_kafka_messages', 'cdc_kafka_apply'),
+                ('apply_catchup_lag_seconds', 'cdc_kafka_apply'),
+                ('apply_catchup_max_tables', 'cdc_kafka_apply'),
+                ('apply_catchup_min_kafka_messages', 'cdc_kafka_apply'),
+                ('apply_process_rss_cap_mb', 'cdc_kafka_apply'),
+                ('full_load_parallel_tables', 'mariadb_load'),
+                ('kafka_purge_consumed_enabled', 'cdc_kafka_apply'),
+                ('kafka_purge_consumed_interval_seconds', 'cdc_kafka_apply'),
+                ('kafka_purge_consumed_max_lag', 'cdc_kafka_apply'),
+                ('kafka_purge_consumed_min_deletable_offsets', 'cdc_kafka_apply'),
+                ('kafka_topic_partitions', 'cdc_kafka_capture'),
+                ('kafka_topic_partitions', 'cdc_kafka_apply')
+            );
+
+        INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
+        VALUES
+            ('full_load_batch_size', 'mariadb_load', '', '50000'::jsonb,
+             'MariaDB full-load COPY batch size'),
+            ('apply_batch_size', 'cdc_kafka_apply', '', '20000'::jsonb,
+             'Apply batch before flush'),
+            ('logs_retention_days', 'global', '', '7'::jsonb,
+             'Purge cdc_catalog.logs retention'),
+            ('applied_events_retention_days', 'cdc_kafka_apply', '', '7'::jsonb,
+             'Dedup audit retention'),
+            ('apply_worker_count', 'cdc_kafka_apply', '', '12'::jsonb,
+             'Cold-path apply worker threads per connection (must divide kafka_topic_partitions evenly)'),
+            ('apply_batch_stats_retention_days', 'global', '', '30'::jsonb,
+             'Retention days for apply_batch_stats batched prune'),
+            ('apply_batch_stats_prune_batch_size', 'global', '', '5000'::jsonb,
+             'Rows per DELETE batch for apply_batch_stats prune'),
+            ('apply_batch_stats_prune_max_batches', 'global', '', '500'::jsonb,
+             'Max DELETE batches per nightly apply_batch_stats prune run'),
+            ('applied_events_prune_batch_size', 'global', '', '5000'::jsonb,
+             'Rows per DELETE batch for cdc_applied_events prune'),
+            ('applied_events_prune_max_batches', 'global', '', '200'::jsonb,
+             'Max DELETE batches per nightly cdc_applied_events prune run'),
+            ('retention_maintenance_last_run_date', 'global', '', '""'::jsonb,
+             'Last America/Costa_Rica date batched retention prune completed (YYYY-MM-DD)')
+        ON CONFLICT (config_key, component, conn_id) DO NOTHING;
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (56, 'runtime_config seeds one-time; apply_worker_count + retention keys persist across restarts');
+        RAISE NOTICE 'migration 056: runtime_config repair (apply_worker_count, retention keys)';
+    END IF;
+END $migration056$;
 )PO_schema_patch";
     }
     /** Idempotent DDL for 050/051/052 — safe when schema_migrations version rows exist without objects. */
