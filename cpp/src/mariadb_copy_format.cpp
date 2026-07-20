@@ -1,5 +1,6 @@
 #include "mariadb_copy_format.hpp"
 
+#include "mariadb_boolean.hpp"
 #include "mariadb_datetime.hpp"
 
 #include <algorithm>
@@ -98,16 +99,20 @@ bool mariadb_format_copy_cell(const char* data, unsigned long len, const MariaDb
         return true;
     }
     if (col.pg_type == "BOOLEAN") {
-        if (s == "0" || s == "false" || s == "FALSE" || s == "f" || s == "F" || s == "no" || s == "NO") {
-            out = "f";
+        if (const auto parsed = try_parse_mariadb_bool_token(s)) {
+            out = *parsed ? "t" : "f";
             return true;
         }
-        if (s == "1" || s == "true" || s == "TRUE" || s == "t" || s == "T" || s == "yes" || s == "YES") {
-            out = "t";
-            return true;
+        // Raw 1-byte BIT from libmysql (may survive normalize_text_for_pg).
+        if (s.size() == 1) {
+            const auto b = static_cast<unsigned char>(s[0]);
+            if (b == 0x00 || b == 0x01) {
+                out = (b != 0) ? "t" : "f";
+                return true;
+            }
         }
         if (!col.is_nullable) {
-            out = "f";
+            out = "f";  // last resort for NOT NULL columns
             return true;
         }
         return csv_null();

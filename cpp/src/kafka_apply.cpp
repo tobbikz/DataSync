@@ -6,6 +6,7 @@
 #include "lake_columns.hpp"
 #include "mariadb_datetime.hpp"
 #include "mssql_conn.hpp"
+#include "mariadb_boolean.hpp"
 #include "mariadb_schema.hpp"
 #include "mssql_lake.hpp"
 #include "mongo_lake.hpp"
@@ -557,17 +558,14 @@ std::string format_boolean_copy_cell(const json& val) {
     if (val.is_string()) {
         const std::string s = val.get<std::string>();
         if (s.empty()) {
-            return "f";
+            return "";  // COPY null — do not invent false
         }
-        if (s == "0" || s == "false" || s == "FALSE" || s == "f" || s == "F" || s == "no" || s == "NO") {
-            return "f";
+        if (const auto parsed = try_parse_mariadb_bool_token(s)) {
+            return *parsed ? "t" : "f";
         }
-        if (s == "1" || s == "true" || s == "TRUE" || s == "t" || s == "T" || s == "yes" || s == "YES") {
-            return "t";
-        }
-        return "f";
+        return "";  // unknown BIT/wire form → null, not silent false
     }
-    return "f";
+    return "";
 }
 
 std::string json_cell_csv(const json& val_in, const std::string& pg_type, bool mssql_text) {

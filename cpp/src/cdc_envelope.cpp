@@ -1,5 +1,6 @@
 #include "cdc_envelope.hpp"
 
+#include "mariadb_boolean.hpp"
 #include "mariadb_schema.hpp"
 
 #include <algorithm>
@@ -45,6 +46,13 @@ nlohmann::json parse_sql_literal(const std::string& raw) {
     }
     const std::string trimmed = trim_copy(raw);
     const std::string lower = to_lower_copy(trimmed);
+    // MariaDB binlog -v BIT(1): b'0' / b'1' → JSON bool (before binary/hex fallback).
+    if (lower == "b'0'" || lower == "b\"0\"") {
+        return false;
+    }
+    if (lower == "b'1'" || lower == "b\"1\"") {
+        return true;
+    }
     if (lower.rfind("_binary", 0) == 0 || (trimmed.size() >= 2 && trimmed[0] == '0' && (trimmed[1] == 'x' || trimmed[1] == 'X')) ||
         (trimmed.size() >= 2 && (trimmed[0] == 'X' || trimmed[0] == 'x') && trimmed[1] == '\'')) {
         return mariadb_binary_cell_to_json_hex(raw);

@@ -20,6 +20,7 @@ set(DATASYNC_SOURCES
     src/mariadb_schema.cpp
     src/mariadb_datetime.cpp
     src/mariadb_copy_format.cpp
+    src/mariadb_boolean.cpp
     src/mariadb_ddl_sync.cpp
     src/mariadb_ddl_sync_run.cpp
     src/full_load_common.cpp
