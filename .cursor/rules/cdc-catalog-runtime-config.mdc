@@ -26,7 +26,7 @@ Workers, Kafka topic mode/buckets/partitions, capture producer queue, reconcile 
 | `kKafkaTopicMode` | bucketed |
 | `kKafkaTopicBuckets` | 64 |
 
-DDL + seeds: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate` (`schema_patches` migrations 038/040/054/055/056).
+DDL + seeds: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate` (`schema_patches` migrations 038/040/054/055/056/057).
 
 ## Canonical keys (runtime_config)
 
@@ -42,8 +42,10 @@ DDL + seeds: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate` (`schema
 | `apply_batch_stats_prune_max_batches` | global | 500 |
 | `applied_events_prune_batch_size` | global | 5000 |
 | `applied_events_prune_max_batches` | global | 200 |
+| `logs_purge_batch_size` | global | 5000 |
+| `logs_purge_max_batches` | global | 500 |
 
-**Retention prune:** `apply_batch_stats` / `cdc_applied_events` are pruned **once per day at 03:00 America/Costa_Rica** by `cdc_daemon` (`retention_maintenance.cpp`), not at apply worker startup. Advisory lock `90420055001`.
+**Retention prune:** `apply_batch_stats` / `cdc_applied_events` / `cdc_catalog.logs` are pruned **once per day at 03:00 America/Costa_Rica** by `cdc_daemon` (`retention_maintenance.cpp`), not at apply worker startup. Session lock `90420055001`; logs purge also uses xact lock `90420057001`.
 
 ## Kafka bootstrap / consumer group
 

@@ -199,6 +199,18 @@ void maybe_run_scheduled_retention_maintenance(PGconn* log_pg, RuntimeConfig& ru
         "applied_events_prune_max_batches",
         pipeline_defaults::kAppliedEventsPruneMaxBatchesDefault,
         "global");
+    const int logs_retention = runtime.get_int(
+        "logs_retention_days",
+        pipeline_defaults::kLogsRetentionDaysDefault,
+        "global");
+    const int logs_batch_size = runtime.get_int(
+        "logs_purge_batch_size",
+        pipeline_defaults::kLogsPurgeBatchSizeDefault,
+        "global");
+    const int logs_max_batches = runtime.get_int(
+        "logs_purge_max_batches",
+        pipeline_defaults::kLogsPurgeMaxBatchesDefault,
+        "global");
 
     log_write(log_pg, {
         .level = LogLevel::Info,
@@ -210,10 +222,13 @@ void maybe_run_scheduled_retention_maintenance(PGconn* log_pg, RuntimeConfig& ru
             {"run_date", today},
             {"apply_batch_stats_retention_days", stats_retention},
             {"applied_events_retention_days", applied_retention},
+            {"logs_retention_days", logs_retention},
             {"apply_batch_stats_batch_size", stats_batch_size},
             {"apply_batch_stats_max_batches", stats_max_batches},
             {"applied_events_batch_size", events_batch_size},
             {"applied_events_max_batches", events_max_batches},
+            {"logs_batch_size", logs_batch_size},
+            {"logs_max_batches", logs_max_batches},
         },
     });
 
@@ -229,20 +244,28 @@ void maybe_run_scheduled_retention_maintenance(PGconn* log_pg, RuntimeConfig& ru
         applied_retention,
         events_batch_size,
         events_max_batches);
+    const long long logs_deleted = call_prune_fn(
+        log_pg,
+        "SELECT cdc_catalog.purge_logs_batched($1::integer, $2::integer, $3::integer)",
+        logs_retention,
+        logs_batch_size,
+        logs_max_batches);
 
     const bool marked = !today.empty() && mark_retention_run_date(log_pg, today);
     advisory_unlock(log_pg, pipeline_defaults::kRetentionMaintenanceAdvisoryLockKey);
 
+    const bool any_error = stats_deleted < 0 || events_deleted < 0 || logs_deleted < 0;
     log_write(log_pg, {
-        .level = (stats_deleted < 0 || events_deleted < 0) ? LogLevel::Warning : LogLevel::Info,
+        .level = any_error ? LogLevel::Warning : LogLevel::Info,
         .component = "retention_maintenance",
-        .message = (stats_deleted < 0 || events_deleted < 0)
+        .message = any_error
             ? "scheduled batched retention prune completed with errors"
             : "scheduled batched retention prune completed",
         .batch_id = batch_id,
         .context = {
             {"apply_batch_stats_deleted", stats_deleted},
             {"applied_events_deleted", events_deleted},
+            {"logs_deleted", logs_deleted},
             {"run_date_marked", marked},
         },
     });

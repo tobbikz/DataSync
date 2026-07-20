@@ -986,9 +986,6 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
 
     RuntimeConfig runtime;
     runtime.reload(log_pg);
-    const int retention_days =
-        runtime.get_int("logs_retention_days", pipeline_defaults::kLogsRetentionDaysDefault, "global");
-    purge_logs(log_pg, retention_days);
 
     const auto conn_ids_initial = wait_for_daemon_connections(log_pg, cfg);
     if (conn_ids_initial.empty()) {

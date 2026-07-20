@@ -24,7 +24,8 @@ Schema DDL: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate`
 ## Rules
 
 - **Persist first**: write to `cdc_catalog.logs`; `stderr` only for bootstrap/fatal before DB is reachable.
-- **Append-only**: INSERT only; no UPDATE/DELETE on `logs` from app code (retention = `cdc_catalog.purge_logs(7)`, run at job start).
+- **Append-only**: INSERT only; no UPDATE/DELETE on `logs` from app code.
+  Retention = `cdc_catalog.purge_logs_batched` (advisory-locked, batched), run **once daily at 03:00 America/Costa_Rica** by `cdc_daemon` (`retention_maintenance.cpp`). Do not call purge from apply/capture workers.
 - **KISS**: one insert per meaningful event; batch summaries OK, not per-row spam.
 - **C++**: shared helper `log_write()` in `cpp/src/obs_log.cpp` — no duplicated SQL.
 - **Checkpoints**: see `.cursor/rules/observability-checkpoints.mdc` — log every important step.

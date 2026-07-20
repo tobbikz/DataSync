@@ -202,20 +202,54 @@ $$;
 -- Name: purge_logs(integer); Type: FUNCTION; Schema: cdc_catalog; Owner: -
 --
 
-CREATE FUNCTION cdc_catalog.purge_logs(p_retention_days integer DEFAULT 7) RETURNS bigint
+CREATE FUNCTION cdc_catalog.purge_logs_batched(
+    p_retention_days integer DEFAULT 7,
+    p_batch_size integer DEFAULT 5000,
+    p_max_batches integer DEFAULT 500
+) RETURNS bigint
     LANGUAGE plpgsql
     AS $$
 DECLARE
-    deleted bigint;
+    total_deleted bigint := 0;
+    batch_deleted bigint;
+    batches_done integer := 0;
+    cutoff timestamptz;
 BEGIN
-    IF p_retention_days IS NULL OR p_retention_days < 1 THEN
+    IF p_retention_days IS NULL OR p_retention_days < 1
+       OR p_batch_size IS NULL OR p_batch_size < 1
+       OR p_max_batches IS NULL OR p_max_batches < 1 THEN
         RETURN 0;
     END IF;
-    DELETE FROM cdc_catalog.logs
-    WHERE logged_at < now() - make_interval(days => p_retention_days);
-    GET DIAGNOSTICS deleted = ROW_COUNT;
-    RETURN deleted;
+    -- One purge at a time; concurrent callers (workers/CLI) skip cleanly.
+    IF NOT pg_try_advisory_xact_lock(90420057001) THEN
+        RETURN 0;
+    END IF;
+    cutoff := now() - make_interval(days => p_retention_days);
+    LOOP
+        WITH doomed AS (
+            SELECT log_id
+            FROM cdc_catalog.logs
+            WHERE logged_at < cutoff
+            ORDER BY log_id
+            LIMIT p_batch_size
+            FOR UPDATE SKIP LOCKED
+        )
+        DELETE FROM cdc_catalog.logs t
+        USING doomed d
+        WHERE t.log_id = d.log_id;
+        GET DIAGNOSTICS batch_deleted = ROW_COUNT;
+        total_deleted := total_deleted + batch_deleted;
+        batches_done := batches_done + 1;
+        EXIT WHEN batch_deleted = 0 OR batches_done >= p_max_batches;
+    END LOOP;
+    RETURN total_deleted;
 END;
+$$;
+
+CREATE FUNCTION cdc_catalog.purge_logs(p_retention_days integer DEFAULT 7) RETURNS bigint
+    LANGUAGE sql
+    AS $$
+    SELECT cdc_catalog.purge_logs_batched(p_retention_days, 5000, 500);
 $$;
 
 
@@ -223,8 +257,10 @@ $$;
 -- Name: FUNCTION purge_logs(p_retention_days integer); Type: COMMENT; Schema: cdc_catalog; Owner: -
 --
 
-COMMENT ON FUNCTION cdc_catalog.purge_logs(p_retention_days integer) IS 'Delete observability log rows older than retention window (append-only table).';
-
+COMMENT ON FUNCTION cdc_catalog.purge_logs_batched(integer, integer, integer) IS
+    'Batched delete of cdc_catalog.logs older than retention; advisory-locked; daemon maintenance window.';
+COMMENT ON FUNCTION cdc_catalog.purge_logs(p_retention_days integer) IS
+    'Compatibility wrapper: batched+locked purge of observability logs (append-only table).';
 
 --
 -- Name: touch_updated_at(); Type: FUNCTION; Schema: cdc_catalog; Owner: -
@@ -1232,7 +1268,7 @@ DROP FUNCTION IF EXISTS cdc_catalog.refresh_pipeline_health_live(
 DROP TABLE IF EXISTS cdc_catalog.pipeline_health;
 
 -- Migration 002: one-time reconcile history reset (legacy).
--- runtime_config seeds: schema_patches migrations 038/040/054/055/056 (not re-run here).
+-- runtime_config seeds: schema_patches migrations 038/040/054/055/056/057 (not re-run here).
 
 DO $$
 BEGIN
@@ -2276,6 +2312,79 @@ BEGIN
         RAISE NOTICE 'migration 056: runtime_config repair (apply_worker_count, retention keys)';
     END IF;
 END $migration056$;
+
+-- Migration 057: serialize + batch cdc_catalog.logs purge (stop worker-startup DELETE stampede).
+DO $migration057$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 57) THEN
+        CREATE OR REPLACE FUNCTION cdc_catalog.purge_logs_batched(
+            p_retention_days integer DEFAULT 7,
+            p_batch_size integer DEFAULT 5000,
+            p_max_batches integer DEFAULT 500
+        ) RETURNS bigint
+        LANGUAGE plpgsql
+        AS $purge_logs_batched$
+        DECLARE
+            total_deleted bigint := 0;
+            batch_deleted bigint;
+            batches_done integer := 0;
+            cutoff timestamptz;
+        BEGIN
+            IF p_retention_days IS NULL OR p_retention_days < 1
+               OR p_batch_size IS NULL OR p_batch_size < 1
+               OR p_max_batches IS NULL OR p_max_batches < 1 THEN
+                RETURN 0;
+            END IF;
+            IF NOT pg_try_advisory_xact_lock(90420057001) THEN
+                RETURN 0;
+            END IF;
+            cutoff := now() - make_interval(days => p_retention_days);
+            LOOP
+                WITH doomed AS (
+                    SELECT log_id
+                    FROM cdc_catalog.logs
+                    WHERE logged_at < cutoff
+                    ORDER BY log_id
+                    LIMIT p_batch_size
+                    FOR UPDATE SKIP LOCKED
+                )
+                DELETE FROM cdc_catalog.logs t
+                USING doomed d
+                WHERE t.log_id = d.log_id;
+                GET DIAGNOSTICS batch_deleted = ROW_COUNT;
+                total_deleted := total_deleted + batch_deleted;
+                batches_done := batches_done + 1;
+                EXIT WHEN batch_deleted = 0 OR batches_done >= p_max_batches;
+            END LOOP;
+            RETURN total_deleted;
+        END;
+        $purge_logs_batched$;
+
+        CREATE OR REPLACE FUNCTION cdc_catalog.purge_logs(p_retention_days integer DEFAULT 7)
+        RETURNS bigint
+        LANGUAGE sql
+        AS $purge_logs$
+            SELECT cdc_catalog.purge_logs_batched(p_retention_days, 5000, 500);
+        $purge_logs$;
+
+        COMMENT ON FUNCTION cdc_catalog.purge_logs_batched(integer, integer, integer) IS
+            'Batched delete of cdc_catalog.logs older than retention; advisory-locked; daemon maintenance window.';
+        COMMENT ON FUNCTION cdc_catalog.purge_logs(integer) IS
+            'Compatibility wrapper: batched+locked purge of observability logs (append-only table).';
+
+        INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
+        VALUES
+            ('logs_purge_batch_size', 'global', '', '5000'::jsonb,
+             'Rows per DELETE batch for cdc_catalog.logs purge'),
+            ('logs_purge_max_batches', 'global', '', '500'::jsonb,
+             'Max DELETE batches per nightly cdc_catalog.logs purge run')
+        ON CONFLICT (config_key, component, conn_id) DO NOTHING;
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (57, 'batched+locked purge_logs; stop worker startup logs DELETE stampede');
+        RAISE NOTICE 'migration 057: batched locked purge_logs';
+    END IF;
+END $migration057$;
 )PO_schema_patch";
     }
     /** Idempotent DDL for 050/051/052 — safe when schema_migrations version rows exist without objects. */

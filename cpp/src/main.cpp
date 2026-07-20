@@ -40,29 +40,7 @@ void emit_or_stderr(PGconn* pg, const LogEvent& event) {
     }
 }
 
-void run_log_retention(PGconn* log_pg, RuntimeConfig& runtime, const std::string& batch_id, const std::string& component) {
-    const int days =
-        runtime.get_int("logs_retention_days", pipeline_defaults::kLogsRetentionDaysDefault, "global");
-    const long long purged = purge_logs(log_pg, days);
-    if (purged >= 0) {
-        emit_or_stderr(log_pg, {
-            .level = LogLevel::Info,
-            .component = component,
-            .message = "logs retention purge completed",
-            .batch_id = batch_id,
-            .conn_id = std::nullopt,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {{"retention_days", days}, {"rows_deleted", purged}},
-        });
-    }
-}
-
 int run_discover(const AppConfig& cfg, PGconn* log_pg, const std::string& batch_id) {
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
-    run_log_retention(log_pg, runtime, batch_id, "catalog");
-
     emit_or_stderr(log_pg, {
         .level = LogLevel::Info,
         .component = "catalog",
@@ -152,13 +130,8 @@ int run_full_load(
         return rc;
     }
 
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
-    run_log_retention(log_pg, runtime, batch_id, "mariadb_load");
     const auto mariadb_stats = run_mariadb_full_load(cfg, log_pg, batch_id);
-    run_log_retention(log_pg, runtime, batch_id, "mssql_load");
     const auto mssql_stats = run_mssql_full_load(cfg, log_pg, batch_id);
-    run_log_retention(log_pg, runtime, batch_id, "mongo_load");
     const auto mongo_stats = run_mongo_full_load(cfg, log_pg, batch_id);
     if (full_load_process_exit_code(mariadb_stats) != 0 || full_load_process_exit_code(mssql_stats) != 0 ||
         full_load_process_exit_code(mongo_stats) != 0) {
@@ -183,14 +156,10 @@ int run_ddl_sync(
     const std::string& conn_id,
     const std::optional<std::string>& schema,
     const std::optional<std::string>& table) {
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
     const std::string engine = conn_engine(cfg, conn_id);
     if (engine == "mssql") {
-        run_log_retention(log_pg, runtime, make_batch_id(), "mssql_ddl_sync");
         return run_mssql_ddl_sync_cli(cfg, log_pg, conn_id, schema, table);
     }
-    run_log_retention(log_pg, runtime, make_batch_id(), "mariadb_ddl_sync");
     return run_mariadb_ddl_sync_cli(cfg, log_pg, conn_id, schema, table);
 }
 

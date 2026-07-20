@@ -728,10 +728,6 @@ int run_kafka_apply_native_cli(
     RuntimeConfig runtime;
     runtime.reload(log_pg);
 
-    const int retention_days =
-        runtime.get_int("logs_retention_days", pipeline_defaults::kLogsRetentionDaysDefault, "global");
-    purge_logs(log_pg, retention_days);
-
     const KafkaBootstrapResolved kafka_boot = resolve_kafka_bootstrap();
     log_write(log_pg, {
         .level = LogLevel::Info,

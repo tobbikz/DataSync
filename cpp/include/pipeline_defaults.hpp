@@ -53,6 +53,10 @@ constexpr int kApplyBatchStatsPruneBatchSizeDefault = 5000;
 constexpr int kApplyBatchStatsPruneMaxBatchesDefault = 500;
 constexpr int kAppliedEventsPruneBatchSizeDefault = 5000;
 constexpr int kAppliedEventsPruneMaxBatchesDefault = 200;
+constexpr int kLogsPurgeBatchSizeDefault = 5000;
+constexpr int kLogsPurgeMaxBatchesDefault = 500;
+/** Session-independent xact lock key inside cdc_catalog.purge_logs_batched. */
+constexpr long long kLogsPurgeAdvisoryLockKey = 90420057001LL;
 constexpr bool kApplyDedupEnabled = true;
 constexpr bool kApplyAuditEnabled = true;
 constexpr int kApplyQueuedMinMessages = 100000;
