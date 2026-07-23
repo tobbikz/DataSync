@@ -279,11 +279,11 @@ void upsert_capture_position(
             last_error = EXCLUDED.last_error,
             last_failed_source_schema = CASE
                 WHEN EXCLUDED.status = 'healthy'::cdc_catalog.cdc_health_status THEN NULL
-                ELSE last_failed_source_schema
+                ELSE capture_position.last_failed_source_schema
             END,
             last_failed_source_table = CASE
                 WHEN EXCLUDED.status = 'healthy'::cdc_catalog.cdc_health_status THEN NULL
-                ELSE last_failed_source_table
+                ELSE capture_position.last_failed_source_table
             END,
             capture_lag_seconds = EXCLUDED.capture_lag_seconds,
             last_event_ts = now(),

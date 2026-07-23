@@ -412,8 +412,8 @@ void mark_capture_position_failed(
         UPDATE cdc_catalog.capture_position
         SET status = 'failed'::cdc_catalog.cdc_health_status,
             last_error = $2,
-            last_failed_source_schema = COALESCE($3, last_failed_source_schema),
-            last_failed_source_table = COALESCE($4, last_failed_source_table),
+            last_failed_source_schema = COALESCE($3, capture_position.last_failed_source_schema),
+            last_failed_source_table = COALESCE($4, capture_position.last_failed_source_table),
             updated_at = now()
         WHERE conn_id = $1
         )",
