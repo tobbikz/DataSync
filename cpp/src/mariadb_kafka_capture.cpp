@@ -25,6 +25,11 @@ namespace {
 
 using TableKey = std::pair<std::string, std::string>;
 
+bool is_kafka_utf8_error(const std::exception& ex) {
+    const std::string msg = ex.what();
+    return msg.find("invalid UTF-8") != std::string::npos || msg.find("type_error.316") != std::string::npos;
+}
+
 std::string to_lower_copy(std::string value) {
     std::transform(
         value.begin(),
@@ -558,6 +563,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     int schema_mismatch_events = 0;
     int case_fold_resolved_events = 0;
     int schema_mismatch_logs = 0;
+    int utf8_skipped_events = 0;
     std::set<TableKey> schema_mismatch_samples;
     const auto publish_row = [&](
                                const std::string& schema,
@@ -674,15 +680,37 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         const std::string topic = topic_for_catalog_table(
             rcfg.topic_prefix, key.first, key.second, rcfg.topic_mode, rcfg.topic_buckets, is_hot);
         const nlohmann::json* row_for_key = (op_char == "d") ? &before : &after;
-        const std::string msg_key = kafka_message_key_for_row(
-            key.first, key.second, row_for_key, pk_by_table[key]);
         const long long catalog_id =
             catalog_id_by_table.count(key) ? catalog_id_by_table.at(key) : 0LL;
-        const int kafka_partition = kafka_produce_partition(
-            catalog_id, msg_key, rcfg.topic_partitions, is_hot);
         try {
+            const std::string msg_key = kafka_message_key_for_row(
+                key.first, key.second, row_for_key, pk_by_table[key]);
+            const int kafka_partition = kafka_produce_partition(
+                catalog_id, msg_key, rcfg.topic_partitions, is_hot);
             producer.produce(topic, msg_key, cdc_event_kafka_payload(event), kafka_partition);
         } catch (const std::exception& ex) {
+            if (is_kafka_utf8_error(ex)) {
+                utf8_skipped_events += 1;
+                if (utf8_skipped_events <= 5) {
+                    log_write(log_pg, {
+                        .level = LogLevel::Warning,
+                        .component = "cdc_kafka_capture",
+                        .message = "capture kafka row skipped invalid utf-8",
+                        .batch_id = batch_id,
+                        .conn_id = conn_id,
+                        .source_schema = key.first,
+                        .source_table = key.second,
+                        .context = {
+                            {"error", ex.what()},
+                            {"topic", topic},
+                            {"binlog_schema", schema},
+                            {"binlog_table", table},
+                            {"op", op_char},
+                        },
+                    });
+                }
+                return;
+            }
             slice_fail_schema = key.first;
             slice_fail_table = key.second;
             log_write(log_pg, {
@@ -1081,6 +1109,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             {"watched_binlog_events", watched_binlog_events},
             {"unwatched_binlog_events", unwatched_binlog_events},
             {"schema_mismatch_events", schema_mismatch_events},
+            {"utf8_skipped_events", utf8_skipped_events},
             {"case_fold_resolved_events", case_fold_resolved_events},
             {"schema_mismatch_samples", mismatch_samples},
             {"catalog_tables", catalog_tables_json},

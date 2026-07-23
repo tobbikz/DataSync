@@ -30,6 +30,9 @@ struct CdcEvent {
 /** Recursively sanitize string keys/values for nlohmann::json::dump(). */
 nlohmann::json json_sanitize_for_kafka(const nlohmann::json& value);
 
+/** dump() with UTF-8 replace — must not throw type_error.316 on invalid bytes. */
+std::string json_dump_for_kafka(const nlohmann::json& value);
+
 /** Safe Kafka payload JSON (invalid UTF-8 replaced, never throws on dump). */
 std::string cdc_event_kafka_payload(const CdcEvent& event);
 

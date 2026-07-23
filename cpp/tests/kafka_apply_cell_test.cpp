@@ -1,5 +1,6 @@
 #include "cdc_envelope.hpp"
 #include "kafka_apply_detail.hpp"
+#include "kafka_topics.hpp"
 #include "mariadb_boolean.hpp"
 
 #include <iostream>
@@ -96,6 +97,20 @@ int main() {
             (void)json::parse(payload);
         } catch (const std::exception& ex) {
             failures += fail_msg(std::string("cdc_event_kafka_payload not valid json: ") + ex.what());
+        }
+
+        nlohmann::json bad_row = json::object({{"note", parsed}});
+        const std::string msg_key = kafka_message_key_for_row(
+            "universal_casino", "transactions", &bad_row, "note");
+        if (msg_key.find(static_cast<char>(0x94)) != std::string::npos) {
+            failures += fail_msg("kafka_message_key_for_row leaked raw 0x94");
+        }
+
+        const std::string dumped = json_dump_for_kafka(bad_row);
+        try {
+            (void)json::parse(dumped);
+        } catch (const std::exception& ex) {
+            failures += fail_msg(std::string("json_dump_for_kafka not valid json: ") + ex.what());
         }
     }
 

@@ -106,7 +106,7 @@ nlohmann::json row_dict_from_columns(
         if (raw.empty() || raw == "NULL") {
             out[col_key] = nullptr;
         } else {
-            out[col_key] = parse_sql_literal(raw);
+            out[col_key] = json_sanitize_for_kafka(parse_sql_literal(raw));
         }
     }
     return out;
@@ -133,6 +133,10 @@ nlohmann::json json_sanitize_for_kafka(const nlohmann::json& value) {
     return value;
 }
 
+std::string json_dump_for_kafka(const nlohmann::json& value) {
+    return value.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 std::string cdc_event_kafka_payload(const CdcEvent& event) {
     CdcEvent safe = event;
     safe.conn_id = sanitize_utf8_for_json(event.conn_id);
@@ -155,7 +159,7 @@ std::string cdc_event_kafka_payload(const CdcEvent& event) {
     if (!event.resume_token.is_null()) {
         safe.resume_token = json_sanitize_for_kafka(event.resume_token);
     }
-    return json_sanitize_for_kafka(safe.to_kafka_dict()).dump();
+    return json_dump_for_kafka(json_sanitize_for_kafka(safe.to_kafka_dict()));
 }
 
 std::string op_char_from_mysql(const std::string& mysql_op) {
@@ -173,36 +177,39 @@ std::string op_char_from_mysql(const std::string& mysql_op) {
 
 nlohmann::json CdcEvent::to_kafka_dict() const {
     nlohmann::json source = nlohmann::json::object();
-    source["gtid"] = gtid.empty() ? nullptr : nlohmann::json(gtid);
-    source["file"] = binlog_file.empty() ? nullptr : nlohmann::json(binlog_file);
+    source["gtid"] = gtid.empty() ? nullptr : nlohmann::json(sanitize_utf8_for_json(gtid));
+    source["file"] = binlog_file.empty() ? nullptr : nlohmann::json(sanitize_utf8_for_json(binlog_file));
     source["pos"] = binlog_pos.has_value() ? nlohmann::json(*binlog_pos) : nullptr;
     source["ts_ms"] = ts_ms.has_value() ? nlohmann::json(*ts_ms) : nullptr;
 
     if (db_engine == "mssql") {
-        source["lsn"] = gtid.empty() ? nullptr : nlohmann::json(gtid);
+        source["lsn"] = gtid.empty() ? nullptr : nlohmann::json(sanitize_utf8_for_json(gtid));
         if (!mssql_seqval.empty()) {
-            source["seqval"] = mssql_seqval;
+            source["seqval"] = sanitize_utf8_for_json(mssql_seqval);
         }
         source["db_engine"] = "mssql";
     }
     if (db_engine == "mongodb") {
-        source["database"] = source_database;
-        source["collection"] = collection.empty() ? table_name : collection;
-        source["gtid"] = gtid.empty() ? nullptr : nlohmann::json(gtid);
-        source["resume_token"] = resume_token.is_null() ? nullptr : resume_token;
+        source["database"] = sanitize_utf8_for_json(source_database);
+        source["collection"] = sanitize_utf8_for_json(collection.empty() ? table_name : collection);
+        source["gtid"] = gtid.empty() ? nullptr : nlohmann::json(sanitize_utf8_for_json(gtid));
+        source["resume_token"] = resume_token.is_null() ? nullptr : json_sanitize_for_kafka(resume_token);
         source["db_engine"] = "mongodb";
     }
 
+    const nlohmann::json before_json = before.is_null() ? nullptr : json_sanitize_for_kafka(before);
+    const nlohmann::json after_json = after.is_null() ? nullptr : json_sanitize_for_kafka(after);
+
     return {
-        {"op", op},
-        {"conn_id", conn_id},
-        {"db_engine", db_engine},
-        {"source_database", source_database},
-        {"source_schema", schema_name},
-        {"source_table", table_name},
-        {"before", before.is_null() ? nullptr : before},
-        {"after", after.is_null() ? nullptr : after},
+        {"op", sanitize_utf8_for_json(op)},
+        {"conn_id", sanitize_utf8_for_json(conn_id)},
+        {"db_engine", sanitize_utf8_for_json(db_engine)},
+        {"source_database", sanitize_utf8_for_json(source_database)},
+        {"source_schema", sanitize_utf8_for_json(schema_name)},
+        {"source_table", sanitize_utf8_for_json(table_name)},
+        {"before", before_json},
+        {"after", after_json},
         {"source", source},
-        {"ingestion_ts", ingestion_ts.empty() ? utc_iso_timestamp_now() : ingestion_ts},
+        {"ingestion_ts", sanitize_utf8_for_json(ingestion_ts.empty() ? utc_iso_timestamp_now() : ingestion_ts)},
     };
 }

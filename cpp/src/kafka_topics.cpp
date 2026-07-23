@@ -1,5 +1,8 @@
 #include "kafka_topics.hpp"
 
+#include "cdc_envelope.hpp"
+#include "mariadb_schema.hpp"
+
 #include <openssl/sha.h>
 
 #include <iomanip>
@@ -121,7 +124,7 @@ std::string kafka_message_key_for_row(
     std::ostringstream oss;
     oss << base << "|" << cols[0] << "=";
     if (it->is_string()) {
-        oss << "'" << it->get<std::string>() << "'";
+        oss << "'" << sanitize_utf8_for_json(it->get<std::string>()) << "'";
     } else if (it->is_number_integer()) {
         oss << it->get<long long>();
     } else if (it->is_number_float()) {
@@ -129,7 +132,7 @@ std::string kafka_message_key_for_row(
     } else if (it->is_boolean()) {
         oss << (it->get<bool>() ? "True" : "False");
     } else {
-        oss << it->dump();
+        oss << json_dump_for_kafka(json_sanitize_for_kafka(*it));
     }
     return oss.str();
 }
