@@ -66,9 +66,12 @@ struct CaptureBinlogResolver {
         if (const auto tit = catalog_keys_by_lower_table.find(lower_key.second);
             tit != catalog_keys_by_lower_table.end()) {
             for (const auto& catalog_key : tit->second) {
-                if (to_lower_copy(catalog_key.first) != lower_key.first) {
-                    return {ResolveKind::SchemaMismatch, catalog_key};
+                if (to_lower_copy(catalog_key.first) == lower_key.first) {
+                    return {ResolveKind::CaseFold, catalog_key};
                 }
+            }
+            if (!tit->second.empty()) {
+                return {ResolveKind::SchemaMismatch, tit->second.front()};
             }
         }
         return {ResolveKind::NoMatch, {}};

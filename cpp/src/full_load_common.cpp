@@ -220,19 +220,22 @@ RowCountVerifyResult verify_full_load_row_counts(const RowCountVerifyRequest& re
     if (use_baseline) {
         result.verify_mode = "baseline_snapshot";
         result.baseline_source_rows = *request.baseline_source_rows;
+        // Lake row count is authoritative after COPY (resume may leave rows_loaded << lake_rows).
         result = verify_loaded_against_reference(
-            *request.baseline_source_rows, request.lake_rows, request.rows_loaded, result);
+            *request.baseline_source_rows, request.lake_rows, request.lake_rows, result);
+        if (result.ok && request.rows_loaded > 0 && request.lake_rows > request.rows_loaded) {
+            result.verify_mode = "baseline_snapshot_resumed";
+        }
     } else {
         result.verify_mode = "live_source";
         result = verify_loaded_against_reference(
             request.source_rows_live, request.lake_rows, request.rows_loaded, result);
-    }
-
-    if (result.ok && request.rows_loaded > 0 && request.lake_rows >= 0 &&
-        !within_row_count_tolerance(request.lake_rows, request.rows_loaded)) {
-        result.ok = false;
-        result.message = "lake row count mismatch vs rows_loaded";
-        result.diff = request.lake_rows - request.rows_loaded;
+        if (result.ok && request.rows_loaded > 0 && request.lake_rows >= 0 &&
+            !within_row_count_tolerance(request.lake_rows, request.rows_loaded)) {
+            result.ok = false;
+            result.message = "lake row count mismatch vs rows_loaded";
+            result.diff = request.lake_rows - request.rows_loaded;
+        }
     }
 
     if (result.ok && use_baseline && request.source_rows_live >= 0 && request.lake_rows >= 0) {
