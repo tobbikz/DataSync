@@ -35,17 +35,46 @@ TruncateResult truncate_lake_table_verified(
     const std::string& table,
     int max_retries = 3);
 
+struct RowCountVerifyRequest {
+    long long source_rows_live{-1};
+    long long lake_rows{-1};
+    long long rows_loaded{-1};
+    std::optional<long long> baseline_source_rows;
+    bool capture_during_full_load{false};
+};
+
 struct RowCountVerifyResult {
     bool ok{true};
+    /** Row count used as verify reference (baseline snapshot or live source). */
     long long source_rows{0};
+    long long source_rows_live{-1};
+    long long baseline_source_rows{-1};
     long long lake_rows{0};
     long long diff{0};
+    /** Live source minus lake when verify uses baseline (expected CDC backlog). */
+    long long pending_cdc_gap{-1};
+    std::string verify_mode;
     std::string message;
 };
+
+RowCountVerifyResult verify_full_load_row_counts(const RowCountVerifyRequest& request);
 
 RowCountVerifyResult verify_full_load_row_counts(
     long long source_rows,
     long long lake_rows,
+    long long rows_loaded);
+
+/** Load truncate-phase baseline and capture_during_full_load from catalog/checkpoints. */
+RowCountVerifyRequest build_row_count_verify_request(
+    PGconn* catalog_pg,
+    long long catalog_id,
+    long long source_rows_live,
+    long long lake_rows,
+    long long rows_loaded);
+
+/** Structured log context for full-load row count verify checkpoints. */
+nlohmann::json row_count_verify_log_context(
+    const RowCountVerifyResult& verify,
     long long rows_loaded);
 
 void acquire_full_load_table_lock(PGconn* pg, long long catalog_id);

@@ -33,6 +33,10 @@ std::optional<FullLoadCheckpoint> load_full_load_checkpoint(
 
 std::vector<FullLoadCheckpoint> load_full_load_checkpoints(PGconn* pg, long long catalog_id);
 
+/** source_rows captured at truncate (full-load snapshot baseline). */
+std::optional<long long> truncate_baseline_source_rows(
+    const std::vector<FullLoadCheckpoint>& checkpoints);
+
 void save_full_load_checkpoint(PGconn* pg, const FullLoadCheckpoint& checkpoint);
 
 void clear_full_load_checkpoints(PGconn* pg, long long catalog_id);

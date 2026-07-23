@@ -110,37 +110,174 @@ TruncateResult truncate_lake_table_verified(
     return result;
 }
 
-RowCountVerifyResult verify_full_load_row_counts(
-    long long source_rows,
+namespace {
+
+bool within_row_count_tolerance(long long reference_rows, long long actual_rows) {
+    if (reference_rows < 0 || actual_rows < 0) {
+        return true;
+    }
+    if (reference_rows == actual_rows) {
+        return true;
+    }
+    const long long abs_diff = std::llabs(reference_rows - actual_rows);
+    if (reference_rows <= pipeline_defaults::kFullLoadRowCountVerifyLargeTableThreshold) {
+        return false;
+    }
+    const double pct =
+        reference_rows > 0 ? static_cast<double>(abs_diff) / static_cast<double>(reference_rows) : 1.0;
+    return pct <= pipeline_defaults::kFullLoadRowCountVerifyTolerancePct;
+}
+
+RowCountVerifyResult verify_loaded_against_reference(
+    long long reference_rows,
     long long lake_rows,
-    long long rows_loaded) {
-    RowCountVerifyResult result;
-    result.source_rows = source_rows;
+    long long rows_loaded,
+    RowCountVerifyResult result) {
+    result.source_rows = reference_rows;
     result.lake_rows = lake_rows;
-    result.diff = source_rows - lake_rows;
+    result.diff = reference_rows - (rows_loaded > 0 ? rows_loaded : lake_rows);
     if (!pipeline_defaults::kFullLoadRowCountVerify) {
         return result;
     }
     const long long loaded = rows_loaded > 0 ? rows_loaded : lake_rows;
-    if (source_rows < 0 || loaded < 0) {
+    if (reference_rows < 0 || loaded < 0) {
         return result;
     }
-    if (source_rows == loaded) {
+    if (within_row_count_tolerance(reference_rows, loaded)) {
         return result;
     }
-    const long long abs_diff = std::llabs(source_rows - loaded);
-    if (source_rows <= pipeline_defaults::kFullLoadRowCountVerifyLargeTableThreshold) {
-        result.ok = false;
+    result.ok = false;
+    if (reference_rows <= pipeline_defaults::kFullLoadRowCountVerifyLargeTableThreshold) {
         result.message = "row count mismatch (exact verify)";
-        return result;
-    }
-    const double pct =
-        source_rows > 0 ? static_cast<double>(abs_diff) / static_cast<double>(source_rows) : 1.0;
-    if (pct > pipeline_defaults::kFullLoadRowCountVerifyTolerancePct) {
-        result.ok = false;
+    } else {
         result.message = "row count mismatch above tolerance";
     }
     return result;
+}
+
+bool catalog_capture_during_full_load(PGconn* pg, long long catalog_id) {
+    if (!pg || catalog_id <= 0) {
+        return false;
+    }
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT capture_during_full_load
+        FROM cdc_catalog.catalog
+        WHERE catalog_id = $1::bigint
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    bool streaming = false;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        const char* v = PQgetvalue(res, 0, 0);
+        streaming = v && (v[0] == 't' || v[0] == 'T' || v[0] == '1');
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return streaming;
+}
+
+}  // namespace
+
+RowCountVerifyRequest build_row_count_verify_request(
+    PGconn* catalog_pg,
+    long long catalog_id,
+    long long source_rows_live,
+    long long lake_rows,
+    long long rows_loaded) {
+    RowCountVerifyRequest request;
+    request.source_rows_live = source_rows_live;
+    request.lake_rows = lake_rows;
+    request.rows_loaded = rows_loaded;
+    if (!catalog_pg || catalog_id <= 0) {
+        return request;
+    }
+    request.capture_during_full_load = catalog_capture_during_full_load(catalog_pg, catalog_id);
+    const auto checkpoints = load_full_load_checkpoints(catalog_pg, catalog_id);
+    request.baseline_source_rows = truncate_baseline_source_rows(checkpoints);
+    return request;
+}
+
+RowCountVerifyResult verify_full_load_row_counts(const RowCountVerifyRequest& request) {
+    RowCountVerifyResult result;
+    result.lake_rows = request.lake_rows;
+    result.source_rows_live = request.source_rows_live;
+
+    if (!pipeline_defaults::kFullLoadRowCountVerify) {
+        return result;
+    }
+
+    const bool use_baseline =
+        request.capture_during_full_load && request.baseline_source_rows.has_value();
+    if (use_baseline) {
+        result.verify_mode = "baseline_snapshot";
+        result.baseline_source_rows = *request.baseline_source_rows;
+        result = verify_loaded_against_reference(
+            *request.baseline_source_rows, request.lake_rows, request.rows_loaded, result);
+    } else {
+        result.verify_mode = "live_source";
+        result = verify_loaded_against_reference(
+            request.source_rows_live, request.lake_rows, request.rows_loaded, result);
+    }
+
+    if (result.ok && request.rows_loaded > 0 && request.lake_rows >= 0 &&
+        !within_row_count_tolerance(request.lake_rows, request.rows_loaded)) {
+        result.ok = false;
+        result.message = "lake row count mismatch vs rows_loaded";
+        result.diff = request.lake_rows - request.rows_loaded;
+    }
+
+    if (result.ok && use_baseline && request.source_rows_live >= 0 && request.lake_rows >= 0) {
+        result.pending_cdc_gap = request.source_rows_live - request.lake_rows;
+    }
+
+    return result;
+}
+
+RowCountVerifyResult verify_full_load_row_counts(
+    long long source_rows,
+    long long lake_rows,
+    long long rows_loaded) {
+    RowCountVerifyRequest request;
+    request.source_rows_live = source_rows;
+    request.lake_rows = lake_rows;
+    request.rows_loaded = rows_loaded;
+    return verify_full_load_row_counts(request);
+}
+
+nlohmann::json row_count_verify_log_context(
+    const RowCountVerifyResult& verify,
+    long long rows_loaded) {
+    nlohmann::json ctx = {
+        {"source_rows", verify.source_rows},
+        {"lake_rows", verify.lake_rows},
+        {"rows_loaded", rows_loaded},
+        {"diff", verify.diff},
+    };
+    if (!verify.verify_mode.empty()) {
+        ctx["verify_mode"] = verify.verify_mode;
+    }
+    if (verify.source_rows_live >= 0) {
+        ctx["source_rows_live"] = verify.source_rows_live;
+    }
+    if (verify.baseline_source_rows >= 0) {
+        ctx["baseline_source_rows"] = verify.baseline_source_rows;
+    }
+    if (verify.pending_cdc_gap >= 0) {
+        ctx["pending_cdc_gap"] = verify.pending_cdc_gap;
+    }
+    if (!verify.message.empty()) {
+        ctx["message"] = verify.message;
+    }
+    return ctx;
 }
 
 void acquire_full_load_table_lock(PGconn* pg, long long catalog_id) {

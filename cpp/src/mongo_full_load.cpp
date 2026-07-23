@@ -708,7 +708,9 @@ bool load_one_collection(
     destroy_coll();
 
     const long long lake_rows = full_load::lake_table_row_count(lake_pg.raw, pg_schema, pg_table);
-    const auto verify = full_load::verify_full_load_row_counts(source_rows, lake_rows, rows_out);
+    const auto verify = full_load::verify_full_load_row_counts(
+        full_load::build_row_count_verify_request(
+            app_pg.raw, target.catalog_id, source_rows, lake_rows, rows_out));
     if (!verify.ok) {
         log_fl(
             log_pg,
@@ -716,11 +718,7 @@ bool load_one_collection(
             LogLevel::Error,
             batch_id,
             "full load row count verify failed",
-            {{"source_rows", verify.source_rows},
-             {"lake_rows", verify.lake_rows},
-             {"rows_loaded", rows_out},
-             {"diff", verify.diff},
-             {"message", verify.message}},
+            full_load::row_count_verify_log_context(verify, rows_out),
             target.conn_id,
             target.source_database,
             target.source_table);

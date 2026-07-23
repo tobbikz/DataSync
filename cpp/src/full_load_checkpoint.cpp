@@ -279,3 +279,13 @@ int recover_full_load_for_checkpoint_resume(
     }
     return count;
 }
+
+std::optional<long long> truncate_baseline_source_rows(
+    const std::vector<FullLoadCheckpoint>& checkpoints) {
+    for (const auto& cp : checkpoints) {
+        if (cp.phase == FullLoadPhase::Truncate && cp.source_rows.has_value()) {
+            return cp.source_rows;
+        }
+    }
+    return std::nullopt;
+}
