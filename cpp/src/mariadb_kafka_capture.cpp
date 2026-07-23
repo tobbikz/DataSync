@@ -410,6 +410,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
 
     std::set<long long> cdc_active_catalog_ids;
     std::set<long long> cdc_in_progress_ids;
+    std::string slice_fail_schema;
+    std::string slice_fail_table;
 
     try {
     MariaDbConn mariadb(*source);
@@ -557,8 +559,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     int case_fold_resolved_events = 0;
     int schema_mismatch_logs = 0;
     std::set<TableKey> schema_mismatch_samples;
-    std::string slice_fail_schema;
-    std::string slice_fail_table;
     const auto publish_row = [&](
                                const std::string& schema,
                                const std::string& table,
@@ -1132,8 +1132,10 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             .message = "capture slice failed; cdc_in_progress rolled back",
             .batch_id = batch_id,
             .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
+            .source_schema = slice_fail_schema.empty()
+                ? std::nullopt
+                : std::make_optional(slice_fail_schema),
+            .source_table = slice_fail_table.empty() ? std::nullopt : std::make_optional(slice_fail_table),
             .context = {
                 {"error", ex.what()},
                 {"tables_touched", static_cast<int>(cdc_active_catalog_ids.size())},
