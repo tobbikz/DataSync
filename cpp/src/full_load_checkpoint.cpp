@@ -287,5 +287,12 @@ std::optional<long long> truncate_baseline_source_rows(
             return cp.source_rows;
         }
     }
+    for (const auto& phase : {FullLoadPhase::Copy, FullLoadPhase::Ddl}) {
+        for (const auto& cp : checkpoints) {
+            if (cp.phase == phase && cp.source_rows.has_value()) {
+                return cp.source_rows;
+            }
+        }
+    }
     return std::nullopt;
 }

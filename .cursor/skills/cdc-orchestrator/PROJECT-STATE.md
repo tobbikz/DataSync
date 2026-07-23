@@ -38,7 +38,7 @@ Config: **`config.json`** en raíz del repo (PG DataSync + DataLake). Fuentes OL
 - [x] **Full-load hardening (migration 050)** — TRUNCATE verified fail-closed, resumable COPY checkpoints (3 engines), row-count verify, daemon/apply isolation
 - [x] **Sprint ops (2026-07-04)** — auto-resume checkpoint, catalog pagination 10k+, `onboard-pending` por `catalog.hot`, apply health alerts, apply_outbox lake-first (051), gate estricto checkpoint+subprocess
 - [x] **Reconcile lite (052)** — tabla `reconciliation`, CLI `reconcile-lite`, COUNT/MAX pk/MAX ts, `v_reconciliation_latest`, `reconcile_row_delta` en apply stats; snapshot RR por lado + COUNT gated si `kafka_consumer_lag > 0`
-- [x] **Full-load verify baseline snapshot (2026-07-23)** — tablas `capture_during_full_load=true` verifican COPY vs `source_rows` del checkpoint truncate (baseline), no vs count live; gap live−lake = backlog CDC esperado (`verify_mode=baseline_snapshot`, `pending_cdc_gap` en logs)
+- [x] **Full-load verify baseline snapshot (2026-07-23)** — tablas `capture_during_full_load=true` verifican COPY vs `source_rows` del snapshot (truncate checkpoint, fallback copy/ddl porque worker_id=0 se pisa), no vs count live; gap live−lake = backlog CDC esperado (`verify_mode=baseline_snapshot`, `pending_cdc_gap` en logs)
 
 ## Daemon 24/7
 

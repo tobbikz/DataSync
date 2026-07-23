@@ -33,7 +33,11 @@ std::optional<FullLoadCheckpoint> load_full_load_checkpoint(
 
 std::vector<FullLoadCheckpoint> load_full_load_checkpoints(PGconn* pg, long long catalog_id);
 
-/** source_rows captured at truncate (full-load snapshot baseline). */
+/**
+ * source_rows snapshot at full-load start (baseline for row-count verify).
+ * Prefers truncate phase; falls back to copy/ddl checkpoints because worker_id=0
+ * is reused (truncate → ddl → copy worker 0 overwrites the same row).
+ */
 std::optional<long long> truncate_baseline_source_rows(
     const std::vector<FullLoadCheckpoint>& checkpoints);
 
