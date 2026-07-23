@@ -450,6 +450,8 @@ CREATE TABLE cdc_catalog.capture_position (
     server_uuid text,
     status cdc_catalog.cdc_health_status DEFAULT 'healthy'::cdc_catalog.cdc_health_status NOT NULL,
     last_error text,
+    last_failed_source_schema text,
+    last_failed_source_table text,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
@@ -2385,6 +2387,20 @@ BEGIN
         RAISE NOTICE 'migration 057: batched locked purge_logs';
     END IF;
 END $migration057$;
+
+-- Migration 058: capture_position last_failed_source_* for alerting and ops triage.
+DO $migration058$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 58) THEN
+        ALTER TABLE cdc_catalog.capture_position
+            ADD COLUMN IF NOT EXISTS last_failed_source_schema text,
+            ADD COLUMN IF NOT EXISTS last_failed_source_table text;
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (58, 'capture_position last_failed_source_schema/table for capture failure triage');
+        RAISE NOTICE 'migration 058: capture_position last_failed_source_* columns';
+    END IF;
+END $migration058$;
 )PO_schema_patch";
     }
     /** Idempotent DDL for 050/051/052 — safe when schema_migrations version rows exist without objects. */

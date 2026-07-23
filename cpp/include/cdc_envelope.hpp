@@ -27,6 +27,12 @@ struct CdcEvent {
     nlohmann::json to_kafka_dict() const;
 };
 
+/** Recursively sanitize string keys/values for nlohmann::json::dump(). */
+nlohmann::json json_sanitize_for_kafka(const nlohmann::json& value);
+
+/** Safe Kafka payload JSON (invalid UTF-8 replaced, never throws on dump). */
+std::string cdc_event_kafka_payload(const CdcEvent& event);
+
 std::string utc_iso_timestamp_now();
 
 nlohmann::json parse_sql_literal(const std::string& raw);

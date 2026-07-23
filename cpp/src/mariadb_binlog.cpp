@@ -79,6 +79,8 @@ void upsert_capture_position_full(
             server_uuid = EXCLUDED.server_uuid,
             status = 'healthy'::cdc_catalog.cdc_health_status,
             last_error = NULL,
+            last_failed_source_schema = NULL,
+            last_failed_source_table = NULL,
             updated_at = now()
         )",
         5,

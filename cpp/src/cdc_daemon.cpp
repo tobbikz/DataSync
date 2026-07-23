@@ -793,8 +793,6 @@ int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::strin
                     });
                 }
                 if (run_conn_capture_slice(cfg, capture_pg.raw, conn_id, round_batch_id) != 0) {
-                    mark_capture_position_failed(
-                        capture_pg.raw, conn_id, "conn capture slice finished with errors");
                     failures.fetch_add(1);
                 }
             } catch (const std::exception& ex) {

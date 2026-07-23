@@ -68,7 +68,12 @@ void touch_capture_position_slice(PGconn* pg, const std::string& conn_id);
 void note_capture_position_deferred(PGconn* pg, const std::string& conn_id, const std::string& reason);
 
 /** MariaDB: record failed capture slice — status + last_error + updated_at. */
-void mark_capture_position_failed(PGconn* pg, const std::string& conn_id, const std::string& error);
+void mark_capture_position_failed(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& error,
+    const std::optional<std::string>& source_schema = std::nullopt,
+    const std::optional<std::string>& source_table = std::nullopt);
 
 /** Refresh capture_position lag seconds and stale status from updated_at / last_event_ts. */
 int refresh_capture_position_health(PGconn* pg, int staleness_seconds);

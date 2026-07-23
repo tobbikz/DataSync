@@ -40,6 +40,7 @@ Config: **`config.json`** en raíz del repo (PG DataSync + DataLake). Fuentes OL
 - [x] **Reconcile lite (052)** — tabla `reconciliation`, CLI `reconcile-lite`, COUNT/MAX pk/MAX ts, `v_reconciliation_latest`, `reconcile_row_delta` en apply stats; snapshot RR por lado + COUNT gated si `kafka_consumer_lag > 0`
 - [x] **Full-load verify baseline snapshot (2026-07-23)** — tablas `capture_during_full_load=true` verifican COPY vs `source_rows` del snapshot (truncate checkpoint, fallback copy/ddl porque worker_id=0 se pisa), compara **lake_rows** vs baseline (no `rows_loaded` en resume); gap live−lake = backlog CDC (`baseline_snapshot_resumed` cuando aplica)
 - [x] **Capture binlog multi-schema same table (2026-07-23)** — resolver elige schema exacto cuando catálogo tiene `casino.transactions` + `universal_casino.transactions` (fix SchemaMismatch falso positivo)
+- [x] **Capture UTF-8 hardening (2026-07-23)** — `cdc_event_kafka_payload()` sanitiza strings/keys antes de Kafka dump; migration 058 `capture_position.last_failed_source_*`; alerta Capture Unhealthy muestra `table=schema.table`
 
 ## Daemon 24/7
 

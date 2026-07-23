@@ -277,6 +277,14 @@ void upsert_capture_position(
             server_uuid = EXCLUDED.server_uuid,
             status = EXCLUDED.status,
             last_error = EXCLUDED.last_error,
+            last_failed_source_schema = CASE
+                WHEN EXCLUDED.status = 'healthy'::cdc_catalog.cdc_health_status THEN NULL
+                ELSE last_failed_source_schema
+            END,
+            last_failed_source_table = CASE
+                WHEN EXCLUDED.status = 'healthy'::cdc_catalog.cdc_health_status THEN NULL
+                ELSE last_failed_source_table
+            END,
             capture_lag_seconds = EXCLUDED.capture_lag_seconds,
             last_event_ts = now(),
             updated_at = now()
@@ -549,6 +557,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     int case_fold_resolved_events = 0;
     int schema_mismatch_logs = 0;
     std::set<TableKey> schema_mismatch_samples;
+    std::string slice_fail_schema;
+    std::string slice_fail_table;
     const auto publish_row = [&](
                                const std::string& schema,
                                const std::string& table,
@@ -671,8 +681,10 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         const int kafka_partition = kafka_produce_partition(
             catalog_id, msg_key, rcfg.topic_partitions, is_hot);
         try {
-            producer.produce(topic, msg_key, event.to_kafka_dict().dump(), kafka_partition);
+            producer.produce(topic, msg_key, cdc_event_kafka_payload(event), kafka_partition);
         } catch (const std::exception& ex) {
+            slice_fail_schema = key.first;
+            slice_fail_table = key.second;
             log_write(log_pg, {
                 .level = LogLevel::Error,
                 .component = "cdc_kafka_capture",
@@ -1108,7 +1120,12 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             return stats;
         }
         rollback_cdc_in_progress_ids(log_pg, cdc_in_progress_ids);
-        mark_capture_position_failed(log_pg, conn_id, ex.what());
+        mark_capture_position_failed(
+            log_pg,
+            conn_id,
+            ex.what(),
+            slice_fail_schema.empty() ? std::nullopt : std::make_optional(slice_fail_schema),
+            slice_fail_table.empty() ? std::nullopt : std::make_optional(slice_fail_table));
         log_write(log_pg, {
             .level = LogLevel::Error,
             .component = "cdc_kafka_capture",
@@ -1120,6 +1137,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             .context = {
                 {"error", ex.what()},
                 {"tables_touched", static_cast<int>(cdc_active_catalog_ids.size())},
+                {"failed_source_schema", slice_fail_schema},
+                {"failed_source_table", slice_fail_table},
             },
         });
         throw;

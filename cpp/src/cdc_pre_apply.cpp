@@ -355,10 +355,6 @@ int run_conn_capture_slice(
         }
     }
 
-    if (errors > 0 && db_engine == "mariadb") {
-        mark_capture_position_failed(log_pg, conn_id, "conn capture completed with errors");
-    }
-
     log_write(log_pg, {
         .level = errors ? LogLevel::Warning : LogLevel::Info,
         .component = "cdc_kafka_daemon",

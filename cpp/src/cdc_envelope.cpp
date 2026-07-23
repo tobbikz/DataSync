@@ -70,7 +70,7 @@ nlohmann::json parse_sql_literal(const std::string& raw) {
             }
         }
         if (unescaped.size() == 10 && unescaped[4] == '-' && unescaped[7] == '-') {
-            return unescaped;
+            return sanitize_utf8_for_json(unescaped);
         }
         return sanitize_utf8_for_json(unescaped);
     }
@@ -101,14 +101,61 @@ nlohmann::json row_dict_from_columns(
         if (i >= col_values.size()) {
             break;
         }
+        const std::string col_key = sanitize_utf8_for_json(columns[i]);
         const std::string& raw = col_values[i];
         if (raw.empty() || raw == "NULL") {
-            out[columns[i]] = nullptr;
+            out[col_key] = nullptr;
         } else {
-            out[columns[i]] = parse_sql_literal(raw);
+            out[col_key] = parse_sql_literal(raw);
         }
     }
     return out;
+}
+
+nlohmann::json json_sanitize_for_kafka(const nlohmann::json& value) {
+    if (value.is_string()) {
+        return sanitize_utf8_for_json(value.get<std::string>());
+    }
+    if (value.is_object()) {
+        nlohmann::json out = nlohmann::json::object();
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            out[sanitize_utf8_for_json(it.key())] = json_sanitize_for_kafka(it.value());
+        }
+        return out;
+    }
+    if (value.is_array()) {
+        nlohmann::json out = nlohmann::json::array();
+        for (const auto& el : value) {
+            out.push_back(json_sanitize_for_kafka(el));
+        }
+        return out;
+    }
+    return value;
+}
+
+std::string cdc_event_kafka_payload(const CdcEvent& event) {
+    CdcEvent safe = event;
+    safe.conn_id = sanitize_utf8_for_json(event.conn_id);
+    safe.db_engine = sanitize_utf8_for_json(event.db_engine);
+    safe.source_database = sanitize_utf8_for_json(event.source_database);
+    safe.schema_name = sanitize_utf8_for_json(event.schema_name);
+    safe.table_name = sanitize_utf8_for_json(event.table_name);
+    safe.gtid = sanitize_utf8_for_json(event.gtid);
+    safe.mssql_seqval = sanitize_utf8_for_json(event.mssql_seqval);
+    safe.binlog_file = sanitize_utf8_for_json(event.binlog_file);
+    safe.collection = sanitize_utf8_for_json(event.collection);
+    safe.ingestion_ts = sanitize_utf8_for_json(
+        event.ingestion_ts.empty() ? utc_iso_timestamp_now() : event.ingestion_ts);
+    if (!event.before.is_null()) {
+        safe.before = json_sanitize_for_kafka(event.before);
+    }
+    if (!event.after.is_null()) {
+        safe.after = json_sanitize_for_kafka(event.after);
+    }
+    if (!event.resume_token.is_null()) {
+        safe.resume_token = json_sanitize_for_kafka(event.resume_token);
+    }
+    return json_sanitize_for_kafka(safe.to_kafka_dict()).dump();
 }
 
 std::string op_char_from_mysql(const std::string& mysql_op) {

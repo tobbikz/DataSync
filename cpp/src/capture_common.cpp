@@ -394,19 +394,30 @@ void note_capture_position_deferred(
     }
 }
 
-void mark_capture_position_failed(PGconn* pg, const std::string& conn_id, const std::string& error) {
+void mark_capture_position_failed(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& error,
+    const std::optional<std::string>& source_schema,
+    const std::optional<std::string>& source_table) {
     const std::string err = error.size() > 2000 ? error.substr(0, 2000) : error;
-    const char* vals[] = {conn_id.c_str(), err.c_str()};
+    const char* schema_val =
+        source_schema.has_value() && !source_schema->empty() ? source_schema->c_str() : nullptr;
+    const char* table_val =
+        source_table.has_value() && !source_table->empty() ? source_table->c_str() : nullptr;
+    const char* vals[] = {conn_id.c_str(), err.c_str(), schema_val, table_val};
     PGresult* res = PQexecParams(
         pg,
         R"(
         UPDATE cdc_catalog.capture_position
         SET status = 'failed'::cdc_catalog.cdc_health_status,
             last_error = $2,
+            last_failed_source_schema = COALESCE($3, last_failed_source_schema),
+            last_failed_source_table = COALESCE($4, last_failed_source_table),
             updated_at = now()
         WHERE conn_id = $1
         )",
-        2,
+        4,
         nullptr,
         vals,
         nullptr,

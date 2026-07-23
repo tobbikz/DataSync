@@ -73,6 +73,32 @@ int main() {
         failures += fail_msg("try_parse_mariadb_bool_token(???) should be nullopt");
     }
 
+    // Capture: invalid Latin-1 / Windows-1252 bytes must not break Kafka JSON dump
+    {
+        std::string raw = "'";
+        raw.push_back(static_cast<char>(0x94));
+        raw.push_back('\'');
+        const json parsed = parse_sql_literal(raw);
+        if (!parsed.is_string()) {
+            failures += fail_msg("parse_sql_literal latin1 byte not string");
+        }
+        CdcEvent event;
+        event.op = "u";
+        event.conn_id = "TEST";
+        event.schema_name = "casino";
+        event.table_name = "transactions";
+        event.after = json::object({{"note", parsed}});
+        const std::string payload = cdc_event_kafka_payload(event);
+        if (payload.find("invalid UTF-8") != std::string::npos) {
+            failures += fail_msg("cdc_event_kafka_payload leaked invalid utf-8 error");
+        }
+        try {
+            (void)json::parse(payload);
+        } catch (const std::exception& ex) {
+            failures += fail_msg(std::string("cdc_event_kafka_payload not valid json: ") + ex.what());
+        }
+    }
+
     if (failures == 0) {
         std::cout << "kafka_apply_cell_test: ok\n";
     }

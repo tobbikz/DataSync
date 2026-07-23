@@ -616,7 +616,7 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             const int kafka_partition = kafka_produce_partition(
                 tbl.catalog_id, msg_key, rcfg.topic_partitions, tbl.hot);
             try {
-                producer.produce(topic, msg_key, event.to_kafka_dict().dump(), kafka_partition);
+                producer.produce(topic, msg_key, cdc_event_kafka_payload(event), kafka_partition);
             } catch (const std::exception& ex) {
                 log_write(log_pg, {
                     .level = LogLevel::Error,
