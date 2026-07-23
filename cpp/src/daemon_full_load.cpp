@@ -142,8 +142,11 @@ SpawnWaitResult spawn_wait_with_timeout(
         slot->child_pid.store(pid);
     }
 
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(1, timeout_seconds));
+    const bool wait_forever = timeout_seconds <= 0;
+    const auto deadline = wait_forever
+                              ? std::chrono::steady_clock::time_point::max()
+                              : (std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(timeout_seconds));
 
     for (;;) {
         int status = 0;
@@ -160,7 +163,7 @@ SpawnWaitResult spawn_wait_with_timeout(
             break;
         }
 
-        if (std::chrono::steady_clock::now() >= deadline) {
+        if (!wait_forever && std::chrono::steady_clock::now() >= deadline) {
             out.timed_out = true;
             kill(pid, SIGTERM);
             std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -345,7 +348,8 @@ int clear_stale_copy_checkpoints_blocking_cdc(
             WHERE c.conn_id = $1
               AND cp.phase = 'copy'
               AND (
-                  c.status <> 'full_load_in_progress'::cdc_catalog.replication_status
+                  c.needs_full_load = false
+                  OR c.status IN ('success', 'failed', 'skipped', 'disabled')
                   OR cp.updated_at < now() - make_interval(mins => $2::int)
               )
         ),
@@ -544,13 +548,15 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
         "full_load_daemon_timeout_minutes",
         pipeline_defaults::kFullLoadDaemonSubprocessTimeoutMinutes,
         "global");
+    const int timeout_seconds = timeout_minutes <= 0 ? 0 : timeout_minutes * 60;
     const SpawnWaitResult spawn = spawn_wait_with_timeout(
         args,
-        timeout_minutes * 60,
+        timeout_seconds,
         slot.get());
     outcome.exit_code = spawn.exit_code;
 
     if (spawn.timed_out) {
+        recover_full_load_for_checkpoint_resume(log_pg, conn_id, db_engine, batch_id);
         reset_full_load_in_progress_for_conn(log_pg, conn_id, db_engine);
         log_write(log_pg, {
             .level = LogLevel::Warning,
@@ -563,6 +569,7 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
             .context = {
                 {"db_engine", db_engine},
                 {"timeout_minutes", timeout_minutes},
+                {"timeout_disabled", timeout_minutes <= 0},
                 {"child_pid", static_cast<long long>(spawn.child_pid)},
                 {"phase", "full_load"},
             },

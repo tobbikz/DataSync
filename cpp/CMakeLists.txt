@@ -15,6 +15,7 @@ set(DATASYNC_SOURCES
     src/config.cpp
     src/connections.cpp
     src/catalog_sync.cpp
+    src/pg_conn.cpp
     src/mariadb_conn.cpp
     src/mariadb_preflight.cpp
     src/mariadb_schema.cpp

@@ -69,8 +69,11 @@ constexpr int kFullLoadFailedCooldownMinutes = 240;
 constexpr int kFullLoadSourceSleepMs = 0;
 constexpr int kFullLoadStaleInProgressMinutes = 30;
 constexpr int kMssqlFullLoadStaleInProgressMinutes = 10;
-/** Max wall time for daemon fork+exec `DataSync full-load --conn-id` subprocess. */
-constexpr int kFullLoadDaemonSubprocessTimeoutMinutes = 120;
+/** Max wall time for daemon fork+exec `DataSync full-load --conn-id` subprocess (0 = disabled). */
+constexpr int kFullLoadDaemonSubprocessTimeoutMinutes = 0;
+constexpr int kPgFullLoadReconnectMaxAttempts = 0;
+constexpr int kPgFullLoadReconnectBaseMs = 500;
+constexpr int kPgFullLoadReconnectMaxMs = 60000;
 constexpr int kFullLoadTruncateMaxRetries = 3;
 constexpr int kFullLoadCopyProgressLogInterval = 10;
 constexpr bool kFullLoadRowCountVerify = true;

@@ -30,40 +30,33 @@ inline std::vector<std::uint8_t> pg_bytea_to_bytes(const char* data, int len) {
     return std::vector<std::uint8_t>(data, data + len);
 }
 
+struct PgRetryOptions {
+    int max_attempts{0};
+    int base_ms{500};
+    int max_ms{60000};
+};
+
 struct PgConn {
+    std::string conninfo_;
     PGconn* raw{nullptr};
 
-    explicit PgConn(const std::string& conninfo) {
-        raw = PQconnectdb(conninfo.c_str());
-        if (!raw) {
-            throw std::runtime_error("PostgreSQL connect failed: PQconnectdb returned null");
-        }
-        if (PQstatus(raw) != CONNECTION_OK) {
-            const std::string err = PQerrorMessage(raw);
-            PQfinish(raw);
-            throw std::runtime_error("PostgreSQL connect failed: " + err);
-        }
-        PGresult* tz = PQexec(raw, "SET TIME ZONE 'UTC'");
-        if (!tz || PQresultStatus(tz) != PGRES_COMMAND_OK) {
-            if (tz) {
-                PQclear(tz);
-            }
-            const std::string err = PQerrorMessage(raw);
-            PQfinish(raw);
-            throw std::runtime_error("PostgreSQL SET TIME ZONE failed: " + err);
-        }
-        PQclear(tz);
-    }
-
-    ~PgConn() {
-        if (raw) {
-            PQfinish(raw);
-        }
-    }
+    explicit PgConn(const std::string& conninfo);
+    ~PgConn();
 
     PgConn(const PgConn&) = delete;
     PgConn& operator=(const PgConn&) = delete;
+
+    void reconnect();
 };
+
+void pg_abort_copy_in(PGconn* pg);
+bool pg_full_load_error_is_transient(PGconn* pg, const std::string& err);
+void pg_sleep_retry_backoff(int attempt, const PgRetryOptions& opts);
+void pg_copy_batch_with_retry(
+    PgConn& lake_pg,
+    const std::string& copy_sql,
+    const std::vector<std::string>& batch_lines,
+    const PgRetryOptions& opts);
 
 void pg_exec(PGconn* pg, const std::string& sql);
 void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const* vals);

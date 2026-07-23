@@ -282,7 +282,7 @@ long long fetch_mariadb_row_count(
 
 long long copy_rows_keyset(
     MariaDbConn& conn,
-    PGconn* pg,
+    PgConn& lake_pg,
     const CatalogTableRow& target,
     const std::vector<MariaDbColumn>& cols,
     const std::vector<std::string>& pk_cols,
@@ -339,6 +339,12 @@ long long copy_rows_keyset(
     if (checkpoint_ctx && !checkpoint_ctx->initial_last_pk.empty()) {
         last_pk_values = checkpoint_ctx->initial_last_pk;
     }
+
+    const PgRetryOptions pg_retry{
+        pipeline_defaults::kPgFullLoadReconnectMaxAttempts,
+        pipeline_defaults::kPgFullLoadReconnectBaseMs,
+        pipeline_defaults::kPgFullLoadReconnectMaxMs,
+    };
 
     while (true) {
         if (g_shutdown.load()) {
@@ -403,51 +409,7 @@ long long copy_rows_keyset(
             break;
         }
 
-        PGresult* copy_res = PQexec(pg, copy_sql.c_str());
-        if (!copy_res || PQresultStatus(copy_res) != PGRES_COPY_IN) {
-            if (copy_res) {
-                PQclear(copy_res);
-            }
-            throw std::runtime_error(std::string("COPY start failed: ") + PQerrorMessage(pg));
-        }
-        PQclear(copy_res);
-
-        bool copy_ok = true;
-        for (const auto& line : batch_lines) {
-            if (PQputCopyData(pg, line.data(), static_cast<int>(line.size())) != 1 ||
-                PQputCopyData(pg, "\n", 1) != 1) {
-                copy_ok = false;
-                break;
-            }
-        }
-        if (!copy_ok) {
-            PQputCopyEnd(pg, "abort");
-            while (PGresult* r = PQgetResult(pg)) {
-                PQclear(r);
-            }
-            throw std::runtime_error(std::string("PQputCopyData failed: ") + PQerrorMessage(pg));
-        }
-        if (PQputCopyEnd(pg, nullptr) != 1) {
-            PQputCopyEnd(pg, "abort");
-            while (PGresult* r = PQgetResult(pg)) {
-                PQclear(r);
-            }
-            throw std::runtime_error(std::string("PQputCopyEnd failed: ") + PQerrorMessage(pg));
-        }
-
-        PGresult* end_res = PQgetResult(pg);
-        while (end_res) {
-            if (PQresultStatus(end_res) != PGRES_COMMAND_OK) {
-                const std::string err = PQerrorMessage(pg);
-                PQclear(end_res);
-                while (PGresult* r = PQgetResult(pg)) {
-                    PQclear(r);
-                }
-                throw std::runtime_error(std::string("COPY failed: ") + err);
-            }
-            PQclear(end_res);
-            end_res = PQgetResult(pg);
-        }
+        pg_copy_batch_with_retry(lake_pg, copy_sql, batch_lines, pg_retry);
 
         total_rows += static_cast<long long>(batch_lines.size());
         if (checkpoint_ctx) {
@@ -477,7 +439,7 @@ long long copy_rows_parallel(
     std::mutex* log_mtx,
     PGconn* app_pg,
     MariaDbConn& conn,
-    PGconn* pg,
+    PgConn& lake_pg,
     const CatalogTableRow& target,
     const std::vector<MariaDbColumn>& cols,
     const std::vector<std::string>& pk_cols,
@@ -520,7 +482,7 @@ long long copy_rows_parallel(
         auto ctx = checkpoint_for_worker(0);
         return copy_rows_keyset(
             conn,
-            pg,
+            lake_pg,
             target,
             cols,
             pk_cols,
@@ -547,7 +509,7 @@ long long copy_rows_parallel(
             target.source_table);
         return copy_rows_keyset(
             conn,
-            pg,
+            lake_pg,
             target,
             cols,
             pk_cols,
@@ -581,7 +543,7 @@ long long copy_rows_parallel(
             target.source_table);
         return copy_rows_keyset(
             conn,
-            pg,
+            lake_pg,
             target,
             cols,
             pk_cols,
@@ -618,7 +580,7 @@ long long copy_rows_parallel(
             target.source_table);
         return copy_rows_keyset(
             conn,
-            pg,
+            lake_pg,
             target,
             cols,
             pk_cols,
@@ -635,7 +597,7 @@ long long copy_rows_parallel(
         auto ctx = checkpoint_for_worker(0);
         return copy_rows_keyset(
             conn,
-            pg,
+            lake_pg,
             target,
             cols,
             pk_cols,
@@ -685,7 +647,7 @@ long long copy_rows_parallel(
                 auto worker_ctx = checkpoint_for_worker(w);
                 row_counts[static_cast<std::size_t>(w)] = copy_rows_keyset(
                     worker_db,
-                    worker_pg.raw,
+                    worker_pg,
                     target,
                     cols,
                     pk_cols,
@@ -1137,7 +1099,7 @@ TableLoadOutcome load_one_table(
         log_mtx,
         app_pg.raw,
         mariadb,
-        lake_pg.raw,
+        lake_pg,
         target,
         cols,
         pk_cols,

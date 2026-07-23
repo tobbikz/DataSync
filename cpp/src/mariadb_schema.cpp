@@ -389,34 +389,6 @@ std::string mariadb_bytea_to_sql_literal(const std::string& value) {
     return out;
 }
 
-void pg_exec(PGconn* pg, const std::string& sql) {
-    PGresult* res = PQexec(pg, sql.c_str());
-    if (!res) {
-        throw std::runtime_error("PQexec returned null");
-    }
-    const auto st = PQresultStatus(res);
-    if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK) {
-        const std::string err = PQerrorMessage(pg);
-        PQclear(res);
-        throw std::runtime_error(err + " | " + sql);
-    }
-    PQclear(res);
-}
-
-void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const* vals) {
-    PGresult* res = PQexecParams(pg, sql, n, nullptr, vals, nullptr, nullptr, 0);
-    if (!res) {
-        throw std::runtime_error(std::string("SQL failed: ") + PQerrorMessage(pg) + " | " + sql);
-    }
-    const auto st = PQresultStatus(res);
-    if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK) {
-        const std::string err = PQerrorMessage(pg);
-        PQclear(res);
-        throw std::runtime_error(std::string("SQL failed: ") + err + " | " + sql);
-    }
-    PQclear(res);
-}
-
 std::string mysql_escape_literal(MYSQL* mysql, const std::string& value) {
     std::string out(value.size() * 2 + 3, '\'');
     const unsigned long len = mysql_real_escape_string(mysql, out.data() + 1, value.c_str(), static_cast<unsigned long>(value.size()));
