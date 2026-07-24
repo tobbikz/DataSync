@@ -79,6 +79,8 @@ constexpr int kFullLoadCopyProgressLogInterval = 10;
 constexpr bool kFullLoadRowCountVerify = true;
 constexpr long long kFullLoadRowCountVerifyLargeTableThreshold = 10000000LL;
 constexpr double kFullLoadRowCountVerifyTolerancePct = 0.0001;
+/** Max lake rows above live source before streaming verify fails (duplicate-load guard). */
+constexpr double kFullLoadStreamingVerifyMaxAboveLivePct = 0.05;
 constexpr int kLakePartitionMonthsAhead = 3;
 constexpr int kMariadbReconnectMaxAttempts = 0;
 constexpr int kMariadbReconnectBaseMs = 500;

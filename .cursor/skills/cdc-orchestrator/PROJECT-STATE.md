@@ -41,6 +41,7 @@ Config: **`config.json`** en raíz del repo (PG DataSync + DataLake). Fuentes OL
 - [x] **Full-load verify baseline snapshot (2026-07-23)** — tablas `capture_during_full_load=true` verifican COPY vs `source_rows` del snapshot (truncate checkpoint, fallback copy/ddl porque worker_id=0 se pisa), compara **lake_rows** vs baseline (no `rows_loaded` en resume); gap live−lake = backlog CDC (`baseline_snapshot_resumed` cuando aplica)
 - [x] **Capture binlog multi-schema same table (2026-07-23)** — resolver elige schema exacto cuando catálogo tiene `casino.transactions` + `universal_casino.transactions` (fix SchemaMismatch falso positivo)
 - [x] **Capture UTF-8 hardening v2 (2026-07-23)** — `json_dump_for_kafka()` con `error_handler_t::replace`; sanitize en `to_kafka_dict` + `row_dict` + `kafka_message_key_for_row`; fila inválida → warning + skip (no abort slice); SQL `mariadb41_partial_full_load_reset.sql`
+- [x] **Full-load streaming verify v3 (2026-07-24)** — `capture_during_full_load`: verify pasa si `lake >= baseline` (CDC concurrente); fail solo si lake << baseline o lake >> live (+5%); resume usa `EXISTS` + `last_pk` (no TRUNCATE por checkpoint/session desync); checkpoint `rows_loaded` acumulativo en resume; SQL `plan_b_mariadb41_casino_transactions_clean_reset.sql`
 
 ## Daemon 24/7
 

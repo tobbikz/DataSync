@@ -72,6 +72,20 @@ long long lake_table_row_count(PGconn* pg, const std::string& schema, const std:
     return count;
 }
 
+bool lake_table_has_rows(PGconn* pg, const std::string& schema, const std::string& table) {
+    const std::string sql =
+        "SELECT EXISTS (SELECT 1 FROM " + pg_ident(schema) + "." + pg_ident(table) + " LIMIT 1)";
+    PGresult* res = PQexec(pg, sql.c_str());
+    bool found = false;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        found = PQgetvalue(res, 0, 0)[0] == 't';
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return found;
+}
+
 TruncateResult truncate_lake_table_verified(
     PGconn* pg,
     const std::string& schema,
@@ -126,6 +140,72 @@ bool within_row_count_tolerance(long long reference_rows, long long actual_rows)
     const double pct =
         reference_rows > 0 ? static_cast<double>(abs_diff) / static_cast<double>(reference_rows) : 1.0;
     return pct <= pipeline_defaults::kFullLoadRowCountVerifyTolerancePct;
+}
+
+bool exceeds_max_above_reference(long long reference_rows, long long actual_rows, double max_pct) {
+    if (reference_rows < 0 || actual_rows < 0 || reference_rows == 0) {
+        return false;
+    }
+    if (actual_rows <= reference_rows) {
+        return false;
+    }
+    const long long excess = actual_rows - reference_rows;
+    const double pct = static_cast<double>(excess) / static_cast<double>(reference_rows);
+    return pct > max_pct;
+}
+
+RowCountVerifyResult verify_baseline_streaming_capture(
+    const RowCountVerifyRequest& request,
+    RowCountVerifyResult result) {
+    const long long baseline = *request.baseline_source_rows;
+    const long long lake = request.lake_rows;
+    result.verify_mode = "baseline_snapshot_streaming";
+    result.baseline_source_rows = baseline;
+    result.source_rows = baseline;
+    result.lake_rows = lake;
+
+    if (baseline < 0 || lake < 0) {
+        return result;
+    }
+
+    // Incomplete COPY: lake materially below truncate-time baseline.
+    if (lake < baseline && !within_row_count_tolerance(baseline, lake)) {
+        result.ok = false;
+        result.message = "lake row count below baseline snapshot (incomplete copy)";
+        result.diff = baseline - lake;
+        return result;
+    }
+
+    // lake >= baseline is expected when capture_during_full_load applies CDC during COPY.
+    if (request.source_rows_live >= 0 && exceeds_max_above_reference(
+            request.source_rows_live,
+            lake,
+            pipeline_defaults::kFullLoadStreamingVerifyMaxAboveLivePct)) {
+        result.ok = false;
+        result.message = "lake row count exceeds live source above tolerance (possible duplicate load)";
+        result.diff = lake - request.source_rows_live;
+        return result;
+    }
+
+    if (request.source_rows_live < 0 &&
+        exceeds_max_above_reference(
+            baseline, lake, pipeline_defaults::kFullLoadStreamingVerifyMaxAboveLivePct)) {
+        result.ok = false;
+        result.message =
+            "lake row count far above baseline without live source (possible duplicate load)";
+        result.diff = lake - baseline;
+        return result;
+    }
+
+    result.ok = true;
+    result.diff = baseline - lake;
+    if (request.source_rows_live >= 0) {
+        result.pending_cdc_gap = request.source_rows_live - lake;
+    }
+    if (request.rows_loaded > 0 && lake > request.rows_loaded) {
+        result.verify_mode = "baseline_snapshot_streaming_resumed";
+    }
+    return result;
 }
 
 RowCountVerifyResult verify_loaded_against_reference(
@@ -218,9 +298,11 @@ RowCountVerifyResult verify_full_load_row_counts(const RowCountVerifyRequest& re
     const bool use_baseline =
         request.capture_during_full_load && request.baseline_source_rows.has_value();
     if (use_baseline) {
+        return verify_baseline_streaming_capture(request, result);
+    }
+    if (request.baseline_source_rows.has_value()) {
         result.verify_mode = "baseline_snapshot";
         result.baseline_source_rows = *request.baseline_source_rows;
-        // Lake row count is authoritative after COPY (resume may leave rows_loaded << lake_rows).
         result = verify_loaded_against_reference(
             *request.baseline_source_rows, request.lake_rows, request.lake_rows, result);
         if (result.ok && request.rows_loaded > 0 && request.lake_rows > request.rows_loaded) {
@@ -236,10 +318,6 @@ RowCountVerifyResult verify_full_load_row_counts(const RowCountVerifyRequest& re
             result.message = "lake row count mismatch vs rows_loaded";
             result.diff = request.lake_rows - request.rows_loaded;
         }
-    }
-
-    if (result.ok && use_baseline && request.source_rows_live >= 0 && request.lake_rows >= 0) {
-        result.pending_cdc_gap = request.source_rows_live - request.lake_rows;
     }
 
     return result;
@@ -354,7 +432,7 @@ void save_copy_batch_checkpoint(
     cp.batch_id = ctx.batch_id;
     cp.phase = FullLoadPhase::Copy;
     cp.last_pk = last_pk_to_json(last_pk_values);
-    cp.rows_loaded = rows_loaded_total;
+    cp.rows_loaded = ctx.rows_loaded_session_baseline + rows_loaded_total;
     cp.source_rows = ctx.source_rows;
     {
         std::unique_lock<std::mutex> lock;
@@ -375,7 +453,8 @@ void save_copy_batch_checkpoint(
         LogLevel::Info,
         ctx.batch_id,
         "full load copy progress",
-        {{"rows_loaded", rows_loaded_total},
+        {{"rows_loaded", cp.rows_loaded},
+         {"rows_loaded_session", rows_loaded_total},
          {"worker_id", ctx.worker_id},
          {"last_pk", cp.last_pk},
          {"batches_completed", ctx.batches_completed}},
@@ -396,22 +475,21 @@ bool should_resume_from_copy_checkpoint(
         return false;
     }
     bool has_copy = false;
-    long long checkpoint_rows = 0;
     for (const auto& cp : checkpoints_out) {
-        if (cp.phase == FullLoadPhase::Copy) {
+        if (cp.phase == FullLoadPhase::Copy && !last_pk_from_json(cp.last_pk).empty()) {
             has_copy = true;
-            checkpoint_rows += cp.rows_loaded;
+            break;
         }
     }
     if (!has_copy) {
         return false;
     }
-    const long long lake_rows = lake_table_row_count(lake_pg, lake_schema, lake_table);
-    if (lake_rows < 0 || lake_rows < checkpoint_rows) {
+    if (!lake_table_has_rows(lake_pg, lake_schema, lake_table)) {
         clear_full_load_checkpoints(app_pg, catalog_id);
         checkpoints_out.clear();
         return false;
     }
+    // Never invalidate resumable copy checkpoints when lake already has rows (resume uses last_pk).
     return true;
 }
 

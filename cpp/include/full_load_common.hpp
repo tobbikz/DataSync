@@ -22,6 +22,9 @@ std::string csv_escape(const std::string& value);
 
 long long lake_table_row_count(PGconn* pg, const std::string& schema, const std::string& table);
 
+/** Fast existence check for resume (avoids COUNT(*) on huge tables). */
+bool lake_table_has_rows(PGconn* pg, const std::string& schema, const std::string& table);
+
 struct TruncateResult {
     bool ok{false};
     long long rows_after{-1};
@@ -95,6 +98,8 @@ struct CopyCheckpointContext {
     std::string log_component;
     std::optional<long long> source_rows;
     std::vector<std::string> initial_last_pk;
+    /** Per-worker rows already in lake when resuming (from copy checkpoint). */
+    long long rows_loaded_session_baseline{0};
     int progress_log_interval{10};
     int batches_completed{0};
     std::mutex* checkpoint_mtx{nullptr};

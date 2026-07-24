@@ -663,6 +663,7 @@ long long copy_rows_parallel(
             for (const auto& cp : *resume_checkpoints) {
                 if (cp.worker_id == worker_id && cp.phase == FullLoadPhase::Copy) {
                     ctx.initial_last_pk = last_pk_from_json(cp.last_pk);
+                    ctx.rows_loaded_session_baseline = cp.rows_loaded;
                     break;
                 }
             }

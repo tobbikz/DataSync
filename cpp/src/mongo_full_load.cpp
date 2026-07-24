@@ -685,6 +685,7 @@ bool load_one_collection(
         for (const auto& cp : resume_checkpoints) {
             if (cp.worker_id == 0 && cp.phase == FullLoadPhase::Copy) {
                 copy_ctx.initial_last_pk = last_pk_from_json(cp.last_pk);
+                copy_ctx.rows_loaded_session_baseline = cp.rows_loaded;
                 break;
             }
         }
