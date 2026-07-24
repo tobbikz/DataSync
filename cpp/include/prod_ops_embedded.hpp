@@ -1250,12 +1250,7 @@ ALTER TABLE ONLY cdc_catalog.schema_migrations
     }
     inline std::string_view datasync_incremental() {
         return R"PO_datasync_inc(
--- Snapshot + concurrent stream: capture to Kafka while full load runs.
-ALTER TABLE cdc_catalog.catalog
-    ADD COLUMN IF NOT EXISTS capture_during_full_load boolean NOT NULL DEFAULT false;
-
-COMMENT ON COLUMN cdc_catalog.catalog.capture_during_full_load IS
-    'When true with needs_full_load: capture publishes to Kafka during COPY; apply waits then replays from stream bookmark. When false: capture pauses during COPY; on FL complete apply offsets jump to Kafka high watermark (skip pre-FL backlog).';
+-- capture_during_full_load: schema_patches migration 059 (versioned one-time DDL).
 
 -- Remove pipeline_health dashboard (unused). Observability: apply_batch_stats + logs.
 
@@ -2401,6 +2396,22 @@ BEGIN
         RAISE NOTICE 'migration 058: capture_position last_failed_source_* columns';
     END IF;
 END $migration058$;
+
+-- Migration 059: capture_during_full_load (snapshot + concurrent stream during full load).
+DO $migration059$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 59) THEN
+        ALTER TABLE cdc_catalog.catalog
+            ADD COLUMN IF NOT EXISTS capture_during_full_load boolean NOT NULL DEFAULT false;
+
+        COMMENT ON COLUMN cdc_catalog.catalog.capture_during_full_load IS
+            'When true with needs_full_load: capture publishes to Kafka during COPY; apply waits then replays from stream bookmark. When false: capture pauses during COPY; on FL complete apply offsets jump to Kafka high watermark (skip pre-FL backlog).';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (59, 'catalog.capture_during_full_load for concurrent CDC during full load');
+        RAISE NOTICE 'migration 059: capture_during_full_load column';
+    END IF;
+END $migration059$;
 )PO_schema_patch";
     }
     /** Idempotent DDL for 050/051/052 — safe when schema_migrations version rows exist without objects. */

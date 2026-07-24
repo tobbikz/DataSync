@@ -2,6 +2,7 @@
 
 #include "mariadb_schema.hpp"
 #include "obs_log.hpp"
+#include "pipeline_defaults.hpp"
 #include "prod_ops_embedded.hpp"
 
 #include <nlohmann/json.hpp>
@@ -112,6 +113,46 @@ std::string strip_psql_meta_commands(std::string_view sql) {
         out << line << '\n';
     }
     return out.str();
+}
+
+bool try_advisory_lock(PGconn* pg, long long lock_key) {
+    const std::string key = std::to_string(lock_key);
+    const char* vals[] = {key.c_str()};
+    PGresult* res = PQexecParams(
+        pg, "SELECT pg_try_advisory_lock($1::bigint)", 1, nullptr, vals, nullptr, nullptr, 0);
+    bool locked = false;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        locked = PQgetvalue(res, 0, 0)[0] == 't';
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return locked;
+}
+
+bool advisory_lock_blocking(PGconn* pg, long long lock_key) {
+    const std::string key = std::to_string(lock_key);
+    const char* vals[] = {key.c_str()};
+    PGresult* res = PQexecParams(
+        pg, "SELECT pg_advisory_lock($1::bigint)", 1, nullptr, vals, nullptr, nullptr, 0);
+    bool locked = false;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        locked = PQgetvalue(res, 0, 0)[0] == 't';
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return locked;
+}
+
+void advisory_unlock(PGconn* pg, long long lock_key) {
+    const std::string key = std::to_string(lock_key);
+    const char* vals[] = {key.c_str()};
+    PGresult* res = PQexecParams(
+        pg, "SELECT pg_advisory_unlock($1::bigint)", 1, nullptr, vals, nullptr, nullptr, 0);
+    if (res) {
+        PQclear(res);
+    }
 }
 
 void exec_sql_section(PGconn* pg, std::string_view sql, const std::string& section) {
@@ -435,6 +476,22 @@ void run_startup_schema_migrate(PGconn* log_pg) {
     if (!log_pg || !catalog_schema_exists(log_pg)) {
         return;
     }
+
+    const long long lock_key = pipeline_defaults::kSchemaMigrateAdvisoryLockKey;
+    const bool owns_lock = try_advisory_lock(log_pg, lock_key);
+    if (!owns_lock) {
+        // Another process is migrating — wait, then skip (schema already applied).
+        if (advisory_lock_blocking(log_pg, lock_key)) {
+            advisory_unlock(log_pg, lock_key);
+        }
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "catalog",
+            .message = "startup schema migrate skipped: peer completed",
+        });
+        return;
+    }
+
     log_write(log_pg, {
         .level = LogLevel::Info,
         .component = "catalog",
@@ -445,6 +502,7 @@ void run_startup_schema_migrate(PGconn* log_pg) {
     try {
         (void)run_schema_migrate(log_pg, nullptr, opts);
     } catch (const std::exception& ex) {
+        advisory_unlock(log_pg, lock_key);
         log_write(log_pg, {
             .level = LogLevel::Error,
             .component = "catalog",
@@ -453,4 +511,5 @@ void run_startup_schema_migrate(PGconn* log_pg) {
         });
         throw;
     }
+    advisory_unlock(log_pg, lock_key);
 }

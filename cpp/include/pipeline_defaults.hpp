@@ -57,6 +57,8 @@ constexpr int kLogsPurgeBatchSizeDefault = 5000;
 constexpr int kLogsPurgeMaxBatchesDefault = 500;
 /** Session-independent xact lock key inside cdc_catalog.purge_logs_batched. */
 constexpr long long kLogsPurgeAdvisoryLockKey = 90420057001LL;
+/** Session lock: one DataSync process runs startup schema migrate per deploy wave. */
+constexpr long long kSchemaMigrateAdvisoryLockKey = 90420058001LL;
 constexpr bool kApplyDedupEnabled = true;
 constexpr bool kApplyAuditEnabled = true;
 constexpr int kApplyQueuedMinMessages = 100000;

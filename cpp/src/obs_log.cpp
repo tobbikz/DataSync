@@ -43,7 +43,10 @@ bool log_write(PGconn* pg, const LogEvent& event) {
         return false;
     }
 
-    const std::string context_json = event.context.empty() ? "{}" : event.context.dump();
+    // Designated initializers without .context can yield json array [{}] — coerce to object.
+    const nlohmann::json& ctx =
+        event.context.is_object() ? event.context : nlohmann::json::object();
+    const std::string context_json = ctx.empty() ? "{}" : ctx.dump();
 
     static const char* kSql = R"(
         INSERT INTO cdc_catalog.logs (
