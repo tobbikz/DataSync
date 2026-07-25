@@ -42,6 +42,7 @@ Config: **`config.json`** en raíz del repo (PG DataSync + DataLake). Fuentes OL
 - [x] **Capture binlog multi-schema same table (2026-07-23)** — resolver elige schema exacto cuando catálogo tiene `casino.transactions` + `universal_casino.transactions` (fix SchemaMismatch falso positivo)
 - [x] **Capture UTF-8 hardening v2 (2026-07-23)** — `json_dump_for_kafka()` con `error_handler_t::replace`; sanitize en `to_kafka_dict` + `row_dict` + `kafka_message_key_for_row`; fila inválida → warning + skip (no abort slice); SQL `mariadb41_partial_full_load_reset.sql`
 - [x] **Full-load streaming verify v3 (2026-07-24)** — `capture_during_full_load`: verify pasa si `lake >= baseline` (CDC concurrente); fail solo si lake << baseline o lake >> live (+5%); resume usa `EXISTS` + `last_pk` (no TRUNCATE por checkpoint/session desync); checkpoint `rows_loaded` acumulativo en resume; SQL `plan_b_mariadb41_casino_transactions_clean_reset.sql`
+- [x] **Onboard CDC enable after full-load (2026-07-24)** — `enable_cdc_after_full_load*` ya no exige `status=full_load_in_progress` (usa `last_full_load_at` + `NOT cdc_enabled`); `mark_catalog_cdc_success` no pisa status cuando `cdc_enabled=false` (fix race capture_during_full_load)
 
 ## Daemon 24/7
 

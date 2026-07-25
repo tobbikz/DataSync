@@ -696,6 +696,15 @@ std::string catalog_hot_filter_sql(CatalogHotTier tier, const std::string& alias
     return "";
 }
 
+/** Full-load COPY done; awaiting onboard (cdc_enabled flip). Status may stay success/cdc_in_progress during long capture_during_full_load runs. */
+std::string catalog_pending_cdc_enable_sql(const std::string& alias) {
+    const std::string p = alias.empty() ? "" : alias + ".";
+    return " AND " + p + "needs_full_load = false"
+           " AND NOT " + p + "cdc_enabled"
+           " AND " + p + "status NOT IN ('skipped', 'disabled')"
+           " AND " + p + "last_full_load_at IS NOT NULL";
+}
+
 bool engine_meta_has_stream_bookmark(const std::string& engine_meta_text) {
     if (engine_meta_text.empty()) {
         return false;
@@ -1179,14 +1188,12 @@ void enable_cdc_after_full_load(
         SET cdc_enabled = true,
             status = 'success',
             updated_at = now()
-        WHERE conn_id = $1
-          AND db_engine = $2::cdc_catalog.db_engine
-          AND active = true
-          AND has_pk = true
-          AND needs_full_load = false
-          AND NOT cdc_enabled
-          AND status = 'full_load_in_progress'
+        WHERE c.conn_id = $1
+          AND c.db_engine = $2::cdc_catalog.db_engine
+          AND c.active = true
+          AND c.has_pk = true
     )";
+    sql << catalog_pending_cdc_enable_sql("c");
     sql << catalog_hot_filter_sql(hot_tier, "c");
     PGresult* res = PQexecParams(
         pg,
@@ -1240,7 +1247,8 @@ bool enable_cdc_after_full_load_table(
           AND has_pk = true
           AND needs_full_load = false
           AND NOT cdc_enabled
-          AND status = 'full_load_in_progress'
+          AND status NOT IN ('skipped', 'disabled')
+          AND last_full_load_at IS NOT NULL
         )",
         1,
         nullptr,
@@ -1395,9 +1403,12 @@ void mark_catalog_cdc_success(PGconn* pg, long long catalog_id) {
         R"(
         UPDATE cdc_catalog.catalog
         SET last_cdc_at = now(),
-            status = 'success',
-            last_error_at = NULL,
-            last_error = NULL,
+            status = CASE
+                WHEN cdc_enabled THEN 'success'::cdc_catalog.replication_status
+                ELSE status
+            END,
+            last_error_at = CASE WHEN cdc_enabled THEN NULL ELSE last_error_at END,
+            last_error = CASE WHEN cdc_enabled THEN NULL ELSE last_error END,
             updated_at = now()
         WHERE catalog_id = $1::bigint
         )",
@@ -1656,13 +1667,11 @@ int count_full_load_pending_onboard(
     sql << R"(
         SELECT COUNT(*)::int
         FROM cdc_catalog.catalog c
-        WHERE conn_id = $1
-          AND db_engine = $2::cdc_catalog.db_engine
-          AND active = true
-          AND needs_full_load = false
-          AND NOT cdc_enabled
-          AND status = 'full_load_in_progress'
+        WHERE c.conn_id = $1
+          AND c.db_engine = $2::cdc_catalog.db_engine
+          AND c.active = true
     )";
+    sql << catalog_pending_cdc_enable_sql("c");
     sql << catalog_hot_filter_sql(hot_tier, "c");
     PGresult* res = PQexecParams(
         pg,
@@ -2188,7 +2197,7 @@ static bool pg_exec_ok(PGconn* pg, const char* sql) {
 
 // Best-effort multi-step onboard: reset Kafka apply offsets for every consumer group,
 // update apply_position/catalog, prune dedup audit rows. Steps are not atomic with
-// Kafka — partial failure leaves tables in full_load_in_progress until a later retry.
+// Kafka — partial failure leaves tables pending onboard (cdc_enabled=false) until a later retry.
 static FullLoadKafkaResetStats execute_kafka_onboard_reset(
     PGconn* pg,
     const std::string& conn_id,
@@ -2234,8 +2243,9 @@ static FullLoadKafkaResetStats execute_kafka_onboard_reset(
           AND c.db_engine = $2::cdc_catalog.db_engine
           AND c.capture_during_full_load = true
           AND NOT c.needs_full_load
-          AND c.status = 'full_load_in_progress'
           AND NOT c.cdc_enabled
+          AND c.status NOT IN ('skipped', 'disabled')
+          AND c.last_full_load_at IS NOT NULL
         )" + catalog_filter;
     PGresult* stream_res = PQexecParams(
         pg,
@@ -2545,7 +2555,8 @@ static FullLoadKafkaResetStats execute_kafka_onboard_reset(
               AND c.active = true
               AND c.needs_full_load = false
               AND NOT c.cdc_enabled
-              AND c.status = 'full_load_in_progress'
+              AND c.status NOT IN ('skipped', 'disabled')
+              AND c.last_full_load_at IS NOT NULL
             )",
             3,
             nullptr,
@@ -2577,7 +2588,8 @@ static FullLoadKafkaResetStats execute_kafka_onboard_reset(
               AND c.active = true
               AND c.needs_full_load = false
               AND NOT c.cdc_enabled
-              AND c.status = 'full_load_in_progress'
+              AND c.status NOT IN ('skipped', 'disabled')
+              AND c.last_full_load_at IS NOT NULL
             )",
             2,
             nullptr,
@@ -2628,9 +2640,8 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load_table(
 
     const std::string catalog_id_str = std::to_string(catalog_id);
     const char* vals[] = {conn_id.c_str(), db_engine.c_str(), catalog_id_str.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
+    std::ostringstream sql;
+    sql << R"(
         SELECT ap.catalog_id, ap.source_schema, ap.source_table, ap.kafka_topic, ap.kafka_partition
         FROM cdc_catalog.apply_position ap
         JOIN cdc_catalog.catalog c ON c.catalog_id = ap.catalog_id
@@ -2638,10 +2649,11 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load_table(
           AND c.db_engine = $2::cdc_catalog.db_engine
           AND c.catalog_id = $3::bigint
           AND c.active = true
-          AND c.needs_full_load = false
-          AND NOT c.cdc_enabled
-          AND c.status = 'full_load_in_progress'
-        )",
+    )";
+    sql << catalog_pending_cdc_enable_sql("c");
+    PGresult* res = PQexecParams(
+        pg,
+        sql.str().c_str(),
         3,
         nullptr,
         vals,
@@ -2770,10 +2782,8 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
         WHERE ap.conn_id = $1
           AND c.db_engine = $2::cdc_catalog.db_engine
           AND c.active = true
-          AND c.needs_full_load = false
-          AND NOT c.cdc_enabled
-          AND c.status = 'full_load_in_progress'
     )";
+    sql << catalog_pending_cdc_enable_sql("c");
     sql << catalog_hot_filter_sql(hot_tier, "c");
     sql << " ORDER BY ap.source_schema, ap.source_table";
     PGresult* res = PQexecParams(
@@ -2895,11 +2905,9 @@ std::vector<std::string> list_conn_ids_pending_onboard(PGconn* pg, CatalogHotTie
     sql << R"(
         SELECT DISTINCT conn_id
         FROM cdc_catalog.catalog c
-        WHERE active = true
-          AND needs_full_load = false
-          AND NOT cdc_enabled
-          AND status = 'full_load_in_progress'
+        WHERE c.active = true
     )";
+    sql << catalog_pending_cdc_enable_sql("c");
     sql << catalog_hot_filter_sql(hot_tier, "c");
     sql << " ORDER BY conn_id";
 
