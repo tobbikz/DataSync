@@ -329,7 +329,46 @@ void ensure_apply_positions(
     const std::string& topic_prefix,
     const std::string& topic_mode,
     int topic_buckets) {
+    // Seed only missing rows — full upsert every slice raced on apply_position_object_uk/pkey.
+    std::set<long long> missing;
+    {
+        const char* vals[] = {conn_id.c_str()};
+        PGresult* res = PQexecParams(
+            pg,
+            R"(
+            SELECT c.catalog_id
+            FROM cdc_catalog.catalog c
+            WHERE c.conn_id = $1
+              AND c.active = true
+              AND c.has_pk = true
+              AND NOT EXISTS (
+                  SELECT 1 FROM cdc_catalog.apply_position ap
+                  WHERE ap.catalog_id = c.catalog_id
+              )
+            )",
+            1,
+            nullptr,
+            vals,
+            nullptr,
+            nullptr,
+            0);
+        if (res && PQresultStatus(res) == PGRES_TUPLES_OK) {
+            for (int i = 0; i < PQntuples(res); ++i) {
+                missing.insert(std::stoll(PQgetvalue(res, i, 0)));
+            }
+        }
+        if (res) {
+            PQclear(res);
+        }
+    }
+    if (missing.empty()) {
+        return;
+    }
+
     for (const auto& [lake_key, meta] : meta_by_key) {
+        if (!missing.count(meta.catalog_id)) {
+            continue;
+        }
         const std::string topic = topic_for_catalog_table(
             topic_prefix, lake_key.first, lake_key.second, topic_mode, topic_buckets, meta.hot);
         const std::string cid = std::to_string(meta.catalog_id);

@@ -139,6 +139,12 @@ Build: Docker `datasync:local` OK. **Migrate + daemon --once** verificados (2025
 - **Alert apply:** exclude short `apply_stale` from apply_position_unhealthy + apply_health_red.
 - **Lake:** `ensure_monthly_partitions` skips overlap; `migrate --lake` always refreshes helpers; apply soft-skips overlap. Manual: `sql/fix_deposit_note_partition_overlap.sql`.
 
+## Sprint — apply_position upsert race fix (2026-08-07)
+
+- **Root cause:** apply hot path called `upsert_apply_position` every slice for all tables; dual UK (`catalog_id` + object_uk) raced under concurrent workers → sticky `catalog.failed` (MSSQL_CRM + MariaDB alerts).
+- **Fix:** advisory xact lock on object key + retry 23505/40P01; soft-succeed if row exists; apply `ensure_apply_positions` seeds **only missing** rows.
+- **Ops:** `sql/recover_apply_position_object_uk_failed.sql` clears failed status without deleting offsets (MariaDB+MSSQL). Deploy binary → run recover → start daemon.
+
 ## Sprint — disk pressure: Docker json logs + Kafka retention (2026-08-07)
 
 - Prod host `/` hit 92%: `datasync-kafka-1` `*-json.log` ~40G (no compose log rotation) + `kafka-data` ~38G (`retention.bytes=1GB`/partition).

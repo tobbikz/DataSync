@@ -1846,6 +1846,56 @@ ApplyPositionObjectKey apply_position_object_key(
     return key;
 }
 
+namespace {
+
+bool apply_position_row_exists(PGconn* pg, long long catalog_id) {
+    const std::string catalog_id_str = std::to_string(catalog_id);
+    const char* vals[] = {catalog_id_str.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(SELECT 1 FROM cdc_catalog.apply_position WHERE catalog_id = $1::bigint LIMIT 1)",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        return false;
+    }
+    const bool exists = PQntuples(res) > 0;
+    PQclear(res);
+    return exists;
+}
+
+bool apply_position_err_is_retryable(const std::string& err) {
+    return err.find("23505") != std::string::npos || err.find("40P01") != std::string::npos ||
+           err.find("apply_position_pkey") != std::string::npos ||
+           err.find("apply_position_object_uk") != std::string::npos ||
+           err.find("deadlock detected") != std::string::npos;
+}
+
+std::string pq_result_err(PGconn* pg, PGresult* res) {
+    std::string err = PQerrorMessage(pg) ? PQerrorMessage(pg) : "";
+    if (const char* msg = res ? PQresultErrorMessage(res) : nullptr) {
+        if (msg[0]) {
+            if (!err.empty()) {
+                err += " | ";
+            }
+            err += msg;
+        }
+    }
+    if (err.empty()) {
+        err = "unknown PostgreSQL error";
+    }
+    return err;
+}
+
+}  // namespace
+
 bool upsert_apply_position(
     PGconn* pg,
     long long catalog_id,
@@ -1855,66 +1905,75 @@ bool upsert_apply_position(
     const std::string& kafka_topic,
     std::string* error_out) {
     const std::string catalog_id_str = std::to_string(catalog_id);
+    const std::string lock_class = std::to_string(pipeline_defaults::kApplyPositionUpsertLockClass);
     const char* upsert_vals[] = {
         catalog_id_str.c_str(),
         conn_id.c_str(),
         source_schema.c_str(),
         source_table.c_str(),
         kafka_topic.c_str(),
+        lock_class.c_str(),
     };
-    // Delete only object_uk orphans (different catalog_id). Never DELETE the row for
-    // catalog_id=$1 — that raced with apply UPDATEs and caused long transactionid waits
-    // plus 23505 apply_position_pkey / 40P01 deadlocks under concurrent ensure_apply_position.
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        WITH orphan AS (
-            DELETE FROM cdc_catalog.apply_position
-            WHERE conn_id = $2
-              AND source_schema = $3
-              AND source_table = $4
-              AND catalog_id <> $1::bigint
-            RETURNING catalog_id
+    // Serialize on object_uk via advisory xact lock in the same statement as DELETE+INSERT.
+    // Reference orphan from INSERT WHERE so PG cannot reorder modifying CTEs.
+    // Never DELETE catalog_id=$1 — that raced with apply UPDATEs (23505/40P01).
+    constexpr const char* kUpsertSql = R"(
+        WITH locked AS (
+            SELECT pg_advisory_xact_lock(
+                $6::integer,
+                hashtext($2 || chr(1) || $3 || chr(1) || $4)
+            ) AS taken
+        ),
+        orphan AS (
+            DELETE FROM cdc_catalog.apply_position ap
+            USING locked
+            WHERE ap.conn_id = $2
+              AND ap.source_schema = $3
+              AND ap.source_table = $4
+              AND ap.catalog_id <> $1::bigint
+            RETURNING ap.catalog_id
         )
         INSERT INTO cdc_catalog.apply_position
             (catalog_id, conn_id, source_schema, source_table, kafka_topic, status)
-        VALUES ($1::bigint, $2, $3, $4, $5, 'healthy'::cdc_catalog.cdc_health_status)
+        SELECT $1::bigint, $2, $3, $4, $5, 'healthy'::cdc_catalog.cdc_health_status
+        FROM locked
+        WHERE (SELECT count(*)::int FROM orphan) >= 0
         ON CONFLICT (catalog_id) DO UPDATE SET
             conn_id = EXCLUDED.conn_id,
             source_schema = EXCLUDED.source_schema,
             source_table = EXCLUDED.source_table,
             kafka_topic = EXCLUDED.kafka_topic,
             updated_at = now()
-        )",
-        5,
-        nullptr,
-        upsert_vals,
-        nullptr,
-        nullptr,
-        0);
-    if (!res) {
-        if (error_out) {
-            *error_out = "PQexecParams returned null";
+        )";
+
+    std::string last_err;
+    const int max_attempts = pipeline_defaults::kApplyPositionUpsertMaxAttempts;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        PGresult* res = PQexecParams(pg, kUpsertSql, 6, nullptr, upsert_vals, nullptr, nullptr, 0);
+        if (!res) {
+            last_err = "PQexecParams returned null";
+        } else if (PQresultStatus(res) == PGRES_COMMAND_OK) {
+            PQclear(res);
+            return true;
+        } else {
+            last_err = pq_result_err(pg, res);
+            PQclear(res);
         }
-        return false;
-    }
-    const auto st = PQresultStatus(res);
-    if (st != PGRES_COMMAND_OK) {
-        if (error_out) {
-            std::string err = PQerrorMessage(pg);
-            if (const char* msg = PQresultErrorMessage(res)) {
-                if (msg[0]) {
-                    err += " | ";
-                    err += msg;
-                }
-            }
-            *error_out = err;
+
+        if (!apply_position_err_is_retryable(last_err) || attempt + 1 >= max_attempts) {
+            break;
         }
-        PQclear(res);
-        return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25 * (attempt + 1)));
     }
-    PQclear(res);
-    return true;
+
+    // Concurrent ensure often leaves the row in place — treat as success to avoid sticky failed.
+    if (apply_position_row_exists(pg, catalog_id)) {
+        return true;
+    }
+    if (error_out) {
+        *error_out = last_err;
+    }
+    return false;
 }
 
 void ensure_apply_positions_for_conn(

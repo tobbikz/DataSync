@@ -62,6 +62,9 @@ constexpr int kRetentionPruneBatchPauseMs = 50;
 constexpr long long kLogsPurgeAdvisoryLockKey = 90420057001LL;
 /** Session lock: one DataSync process runs startup schema migrate per deploy wave. */
 constexpr long long kSchemaMigrateAdvisoryLockKey = 90420058001LL;
+/** pg_advisory_xact_lock class for apply_position upsert (key2 = hashtext object uk). */
+constexpr int kApplyPositionUpsertLockClass = 90420059;
+constexpr int kApplyPositionUpsertMaxAttempts = 3;
 constexpr bool kApplyDedupEnabled = true;
 constexpr bool kApplyAuditEnabled = true;
 constexpr int kApplyQueuedMinMessages = 100000;
