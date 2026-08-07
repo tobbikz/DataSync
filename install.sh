@@ -635,8 +635,8 @@ kafka_set_topic_retention() {
   ensure_container_runtime || exit 1
   cd "$ROOT"
   local bootstrap="${KAFKA_BOOTSTRAP:-127.0.0.1:9092}"
-  local retention_ms="${KAFKA_RETENTION_MS:-259200000}"
-  local retention_bytes="${KAFKA_RETENTION_BYTES:-1073741824}"
+  local retention_ms="${KAFKA_RETENTION_MS:-21600000}"
+  local retention_bytes="${KAFKA_RETENTION_BYTES:-134217728}"
   local segment_bytes="${KAFKA_SEGMENT_BYTES:-134217728}"
   local topic_prefix="${TOPIC_PREFIX:-}"
   local config="retention.ms=${retention_ms},retention.bytes=${retention_bytes},segment.bytes=${segment_bytes},cleanup.policy=delete"

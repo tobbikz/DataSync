@@ -34,10 +34,9 @@ services:
       # Large CDC payloads (align with pipeline_defaults kApplyMaxPartitionFetchBytes).
       KAFKA_MESSAGE_MAX_BYTES: "10485760"
       KAFKA_REPLICA_FETCH_MAX_BYTES: "10485760"
-      # Log retention: 3 days OR per-partition byte cap (whichever triggers first).
-      # Without retention.bytes, high CDC volume can fill disk within the time window.
-      KAFKA_LOG_RETENTION_MS: "259200000"
-      KAFKA_LOG_RETENTION_BYTES: "1073741824"
+      # Log retention: 6h OR 128MB per partition (whichever first). 1GB/partition filled disks.
+      KAFKA_LOG_RETENTION_MS: "21600000"
+      KAFKA_LOG_RETENTION_BYTES: "134217728"
       KAFKA_LOG_SEGMENT_BYTES: "134217728"
       KAFKA_LOG_SEGMENT_MS: "86400000"
       KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: "300000"
@@ -45,6 +44,11 @@ services:
       KAFKA_LOG_CLEANER_ENABLE: "true"
       # Expire stale consumer group offsets (unrelated to log segments, frees __consumer_offsets).
       KAFKA_OFFSETS_RETENTION_MINUTES: "10080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "127.0.0.1:9092"]
       interval: 10s
@@ -69,6 +73,11 @@ services:
       - ./config.json:/app/config.json:ro,z
     restart: unless-stopped
     stop_grace_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
     depends_on:
       kafka:
         condition: service_healthy

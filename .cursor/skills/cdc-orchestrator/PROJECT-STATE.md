@@ -139,6 +139,12 @@ Build: Docker `datasync:local` OK. **Migrate + daemon --once** verificados (2025
 - **Alert apply:** exclude short `apply_stale` from apply_position_unhealthy + apply_health_red.
 - **Lake:** `ensure_monthly_partitions` skips overlap; `migrate --lake` always refreshes helpers; apply soft-skips overlap. Manual: `sql/fix_deposit_note_partition_overlap.sql`.
 
+## Sprint — disk pressure: Docker json logs + Kafka retention (2026-08-07)
+
+- Prod host `/` hit 92%: `datasync-kafka-1` `*-json.log` ~40G (no compose log rotation) + `kafka-data` ~38G (`retention.bytes=1GB`/partition).
+- **Fix:** `docker-compose.yml` — `logging` json-file `max-size=100m` / `max-file=3` on kafka+datasync; broker defaults `KAFKA_LOG_RETENTION_MS=6h`, `KAFKA_LOG_RETENTION_BYTES=128MB`. `install.sh kafka-retention` defaults aligned.
+- **Ops:** after deploy recreate stack; run `./install.sh kafka-retention` so existing topics pick up new retention (broker env alone does not alter created topics).
+
 ## Env vars (Docker)
 
 | Variable | Default | Use |
