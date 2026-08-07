@@ -316,26 +316,21 @@ int run_schema_migrate(PGconn* log_pg, PGconn* lake_pg, const SchemaMigrateOptio
         if (!lake_pg) {
             throw std::runtime_error("migrate --lake requires datalake connection");
         }
-        if (lake_schema_exists(lake_pg)) {
-            log_write(log_pg, {
-                .level = LogLevel::Info,
-                .component = "catalog",
-                .message = "migrate lake skipped: lake schema exists",
-            });
-        } else {
-            log_write(log_pg, {
-                .level = LogLevel::Info,
-                .component = "catalog",
-                .message = "migrate applying lake schema",
-            });
-            exec_sql_section(lake_pg, prod_ops_embedded::datalake_lake(), "datalake_lake");
-            steps += 1;
-            log_write(log_pg, {
-                .level = LogLevel::Info,
-                .component = "catalog",
-                .message = "migrate lake applied",
-            });
-        }
+        // Always re-apply: datalake_lake() is CREATE OR REPLACE (partition helpers evolve).
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "catalog",
+            .message = lake_schema_exists(lake_pg)
+                ? "migrate refreshing lake helpers"
+                : "migrate applying lake schema",
+        });
+        exec_sql_section(lake_pg, prod_ops_embedded::datalake_lake(), "datalake_lake");
+        steps += 1;
+        log_write(log_pg, {
+            .level = LogLevel::Info,
+            .component = "catalog",
+            .message = "migrate lake applied",
+        });
     }
 
     if (options.incremental) {

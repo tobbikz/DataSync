@@ -4,9 +4,11 @@
 #include "pipeline_defaults.hpp"
 #include "runtime_config.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -34,6 +36,34 @@ long long call_prune_fn(
         PQgetisnull(res, 0, 0) ? 0 : std::atoll(PQgetvalue(res, 0, 0));
     PQclear(res);
     return deleted;
+}
+
+/**
+ * Call prune_*_batched with p_max_batches=1 repeatedly so each DELETE commits
+ * in its own transaction (function body otherwise holds one long txn).
+ */
+long long prune_in_committed_batches(
+    PGconn* pg,
+    const char* sql,
+    int retention_days,
+    int batch_size,
+    int max_batches,
+    int pause_ms) {
+    long long total = 0;
+    for (int i = 0; i < max_batches; ++i) {
+        const long long deleted = call_prune_fn(pg, sql, retention_days, batch_size, 1);
+        if (deleted < 0) {
+            return -1;
+        }
+        total += deleted;
+        if (deleted == 0) {
+            break;
+        }
+        if (pause_ms > 0 && i + 1 < max_batches) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms));
+        }
+    }
+    return total;
 }
 
 bool try_advisory_lock(PGconn* pg, int lock_key) {
@@ -211,6 +241,7 @@ void maybe_run_scheduled_retention_maintenance(PGconn* log_pg, RuntimeConfig& ru
         "logs_purge_max_batches",
         pipeline_defaults::kLogsPurgeMaxBatchesDefault,
         "global");
+    const int pause_ms = pipeline_defaults::kRetentionPruneBatchPauseMs;
 
     log_write(log_pg, {
         .level = LogLevel::Info,
@@ -229,27 +260,32 @@ void maybe_run_scheduled_retention_maintenance(PGconn* log_pg, RuntimeConfig& ru
             {"applied_events_max_batches", events_max_batches},
             {"logs_batch_size", logs_batch_size},
             {"logs_max_batches", logs_max_batches},
+            {"commit_per_batch", true},
+            {"batch_pause_ms", pause_ms},
         },
     });
 
-    const long long stats_deleted = call_prune_fn(
+    const long long stats_deleted = prune_in_committed_batches(
         log_pg,
         "SELECT cdc_catalog.prune_apply_batch_stats_batched($1::integer, $2::integer, $3::integer)",
         stats_retention,
         stats_batch_size,
-        stats_max_batches);
-    const long long events_deleted = call_prune_fn(
+        stats_max_batches,
+        pause_ms);
+    const long long events_deleted = prune_in_committed_batches(
         log_pg,
         "SELECT cdc_catalog.prune_applied_events_batched($1::integer, $2::integer, $3::integer)",
         applied_retention,
         events_batch_size,
-        events_max_batches);
-    const long long logs_deleted = call_prune_fn(
+        events_max_batches,
+        pause_ms);
+    const long long logs_deleted = prune_in_committed_batches(
         log_pg,
         "SELECT cdc_catalog.purge_logs_batched($1::integer, $2::integer, $3::integer)",
         logs_retention,
         logs_batch_size,
-        logs_max_batches);
+        logs_max_batches,
+        pause_ms);
 
     const bool marked = !today.empty() && mark_retention_run_date(log_pg, today);
     advisory_unlock(log_pg, pipeline_defaults::kRetentionMaintenanceAdvisoryLockKey);

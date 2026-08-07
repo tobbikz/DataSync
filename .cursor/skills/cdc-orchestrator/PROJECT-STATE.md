@@ -128,6 +128,17 @@ Build: Docker `datasync:local` OK. **Migrate + daemon --once** verificados (2025
 2. QA Mongo/MSSQL full-load resume en dev
 3. Migración catálogo prod por tier (operacional)
 
+## Sprint — retention prune + apply_position lock (2026-08-06)
+
+- **Prune:** daemon llama `prune_*_batched` con `p_max_batches=1` en loop (commit por batch + 50ms pause); defaults batch_size 1000 (migration 060). Evita statements de 1–2h+ en scrapers.
+- **apply_position:** `upsert_apply_position` ya no hace `DELETE WHERE catalog_id=$1` (solo orphans object_uk); reduce blocking storms / 23505 / 40P01 vs apply UPDATE.
+
+## Sprint — #DataSync alert noise + deposit_note partitions (2026-08-06)
+
+- **Alert kafka_backlog:** exclude MARIADB21 Myaffiliates truncate/reload tables; conn/orphan threshold 50k→100k.
+- **Alert apply:** exclude short `apply_stale` from apply_position_unhealthy + apply_health_red.
+- **Lake:** `ensure_monthly_partitions` skips overlap; `migrate --lake` always refreshes helpers; apply soft-skips overlap. Manual: `sql/fix_deposit_note_partition_overlap.sql`.
+
 ## Env vars (Docker)
 
 | Variable | Default | Use |

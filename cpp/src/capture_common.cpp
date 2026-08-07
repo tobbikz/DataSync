@@ -1862,19 +1862,27 @@ bool upsert_apply_position(
         source_table.c_str(),
         kafka_topic.c_str(),
     };
+    // Delete only object_uk orphans (different catalog_id). Never DELETE the row for
+    // catalog_id=$1 — that raced with apply UPDATEs and caused long transactionid waits
+    // plus 23505 apply_position_pkey / 40P01 deadlocks under concurrent ensure_apply_position.
     PGresult* res = PQexecParams(
         pg,
         R"(
-        WITH deleted AS (
+        WITH orphan AS (
             DELETE FROM cdc_catalog.apply_position
-            WHERE catalog_id = $1::bigint
-               OR (conn_id = $2 AND source_schema = $3 AND source_table = $4 AND catalog_id <> $1::bigint)
+            WHERE conn_id = $2
+              AND source_schema = $3
+              AND source_table = $4
+              AND catalog_id <> $1::bigint
+            RETURNING catalog_id
         )
         INSERT INTO cdc_catalog.apply_position
             (catalog_id, conn_id, source_schema, source_table, kafka_topic, status)
         VALUES ($1::bigint, $2, $3, $4, $5, 'healthy'::cdc_catalog.cdc_health_status)
-        ON CONFLICT (conn_id, source_schema, source_table) DO UPDATE SET
-            catalog_id = EXCLUDED.catalog_id,
+        ON CONFLICT (catalog_id) DO UPDATE SET
+            conn_id = EXCLUDED.conn_id,
+            source_schema = EXCLUDED.source_schema,
+            source_table = EXCLUDED.source_table,
             kafka_topic = EXCLUDED.kafka_topic,
             updated_at = now()
         )",

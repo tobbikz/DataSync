@@ -228,7 +228,7 @@ ApplyPositionObjectKey apply_position_object_key(
     const std::string& source_schema,
     const std::string& source_table);
 
-/** Idempotent apply_position row: atomic CTE delete + INSERT ON CONFLICT (object_uk). */
+/** Idempotent apply_position: orphan object_uk DELETE + INSERT ON CONFLICT (catalog_id). */
 bool upsert_apply_position(
     PGconn* pg,
     long long catalog_id,

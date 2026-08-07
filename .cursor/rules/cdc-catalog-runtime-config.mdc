@@ -38,12 +38,14 @@ DDL + seeds: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate` (`schema
 | `logs_retention_days` | global | 7 |
 | `applied_events_retention_days` | cdc_kafka_apply | 7 |
 | `apply_batch_stats_retention_days` | global | 30 |
-| `apply_batch_stats_prune_batch_size` | global | 5000 |
+| `apply_batch_stats_prune_batch_size` | global | 1000 |
 | `apply_batch_stats_prune_max_batches` | global | 500 |
-| `applied_events_prune_batch_size` | global | 5000 |
-| `applied_events_prune_max_batches` | global | 200 |
-| `logs_purge_batch_size` | global | 5000 |
+| `applied_events_prune_batch_size` | global | 1000 |
+| `applied_events_prune_max_batches` | global | 500 |
+| `logs_purge_batch_size` | global | 1000 |
 | `logs_purge_max_batches` | global | 500 |
+
+Daemon retention calls each prune function with `p_max_batches=1` in a C++ loop (commit per batch + 50ms pause) so statements stay short under scrapers.
 
 **Retention prune:** `apply_batch_stats` / `cdc_applied_events` / `cdc_catalog.logs` are pruned **once per day at 03:00 America/Costa_Rica** by `cdc_daemon` (`retention_maintenance.cpp`), not at apply worker startup. Session lock `90420055001`; logs purge also uses xact lock `90420057001`.
 

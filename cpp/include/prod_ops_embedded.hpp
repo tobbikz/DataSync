@@ -41,14 +41,27 @@ BEGIN
         SELECT lb.start_date, lb.end_date INTO start_d, end_d FROM lake.month_bounds(m) lb;
         part_name := format('%s_%s', p_table, to_char(start_d, 'YYYY_MM'));
 
+        -- Date literals (no forced +00) match existing TIMESTAMP/TIMESTAMPTZ partition bounds
+        -- and avoid false "would overlap" when older partitions used session-local midnight.
         IF to_regclass(format('%I.%I', p_schema, part_name)) IS NULL THEN
-            EXECUTE format(
-                'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.%I FOR VALUES FROM (%L) TO (%L)',
-                p_schema, part_name, p_schema, p_table,
-                start_d::text || ' 00:00:00+00',
-                end_d::text || ' 00:00:00+00'
-            );
-            created := created + 1;
+            BEGIN
+                EXECUTE format(
+                    'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.%I FOR VALUES FROM (%L) TO (%L)',
+                    p_schema, part_name, p_schema, p_table,
+                    start_d::text,
+                    end_d::text
+                );
+                created := created + 1;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    -- Race or legacy overlapping bounds: skip month; do not fail apply.
+                    IF SQLERRM ILIKE '%would overlap%'
+                       OR SQLERRM ILIKE '%already exists%' THEN
+                        NULL;
+                    ELSE
+                        RAISE;
+                    END IF;
+            END;
         END IF;
         m := (m + interval '1 month')::date;
     END LOOP;
@@ -57,7 +70,7 @@ END;
 $$;
 
 COMMENT ON FUNCTION lake.ensure_monthly_partitions(text, text, integer) IS
-    'Create monthly RANGE partitions on _dl_load_timestamp for a partitioned lake table.';
+    'Create monthly RANGE partitions on _dl_load_timestamp; skips overlap/race instead of failing apply.';
 )PO_datalake_lak";
     }
     inline std::string_view datasync_baseline() {
@@ -2412,6 +2425,38 @@ BEGIN
         RAISE NOTICE 'migration 059: capture_during_full_load column';
     END IF;
 END $migration059$;
+
+-- Migration 060: smaller retention prune batches (daemon commits one batch per call).
+DO $migration060$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 60) THEN
+        INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
+        VALUES
+            ('apply_batch_stats_prune_batch_size', 'global', '', '1000'::jsonb,
+             'Rows per DELETE batch for apply_batch_stats prune (daemon commits per batch)'),
+            ('apply_batch_stats_prune_max_batches', 'global', '', '500'::jsonb,
+             'Max DELETE batches per nightly apply_batch_stats prune run'),
+            ('applied_events_prune_batch_size', 'global', '', '1000'::jsonb,
+             'Rows per DELETE batch for cdc_applied_events prune (daemon commits per batch)'),
+            ('applied_events_prune_max_batches', 'global', '', '500'::jsonb,
+             'Max DELETE batches per nightly cdc_applied_events prune run'),
+            ('logs_purge_batch_size', 'global', '', '1000'::jsonb,
+             'Rows per DELETE batch for cdc_catalog.logs purge (daemon commits per batch)'),
+            ('logs_purge_max_batches', 'global', '', '500'::jsonb,
+             'Max DELETE batches per nightly logs purge run')
+        ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
+            config_value = EXCLUDED.config_value,
+            description  = EXCLUDED.description,
+            updated_at   = now();
+
+        COMMENT ON FUNCTION cdc_catalog.prune_applied_events_batched(integer, integer, integer) IS
+            'Batched delete of cdc_applied_events; call with p_max_batches=1 from daemon so each batch commits separately.';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (60, 'smaller retention prune batch defaults; commit-per-batch from daemon');
+        RAISE NOTICE 'migration 060: retention prune smaller batches';
+    END IF;
+END $migration060$;
 )PO_schema_patch";
     }
     /** Idempotent DDL for 050/051/052 — safe when schema_migrations version rows exist without objects. */

@@ -801,6 +801,12 @@ void ensure_partitions(PGconn* pg, const std::string& schema, const std::string&
         if (PQresultStatus(res) != PGRES_TUPLES_OK) {
             const std::string err = PQerrorMessage(pg);
             PQclear(res);
+            // Legacy lake helper / bad bounds: do not quarantine the table forever.
+            if (err.find("would overlap") != std::string::npos
+                || err.find("already exists") != std::string::npos) {
+                ready.insert(key);
+                return;
+            }
             throw std::runtime_error("ensure_monthly_partitions failed: " + err);
         }
         PQclear(res);

@@ -49,12 +49,15 @@ constexpr int kApplyBatchStatsRetentionDays = 30;
 /** Scheduled retention prune: local hour (America/Costa_Rica) — 03:00 CST. */
 constexpr int kRetentionMaintenanceLocalHour = 3;
 constexpr int kRetentionMaintenanceAdvisoryLockKey = 90420055001;
-constexpr int kApplyBatchStatsPruneBatchSizeDefault = 5000;
+constexpr int kApplyBatchStatsPruneBatchSizeDefault = 1000;
 constexpr int kApplyBatchStatsPruneMaxBatchesDefault = 500;
-constexpr int kAppliedEventsPruneBatchSizeDefault = 5000;
-constexpr int kAppliedEventsPruneMaxBatchesDefault = 200;
-constexpr int kLogsPurgeBatchSizeDefault = 5000;
+/** Small batches + one commit per C++ call — avoids multi-hour prune_*_batched statements. */
+constexpr int kAppliedEventsPruneBatchSizeDefault = 1000;
+constexpr int kAppliedEventsPruneMaxBatchesDefault = 500;
+constexpr int kLogsPurgeBatchSizeDefault = 1000;
 constexpr int kLogsPurgeMaxBatchesDefault = 500;
+/** Pause between single-batch prune commits so apply/upsert can proceed. */
+constexpr int kRetentionPruneBatchPauseMs = 50;
 /** Session-independent xact lock key inside cdc_catalog.purge_logs_batched. */
 constexpr long long kLogsPurgeAdvisoryLockKey = 90420057001LL;
 /** Session lock: one DataSync process runs startup schema migrate per deploy wave. */
