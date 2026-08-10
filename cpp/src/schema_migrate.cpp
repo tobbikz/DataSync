@@ -16,7 +16,6 @@ namespace {
 
 constexpr const char* kRequiredCatalogTables[] = {
     "apply_batch_stats",
-    "apply_outbox",
     "apply_position",
     "capture_position",
     "catalog",

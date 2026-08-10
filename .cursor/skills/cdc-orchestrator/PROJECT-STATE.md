@@ -158,6 +158,13 @@ Build: Docker `datasync:local` OK. **Migrate + daemon --once** verificados (2025
 - **Catalog UPDATEs:** `pg_exec_params_retry_deadlock` on `mark_catalog_cdc_*` (same frequency, 40P01 retry + ROLLBACK); single-statement `mark_catalog_cdc_success` (no prior SELECT).
 - **Migration 061:** `v_apply_batch_stats_hourly` + `(logged_at, stat_id)` index; prune ORDER BY `logged_at, stat_id`.
 
+## Sprint — retention 3d + drop apply_outbox (2026-08-10)
+
+- **Retention:** `apply_batch_stats` / `cdc_applied_events` / `logs` → **3 days**; batch 500 / max_batches 10000.
+- **Removed `apply_outbox`:** unused lake-first audit buffer (~22GB); apply goes lake COMMIT → audit/position directly. Migration **063** DROPs table; C++ drain/insert path deleted.
+- **Idle apply_batch_stats rows:** kept.
+- **Telemetry:** enough with `logs` + `apply_batch_stats` + `apply_position` — no new tables; fix Superset to use hourly view / stop full-table SUM.
+
 ## Env vars (Docker)
 
 | Variable | Default | Use |

@@ -100,7 +100,7 @@
 - [ ] **Airflow 3.0 operadores** (orquestar, no reemplazar daemon)
   - DiscoverOperator, OnboardOperator, FullLoadOperator, ReconcileLiteOperator, health sensor
 
-- [ ] **Consumidor estándar de `apply_outbox`** (migración 051, lake-first)
+- [x] ~~**Consumidor estándar de `apply_outbox`**~~ — **removed** (migration 063); unused, lake→audit directo
 
 - [ ] **Dashboard Grafana empaquetado** + runbooks Obsidian
 

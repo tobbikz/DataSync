@@ -2057,19 +2057,6 @@ BEGIN
         CREATE INDEX IF NOT EXISTS full_load_checkpoint_updated_idx
             ON cdc_catalog.full_load_checkpoint (updated_at DESC);
 
-        CREATE TABLE IF NOT EXISTS cdc_catalog.apply_outbox (
-            event_id text PRIMARY KEY,
-            conn_id text NOT NULL,
-            catalog_id bigint NOT NULL,
-            batch_id text NOT NULL,
-            payload jsonb NOT NULL,
-            lake_committed_at timestamptz NOT NULL DEFAULT now(),
-            audit_committed_at timestamptz
-        );
-        CREATE INDEX IF NOT EXISTS apply_outbox_pending_idx
-            ON cdc_catalog.apply_outbox (conn_id, lake_committed_at)
-            WHERE audit_committed_at IS NULL;
-
         CREATE TABLE IF NOT EXISTS cdc_catalog.reconciliation (
             reconciliation_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             batch_id text NOT NULL,
@@ -2543,6 +2530,82 @@ BEGIN
         RAISE NOTICE 'migration 061: hourly apply_batch_stats view + prune index';
     END IF;
 END $migration061$;
+
+-- Migration 062: retention 3d everywhere + small batches + prune/catalog indexes.
+DO $migration062$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 62) THEN
+        INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
+        VALUES
+            ('apply_batch_stats_retention_days', 'global', '', '3'::jsonb,
+             'Retention days for apply_batch_stats (daemon prune 03:00 CST)'),
+            ('applied_events_retention_days', 'cdc_kafka_apply', '', '3'::jsonb,
+             'Retention days for cdc_applied_events dedup ledger'),
+            ('logs_retention_days', 'global', '', '3'::jsonb,
+             'Retention days for cdc_catalog.logs'),
+            ('apply_batch_stats_prune_batch_size', 'global', '', '500'::jsonb,
+             'Rows per DELETE batch for apply_batch_stats prune'),
+            ('apply_batch_stats_prune_max_batches', 'global', '', '10000'::jsonb,
+             'Max DELETE batches per nightly apply_batch_stats prune run'),
+            ('applied_events_prune_batch_size', 'global', '', '500'::jsonb,
+             'Rows per DELETE batch for cdc_applied_events prune'),
+            ('applied_events_prune_max_batches', 'global', '', '10000'::jsonb,
+             'Max DELETE batches per nightly cdc_applied_events prune run'),
+            ('logs_purge_batch_size', 'global', '', '500'::jsonb,
+             'Rows per DELETE batch for cdc_catalog.logs purge'),
+            ('logs_purge_max_batches', 'global', '', '10000'::jsonb,
+             'Max DELETE batches per nightly logs purge run')
+        ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
+            config_value = EXCLUDED.config_value,
+            description  = EXCLUDED.description,
+            updated_at   = now();
+
+        CREATE INDEX IF NOT EXISTS apply_batch_stats_logged_at_brin
+            ON cdc_catalog.apply_batch_stats USING brin (logged_at);
+        CREATE INDEX IF NOT EXISTS cdc_applied_events_applied_at_brin
+            ON cdc_catalog.cdc_applied_events USING brin (applied_at);
+        CREATE INDEX IF NOT EXISTS logs_logged_at_brin
+            ON cdc_catalog.logs USING brin (logged_at);
+
+        CREATE INDEX IF NOT EXISTS catalog_conn_engine_active_idx
+            ON cdc_catalog.catalog (conn_id, db_engine)
+            WHERE active = true;
+        CREATE INDEX IF NOT EXISTS catalog_capture_during_full_load_idx
+            ON cdc_catalog.catalog (conn_id, db_engine)
+            WHERE capture_during_full_load = true
+              AND needs_full_load = false
+              AND cdc_enabled = false;
+        CREATE INDEX IF NOT EXISTS catalog_status_updated_idx
+            ON cdc_catalog.catalog (status, updated_at DESC);
+
+        CREATE INDEX IF NOT EXISTS apply_position_conn_status_idx
+            ON cdc_catalog.apply_position (conn_id, status);
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (62, 'retention 3d + batch 500/max 10k; BRIN + catalog/apply_position indexes');
+        RAISE NOTICE 'migration 062: retention 3d + indexes';
+    END IF;
+END $migration062$;
+
+-- Migration 063: drop unused apply_outbox (lake-first audit retry never used operationally).
+DO $migration063$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 63) THEN
+        DROP FUNCTION IF EXISTS cdc_catalog.prune_apply_outbox_batched(integer, integer, integer);
+        DROP TABLE IF EXISTS cdc_catalog.apply_outbox CASCADE;
+
+        DELETE FROM cdc_catalog.runtime_config
+        WHERE config_key IN (
+            'apply_outbox_retention_days',
+            'apply_outbox_prune_batch_size',
+            'apply_outbox_prune_max_batches'
+        );
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (63, 'drop unused apply_outbox table and related prune/runtime keys');
+        RAISE NOTICE 'migration 063: apply_outbox dropped';
+    END IF;
+END $migration063$;
 )PO_schema_patch";
     }
     /** Idempotent DDL for 050/051/052 — safe when schema_migrations version rows exist without objects. */
@@ -2563,19 +2626,6 @@ CREATE TABLE IF NOT EXISTS cdc_catalog.full_load_checkpoint (
 );
 CREATE INDEX IF NOT EXISTS full_load_checkpoint_updated_idx
     ON cdc_catalog.full_load_checkpoint (updated_at DESC);
-
-CREATE TABLE IF NOT EXISTS cdc_catalog.apply_outbox (
-    event_id text PRIMARY KEY,
-    conn_id text NOT NULL,
-    catalog_id bigint NOT NULL,
-    batch_id text NOT NULL,
-    payload jsonb NOT NULL,
-    lake_committed_at timestamptz NOT NULL DEFAULT now(),
-    audit_committed_at timestamptz
-);
-CREATE INDEX IF NOT EXISTS apply_outbox_pending_idx
-    ON cdc_catalog.apply_outbox (conn_id, lake_committed_at)
-    WHERE audit_committed_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS cdc_catalog.reconciliation (
     reconciliation_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

@@ -45,17 +45,17 @@ constexpr int kApplyMaxPartitionFetchBytes = 10485760;
 constexpr int kApplyEmptyPollQuietThreshold = 3;
 constexpr int kApplyMaxTableStalenessSeconds = 900;
 constexpr int kApplyInactiveSeconds = 3600;
-constexpr int kApplyBatchStatsRetentionDays = 30;
+constexpr int kApplyBatchStatsRetentionDays = 3;
 /** Scheduled retention prune: local hour (America/Costa_Rica) — 03:00 CST. */
 constexpr int kRetentionMaintenanceLocalHour = 3;
 constexpr int kRetentionMaintenanceAdvisoryLockKey = 90420055001;
-constexpr int kApplyBatchStatsPruneBatchSizeDefault = 1000;
-constexpr int kApplyBatchStatsPruneMaxBatchesDefault = 500;
-/** Small batches + one commit per C++ call — avoids multi-hour prune_*_batched statements. */
-constexpr int kAppliedEventsPruneBatchSizeDefault = 1000;
-constexpr int kAppliedEventsPruneMaxBatchesDefault = 500;
-constexpr int kLogsPurgeBatchSizeDefault = 1000;
-constexpr int kLogsPurgeMaxBatchesDefault = 500;
+/** Small batches + one commit per C++ call — short statements under scrapers. */
+constexpr int kApplyBatchStatsPruneBatchSizeDefault = 500;
+constexpr int kApplyBatchStatsPruneMaxBatchesDefault = 10000;
+constexpr int kAppliedEventsPruneBatchSizeDefault = 500;
+constexpr int kAppliedEventsPruneMaxBatchesDefault = 10000;
+constexpr int kLogsPurgeBatchSizeDefault = 500;
+constexpr int kLogsPurgeMaxBatchesDefault = 10000;
 /** Pause between single-batch prune commits so apply/upsert can proceed. */
 constexpr int kRetentionPruneBatchPauseMs = 50;
 /** Session-independent xact lock key inside cdc_catalog.purge_logs_batched. */
@@ -69,7 +69,7 @@ constexpr int kApplyPositionUpsertMaxAttempts = 3;
 constexpr int kCatalogUpdateDeadlockMaxAttempts = 5;
 constexpr int kCatalogUpdateDeadlockBaseSleepMs = 25;
 /** Discover orphan cleanup: max rows deleted from cdc_applied_events per batch. */
-constexpr int kDiscoverOrphanAppliedEventsBatchSize = 5000;
+constexpr int kDiscoverOrphanAppliedEventsBatchSize = 500;
 constexpr bool kApplyDedupEnabled = true;
 constexpr bool kApplyAuditEnabled = true;
 constexpr int kApplyQueuedMinMessages = 100000;
@@ -147,7 +147,7 @@ constexpr int kTableLagScanTimeoutMsDefault = 120000;
 constexpr long long kTableLagScanMaxMessagesDefault = 0;
 /** End-of-slice lag-only drain polls after main apply loop. */
 constexpr int kApplyLagDrainQuietPollsDefault = 5;
-constexpr int kLogsRetentionDaysDefault = 7;
-constexpr int kAppliedEventsRetentionDaysDefault = 7;
+constexpr int kLogsRetentionDaysDefault = 3;
+constexpr int kAppliedEventsRetentionDaysDefault = 3;
 
 }  // namespace pipeline_defaults

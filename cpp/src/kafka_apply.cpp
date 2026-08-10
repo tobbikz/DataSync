@@ -1586,216 +1586,6 @@ long long apply_table_batch(
     return applied_deletes + static_cast<long long>(upserts.size() - skipped_missing_pk);
 }
 
-json apply_event_to_json(const ApplyEvent& e) {
-    return {
-        {"event_id", e.event_id},
-        {"op", e.op},
-        {"schema_name", e.schema_name},
-        {"table_name", e.table_name},
-        {"topic", e.topic},
-        {"partition", e.partition},
-        {"offset", e.offset},
-        {"gtid", e.gtid},
-        {"catalog_id", e.catalog_id},
-    };
-}
-
-ApplyEvent apply_event_from_json(const json& j) {
-    ApplyEvent e;
-    e.event_id = j.value("event_id", "");
-    e.op = j.value("op", "");
-    e.schema_name = j.value("schema_name", "");
-    e.table_name = j.value("table_name", "");
-    e.topic = j.value("topic", "");
-    e.partition = j.value("partition", 0);
-    e.offset = j.value("offset", 0LL);
-    e.gtid = j.value("gtid", "");
-    e.catalog_id = j.value("catalog_id", 0LL);
-    return e;
-}
-
-json build_apply_outbox_payload(const std::vector<ApplyEvent>& audit, long long catalog_id) {
-    json payload;
-    payload["catalog_id"] = catalog_id;
-    json arr = json::array();
-    for (const auto& e : audit) {
-        arr.push_back(apply_event_to_json(e));
-    }
-    payload["audit"] = std::move(arr);
-    return payload;
-}
-
-std::string apply_outbox_id(long long catalog_id, const ApplyEvent& last) {
-    return std::to_string(catalog_id) + ":" + last.topic + ":" + std::to_string(last.partition) + ":" +
-           std::to_string(last.offset);
-}
-
-void insert_apply_outbox(
-    PGconn* pg,
-    const std::string& outbox_id,
-    const std::string& conn_id,
-    long long catalog_id,
-    const std::string& batch_id,
-    const json& payload) {
-    const std::string cid = std::to_string(catalog_id);
-    const std::string payload_str = payload.dump();
-    const char* vals[] = {
-        outbox_id.c_str(),
-        conn_id.c_str(),
-        cid.c_str(),
-        batch_id.c_str(),
-        payload_str.c_str(),
-    };
-    pg_exec_params_simple(
-        pg,
-        R"(
-        INSERT INTO cdc_catalog.apply_outbox (event_id, conn_id, catalog_id, batch_id, payload)
-        VALUES ($1, $2, $3::bigint, $4, $5::jsonb)
-        ON CONFLICT (event_id) DO NOTHING
-        )",
-        5,
-        vals);
-}
-
-void mark_apply_outbox_committed(PGconn* pg, const std::string& outbox_id) {
-    const char* vals[] = {outbox_id.c_str()};
-    pg_exec_params_simple(
-        pg,
-        "UPDATE cdc_catalog.apply_outbox SET audit_committed_at = now() WHERE event_id = $1",
-        1,
-        vals);
-}
-
-void commit_audit_from_outbox_payload(
-    PGconn* app_pg,
-    const std::string& conn_id,
-    const json& payload) {
-    std::vector<ApplyEvent> audit;
-    if (payload.contains("audit") && payload["audit"].is_array()) {
-        audit.reserve(payload["audit"].size());
-        for (const auto& j : payload["audit"]) {
-            audit.push_back(apply_event_from_json(j));
-        }
-    }
-    if (audit.empty()) {
-        return;
-    }
-    record_applied_events(app_pg, conn_id, audit);
-    const ApplyEvent* max_kafka = max_kafka_audit_position(audit);
-    const long long catalog_id = payload.value("catalog_id", 0LL);
-    if (max_kafka != nullptr && catalog_id > 0) {
-        update_apply_position(
-            app_pg,
-            catalog_id,
-            max_kafka->topic,
-            max_kafka->partition,
-            max_kafka->offset,
-            max_kafka->gtid);
-    }
-}
-
-int drain_apply_outbox_pending(PGconn* pg, const std::string& conn_id, const std::string& batch_id) {
-    const char* vals[] = {conn_id.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        SELECT event_id, payload::text
-        FROM cdc_catalog.apply_outbox
-        WHERE conn_id = $1
-          AND audit_committed_at IS NULL
-        ORDER BY lake_committed_at
-        LIMIT 200
-        )",
-        1,
-        nullptr,
-        vals,
-        nullptr,
-        nullptr,
-        0);
-    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (res) {
-            PQclear(res);
-        }
-        return 0;
-    }
-
-    int drained = 0;
-    for (int i = 0; i < PQntuples(res); ++i) {
-        const std::string outbox_id = PQgetvalue(res, i, 0);
-        json payload;
-        try {
-            payload = json::parse(PQgetvalue(res, i, 1));
-        } catch (...) {
-            log_write(pg, {
-                .level = LogLevel::Error,
-                .component = "cdc_kafka_apply",
-                .message = "apply outbox payload parse failed",
-                .batch_id = batch_id,
-                .conn_id = conn_id,
-                .source_schema = std::nullopt,
-                .source_table = std::nullopt,
-                .context = {{"outbox_id", outbox_id}},
-            });
-            continue;
-        }
-
-        PGresult* begin = PQexec(pg, "BEGIN");
-        if (begin) {
-            PQclear(begin);
-        }
-        try {
-            commit_audit_from_outbox_payload(pg, conn_id, payload);
-            PGresult* commit = PQexec(pg, "COMMIT");
-            const bool ok = commit && PQresultStatus(commit) == PGRES_COMMAND_OK;
-            if (commit) {
-                PQclear(commit);
-            }
-            if (!ok) {
-                { PGresult* r = PQexec(pg, "ROLLBACK"); if (r) PQclear(r); }
-                log_write(pg, {
-                    .level = LogLevel::Error,
-                    .component = "cdc_kafka_apply",
-                    .message = "apply outbox audit commit failed",
-                    .batch_id = batch_id,
-                    .conn_id = conn_id,
-                    .source_schema = std::nullopt,
-                    .source_table = std::nullopt,
-                    .context = {{"outbox_id", outbox_id}, {"error", PQerrorMessage(pg)}},
-                });
-                continue;
-            }
-            mark_apply_outbox_committed(pg, outbox_id);
-            drained += 1;
-        } catch (const std::exception& ex) {
-            { PGresult* r = PQexec(pg, "ROLLBACK"); if (r) PQclear(r); }
-            log_write(pg, {
-                .level = LogLevel::Error,
-                .component = "cdc_kafka_apply",
-                .message = "apply outbox drain failed",
-                .batch_id = batch_id,
-                .conn_id = conn_id,
-                .source_schema = std::nullopt,
-                .source_table = std::nullopt,
-                .context = {{"outbox_id", outbox_id}, {"error", ex.what()}},
-            });
-        }
-    }
-    PQclear(res);
-    if (drained > 0) {
-        log_write(pg, {
-            .level = LogLevel::Info,
-            .component = "cdc_kafka_apply",
-            .message = "apply outbox drained",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {{"rows_drained", drained}},
-        });
-    }
-    return drained;
-}
-
 json apply_events_batch(
     PGconn* app_pg,
     PGconn* lake_pg,
@@ -1806,8 +1596,6 @@ json apply_events_batch(
     const std::string db_engine = (options.source_system == "MSSQL")
         ? "mssql"
         : (options.source_system == "MongoDB") ? "mongodb" : "mariadb";
-
-    drain_apply_outbox_pending(app_pg, conn_id, batch_id);
 
     thread_local std::unordered_map<std::string, std::vector<std::string>> lake_pk_cache;
     thread_local std::unordered_map<std::string, std::vector<std::string>> lake_data_cols_cache;
@@ -2214,7 +2002,6 @@ json apply_events_batch(
                                            .count();
         const ApplyEvent* max_kafka = max_kafka_audit_position(audit);
         std::optional<std::pair<std::string, long long>> kafka_offset_out;
-        std::optional<std::string> outbox_id;
 
         pg_exec(lake_pg, "RELEASE SAVEPOINT sp_lake_apply");
         bool lake_commit_ok = false;
@@ -2260,17 +2047,6 @@ json apply_events_batch(
                 quarantine_apply_position(app_pg, meta.catalog_id, lake_err);
             }
             continue;
-        }
-
-        if (options.audit_enabled && !audit.empty() && max_kafka != nullptr && meta.catalog_id > 0) {
-            outbox_id = apply_outbox_id(meta.catalog_id, *max_kafka);
-            insert_apply_outbox(
-                app_pg,
-                *outbox_id,
-                conn_id,
-                meta.catalog_id,
-                batch_id,
-                build_apply_outbox_payload(audit, meta.catalog_id));
         }
 
         PGresult* app_begin = PQexec(app_pg, "BEGIN");
@@ -2391,14 +2167,9 @@ json apply_events_batch(
                         {"lake_table", meta.table_name},
                         {"error", app_err},
                         {"audit_events", static_cast<int>(audit.size())},
-                        {"outbox_id", outbox_id ? *outbox_id : ""},
-                        {"outbox_retry", true},
                     },
                 });
                 continue;
-            }
-            if (outbox_id) {
-                mark_apply_outbox_committed(app_pg, *outbox_id);
             }
             if (meta.catalog_id > 0) {
                 mark_catalog_cdc_success(app_pg, meta.catalog_id);
@@ -2422,8 +2193,6 @@ json apply_events_batch(
                     {"lake_schema", meta.schema_name},
                     {"lake_table", meta.table_name},
                     {"error", ex.what()},
-                    {"outbox_id", outbox_id ? *outbox_id : ""},
-                    {"outbox_retry", true},
                 },
             });
             continue;
