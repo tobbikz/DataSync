@@ -151,6 +151,13 @@ Build: Docker `datasync:local` OK. **Migrate + daemon --once** verificados (2025
 - **Fix:** `docker-compose.yml` — `logging` json-file `max-size=100m` / `max-file=3` on kafka+datasync; broker defaults `KAFKA_LOG_RETENTION_MS=6h`, `KAFKA_LOG_RETENTION_BYTES=128MB`. `install.sh kafka-retention` defaults aligned.
 - **Ops:** after deploy recreate stack; run `./install.sh kafka-retention` so existing topics pick up new retention (broker env alone does not alter created topics).
 
+## Sprint — PG alert root causes: migrate 003, discover prune, catalog deadlock (2026-08-10)
+
+- **Migration 003/004:** versioned with `schema_migrations` (were re-running ALTER/ADD COLUMN every daemon migrate → ACCESS EXCLUSIVE vs apply). 003 no-ops DDL if `reconciliation_run` already dropped (046).
+- **Discover prune:** materialize `tmp_catalog_doomed`, early-exit when empty; batch-delete orphan `cdc_applied_events` (5000/batch).
+- **Catalog UPDATEs:** `pg_exec_params_retry_deadlock` on `mark_catalog_cdc_*` (same frequency, 40P01 retry + ROLLBACK); single-statement `mark_catalog_cdc_success` (no prior SELECT).
+- **Migration 061:** `v_apply_batch_stats_hourly` + `(logged_at, stat_id)` index; prune ORDER BY `logged_at, stat_id`.
+
 ## Env vars (Docker)
 
 | Variable | Default | Use |

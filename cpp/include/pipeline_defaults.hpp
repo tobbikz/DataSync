@@ -65,6 +65,11 @@ constexpr long long kSchemaMigrateAdvisoryLockKey = 90420058001LL;
 /** pg_advisory_xact_lock class for apply_position upsert (key2 = hashtext object uk). */
 constexpr int kApplyPositionUpsertLockClass = 90420059;
 constexpr int kApplyPositionUpsertMaxAttempts = 3;
+/** Retries for catalog row UPDATEs on deadlock (40P01); same call frequency, transient backoff. */
+constexpr int kCatalogUpdateDeadlockMaxAttempts = 5;
+constexpr int kCatalogUpdateDeadlockBaseSleepMs = 25;
+/** Discover orphan cleanup: max rows deleted from cdc_applied_events per batch. */
+constexpr int kDiscoverOrphanAppliedEventsBatchSize = 5000;
 constexpr bool kApplyDedupEnabled = true;
 constexpr bool kApplyAuditEnabled = true;
 constexpr int kApplyQueuedMinMessages = 100000;

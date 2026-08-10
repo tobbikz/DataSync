@@ -305,48 +305,80 @@ void cleanup_orphans_before_prune(PgTxn& tx, const std::string& conn_id, const s
             : R"(d.source_database = c.source_database
               AND d.source_schema = c.source_schema
               AND d.source_table = c.source_table)";
-    const std::string kDoomed =
-        "SELECT c.source_database, c.source_schema, c.source_table"
-        " FROM cdc_catalog.catalog c"
-        " WHERE c.conn_id = $1"
-        "   AND c.db_engine = $2::cdc_catalog.db_engine"
-        "   AND NOT EXISTS ("
-        "     SELECT 1 FROM tmp_catalog_discovered d"
-        "     WHERE " +
-        discovered_match + ")";
 
+    // Materialize doomed keys once; early-exit when nothing disappeared (common path).
+    tx.exec(
+        "CREATE TEMP TABLE IF NOT EXISTS tmp_catalog_doomed ("
+        "source_database text NOT NULL DEFAULT '',"
+        "source_schema text NOT NULL,"
+        "source_table text NOT NULL,"
+        "PRIMARY KEY (source_database, source_schema, source_table)) ON COMMIT DROP");
+    tx.exec("TRUNCATE tmp_catalog_doomed");
     tx.exec_params(
-        ("WITH doomed AS (" + std::string(kDoomed) + R"()
-        DELETE FROM cdc_catalog.cdc_applied_events ae
-        USING doomed d
-        WHERE ae.conn_id = $1
-          AND ae.source_schema = d.source_schema
-          AND ae.source_table = d.source_table
-        )").c_str(),
+        ("INSERT INTO tmp_catalog_doomed (source_database, source_schema, source_table)"
+         " SELECT c.source_database, c.source_schema, c.source_table"
+         " FROM cdc_catalog.catalog c"
+         " WHERE c.conn_id = $1"
+         "   AND c.db_engine = $2::cdc_catalog.db_engine"
+         "   AND NOT EXISTS ("
+         "     SELECT 1 FROM tmp_catalog_discovered d"
+         "     WHERE " +
+         discovered_match + ")")
+            .c_str(),
         2,
         vals);
 
+    const int doomed_n = tx.exec_count("SELECT COUNT(*)::int FROM tmp_catalog_doomed");
+    if (doomed_n <= 0) {
+        return;
+    }
+
+    // Batched deletes — full-table orphan wipe of cdc_applied_events can run for minutes.
+    const int batch_size = pipeline_defaults::kDiscoverOrphanAppliedEventsBatchSize;
+    for (;;) {
+        const std::string batch_sql =
+            "WITH doomed_batch AS ("
+            "  SELECT ae.event_id"
+            "  FROM cdc_catalog.cdc_applied_events ae"
+            "  INNER JOIN tmp_catalog_doomed d"
+            "    ON ae.source_schema = d.source_schema"
+            "   AND ae.source_table = d.source_table"
+            "  WHERE ae.conn_id = $1"
+            "  LIMIT " +
+            std::to_string(batch_size) +
+            "), deleted AS ("
+            "  DELETE FROM cdc_catalog.cdc_applied_events t"
+            "  USING doomed_batch b"
+            "  WHERE t.event_id = b.event_id"
+            "  RETURNING 1"
+            ") SELECT COUNT(*)::int FROM deleted";
+        const int deleted = tx.exec_params_count(batch_sql.c_str(), 1, vals);
+        if (deleted <= 0) {
+            break;
+        }
+    }
+
     tx.exec_params(
-        ("WITH doomed AS (" + std::string(kDoomed) + R"()
+        R"(
         DELETE FROM cdc_catalog.cdc_mssql_lsn l
-        USING doomed d
+        USING tmp_catalog_doomed d
         WHERE l.conn_id = $1
           AND l.database = d.source_database
           AND l.schema_name = d.source_schema
           AND l.table_name = d.source_table
-        )").c_str(),
-        2,
+        )",
+        1,
         vals);
 
     tx.exec_params(
-        ("WITH doomed AS (" + std::string(kDoomed) + R"()
+        R"(
         DELETE FROM cdc_catalog.cdc_mongo_resume r
-        USING doomed d
+        USING tmp_catalog_doomed d
         WHERE r.conn_id = $1
           AND r.database = d.source_database
           AND r.collection = d.source_table
-        )").c_str(),
-        2,
+        )",
+        1,
         vals);
 }
 

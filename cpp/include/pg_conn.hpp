@@ -60,3 +60,11 @@ void pg_copy_batch_with_retry(
 
 void pg_exec(PGconn* pg, const std::string& sql);
 void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const* vals);
+/** Like pg_exec_params_simple but retries on deadlock (40P01). Issues ROLLBACK between attempts. */
+void pg_exec_params_retry_deadlock(
+    PGconn* pg,
+    const char* sql,
+    int n,
+    const char* const* vals,
+    int max_attempts = 5,
+    int base_sleep_ms = 25);

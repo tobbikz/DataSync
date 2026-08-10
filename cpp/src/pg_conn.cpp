@@ -191,3 +191,65 @@ void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const
     }
     PQclear(res);
 }
+
+namespace {
+
+bool pg_err_is_deadlock(const std::string& err) {
+    return contains_ci(err, "40P01") || contains_ci(err, "deadlock detected");
+}
+
+std::string pg_result_err_text(PGconn* pg, PGresult* res) {
+    std::string err = pg && PQerrorMessage(pg) ? PQerrorMessage(pg) : "";
+    if (const char* msg = res ? PQresultErrorMessage(res) : nullptr) {
+        if (msg[0]) {
+            if (!err.empty()) {
+                err += " | ";
+            }
+            err += msg;
+        }
+    }
+    if (err.empty()) {
+        err = "unknown PostgreSQL error";
+    }
+    return err;
+}
+
+}  // namespace
+
+void pg_exec_params_retry_deadlock(
+    PGconn* pg,
+    const char* sql,
+    int n,
+    const char* const* vals,
+    int max_attempts,
+    int base_sleep_ms) {
+    if (max_attempts < 1) {
+        max_attempts = 1;
+    }
+    if (base_sleep_ms < 1) {
+        base_sleep_ms = 1;
+    }
+    std::string last_err;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        PGresult* res = PQexecParams(pg, sql, n, nullptr, vals, nullptr, nullptr, 0);
+        if (res &&
+            (PQresultStatus(res) == PGRES_COMMAND_OK || PQresultStatus(res) == PGRES_TUPLES_OK)) {
+            PQclear(res);
+            return;
+        }
+        last_err = pg_result_err_text(pg, res);
+        if (res) {
+            PQclear(res);
+        }
+        if (!pg_err_is_deadlock(last_err) || attempt + 1 >= max_attempts) {
+            break;
+        }
+        // Deadlock aborts the current transaction; clear so the next attempt can run.
+        PGresult* rb = PQexec(pg, "ROLLBACK");
+        if (rb) {
+            PQclear(rb);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(base_sleep_ms * (attempt + 1)));
+    }
+    throw std::runtime_error("PostgreSQL exec_params failed after deadlock retries: " + last_err);
+}

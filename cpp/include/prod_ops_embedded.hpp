@@ -1372,37 +1372,52 @@ LIMIT 20;
     inline std::string_view schema_patches() {
         return R"PO_schema_patch(
 
--- Migration 003 (legacy): reconcile_mode on reconciliation_run — skipped when table absent.
+-- Migration 003 (legacy): reconcile_mode on reconciliation_run — once only.
+-- Previously unversioned: every migrate DROP/ADD CONSTRAINT → ACCESS EXCLUSIVE locks vs apply.
 DO $$
 BEGIN
-    IF to_regclass('cdc_catalog.reconciliation_run') IS NOT NULL THEN
-        ALTER TABLE cdc_catalog.reconciliation_run
-            ADD COLUMN IF NOT EXISTS reconcile_mode text NOT NULL DEFAULT 'full';
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 3) THEN
+        IF to_regclass('cdc_catalog.reconciliation_run') IS NOT NULL THEN
+            ALTER TABLE cdc_catalog.reconciliation_run
+                ADD COLUMN IF NOT EXISTS reconcile_mode text NOT NULL DEFAULT 'full';
 
-        ALTER TABLE cdc_catalog.reconciliation_run
-            DROP CONSTRAINT IF EXISTS reconciliation_run_mode_check;
+            ALTER TABLE cdc_catalog.reconciliation_run
+                DROP CONSTRAINT IF EXISTS reconciliation_run_mode_check;
 
-        ALTER TABLE cdc_catalog.reconciliation_run
-            ADD CONSTRAINT reconciliation_run_mode_check
-                CHECK (reconcile_mode = 'full'::text);
+            ALTER TABLE cdc_catalog.reconciliation_run
+                ADD CONSTRAINT reconciliation_run_mode_check
+                    CHECK (reconcile_mode = 'full'::text);
 
-        COMMENT ON TABLE cdc_catalog.reconciliation_run IS
-            'Legacy reconcile CLI run header (removed — table dropped by migration 046)';
+            COMMENT ON TABLE cdc_catalog.reconciliation_run IS
+                'Legacy reconcile CLI run header (removed — table dropped by migration 046)';
+        END IF;
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (3, 'reconcile_mode on reconciliation_run (legacy; no-op when table already dropped)');
+        RAISE NOTICE 'migration 003: reconcile_mode recorded (DDL applied only if table present)';
     END IF;
 END $$;
 
--- Migration 004: apply observability columns on existing deployments.
-ALTER TABLE cdc_catalog.apply_batch_stats
-    ADD COLUMN IF NOT EXISTS parse_skipped bigint NOT NULL DEFAULT 0;
+-- Migration 004: apply observability columns — once only (ADD COLUMN still takes AccessExclusiveLock).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 4) THEN
+        ALTER TABLE cdc_catalog.apply_batch_stats
+            ADD COLUMN IF NOT EXISTS parse_skipped bigint NOT NULL DEFAULT 0;
 
-ALTER TABLE cdc_catalog.apply_batch_stats
-    ADD COLUMN IF NOT EXISTS dropped_unrecoverable bigint NOT NULL DEFAULT 0;
+        ALTER TABLE cdc_catalog.apply_batch_stats
+            ADD COLUMN IF NOT EXISTS dropped_unrecoverable bigint NOT NULL DEFAULT 0;
 
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.parse_skipped IS
-    'Kafka messages skipped due to JSON/payload parse failure in apply slice (per table batch)';
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.parse_skipped IS
+            'Kafka messages skipped due to JSON/payload parse failure in apply slice (per table batch)';
 
-COMMENT ON COLUMN cdc_catalog.apply_batch_stats.dropped_unrecoverable IS
-    'Events dropped because lake schema/table could not be resolved (per table batch)';
+        COMMENT ON COLUMN cdc_catalog.apply_batch_stats.dropped_unrecoverable IS
+            'Events dropped because lake schema/table could not be resolved (per table batch)';
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (4, 'apply_batch_stats parse_skipped + dropped_unrecoverable columns');
+        RAISE NOTICE 'migration 004: apply_batch_stats observability columns';
+    END IF;
+END $$;
 
 -- Migration 035: drop service_tier (tier routing removed from C++ daemon).
 DO $$
@@ -2457,6 +2472,77 @@ BEGIN
         RAISE NOTICE 'migration 060: retention prune smaller batches';
     END IF;
 END $migration060$;
+
+-- Migration 061: hourly apply_batch_stats view for BI (avoids full-table SUM scans in Superset).
+DO $migration061$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 61) THEN
+        CREATE OR REPLACE VIEW cdc_catalog.v_apply_batch_stats_hourly AS
+        SELECT
+            date_trunc('hour', logged_at) AS logged_at,
+            COALESCE(SUM(events_total), 0)::bigint AS events_total,
+            COALESCE(SUM(events_inserts), 0)::bigint AS events_inserts,
+            COALESCE(SUM(events_updates), 0)::bigint AS events_updates,
+            COALESCE(SUM(events_deletes), 0)::bigint AS events_deletes,
+            COALESCE(SUM(parse_skipped), 0)::bigint AS parse_skipped,
+            COALESCE(SUM(dropped_unrecoverable), 0)::bigint AS dropped_unrecoverable,
+            COALESCE(SUM(dedup_skipped), 0)::bigint AS dedup_skipped,
+            COUNT(*)::bigint AS slice_rows
+        FROM cdc_catalog.apply_batch_stats
+        GROUP BY 1;
+
+        COMMENT ON VIEW cdc_catalog.v_apply_batch_stats_hourly IS
+            'Hourly rollup of apply_batch_stats for dashboards; prefer over raw SUM(date_trunc(...)) on the base table.';
+
+        CREATE INDEX IF NOT EXISTS apply_batch_stats_logged_at_stat_id_idx
+            ON cdc_catalog.apply_batch_stats USING btree (logged_at, stat_id);
+
+        -- Prefer logged_at range + SKIP LOCKED over sorting by stat_id alone on large heaps.
+        CREATE OR REPLACE FUNCTION cdc_catalog.prune_apply_batch_stats_batched(
+            p_retention_days integer DEFAULT 30,
+            p_batch_size integer DEFAULT 5000,
+            p_max_batches integer DEFAULT 500
+        ) RETURNS bigint
+        LANGUAGE plpgsql
+        AS $prune_abs_batched$
+        DECLARE
+            total_deleted bigint := 0;
+            batch_deleted bigint;
+            batches_done integer := 0;
+            cutoff timestamptz;
+        BEGIN
+            IF p_retention_days IS NULL OR p_retention_days < 1
+               OR p_batch_size IS NULL OR p_batch_size < 1
+               OR p_max_batches IS NULL OR p_max_batches < 1 THEN
+                RETURN 0;
+            END IF;
+            cutoff := now() - make_interval(days => p_retention_days);
+            LOOP
+                WITH doomed AS (
+                    SELECT stat_id
+                    FROM cdc_catalog.apply_batch_stats
+                    WHERE logged_at < cutoff
+                    ORDER BY logged_at, stat_id
+                    LIMIT p_batch_size
+                    FOR UPDATE SKIP LOCKED
+                )
+                DELETE FROM cdc_catalog.apply_batch_stats t
+                USING doomed d
+                WHERE t.stat_id = d.stat_id;
+                GET DIAGNOSTICS batch_deleted = ROW_COUNT;
+                total_deleted := total_deleted + batch_deleted;
+                batches_done := batches_done + 1;
+                EXIT WHEN batch_deleted = 0 OR batches_done >= p_max_batches;
+            END LOOP;
+            RETURN total_deleted;
+        END;
+        $prune_abs_batched$;
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (61, 'v_apply_batch_stats_hourly + (logged_at,stat_id) index + prune ORDER BY logged_at');
+        RAISE NOTICE 'migration 061: hourly apply_batch_stats view + prune index';
+    END IF;
+END $migration061$;
 )PO_schema_patch";
     }
     /** Idempotent DDL for 050/051/052 — safe when schema_migrations version rows exist without objects. */

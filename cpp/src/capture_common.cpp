@@ -1334,7 +1334,7 @@ void mark_catalog_skipped(PGconn* pg, long long catalog_id, const std::string& r
 void mark_catalog_cdc_in_progress(PGconn* pg, long long catalog_id) {
     const std::string id = std::to_string(catalog_id);
     const char* vals[] = {id.c_str()};
-    pg_exec_params_simple(
+    pg_exec_params_retry_deadlock(
         pg,
         R"(
         UPDATE cdc_catalog.catalog
@@ -1343,84 +1343,52 @@ void mark_catalog_cdc_in_progress(PGconn* pg, long long catalog_id) {
         WHERE catalog_id = $1::bigint
         )",
         1,
-        vals);
-}
-
-namespace {
-
-bool catalog_needs_full_load(PGconn* pg, long long catalog_id) {
-    const std::string id = std::to_string(catalog_id);
-    const char* vals[] = {id.c_str()};
-    PGresult* sel = PQexecParams(
-        pg,
-        R"(
-        SELECT needs_full_load
-        FROM cdc_catalog.catalog
-        WHERE catalog_id = $1::bigint
-        )",
-        1,
-        nullptr,
         vals,
-        nullptr,
-        nullptr,
-        0);
-    bool needs_full_load = false;
-    if (sel && PQresultStatus(sel) == PGRES_TUPLES_OK && PQntuples(sel) > 0) {
-        needs_full_load = std::string(PQgetvalue(sel, 0, 0)) == "t";
-    }
-    if (sel) {
-        PQclear(sel);
-    }
-    return needs_full_load;
+        pipeline_defaults::kCatalogUpdateDeadlockMaxAttempts,
+        pipeline_defaults::kCatalogUpdateDeadlockBaseSleepMs);
 }
-
-}  // namespace
 
 void mark_catalog_cdc_success(PGconn* pg, long long catalog_id) {
     const std::string id = std::to_string(catalog_id);
     const char* vals[] = {id.c_str()};
-    const bool needs_full_load = catalog_needs_full_load(pg, catalog_id);
-    if (needs_full_load) {
-        pg_exec_params_simple(
-            pg,
-            R"(
-            UPDATE cdc_catalog.catalog
-            SET last_cdc_at = now(),
-                status = CASE
-                    WHEN status = 'success'::cdc_catalog.replication_status
-                    THEN 'pending'::cdc_catalog.replication_status
-                    ELSE status
-                END,
-                updated_at = now()
-            WHERE catalog_id = $1::bigint
-            )",
-            1,
-            vals);
-        return;
-    }
-    pg_exec_params_simple(
+    // Single statement (no prior SELECT) to shrink lock window; retry on 40P01.
+    pg_exec_params_retry_deadlock(
         pg,
         R"(
         UPDATE cdc_catalog.catalog
         SET last_cdc_at = now(),
             status = CASE
+                WHEN needs_full_load
+                     AND status = 'success'::cdc_catalog.replication_status
+                    THEN 'pending'::cdc_catalog.replication_status
+                WHEN needs_full_load THEN status
                 WHEN cdc_enabled THEN 'success'::cdc_catalog.replication_status
                 ELSE status
             END,
-            last_error_at = CASE WHEN cdc_enabled THEN NULL ELSE last_error_at END,
-            last_error = CASE WHEN cdc_enabled THEN NULL ELSE last_error END,
+            last_error_at = CASE
+                WHEN needs_full_load THEN last_error_at
+                WHEN cdc_enabled THEN NULL
+                ELSE last_error_at
+            END,
+            last_error = CASE
+                WHEN needs_full_load THEN last_error
+                WHEN cdc_enabled THEN NULL
+                ELSE last_error
+            END,
             updated_at = now()
         WHERE catalog_id = $1::bigint
         )",
         1,
-        vals);
+        vals,
+        pipeline_defaults::kCatalogUpdateDeadlockMaxAttempts,
+        pipeline_defaults::kCatalogUpdateDeadlockBaseSleepMs);
 }
 
 void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string& error) {
     const std::string id = std::to_string(catalog_id);
     const std::string trunc = error.substr(0, 1000);
     const char* vals[] = {id.c_str(), trunc.c_str()};
-    pg_exec_params_simple(
+    pg_exec_params_retry_deadlock(
         pg,
         R"(
         UPDATE cdc_catalog.catalog
@@ -1431,7 +1399,9 @@ void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string
         WHERE catalog_id = $1::bigint
         )",
         2,
-        vals);
+        vals,
+        pipeline_defaults::kCatalogUpdateDeadlockMaxAttempts,
+        pipeline_defaults::kCatalogUpdateDeadlockBaseSleepMs);
 }
 
 void quarantine_apply_position(PGconn* pg, long long catalog_id, const std::string& reason) {
