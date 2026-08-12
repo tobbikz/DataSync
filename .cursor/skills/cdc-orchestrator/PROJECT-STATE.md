@@ -165,6 +165,13 @@ Build: Docker `datasync:local` OK. **Migrate + daemon --once** verificados (2025
 - **Idle apply_batch_stats rows:** kept.
 - **Telemetry:** enough with `logs` + `apply_batch_stats` + `apply_position` — no new tables; fix Superset to use hourly view / stop full-table SUM.
 
+## Sprint — applied_events prune fix migration 064 (2026-08-11)
+
+- **Root cause:** nightly prune marked complete after ≤5M deletes; 912M rows / oldest 2026-06-29; `ORDER BY event_id` (text) not `applied_at`.
+- **Migration 064:** prune by `applied_at, event_id`; runtime batch **5000** / max **50000**; FILLFACTOR apply_position=70, catalog=80.
+- **Daemon:** do not mark `retention_maintenance_last_run_date` when prune hits cap (`backlog_remaining`).
+- **Ops (manual):** `CREATE INDEX CONCURRENTLY cdc_applied_events_applied_at_event_id_idx`; catch-up prune; `REINDEX TABLE CONCURRENTLY apply_position`. SQL: `sql-queries/monitoring/datasync/sql/pg_phase2_applied_events_prune_ops.sql`.
+
 ## Env vars (Docker)
 
 | Variable | Default | Use |

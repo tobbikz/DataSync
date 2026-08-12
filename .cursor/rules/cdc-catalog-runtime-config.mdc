@@ -40,14 +40,14 @@ DDL + seeds: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate` (`schema
 | `apply_batch_stats_retention_days` | global | 3 |
 | `apply_batch_stats_prune_batch_size` | global | 500 |
 | `apply_batch_stats_prune_max_batches` | global | 10000 |
-| `applied_events_prune_batch_size` | global | 500 |
-| `applied_events_prune_max_batches` | global | 10000 |
+| `applied_events_prune_batch_size` | global | 5000 |
+| `applied_events_prune_max_batches` | global | 50000 |
 | `logs_purge_batch_size` | global | 500 |
 | `logs_purge_max_batches` | global | 10000 |
 
-Daemon retention calls each prune function with `p_max_batches=1` in a C++ loop (commit per batch + 50ms pause) so statements stay short under scrapers.
+Daemon retention calls each prune function with `p_max_batches=1` in a C++ loop (commit per batch + 50ms pause) so statements stay short under scrapers. If a prune hits its row cap, the day is **not** marked complete so another pass can run inside the 03:00 CST hour.
 
-**Retention prune:** `apply_batch_stats` / `cdc_applied_events` / `cdc_catalog.logs` are pruned **once per day at 03:00 America/Costa_Rica** by `cdc_daemon` (`retention_maintenance.cpp`), not at apply worker startup. Session lock `90420055001`; logs purge also uses xact lock `90420057001`. Seeds: migrations 038/040/054/055/056/057/060/062. `apply_outbox` removed in migration 063.
+**Retention prune:** `apply_batch_stats` / `cdc_applied_events` / `cdc_catalog.logs` are pruned **once per day at 03:00 America/Costa_Rica** by `cdc_daemon` (`retention_maintenance.cpp`), not at apply worker startup. Session lock `90420055001`; logs purge also uses xact lock `90420057001`. Seeds: migrations 038/040/054/055/056/057/060/062/064. `apply_outbox` removed in migration 063. Migration **064**: prune `cdc_applied_events` by `applied_at` (not `event_id`); raise applied_events prune throughput; FILLFACTOR on `apply_position`/`catalog`. btree `(applied_at, event_id)` created **CONCURRENTLY** via ops SQL (not migrate).
 
 ## Kafka bootstrap / consumer group
 

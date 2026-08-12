@@ -52,8 +52,9 @@ constexpr int kRetentionMaintenanceAdvisoryLockKey = 90420055001;
 /** Small batches + one commit per C++ call — short statements under scrapers. */
 constexpr int kApplyBatchStatsPruneBatchSizeDefault = 500;
 constexpr int kApplyBatchStatsPruneMaxBatchesDefault = 10000;
-constexpr int kAppliedEventsPruneBatchSizeDefault = 500;
-constexpr int kAppliedEventsPruneMaxBatchesDefault = 10000;
+/** Dedup ledger is huge — higher throughput than logs/stats or backlog never drains. */
+constexpr int kAppliedEventsPruneBatchSizeDefault = 5000;
+constexpr int kAppliedEventsPruneMaxBatchesDefault = 50000;
 constexpr int kLogsPurgeBatchSizeDefault = 500;
 constexpr int kLogsPurgeMaxBatchesDefault = 10000;
 /** Pause between single-batch prune commits so apply/upsert can proceed. */

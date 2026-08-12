@@ -287,22 +287,41 @@ void maybe_run_scheduled_retention_maintenance(PGconn* log_pg, RuntimeConfig& ru
         logs_max_batches,
         pause_ms);
 
-    const bool marked = !today.empty() && mark_retention_run_date(log_pg, today);
+    // Hit batch cap ⇒ backlog remains; do not mark the day so another pass can run
+    // while still inside the 03:00 CST hour (or tomorrow if the window ended).
+    const long long stats_cap =
+        static_cast<long long>(stats_batch_size) * static_cast<long long>(stats_max_batches);
+    const long long events_cap =
+        static_cast<long long>(events_batch_size) * static_cast<long long>(events_max_batches);
+    const long long logs_cap =
+        static_cast<long long>(logs_batch_size) * static_cast<long long>(logs_max_batches);
+    const bool any_error = stats_deleted < 0 || events_deleted < 0 || logs_deleted < 0;
+    const bool backlog_remaining =
+        (!any_error) &&
+        ((stats_deleted >= stats_cap && stats_cap > 0) ||
+         (events_deleted >= events_cap && events_cap > 0) ||
+         (logs_deleted >= logs_cap && logs_cap > 0));
+    const bool marked =
+        !today.empty() && !backlog_remaining && !any_error &&
+        mark_retention_run_date(log_pg, today);
     advisory_unlock(log_pg, pipeline_defaults::kRetentionMaintenanceAdvisoryLockKey);
 
-    const bool any_error = stats_deleted < 0 || events_deleted < 0 || logs_deleted < 0;
     log_write(log_pg, {
-        .level = any_error ? LogLevel::Warning : LogLevel::Info,
+        .level = any_error || backlog_remaining ? LogLevel::Warning : LogLevel::Info,
         .component = "retention_maintenance",
         .message = any_error
             ? "scheduled batched retention prune completed with errors"
-            : "scheduled batched retention prune completed",
+            : (backlog_remaining
+                   ? "scheduled batched retention prune completed with backlog remaining"
+                   : "scheduled batched retention prune completed"),
         .batch_id = batch_id,
         .context = {
             {"apply_batch_stats_deleted", stats_deleted},
             {"applied_events_deleted", events_deleted},
             {"logs_deleted", logs_deleted},
+            {"backlog_remaining", backlog_remaining},
             {"run_date_marked", marked},
+            {"applied_events_cap", events_cap},
         },
     });
 }

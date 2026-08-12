@@ -2606,6 +2606,76 @@ BEGIN
         RAISE NOTICE 'migration 063: apply_outbox dropped';
     END IF;
 END $migration063$;
+
+-- Migration 064: fix applied_events prune ORDER BY time; raise prune throughput; FILLFACTOR
+-- on hot UPDATE tables. btree (applied_at, event_id) is created CONCURRENTLY via ops SQL
+-- (not here — 388GB+ table must not take ACCESS EXCLUSIVE in migrate).
+DO $migration064$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cdc_catalog.schema_migrations WHERE version = 64) THEN
+        CREATE OR REPLACE FUNCTION cdc_catalog.prune_applied_events_batched(
+            p_retention_days integer DEFAULT 3,
+            p_batch_size integer DEFAULT 5000,
+            p_max_batches integer DEFAULT 50000
+        ) RETURNS bigint
+        LANGUAGE plpgsql
+        AS $prune_ae_batched$
+        DECLARE
+            total_deleted bigint := 0;
+            batch_deleted bigint;
+            batches_done integer := 0;
+            cutoff timestamptz;
+        BEGIN
+            IF p_retention_days IS NULL OR p_retention_days < 1
+               OR p_batch_size IS NULL OR p_batch_size < 1
+               OR p_max_batches IS NULL OR p_max_batches < 1 THEN
+                RETURN 0;
+            END IF;
+            cutoff := now() - make_interval(days => p_retention_days);
+            LOOP
+                WITH doomed AS (
+                    SELECT event_id
+                    FROM cdc_catalog.cdc_applied_events
+                    WHERE applied_at < cutoff
+                    ORDER BY applied_at, event_id
+                    LIMIT p_batch_size
+                    FOR UPDATE SKIP LOCKED
+                )
+                DELETE FROM cdc_catalog.cdc_applied_events t
+                USING doomed d
+                WHERE t.event_id = d.event_id;
+                GET DIAGNOSTICS batch_deleted = ROW_COUNT;
+                total_deleted := total_deleted + batch_deleted;
+                batches_done := batches_done + 1;
+                EXIT WHEN batch_deleted = 0 OR batches_done >= p_max_batches;
+            END LOOP;
+            RETURN total_deleted;
+        END;
+        $prune_ae_batched$;
+
+        COMMENT ON FUNCTION cdc_catalog.prune_applied_events_batched(integer, integer, integer) IS
+            'Batched delete by applied_at (not event_id text PK); daemon calls with p_max_batches=1 per commit.';
+
+        INSERT INTO cdc_catalog.runtime_config (config_key, component, conn_id, config_value, description)
+        VALUES
+            ('applied_events_prune_batch_size', 'global', '', '5000'::jsonb,
+             'Rows per DELETE batch for cdc_applied_events prune (daemon commits per batch)'),
+            ('applied_events_prune_max_batches', 'global', '', '50000'::jsonb,
+             'Max DELETE batches per nightly cdc_applied_events prune run (~250M rows/night max)')
+        ON CONFLICT (config_key, component, conn_id) DO UPDATE SET
+            config_value = EXCLUDED.config_value,
+            description  = EXCLUDED.description,
+            updated_at   = now();
+
+        -- Future page splits leave free space for HOT UPDATEs (existing pages need REINDEX).
+        ALTER TABLE cdc_catalog.apply_position SET (fillfactor = 70);
+        ALTER TABLE cdc_catalog.catalog SET (fillfactor = 80);
+
+        INSERT INTO cdc_catalog.schema_migrations (version, description)
+        VALUES (64, 'prune applied_events by applied_at; raise prune throughput; fillfactor apply_position/catalog');
+        RAISE NOTICE 'migration 064: applied_events prune fix + fillfactor';
+    END IF;
+END $migration064$;
 )PO_schema_patch";
     }
     /** Idempotent DDL for 050/051/052 — safe when schema_migrations version rows exist without objects. */
