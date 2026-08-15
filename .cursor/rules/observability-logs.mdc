@@ -14,18 +14,18 @@ Do **not** add parallel log sinks (files, `metadata.process_log`, ad-hoc tables)
 | Column | Use |
 |--------|-----|
 | `level` | `debug`, `info`, `warning`, `error` |
-| `component` | Owner: `catalog`, `mariadb_load`, `mariadb_cdc`, `reconcile` |
+| `component` | Owner: `catalog`, `mariadb_load`, `mariadb_cdc` |
 | `message` | Human-readable summary (one line) |
 | `context` | JSON object: counts, durations, error codes — **never passwords** |
 | `batch_id`, `conn_id`, `source_schema`, `source_table` | Correlation when applicable |
 
-Schema DDL: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate`
+Schema DDL: operator-managed (`sql/manual/`, app off + psql). Binary does not migrate.
 
 ## Rules
 
 - **Persist first**: write to `cdc_catalog.logs`; `stderr` only for bootstrap/fatal before DB is reachable.
 - **Append-only**: INSERT only; no UPDATE/DELETE on `logs` from app code.
-  Retention = `cdc_catalog.purge_logs_batched` (advisory-locked, batched), run **once daily at 03:00 America/Costa_Rica** by `cdc_daemon` (`retention_maintenance.cpp`). Do not call purge from apply/capture workers.
+  Retention = `cdc_catalog.purge_logs_batched` (advisory-locked, batched). **DataSync daemon once per CST hour**, cap 1M rows/run. Do not call purge from apply/capture workers. Do not use pg_cron (requires Postgres restart).
 - **KISS**: one insert per meaningful event; batch summaries OK, not per-row spam.
 - **C++**: shared helper `log_write()` in `cpp/src/obs_log.cpp` — no duplicated SQL.
 - **Checkpoints**: see `.cursor/rules/observability-checkpoints.mdc` — log every important step.

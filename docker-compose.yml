@@ -65,7 +65,6 @@ services:
     environment:
       DATASYNC_ROOT: /app
       DATASYNC_CONFIG: /app/config.json
-      DATASYNC_RUN_MIGRATIONS: "0"
       DATASYNC_AUTO_DISCOVER: "0"
       DATASYNC_HOST_NETWORK: "1"
       KAFKA_BOOTSTRAP: 127.0.0.1:9092

@@ -1,71 +1,75 @@
 ---
-description: Runtime knobs live in cdc_catalog.runtime_config (hot reload)
+description: Runtime knobs are hardcoded in C++ (no runtime_config table)
 alwaysApply: true
 ---
 
-# Runtime config (cdc_catalog.runtime_config)
+# Pipeline knobs (`pipeline_defaults.hpp`)
 
-Tunables en **`cdc_catalog.runtime_config`** — keys listadas abajo (hot-reload). Todo lo demás está en `cpp/include/pipeline_defaults.hpp`. `config.json` = **credentials only**. **No** re-seed en cada restart: seeds en `schema_patches` migrations 038/040/054/055/056 solamente.
+All tunables live in **`cpp/include/pipeline_defaults.hpp`**. There is **no** `cdc_catalog.runtime_config` table. `config.json` = **credentials + `cdc` slice only** (`round_idle_seconds`, `slice_max_seconds`, `slice_max_events`). Changing a knob = edit C++ + rebuild.
+
+Schema changes: **app off + manual psql** (`sql/manual/`). The binary does **not** migrate.
 
 ## Rules
 
-- Read via `RuntimeConfig` with `pipeline_defaults::k*Default` fallback when key absent in DB.
-- **Reload** before each run and before each table/batch in long jobs.
-- Scope: `(component, conn_id)` → `(component, '')` → `(global, '')`.
+- Read constants from `pipeline_defaults::k*` — never query PostgreSQL for knobs.
+- Do **not** recreate `runtime_config` or a knobs table.
+- Do **not** add a dedicated hot apply pool / per_table Kafka topics. `catalog.hot` is onboard filter only.
+- Kafka bootstrap: env `KAFKA_BOOTSTRAP` → `localhost:9092`.
+- Consumer group prefix: `datalake-cdc-apply-{conn_id}-w{N}` (hardcoded).
+- Daemon apply workers keep the Kafka consumer **alive across slices** (`KafkaApplySession`). Recreate only on Kafka/fatal errors or topic-set change.
+- Lag written to `apply_batch_stats` is **partition watermark − offset**, not a per-table Kafka scan. Fleet SUM in reports must be distinct `(topic, partition)`.
 
-## Hardcoded in C++ (`pipeline_defaults.hpp`)
+## Current values (CPU/RAM — moderate, not hardcore)
 
-Workers, Kafka topic mode/buckets/partitions, capture producer queue, reconcile tolerances, DDL flags, catalog chunk size, daemon sync interval, etc.
+| Constant | Value | Why |
+|----------|-------|-----|
+| `kApplyWorkerCount` | 4 | 24 Kafka partitions / 4 = 6; fewer PG backends |
+| `kCaptureWorkerCount` | 1 | capture parallelism |
+| `kFullLoadParallelTables` | 2 | full-load table fan-out |
+| `kFullLoadWorkers` | 4 | COPY workers per table |
+| `kKafkaTopicMode` | bucketed | 64 topics; no per_table hot topics |
+| `kKafkaTopicBuckets` | 64 | |
+| `kKafkaTopicPartitions` | 24 | must divide evenly by apply workers |
+| `kApplyBatchSizeDefault` | 8000 | single apply flush size |
+| `kFullLoadBatchSizeDefault` | 20000 | COPY batch (was 50000) |
+| `kApplyDeleteChunkSizeDefault` | 2000 | PK deletes per statement |
+| `kApplyQueuedMinMessages` | 100000 | rdkafka queued.min.messages |
+| `kApplyFetchMaxBytes` | 50 MB | consumer fetch |
+| `kApplyMaxPartitionFetchBytes` | 10 MB | per-partition fetch |
+| `kCaptureProducerQueueMaxMessages` | 500000 | capture producer queue |
+| `kCaptureProducerQueueMaxKbytes` | 1 GB | capture producer queue |
+| `kApplyLakeStatementTimeoutMsDefault` | 600000 | 10 min |
+| `kApplyWorkMem` / `kApplyTempBuffers` | 16MB | cap per apply backend |
+| `kApplyDedupEnabled` | false | Kafka offset + lake business-PK |
+| `kLogsRetentionDaysDefault` | 3 | hourly daemon prune, 1M rows/run |
+| `kApplyBatchStatsRetentionDays` | 3 | same; idle+age share 1M/hour |
 
-| Constant | Value |
-|----------|-------|
-| `kApplyWorkerCount` | 12 |
-| `kCaptureWorkerCount` | 1 |
-| `kFullLoadParallelTables` | 2 |
-| `kFullLoadWorkers` | 4 |
-| `kKafkaTopicMode` | bucketed |
-| `kKafkaTopicBuckets` | 64 |
+`kApplyWorkerCount` **must divide** `kKafkaTopicPartitions` evenly (24 → 2, 3, 4, 6, 8, 12). If lag stays high after 30–60 min, bump to 6 or 8 in **code** and rebuild.
 
-DDL + seeds: `cpp/include/prod_ops_embedded.hpp` → `DataSync migrate` (`schema_patches` migrations 038/040/054/055/056/057).
+- Do **not** INSERT `apply_batch_stats` when the slice is all zeros (no events/parse/drop). Health is catalog-first, not heartbeats.
 
-## Canonical keys (runtime_config)
+## Retention prune (no knobs table)
 
-| Key | Component | Default |
-|-----|-----------|---------|
-| `full_load_batch_size` | mariadb_load | 50000 |
-| `apply_batch_size` | cdc_kafka_apply | 20000 |
-| `apply_worker_count` | cdc_kafka_apply | 12 |
-| `logs_retention_days` | global | 3 |
-| `applied_events_retention_days` | cdc_kafka_apply | 3 |
-| `apply_batch_stats_retention_days` | global | 3 |
-| `apply_batch_stats_prune_batch_size` | global | 500 |
-| `apply_batch_stats_prune_max_batches` | global | 10000 |
-| `applied_events_prune_batch_size` | global | 5000 |
-| `applied_events_prune_max_batches` | global | 50000 |
-| `logs_purge_batch_size` | global | 500 |
-| `logs_purge_max_batches` | global | 10000 |
+**DataSync daemon, once per CST hour** (`retention_maintenance.cpp`). No `pg_cron` (no Postgres restart). Idle/zero `apply_batch_stats` first, leftover budget → age 3d, then logs 3d. Batches of **500**, cap **1M rows per prune per hour** (`kRetentionPruneMaxRowsPerRun`; 100k = set to 100000 and rebuild). COMMIT per batch + 50ms pause.
 
-Daemon retention calls each prune function with `p_max_batches=1` in a C++ loop (commit per batch + 50ms pause) so statements stay short under scrapers. If a prune hits its row cap, the day is **not** marked complete so another pass can run inside the 03:00 CST hour.
+“Already ran this hour” = `cdc_catalog.logs` (`retention_maintenance` / `scheduled batched retention prune completed%`). Cap hit → warning + wait until the next hour.
 
-**Retention prune:** `apply_batch_stats` / `cdc_applied_events` / `cdc_catalog.logs` are pruned **once per day at 03:00 America/Costa_Rica** by `cdc_daemon` (`retention_maintenance.cpp`), not at apply worker startup. Session lock `90420055001`; logs purge also uses xact lock `90420057001`. Seeds: migrations 038/040/054/055/056/057/060/062/064. `apply_outbox` removed in migration 063. Migration **064**: prune `cdc_applied_events` by `applied_at` (not `event_id`); raise applied_events prune throughput; FILLFACTOR on `apply_position`/`catalog`. btree `(applied_at, event_id)` created **CONCURRENTLY** via ops SQL (not migrate).
+Session lock `90420055001`; logs purge xact lock `90420057001`. `cdc_applied_events` is gone.
 
-## Kafka bootstrap / consumer group
-
-- Bootstrap: env `KAFKA_BOOTSTRAP` → `localhost:9092` (no runtime_config)
-- Consumer group prefix: `datalake-cdc-apply-{conn_id}-w{N}` (hardcoded)
+Idle SQL: `cdc_catalog.prune_apply_batch_stats_idle_batched` (`sql/manual/2026-08-14_pg_cron_retention.sql` — functions only; skip the cron/CALL bits).
 
 ## C++ pattern
 
 ```cpp
 #include "pipeline_defaults.hpp"
 
-RuntimeConfig runtime;
-runtime.reload(pg);
-const auto batch = runtime.get_size_t(
-    "full_load_batch_size",
-    pipeline_defaults::kFullLoadBatchSizeDefault,
-    "mariadb_load",
-    conn_id);
-const int workers = pipeline_defaults::kFullLoadWorkers;
-const int parallel_tables = pipeline_defaults::kFullLoadParallelTables;
+const auto batch = pipeline_defaults::kFullLoadBatchSizeDefault;
+const int workers = pipeline_defaults::kApplyWorkerCount;
 ```
+
+## Deploy (app off)
+
+1. Rebuild binary on Linux (`./install.sh` / Docker, `HAVE_RDKAFKA`).
+2. `psql` `sql/manual/2026-08-14_drop_runtime_config.sql` on **datasync**.
+3. Prod `config.json`: `cdc.slice_max_seconds: 180`.
+4. Idle prune function: `psql` functions from `sql/manual/2026-08-14_pg_cron_retention.sql` (skip pg_cron enable / CALL). Daemon prunes hourly after rebuild.

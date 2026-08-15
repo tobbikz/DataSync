@@ -8,7 +8,6 @@
 #include "mssql_lake.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
-#include "runtime_config.hpp"
 
 #include <chrono>
 #include <iomanip>
@@ -365,10 +364,8 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         throw std::runtime_error("MSSQL source not found: " + conn_id);
     }
 
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
     const CaptureRuntimeConfig rcfg =
-        load_mssql_capture_runtime(runtime, log_pg, conn_id, &cfg.cdc);
+        load_mssql_capture_runtime(conn_id, &cfg.cdc);
     const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
     log_write(log_pg, {
         .level = LogLevel::Info,
@@ -409,16 +406,12 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
     }
 
     std::vector<std::pair<std::string, std::string>> table_pairs;
-    std::set<std::pair<std::string, std::string>> hot_tables;
     table_pairs.reserve(tables.size());
     for (const auto& tbl : tables) {
         table_pairs.emplace_back(tbl.lake_schema, tbl.lake_table);
-        if (tbl.hot) {
-            hot_tables.emplace(tbl.lake_schema, tbl.lake_table);
-        }
     }
     ensure_capture_kafka_topics(
-        log_pg, "cdc_kafka_mssql_capture", batch_id, conn_id, rcfg, table_pairs, hot_tables);
+        log_pg, "cdc_kafka_mssql_capture", batch_id, conn_id, rcfg, table_pairs);
 
     KafkaProducer producer(rcfg.bootstrap, rcfg.linger_ms, rcfg.producer_batch);
     if (!producer.available()) {
@@ -609,12 +602,12 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             event.ingestion_ts = utc_iso_timestamp_now();
 
             const std::string topic = topic_for_catalog_table(
-                rcfg.topic_prefix, tbl.lake_schema, tbl.lake_table, rcfg.topic_mode, rcfg.topic_buckets, tbl.hot);
+                rcfg.topic_prefix, tbl.lake_schema, tbl.lake_table, rcfg.topic_mode, rcfg.topic_buckets);
             const nlohmann::json* row_for_key = (op == "d") ? &before : &after;
             const std::string msg_key = kafka_message_key_for_row(
                 tbl.lake_schema, tbl.lake_table, row_for_key, tbl.pk_columns);
             const int kafka_partition = kafka_produce_partition(
-                tbl.catalog_id, msg_key, rcfg.topic_partitions, tbl.hot);
+                tbl.catalog_id, rcfg.topic_partitions);
             try {
                 producer.produce(topic, msg_key, cdc_event_kafka_payload(event), kafka_partition);
             } catch (const std::exception& ex) {

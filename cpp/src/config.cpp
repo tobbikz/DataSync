@@ -84,7 +84,7 @@ std::filesystem::path find_default_config_path(const char* argv0) {
 CdcConfig default_cdc_config() {
     CdcConfig cdc;
     cdc.round_idle_seconds = 5;
-    cdc.slice_max_seconds = 15;
+    cdc.slice_max_seconds = 180;
     cdc.slice_max_events = 10'000'000;
     return cdc;
 }

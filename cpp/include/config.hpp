@@ -43,15 +43,15 @@ struct MongoSource {
     bool replica_set_in_extras{false};
 };
 
-/** CDC daemon tuning — config.json only (not runtime_config). */
+/** CDC daemon tuning — config.json only. */
 struct CdcConfig {
     int round_idle_seconds{5};
-    int slice_max_seconds{60};
+    int slice_max_seconds{180};
     int slice_max_events{10'000'000};
 };
 
 struct AppConfig {
-    /** Control plane: catalog, runtime_config, logs, dedup, apply_position. */
+    /** Control plane: catalog, logs, apply_position, apply_batch_stats. */
     PgConfig datasync;
     /** Lake targets: full-load COPY and CDC apply INSERT/COPY. */
     PgConfig datalake;

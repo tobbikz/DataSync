@@ -8,7 +8,6 @@
 #include "mongo_conn.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
-#include "runtime_config.hpp"
 #include "pipeline_defaults.hpp"
 
 #include <mysql/mysql.h>
@@ -331,31 +330,6 @@ void cleanup_orphans_before_prune(PgTxn& tx, const std::string& conn_id, const s
     const int doomed_n = tx.exec_count("SELECT COUNT(*)::int FROM tmp_catalog_doomed");
     if (doomed_n <= 0) {
         return;
-    }
-
-    // Batched deletes — full-table orphan wipe of cdc_applied_events can run for minutes.
-    const int batch_size = pipeline_defaults::kDiscoverOrphanAppliedEventsBatchSize;
-    for (;;) {
-        const std::string batch_sql =
-            "WITH doomed_batch AS ("
-            "  SELECT ae.event_id"
-            "  FROM cdc_catalog.cdc_applied_events ae"
-            "  INNER JOIN tmp_catalog_doomed d"
-            "    ON ae.source_schema = d.source_schema"
-            "   AND ae.source_table = d.source_table"
-            "  WHERE ae.conn_id = $1"
-            "  LIMIT " +
-            std::to_string(batch_size) +
-            "), deleted AS ("
-            "  DELETE FROM cdc_catalog.cdc_applied_events t"
-            "  USING doomed_batch b"
-            "  WHERE t.event_id = b.event_id"
-            "  RETURNING 1"
-            ") SELECT COUNT(*)::int FROM deleted";
-        const int deleted = tx.exec_params_count(batch_sql.c_str(), 1, vals);
-        if (deleted <= 0) {
-            break;
-        }
     }
 
     tx.exec_params(

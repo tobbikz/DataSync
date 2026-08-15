@@ -2,7 +2,6 @@
 
 #include "config.hpp"
 #include "mariadb_conn.hpp"
-#include "runtime_config.hpp"
 
 #include <libpq-fe.h>
 #include <mysql/mysql.h>
@@ -26,18 +25,14 @@ DdlSyncResult sync_mariadb_ddl_after_truncate(
     MYSQL* mysql,
     const std::string& schema,
     const std::string& table,
-    const std::vector<MariaDbColumn>& cols,
-    const RuntimeConfig& cfg,
-    const std::string& conn_id);
+    const std::vector<MariaDbColumn>& cols);
 
 // CDC DDL replay: sync columns only (create lake table if missing). No indexes/FKs.
 DdlSyncResult sync_mariadb_columns_to_lake(
     PGconn* pg,
     MYSQL* mysql,
     const std::string& schema,
-    const std::string& table,
-    const RuntimeConfig& cfg,
-    const std::string& conn_id);
+    const std::string& table);
 
 struct DdlSyncRunStats {
     int tables_processed{0};

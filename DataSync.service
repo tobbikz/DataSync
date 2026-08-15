@@ -16,7 +16,6 @@ RemainAfterExit=yes
 WorkingDirectory=@DATASYNC_ROOT@
 Environment=DATASYNC_AUTO_DISCOVER=1
 Environment=KAFKA_BOOTSTRAP=127.0.0.1:9092
-# First install only: Environment=DATASYNC_RUN_MIGRATIONS=1  (baseline + lake DDL)
 EnvironmentFile=-/etc/datasync/datasync.env
 ExecStart=@DATASYNC_ROOT@/install.sh start
 ExecStop=@DATASYNC_ROOT@/install.sh stop

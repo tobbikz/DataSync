@@ -17,7 +17,7 @@
   },
   "cdc": {
     "round_idle_seconds": 5,
-    "slice_max_seconds": 60,
+    "slice_max_seconds": 180,
     "slice_max_events": 10000000
   }
 }

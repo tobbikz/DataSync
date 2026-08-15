@@ -3,7 +3,6 @@
 #include "config.hpp"
 #include "mariadb_ddl_sync.hpp"
 #include "mssql_schema.hpp"
-#include "runtime_config.hpp"
 
 #include <libpq-fe.h>
 
@@ -23,18 +22,14 @@ DdlSyncResult sync_mssql_ddl_after_truncate(
     const std::string& source_database,
     const std::string& source_schema,
     const std::string& source_table,
-    const std::vector<MssqlColumn>& cols,
-    const RuntimeConfig& cfg,
-    const std::string& conn_id);
+    const std::vector<MssqlColumn>& cols);
 
 DdlSyncResult sync_mssql_columns_to_lake(
     PGconn* pg,
     MssqlConn& mssql,
     const std::string& source_database,
     const std::string& source_schema,
-    const std::string& source_table,
-    const RuntimeConfig& cfg,
-    const std::string& conn_id);
+    const std::string& source_table);
 
 DdlSyncRunStats run_mssql_ddl_sync(
     const AppConfig& cfg,

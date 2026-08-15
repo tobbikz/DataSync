@@ -10,7 +10,6 @@
 #include "mariadb_schema.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
-#include "runtime_config.hpp"
 #include "pipeline_defaults.hpp"
 
 #ifdef HAVE_FREETDS
@@ -31,11 +30,9 @@ namespace {
 int sync_mssql_columns_for_conn(
     const AppConfig& cfg,
     PGconn* log_pg,
-    RuntimeConfig& runtime,
     const std::string& conn_id,
     const std::string& batch_id,
     int daemon_round) {
-    (void)runtime;
     const MssqlSource* source = find_mssql_source(cfg, conn_id);
     if (!source) {
         return 0;
@@ -77,7 +74,7 @@ int sync_mssql_columns_for_conn(
                 continue;
             }
             const auto ddl = sync_mssql_columns_to_lake(
-                lake_pg.raw, mssql, db, schema, table, runtime, conn_id);
+                lake_pg.raw, mssql, db, schema, table);
             if (ddl.columns_added > 0 || ddl.columns_widened > 0) {
                 synced += 1;
                 log_write(log_pg, {
@@ -115,7 +112,6 @@ int sync_mssql_columns_for_conn(
 int sync_mongo_columns_for_conn(
     const AppConfig& cfg,
     PGconn* log_pg,
-    RuntimeConfig& runtime,
     const std::string& conn_id,
     const std::string& batch_id,
     int daemon_round) {
@@ -217,9 +213,8 @@ PreApplyCycleResult run_mssql_pre_apply(
     };
 
 #ifdef HAVE_FREETDS
-    RuntimeConfig runtime;
     const int ddl_synced =
-        sync_mssql_columns_for_conn(cfg, log_pg, runtime, conn_id, batch_id, daemon_round);
+        sync_mssql_columns_for_conn(cfg, log_pg, conn_id, batch_id, daemon_round);
     if (ddl_synced < 0) {
         result.errors += 1;
     } else if (ddl_synced > 0) {
@@ -245,11 +240,9 @@ PreApplyCycleResult run_mongo_pre_apply(
     };
 
 #ifdef HAVE_MONGOC
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
     try {
         const int ddl_synced =
-            sync_mongo_columns_for_conn(cfg, log_pg, runtime, conn_id, batch_id, daemon_round);
+            sync_mongo_columns_for_conn(cfg, log_pg, conn_id, batch_id, daemon_round);
         if (ddl_synced > 0) {
             result.payload["ddl_sync"] = {{"tables", ddl_synced}};
         }
@@ -279,8 +272,6 @@ int run_conn_capture_slice(
     const std::string& batch_id) {
     const std::string db_engine = conn_engine(cfg, conn_id);
 
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
     const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
     log_write(log_pg, {
         .level = LogLevel::Info,

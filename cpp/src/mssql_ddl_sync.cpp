@@ -7,6 +7,7 @@
 #include "mssql_lake.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
+#include "pipeline_defaults.hpp"
 
 #include <iostream>
 #include <functional>
@@ -615,25 +616,23 @@ DdlSyncResult sync_mssql_ddl_after_truncate(
     const std::string& source_database,
     const std::string& source_schema,
     const std::string& source_table,
-    const std::vector<MssqlColumn>& cols,
-    const RuntimeConfig& cfg,
-    const std::string& conn_id) {
+    const std::vector<MssqlColumn>& cols) {
     DdlSyncResult result;
     const std::string pg_schema = mssql_pg_schema_name(source_database, source_schema);
     const std::string pg_table = mssql_pg_table_name(source_table);
 
     result.columns_added = 0;
     result.columns_widened = 0;
-    if (cfg.get_bool("ddl_sync_columns", true, "mssql_load", conn_id)) {
+    if (pipeline_defaults::kDdlSyncColumns) {
         result.columns_added = sync_missing_columns(pg, pg_schema, pg_table, cols);
         result.columns_widened = sync_mssql_column_types(pg, pg_schema, pg_table, cols);
     }
 
-    if (cfg.get_bool("ddl_sync_indexes", true, "mssql_load", conn_id)) {
+    if (pipeline_defaults::kDdlSyncIndexes) {
         result.indexes_created =
             sync_indexes(pg, pg_schema, pg_table, fetch_mssql_indexes(mssql, source_schema, source_table));
     }
-    if (cfg.get_bool("ddl_sync_foreign_keys", true, "mssql_load", conn_id)) {
+    if (pipeline_defaults::kDdlSyncForeignKeys) {
         result.foreign_keys_created = sync_foreign_keys(
             pg,
             pg_schema,
@@ -649,9 +648,7 @@ DdlSyncResult sync_mssql_columns_to_lake(
     MssqlConn& mssql,
     const std::string& source_database,
     const std::string& source_schema,
-    const std::string& source_table,
-    const RuntimeConfig& cfg,
-    const std::string& conn_id) {
+    const std::string& source_table) {
     mssql.use_database(source_database);
     const auto cols = fetch_mssql_columns(mssql.handle, source_schema, source_table);
     const std::string pg_schema = mssql_pg_schema_name(source_database, source_schema);
@@ -669,11 +666,11 @@ DdlSyncResult sync_mssql_columns_to_lake(
             pg_table,
             cols,
             pk_cols,
-            cfg.get_int("lake_partition_months_ahead", 3, "mssql_load", conn_id));
+            pipeline_defaults::kLakePartitionMonthsAhead);
         return {};
     }
     DdlSyncResult result;
-    if (cfg.get_bool("ddl_sync_columns", true, "mssql_load", conn_id)) {
+    if (pipeline_defaults::kDdlSyncColumns) {
         result.columns_added = sync_missing_columns(pg, pg_schema, pg_table, cols);
         result.columns_widened = sync_mssql_column_types(pg, pg_schema, pg_table, cols);
     }
@@ -688,8 +685,6 @@ DdlSyncRunStats run_mssql_ddl_sync(
     const std::optional<std::string>& source_schema,
     const std::optional<std::string>& source_table) {
     DdlSyncRunStats stats;
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
 
     log_write(log_pg, {
         .level = LogLevel::Info,
@@ -723,20 +718,16 @@ DdlSyncRunStats run_mssql_ddl_sync(
     }
 
     MssqlConn mssql(*source);
-    runtime.reload(app_pg.raw);
 
     for (const auto& target : targets) {
         stats.tables_processed += 1;
         try {
-            runtime.reload(app_pg.raw);
             const auto result = sync_mssql_columns_to_lake(
                 lake_pg.raw,
                 mssql,
                 target.source_database,
                 target.source_schema,
-                target.source_table,
-                runtime,
-                conn_id);
+                target.source_table);
             stats.tables_success += 1;
             stats.columns_added += result.columns_added;
             if (result.columns_added > 0 || result.indexes_created > 0 || result.foreign_keys_created > 0) {

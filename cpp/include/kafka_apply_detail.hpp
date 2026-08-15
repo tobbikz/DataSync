@@ -7,11 +7,8 @@
 #include <map>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
-
-class RuntimeConfig;
 
 namespace kafka_apply_detail {
 
@@ -53,7 +50,6 @@ struct SliceFlushStats {
 };
 
 struct ApplyBatchOptions {
-    bool audit_enabled{true};
     std::string source_system{"MariaDB"};
     int apply_staleness_seconds{900};
     int apply_inactive_seconds{3600};
@@ -68,8 +64,6 @@ struct ApplyBatchOptions {
     std::map<std::pair<std::string, std::string>, int>* dropped_unrecoverable_by_table{nullptr};
     /** Optional: per-table flush stats (lake key) — written once at slice finalize. */
     std::map<std::pair<std::string, std::string>, SliceFlushStats>* slice_flush_stats{nullptr};
-    /** Lake schema|table → catalog.hot (batch sizing / synchronous_commit). */
-    std::map<std::pair<std::string, std::string>, bool> table_hot;
 };
 
 struct SliceLagTableState {
@@ -84,7 +78,7 @@ struct SliceLagTableState {
     long long kafka_offset{-1};
 };
 
-/** Single apply_batch_stats row per table per slice (flush metrics + lag scan). */
+/** Single apply_batch_stats row per table per slice (flush metrics + partition lag). */
 void record_slice_table_lag_stats(
     PGconn* app_pg,
     const std::string& conn_id,
@@ -101,12 +95,11 @@ std::map<std::pair<std::string, std::string>, SliceLagTableState> fetch_apply_cu
     PGconn* app_pg,
     const std::map<std::pair<std::string, std::string>, long long>& catalog_id_by_lake_key);
 
-/** Lake PG session knobs for apply workers (timeouts, hot synchronous_commit). */
-void configure_lake_apply_session(
-    PGconn* lake_pg,
-    RuntimeConfig& runtime,
-    bool hot_path,
-    const std::string& conn_id);
+/** work_mem / temp_buffers cap for apply backends (datasync + lake). */
+void configure_apply_session_resources(PGconn* pg);
+
+/** Lake PG session knobs for apply workers (timeouts, synchronous_commit). */
+void configure_lake_apply_session(PGconn* lake_pg);
 
 nlohmann::json apply_events_batch(
     PGconn* app_pg,
@@ -130,8 +123,6 @@ void record_dropped_unrecoverable(
     PGconn* pg,
     const ApplyEvent& event,
     std::map<std::pair<std::string, std::string>, int>* by_table);
-
-std::unordered_set<std::string> filter_new_event_ids(PGconn* pg, const std::vector<std::string>& event_ids);
 
 nlohmann::json parse_kafka_message_json(const std::string& payload);
 

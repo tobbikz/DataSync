@@ -6,7 +6,6 @@
 #include "mariadb_conn.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
-#include "runtime_config.hpp"
 
 #include <iostream>
 #include <optional>
@@ -86,8 +85,6 @@ DdlSyncRunStats run_mariadb_ddl_sync(
     const std::optional<std::string>& source_schema,
     const std::optional<std::string>& source_table) {
     DdlSyncRunStats stats;
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
 
     log_write(log_pg, {
         .level = LogLevel::Info,
@@ -121,14 +118,12 @@ DdlSyncRunStats run_mariadb_ddl_sync(
     }
 
     MariaDbConn mysql(*source);
-    runtime.reload(app_pg.raw);
 
     for (const auto& target : targets) {
         stats.tables_processed += 1;
         try {
-            runtime.reload(app_pg.raw);
             const auto result = sync_mariadb_columns_to_lake(
-                lake_pg.raw, mysql.handle, target.schema, target.table, runtime, conn_id);
+                lake_pg.raw, mysql.handle, target.schema, target.table);
             const auto pk_cols = split_pk_columns(target.pk_columns);
             if (!pk_cols.empty()) {
                 ensure_mirror_apply_pk_index(lake_pg.raw, target.schema, target.table, pk_cols);

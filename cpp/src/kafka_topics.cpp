@@ -35,16 +35,9 @@ int positive_mod(long long value, int modulus) {
     return static_cast<int>(r);
 }
 
-int kafka_produce_partition(
-    long long catalog_id,
-    const std::string& message_key,
-    int topic_partitions,
-    bool per_table_topic) {
+int kafka_produce_partition(long long catalog_id, int topic_partitions) {
     if (topic_partitions <= 0) {
         return -1;
-    }
-    if (per_table_topic) {
-        return partition_index_for_key(message_key, topic_partitions);
     }
     return positive_mod(catalog_id, topic_partitions);
 }
@@ -79,11 +72,7 @@ std::string topic_for_catalog_table(
     const std::string& schema,
     const std::string& table,
     const std::string& default_mode,
-    int num_buckets,
-    bool hot) {
-    if (hot) {
-        return topic_for_catalog(prefix, schema, table, "per_table", num_buckets);
-    }
+    int num_buckets) {
     return topic_for_catalog(prefix, schema, table, default_mode, num_buckets);
 }
 
@@ -142,19 +131,9 @@ std::vector<std::string> topics_for_tables(
     const std::vector<std::pair<std::string, std::string>>& tables,
     const std::string& mode,
     int num_buckets) {
-    return topics_for_tables(prefix, tables, mode, num_buckets, {});
-}
-
-std::vector<std::string> topics_for_tables(
-    const std::string& prefix,
-    const std::vector<std::pair<std::string, std::string>>& tables,
-    const std::string& mode,
-    int num_buckets,
-    const std::set<std::pair<std::string, std::string>>& hot_tables) {
     std::set<std::string> uniq;
     for (const auto& [schema, table] : tables) {
-        const bool hot = hot_tables.count({schema, table}) > 0;
-        uniq.insert(topic_for_catalog_table(prefix, schema, table, mode, num_buckets, hot));
+        uniq.insert(topic_for_catalog(prefix, schema, table, mode, num_buckets));
     }
     return {uniq.begin(), uniq.end()};
 }

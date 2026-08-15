@@ -9,7 +9,6 @@
 #include "mariadb_conn.hpp"
 #include "mariadb_schema.hpp"
 #include "obs_log.hpp"
-#include "runtime_config.hpp"
 
 #include <cctype>
 #include <chrono>
@@ -332,10 +331,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         throw std::runtime_error("MariaDB source not found: " + conn_id);
     }
 
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
     const CaptureRuntimeConfig rcfg =
-        load_mariadb_capture_runtime(runtime, log_pg, conn_id, &cfg.cdc);
+        load_mariadb_capture_runtime(conn_id, &cfg.cdc);
     const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
 
     log_write(log_pg, {
@@ -380,8 +377,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     }
 
     std::set<TableKey> wanted;
-    std::set<TableKey> hot_tables;
-    std::map<TableKey, bool> hot_by_table;
     CaptureBinlogResolver binlog_resolver;
     std::map<TableKey, std::string> pk_by_table;
     std::map<TableKey, long long> catalog_id_by_table;
@@ -389,10 +384,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     for (const auto& tbl : tables) {
         const TableKey key{tbl.source_schema, tbl.source_table};
         wanted.insert(key);
-        if (tbl.hot) {
-            hot_tables.insert(key);
-            hot_by_table[key] = true;
-        }
         binlog_resolver.add(key);
         pk_by_table[key] = tbl.pk_columns;
         catalog_id_by_table[key] = tbl.catalog_id;
@@ -409,7 +400,6 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         .source_table = std::nullopt,
         .context = {
             {"table_count", static_cast<int>(tables.size())},
-            {"catalog_tables", catalog_tables_json},
         },
     });
 
@@ -434,7 +424,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         table_pairs.emplace_back(key.first, key.second);
     }
     ensure_capture_kafka_topics(
-        log_pg, "cdc_kafka_capture", batch_id, conn_id, rcfg, table_pairs, hot_tables);
+        log_pg, "cdc_kafka_capture", batch_id, conn_id, rcfg, table_pairs);
 
     CapturePosition start_pos = read_capture_position(log_pg, conn_id);
     log_write(log_pg, {
@@ -676,9 +666,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         event.ts_ms = now_ms();
         event.ingestion_ts = utc_iso_timestamp_now();
 
-        const bool is_hot = hot_by_table.count(key) > 0;
         const std::string topic = topic_for_catalog_table(
-            rcfg.topic_prefix, key.first, key.second, rcfg.topic_mode, rcfg.topic_buckets, is_hot);
+            rcfg.topic_prefix, key.first, key.second, rcfg.topic_mode, rcfg.topic_buckets);
         const nlohmann::json* row_for_key = (op_char == "d") ? &before : &after;
         const long long catalog_id =
             catalog_id_by_table.count(key) ? catalog_id_by_table.at(key) : 0LL;
@@ -686,7 +675,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             const std::string msg_key = kafka_message_key_for_row(
                 key.first, key.second, row_for_key, pk_by_table[key]);
             const int kafka_partition = kafka_produce_partition(
-                catalog_id, msg_key, rcfg.topic_partitions, is_hot);
+                catalog_id, rcfg.topic_partitions);
             producer.produce(topic, msg_key, cdc_event_kafka_payload(event), kafka_partition);
         } catch (const std::exception& ex) {
             if (is_kafka_utf8_error(ex)) {

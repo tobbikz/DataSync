@@ -15,8 +15,6 @@
 #include "mongo_full_load.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
-#include "reconcile_lite.hpp"
-#include "schema_migrate.hpp"
 #include "pipeline_defaults.hpp"
 
 #ifdef HAVE_MONGOC
@@ -210,11 +208,9 @@ void print_usage(const char* prog) {
               << "  " << prog << " discover\n"
               << "  " << prog << " full-load [--conn-id ID] [--skip-onboard]\n"
               << "  " << prog << " onboard-pending [--conn-id ID] [--hot-only|--cold-only]\n"
-              << "  " << prog << " reconcile-lite [--conn-id ID] [--hot-only|--cold-only] [--sample-pct N]\n"
               << "  " << prog << " ddl-sync --conn-id ID [--schema S] [--table T]\n"
               << "  " << prog << " kafka-apply --conn-id ID\n"
               << "  " << prog << " capture --conn-id ID\n"
-              << "  " << prog << " migrate [--baseline] [--lake] [--diagnostics]\n"
               << "  " << prog << " daemon [--once]\n"
               << "  " << prog << " [--config PATH] <command> ...\n"
               << "  PG: config.json at project root (datasync + datalake)\n"
@@ -232,10 +228,6 @@ int main(int argc, char** argv) {
     bool skip_onboard = false;
     bool hot_only = false;
     bool cold_only = false;
-    int sample_pct = 100;
-    bool migrate_baseline = false;
-    bool migrate_lake = false;
-    bool migrate_diagnostics = false;
     std::string config_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -254,14 +246,6 @@ int main(int argc, char** argv) {
             hot_only = true;
         } else if (arg == "--cold-only") {
             cold_only = true;
-        } else if (arg == "--sample-pct" && i + 1 < argc) {
-            sample_pct = std::atoi(argv[++i]);
-        } else if (arg == "--baseline") {
-            migrate_baseline = true;
-        } else if (arg == "--lake") {
-            migrate_lake = true;
-        } else if (arg == "--diagnostics") {
-            migrate_diagnostics = true;
         } else if (arg == "--config" && i + 1 < argc) {
             config_path = argv[++i];
         } else if (arg == "-h" || arg == "--help") {
@@ -278,9 +262,7 @@ int main(int argc, char** argv) {
 
     if (command != "discover" && command != "full-load" && command != "ddl-sync" &&
         command != "kafka-apply" && command != "capture" &&
-        command != "daemon" && command != "onboard-pending" &&
-        command != "reconcile-lite" &&
-        command != "migrate") {
+        command != "daemon" && command != "onboard-pending") {
         print_usage(argv[0]);
         return 2;
     }
@@ -308,28 +290,8 @@ int main(int argc, char** argv) {
         PgConn log_pg(cfg.datasync.conn_string());
         reload_connections(log_pg.raw, cfg);
 
-        if (command != "migrate" && catalog_schema_exists(log_pg.raw)) {
-            run_startup_schema_migrate(log_pg.raw);
-        }
-
         if (command == "discover") {
             return run_discover(cfg, log_pg.raw, batch_id);
-        }
-        if (command == "migrate") {
-            SchemaMigrateOptions opts;
-            opts.baseline = migrate_baseline;
-            opts.lake = migrate_lake;
-            opts.diagnostics = migrate_diagnostics;
-            opts.incremental =
-                !migrate_baseline && !migrate_lake && !migrate_diagnostics;
-            std::optional<PgConn> lake_pg;
-            if (opts.lake) {
-                lake_pg.emplace(cfg.datalake.conn_string());
-            }
-            return run_schema_migrate(
-                log_pg.raw,
-                lake_pg ? lake_pg->raw : nullptr,
-                opts);
         }
         if (command == "full-load") {
             return run_full_load(
@@ -350,32 +312,16 @@ int main(int argc, char** argv) {
                 conn_id.empty() ? std::nullopt : std::optional(conn_id),
                 tier);
         }
-        if (command == "reconcile-lite") {
-            PgConn lake_pg(cfg.datalake.conn_string());
-            if (!lake_pg.raw) {
-                std::cerr << "reconcile-lite: datalake connection failed\n";
-                return 1;
-            }
-            const CatalogHotTier tier = hot_only ? CatalogHotTier::HotOnly
-                                                 : (cold_only ? CatalogHotTier::ColdOnly
-                                                              : CatalogHotTier::All);
-            return run_reconcile_lite(
-                cfg,
-                log_pg.raw,
-                lake_pg.raw,
-                batch_id,
-                conn_id.empty() ? std::nullopt : std::optional(conn_id),
-                tier,
-                sample_pct);
-        }
         if (command == "ddl-sync") {
             return run_ddl_sync(cfg, log_pg.raw, conn_id, source_schema, source_table);
         }
         if (command == "kafka-apply") {
             int failures = 0;
-            auto run_pool = [&](CatalogHotTier tier, int workers) {
+            auto run_pool = [&](int workers) {
                 if (workers <= 1) {
-                    if (run_kafka_apply_native_cli(cfg, log_pg.raw, conn_id, 0, 1, tier) != 0) {
+                    PgConn lake_pg(cfg.datalake.conn_string());
+                    if (!lake_pg.raw
+                        || run_kafka_apply_native_cli(cfg, log_pg.raw, lake_pg.raw, conn_id, 0, 1) != 0) {
                         failures += 1;
                     }
                     return;
@@ -386,12 +332,13 @@ int main(int argc, char** argv) {
                 for (int worker_id = 0; worker_id < workers; ++worker_id) {
                     threads.emplace_back([&, worker_id]() {
                         PgConn worker_pg(cfg.datasync.conn_string());
-                        if (!worker_pg.raw) {
+                        PgConn lake_pg(cfg.datalake.conn_string());
+                        if (!worker_pg.raw || !lake_pg.raw) {
                             pool_failures.fetch_add(1);
                             return;
                         }
                         if (run_kafka_apply_native_cli(
-                                cfg, worker_pg.raw, conn_id, worker_id, workers, tier) != 0) {
+                                cfg, worker_pg.raw, lake_pg.raw, conn_id, worker_id, workers) != 0) {
                             pool_failures.fetch_add(1);
                         }
                     });
@@ -401,8 +348,7 @@ int main(int argc, char** argv) {
                 }
                 failures += pool_failures.load();
             };
-            run_pool(CatalogHotTier::ColdOnly, kApplyWorkerCount);
-            run_pool(CatalogHotTier::HotOnly, pipeline_defaults::kHotApplyConsumerCount);
+            run_pool(kApplyWorkerCount);
             return failures > 0 ? 1 : 0;
         }
         if (command == "capture") {

@@ -10,7 +10,6 @@
 #include "mongo_lake.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
-#include "runtime_config.hpp"
 #include "pipeline_defaults.hpp"
 
 #include <chrono>
@@ -449,14 +448,7 @@ bool load_one_collection(
     PgConn lake_pg(cfg.datalake.conn_string());
     MongoConn mongo(source);
 
-    RuntimeConfig runtime;
-    runtime.reload(app_pg.raw);
-
-    const std::size_t batch_size = runtime.get_size_t(
-        "full_load_batch_size",
-        pipeline_defaults::kFullLoadBatchSizeDefault,
-        "mongo_load",
-        target.conn_id);
+    const std::size_t batch_size = pipeline_defaults::kFullLoadBatchSizeDefault;
     const int source_sleep_ms = pipeline_defaults::kFullLoadSourceSleepMs;
     const int partition_months = pipeline_defaults::kLakePartitionMonthsAhead;
     const bool ddl_sync = pipeline_defaults::kDdlSyncColumns;
@@ -794,8 +786,6 @@ FullLoadRunStats run_mongo_full_load(
     mongoc_init();
 
     PgConn app_pg(cfg.datasync.conn_string());
-    RuntimeConfig runtime;
-    runtime.reload(app_pg.raw);
 
     log_fl(
         log_pg,
@@ -803,9 +793,7 @@ FullLoadRunStats run_mongo_full_load(
         LogLevel::Info,
         batch_id,
         "full load started",
-        {{"batch_size",
-          runtime.get_size_t(
-              "full_load_batch_size", pipeline_defaults::kFullLoadBatchSizeDefault, "mongo_load")},
+        {{"batch_size", pipeline_defaults::kFullLoadBatchSizeDefault},
          {"parallel_tables", kFullLoadParallelTables}});
 
     const auto targets_all = fetch_full_load_targets(app_pg.raw);

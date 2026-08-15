@@ -16,8 +16,8 @@ After **any** meaningful code, SQL, config, or architecture change:
 | Change type | Update |
 |-------------|--------|
 | New command / binary flag | Relevant flow note + index |
-| New SQL migration | `SQL Migrations.md` + dedicated note if non-trivial |
-| New runtime_config key | `Runtime Config.md` + seed in `sql/` |
+| New SQL (manual, app off) | `SQL Migrations.md` + dedicated note if non-trivial |
+| New pipeline knob | `Runtime Config.md` + constant in `pipeline_defaults.hpp` (rebuild) |
 | New component / log checkpoints | `Observability.md` |
 | Architecture decision | `Architecture.md` |
 | Completed milestone | Index checklist in `DataLake ETL (C++).md` |
@@ -28,7 +28,7 @@ Each major feature gets a note with:
 
 - **Qué hace** (KISS, 3–5 bullets)
 - **Comando / SQL** (copy-paste ready)
-- **Config runtime** (keys from `cdc_catalog.runtime_config`)
+- **Config** (`pipeline_defaults.hpp` constants; `config.json` = credentials + slice)
 - **Logs** (`component`, checkpoint table)
 - **Código** (paths under `cpp/` or `sql/`)
 

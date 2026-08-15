@@ -10,7 +10,6 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "retention_maintenance.hpp"
-#include "runtime_config.hpp"
 #include "pipeline_defaults.hpp"
 
 #include <atomic>
@@ -73,14 +72,15 @@ std::vector<std::string> all_conn_ids(const AppConfig& cfg) {
 
 int run_apply_workers(const AppConfig& cfg, const std::string& conn_id) {
     int failures = 0;
-    auto run_pool = [&](CatalogHotTier tier, int workers) {
+    auto run_pool = [&](int workers) {
         if (workers <= 1) {
-            PgConn pg(cfg.datasync.conn_string());
-            if (!pg.raw) {
+            PgConn app_pg(cfg.datasync.conn_string());
+            PgConn lake_pg(cfg.datalake.conn_string());
+            if (!app_pg.raw || !lake_pg.raw) {
                 failures += 1;
                 return;
             }
-            if (run_kafka_apply_native_cli(cfg, pg.raw, conn_id, 0, 1, tier) != 0) {
+            if (run_kafka_apply_native_cli(cfg, app_pg.raw, lake_pg.raw, conn_id, 0, 1) != 0) {
                 failures += 1;
             }
             return;
@@ -91,13 +91,14 @@ int run_apply_workers(const AppConfig& cfg, const std::string& conn_id) {
         for (int worker_id = 0; worker_id < workers; ++worker_id) {
             threads.emplace_back([&, worker_id]() {
                 try {
-                    PgConn pg(cfg.datasync.conn_string());
-                    if (!pg.raw) {
+                    PgConn app_pg(cfg.datasync.conn_string());
+                    PgConn lake_pg(cfg.datalake.conn_string());
+                    if (!app_pg.raw || !lake_pg.raw) {
                         pool_failures.fetch_add(1);
                         return;
                     }
-                    const int rc =
-                        run_kafka_apply_native_cli(cfg, pg.raw, conn_id, worker_id, workers, tier);
+                    const int rc = run_kafka_apply_native_cli(
+                        cfg, app_pg.raw, lake_pg.raw, conn_id, worker_id, workers);
                     if (rc != 0) {
                         pool_failures.fetch_add(1);
                     }
@@ -111,8 +112,7 @@ int run_apply_workers(const AppConfig& cfg, const std::string& conn_id) {
         }
         failures += pool_failures.load();
     };
-    run_pool(CatalogHotTier::ColdOnly, kApplyWorkerCount);
-    run_pool(CatalogHotTier::HotOnly, pipeline_defaults::kHotApplyConsumerCount);
+    run_pool(kApplyWorkerCount);
     return failures > 0 ? 1 : 0;
 }
 
@@ -120,20 +120,29 @@ void apply_worker_loop(
     AppConfig cfg,
     std::string conn_id,
     int worker_id,
-    int worker_count,
-    CatalogHotTier hot_tier) {
-    const bool hot_path = hot_tier == CatalogHotTier::HotOnly;
+    int worker_count) {
+    std::optional<PgConn> app_pg;
+    std::optional<PgConn> lake_pg;
+    KafkaApplySession kafka_session;
     while (!g_shutdown.load()) {
         try {
-            PgConn pg(cfg.datasync.conn_string());
-            if (!pg.raw) {
+            if (!app_pg || !app_pg->raw || PQstatus(app_pg->raw) != CONNECTION_OK) {
+                app_pg.emplace(cfg.datasync.conn_string());
+            }
+            if (!lake_pg || !lake_pg->raw || PQstatus(lake_pg->raw) != CONNECTION_OK) {
+                lake_pg.emplace(cfg.datalake.conn_string());
+            }
+            if (!app_pg->raw || !lake_pg->raw) {
+                app_pg.reset();
+                lake_pg.reset();
+                kafka_session.reset();
                 sleep_interruptible(round_idle_seconds(cfg.cdc));
                 continue;
             }
-            const int rc =
-                run_kafka_apply_native_cli(cfg, pg.raw, conn_id, worker_id, worker_count, hot_tier);
+            const int rc = run_kafka_apply_native_cli(
+                cfg, app_pg->raw, lake_pg->raw, conn_id, worker_id, worker_count, &kafka_session);
             if (rc != 0) {
-                log_write(pg.raw, {
+                log_write(app_pg->raw, {
                     .level = LogLevel::Warning,
                     .component = "cdc_daemon",
                     .message = "apply worker slice finished with errors",
@@ -144,16 +153,21 @@ void apply_worker_loop(
                     .context = {
                         {"worker_id", worker_id},
                         {"worker_count", worker_count},
-                        {"hot_path", hot_path},
                         {"exit_code", rc},
                     },
                 });
+                kafka_session.reset();
+                app_pg.reset();
+                lake_pg.reset();
             }
         } catch (const std::exception& ex) {
+            kafka_session.reset();
+            app_pg.reset();
+            lake_pg.reset();
             try {
-                PgConn pg(cfg.datasync.conn_string());
-                if (pg.raw) {
-                    log_write(pg.raw, {
+                PgConn log_pg(cfg.datasync.conn_string());
+                if (log_pg.raw) {
+                    log_write(log_pg.raw, {
                         .level = LogLevel::Error,
                         .component = "cdc_daemon",
                         .message = "apply worker loop failed",
@@ -164,7 +178,6 @@ void apply_worker_loop(
                         .context = {
                             {"worker_id", worker_id},
                             {"worker_count", worker_count},
-                            {"hot_path", hot_path},
                             {"error", ex.what()},
                         },
                     });
@@ -182,17 +195,14 @@ void apply_worker_loop(
 void spawn_apply_worker_pool(
     const AppConfig& worker_cfg,
     const std::string& conn_id,
-    CatalogHotTier hot_tier,
-    int worker_count,
-    const std::string& spawn_key) {
+    int worker_count) {
     std::lock_guard<std::mutex> lock(g_apply_workers_mu);
-    if (!g_apply_workers_spawned.insert(spawn_key).second) {
+    if (!g_apply_workers_spawned.insert(conn_id).second) {
         return;
     }
-    const bool hot_path = hot_tier == CatalogHotTier::HotOnly;
     for (int worker_id = 0; worker_id < worker_count; ++worker_id) {
-        std::thread t([worker_cfg, conn_id, worker_id, worker_count, hot_tier]() {
-            apply_worker_loop(worker_cfg, conn_id, worker_id, worker_count, hot_tier);
+        std::thread t([worker_cfg, conn_id, worker_id, worker_count]() {
+            apply_worker_loop(worker_cfg, conn_id, worker_id, worker_count);
         });
         std::lock_guard<std::mutex> bg_lock(g_background_threads_mu);
         g_background_threads.push_back(std::move(t));
@@ -203,14 +213,13 @@ void spawn_apply_worker_pool(
             log_write(pg.raw, {
                 .level = LogLevel::Info,
                 .component = "cdc_daemon",
-                .message = hot_path ? "hot apply worker loops started" : "apply worker loops started",
+                .message = "apply worker loops started",
                 .batch_id = make_batch_id(),
                 .conn_id = conn_id,
                 .source_schema = std::nullopt,
                 .source_table = std::nullopt,
                 .context = {
                     {"worker_count", worker_count},
-                    {"hot_path", hot_path},
                     {"mode", "background"},
                 },
             });
@@ -223,8 +232,7 @@ void ensure_apply_worker_loops(const AppConfig& cfg, const std::vector<std::stri
     {
         std::unordered_set<std::string> valid;
         for (const auto& conn_id : conn_ids) {
-            valid.insert(conn_id + ":cold");
-            valid.insert(conn_id + ":hot");
+            valid.insert(conn_id);
         }
         std::lock_guard<std::mutex> lock(g_apply_workers_mu);
         for (auto it = g_apply_workers_spawned.begin(); it != g_apply_workers_spawned.end();) {
@@ -236,29 +244,9 @@ void ensure_apply_worker_loops(const AppConfig& cfg, const std::vector<std::stri
         }
     }
     const AppConfig worker_cfg = snapshot_app_config(cfg);
-    int cold_workers = pipeline_defaults::kApplyWorkerCount;
-    try {
-        PgConn pg(worker_cfg.datasync.conn_string());
-        if (pg.raw) {
-            RuntimeConfig runtime;
-            runtime.reload(pg.raw);
-            cold_workers = runtime.get_int(
-                "apply_worker_count",
-                pipeline_defaults::kApplyWorkerCount,
-                "cdc_kafka_apply",
-                "");
-        }
-    } catch (...) {
-    }
+    const int workers = pipeline_defaults::kApplyWorkerCount;
     for (const auto& conn_id : conn_ids) {
-        spawn_apply_worker_pool(
-            worker_cfg, conn_id, CatalogHotTier::ColdOnly, cold_workers, conn_id + ":cold");
-        spawn_apply_worker_pool(
-            worker_cfg,
-            conn_id,
-            CatalogHotTier::HotOnly,
-            pipeline_defaults::kHotApplyConsumerCount,
-            conn_id + ":hot");
+        spawn_apply_worker_pool(worker_cfg, conn_id, workers);
     }
 }
 
@@ -982,9 +970,6 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
-
     const auto conn_ids_initial = wait_for_daemon_connections(log_pg, cfg);
     if (conn_ids_initial.empty()) {
         return 0;
@@ -1108,8 +1093,7 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
             break;
         }
 
-        runtime.reload(log_pg);
-        maybe_run_scheduled_retention_maintenance(log_pg, runtime);
+        maybe_run_scheduled_retention_maintenance(log_pg);
         sleep_interruptible(round_idle_seconds(cfg.cdc));
 
         cycles += 1;

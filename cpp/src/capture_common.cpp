@@ -182,13 +182,9 @@ KafkaBootstrapResolved resolve_kafka_bootstrap() {
 std::string kafka_apply_consumer_group(
     const std::string& conn_id,
     int worker_id,
-    int worker_count,
-    bool hot_path) {
+    int worker_count) {
     std::string group(pipeline_defaults::kKafkaConsumerGroupPrefix);
     group += '-';
-    if (hot_path) {
-        group += "hot-";
-    }
     group += conn_id;
     if (worker_count > 1) {
         group += "-w";
@@ -213,11 +209,8 @@ int capture_slice_max_events(const CdcConfig* cdc) {
 }  // namespace
 
 CaptureRuntimeConfig load_mariadb_capture_runtime(
-    RuntimeConfig& runtime,
-    PGconn* pg,
     const std::string& conn_id,
     const CdcConfig* cdc) {
-    (void)pg;
     CaptureRuntimeConfig cfg;
     cfg.max_seconds = capture_slice_max_seconds(cdc);
     cfg.max_events = capture_slice_max_events(cdc);
@@ -229,11 +222,7 @@ CaptureRuntimeConfig load_mariadb_capture_runtime(
     cfg.producer_batch = pipeline_defaults::kCaptureProducerBatchSize;
     cfg.producer_queue_max_messages = pipeline_defaults::kCaptureProducerQueueMaxMessages;
     cfg.producer_queue_max_kbytes = pipeline_defaults::kCaptureProducerQueueMaxKbytes;
-    cfg.topic_partitions = runtime.get_int(
-        "kafka_topic_partitions",
-        pipeline_defaults::kKafkaTopicPartitions,
-        "cdc_kafka_capture",
-        conn_id);
+    cfg.topic_partitions = pipeline_defaults::kKafkaTopicPartitions;
     cfg.idle_poll_seconds = pipeline_defaults::kCaptureIdlePollSeconds;
     cfg.quiet_exit_lagging_chunks = pipeline_defaults::kCaptureQuietExitLaggingChunks;
     cfg.heartbeat_seconds = pipeline_defaults::kCaptureHeartbeatSeconds;
@@ -241,11 +230,8 @@ CaptureRuntimeConfig load_mariadb_capture_runtime(
 }
 
 CaptureRuntimeConfig load_mssql_capture_runtime(
-    RuntimeConfig& runtime,
-    PGconn* pg,
     const std::string& conn_id,
     const CdcConfig* cdc) {
-    (void)pg;
     CaptureRuntimeConfig cfg;
     cfg.max_seconds = capture_slice_max_seconds(cdc);
     cfg.max_events = capture_slice_max_events(cdc);
@@ -255,11 +241,7 @@ CaptureRuntimeConfig load_mssql_capture_runtime(
     cfg.bootstrap = resolve_kafka_bootstrap().bootstrap;
     cfg.linger_ms = pipeline_defaults::kCaptureProducerLingerMs;
     cfg.producer_batch = pipeline_defaults::kCaptureProducerBatchSize;
-    cfg.topic_partitions = runtime.get_int(
-        "kafka_topic_partitions",
-        pipeline_defaults::kKafkaTopicPartitions,
-        "cdc_kafka_capture",
-        conn_id);
+    cfg.topic_partitions = pipeline_defaults::kKafkaTopicPartitions;
     cfg.idle_poll_seconds = pipeline_defaults::kCaptureIdlePollSeconds;
     cfg.heartbeat_seconds = pipeline_defaults::kCaptureHeartbeatSeconds;
     cfg.mssql_replay_on_idle = pipeline_defaults::kMssqlCaptureReplayOnIdle;
@@ -267,11 +249,8 @@ CaptureRuntimeConfig load_mssql_capture_runtime(
 }
 
 CaptureRuntimeConfig load_mongo_capture_runtime(
-    RuntimeConfig& runtime,
-    PGconn* pg,
     const std::string& conn_id,
     const CdcConfig* cdc) {
-    (void)pg;
     CaptureRuntimeConfig cfg;
     cfg.max_seconds = capture_slice_max_seconds(cdc);
     cfg.max_events = capture_slice_max_events(cdc);
@@ -281,11 +260,7 @@ CaptureRuntimeConfig load_mongo_capture_runtime(
     cfg.bootstrap = resolve_kafka_bootstrap().bootstrap;
     cfg.linger_ms = pipeline_defaults::kCaptureProducerLingerMs;
     cfg.producer_batch = pipeline_defaults::kCaptureProducerBatchSize;
-    cfg.topic_partitions = runtime.get_int(
-        "kafka_topic_partitions",
-        pipeline_defaults::kKafkaTopicPartitions,
-        "cdc_kafka_capture",
-        conn_id);
+    cfg.topic_partitions = pipeline_defaults::kKafkaTopicPartitions;
     cfg.idle_poll_seconds = pipeline_defaults::kCaptureIdlePollSeconds;
     cfg.heartbeat_seconds = pipeline_defaults::kCaptureHeartbeatSeconds;
     return cfg;
@@ -839,7 +814,7 @@ bool seed_stream_capture_bookmark_if_needed(
         pg,
         R"(
         SELECT source_database, source_schema, source_table,
-               capture_during_full_load, engine_meta::text, hot
+               capture_during_full_load, engine_meta::text
         FROM cdc_catalog.catalog
         WHERE catalog_id = $1::bigint
         )",
@@ -860,12 +835,10 @@ bool seed_stream_capture_bookmark_if_needed(
     const char* st = PQgetvalue(res, 0, 2);
     const char* st4 = PQgetvalue(res, 0, 3);
     const char* emt = PQgetvalue(res, 0, 4);
-    const char* hot_raw = PQgetvalue(res, 0, 5);
     const std::string source_database = sd ? sd : "";
     const std::string source_schema = ss ? ss : "";
     const std::string source_table = st ? st : "";
     const bool streaming = st4 ? (std::string(st4) == "t") : false;
-    const bool table_hot = hot_raw && (hot_raw[0] == 't' || hot_raw[0] == 'T' || hot_raw[0] == '1');
     const std::string engine_meta_text = emt ? emt : "";
     PQclear(res);
     if (engine_meta_has_stream_bookmark(engine_meta_text)) {
@@ -891,7 +864,7 @@ bool seed_stream_capture_bookmark_if_needed(
     const std::string topic_mode = std::string(pipeline_defaults::kKafkaTopicMode);
     const int topic_buckets = pipeline_defaults::kKafkaTopicBuckets;
     const std::string topic = topic_for_catalog_table(
-        topic_prefix, lake_schema, lake_table, topic_mode, topic_buckets, table_hot);
+        topic_prefix, lake_schema, lake_table, topic_mode, topic_buckets);
     const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
 
     nlohmann::json partition_offsets = nlohmann::json::object();
@@ -1958,7 +1931,7 @@ void ensure_apply_positions_for_conn(
     PGresult* res = PQexecParams(
         pg,
         R"(
-        SELECT c.catalog_id, c.source_database, c.source_schema, c.source_table, c.hot
+        SELECT c.catalog_id, c.source_database, c.source_schema, c.source_table
         FROM cdc_catalog.catalog c
         WHERE c.conn_id = $1
           AND c.db_engine = $2::cdc_catalog.db_engine
@@ -1991,8 +1964,6 @@ void ensure_apply_positions_for_conn(
         const std::string source_database = PQgetvalue(res, i, 1);
         const std::string source_schema = PQgetvalue(res, i, 2);
         const std::string source_table = PQgetvalue(res, i, 3);
-        const char* hot_raw = PQgetvalue(res, i, 4);
-        const bool table_hot = hot_raw && (hot_raw[0] == 't' || hot_raw[0] == 'T' || hot_raw[0] == '1');
         std::string lake_schema;
         std::string lake_table;
         if (db_engine == "mssql") {
@@ -2006,7 +1977,7 @@ void ensure_apply_positions_for_conn(
             lake_table = source_table;
         }
         const std::string topic = topic_for_catalog_table(
-            topic_prefix, lake_schema, lake_table, topic_mode, topic_buckets, table_hot);
+            topic_prefix, lake_schema, lake_table, topic_mode, topic_buckets);
         const ApplyPositionObjectKey pos_key = apply_position_object_key(
             db_engine, source_database, source_schema, source_table);
         auto mark_ap_failed = [&](const std::string& err_msg) {
@@ -2054,7 +2025,7 @@ void ensure_apply_position_for_catalog(
     PGresult* res = PQexecParams(
         pg,
         R"(
-        SELECT catalog_id, source_database, source_schema, source_table, hot
+        SELECT catalog_id, source_database, source_schema, source_table
         FROM cdc_catalog.catalog
         WHERE catalog_id = $1::bigint
           AND conn_id = $2
@@ -2079,8 +2050,6 @@ void ensure_apply_position_for_catalog(
     const std::string source_database = PQgetvalue(res, 0, 1);
     const std::string source_schema = PQgetvalue(res, 0, 2);
     const std::string source_table = PQgetvalue(res, 0, 3);
-    const char* hot_raw = PQgetvalue(res, 0, 4);
-    const bool table_hot = hot_raw && (hot_raw[0] == 't' || hot_raw[0] == 'T' || hot_raw[0] == '1');
     PQclear(res);
 
     std::string lake_schema;
@@ -2096,7 +2065,7 @@ void ensure_apply_position_for_catalog(
         lake_table = source_table;
     }
     const std::string topic = topic_for_catalog_table(
-        topic_prefix, lake_schema, lake_table, topic_mode, topic_buckets, table_hot);
+        topic_prefix, lake_schema, lake_table, topic_mode, topic_buckets);
     const ApplyPositionObjectKey pos_key =
         apply_position_object_key(db_engine, source_database, source_schema, source_table);
     auto mark_ap_failed = [&](const std::string& err_msg) {
@@ -2365,14 +2334,9 @@ static FullLoadKafkaResetStats execute_kafka_onboard_reset(
 
                 for (int w = 0; w < apply_workers; ++w) {
                     const std::string consumer_group =
-                        kafka_apply_consumer_group(conn_id, w, apply_workers, false);
+                        kafka_apply_consumer_group(conn_id, w, apply_workers);
                     alter_consumer_group_offset(
                         admin.rk, consumer_group, topic, partition, commit_offset);
-                }
-                for (int w = 0; w < pipeline_defaults::kHotApplyConsumerCount; ++w) {
-                    const std::string hot_group = kafka_apply_consumer_group(
-                        conn_id, w, pipeline_defaults::kHotApplyConsumerCount, true);
-                    alter_consumer_group_offset(admin.rk, hot_group, topic, partition, commit_offset);
                 }
                 topic_offsets.emplace(topic_key, stored_offset);
                 stats.topics_reset += 1;
@@ -2572,76 +2536,6 @@ static FullLoadKafkaResetStats execute_kafka_onboard_reset(
 
     if (stats.errors > 0) {
         return stats;
-    }
-
-    if (single_catalog_id) {
-        const std::string cid = std::to_string(*single_catalog_id);
-        const char* dedup_vals[] = {conn_id.c_str(), db_engine.c_str(), cid.c_str()};
-        PGresult* dedup = PQexecParams(
-            pg,
-            R"(
-            DELETE FROM cdc_catalog.cdc_applied_events ae
-            USING cdc_catalog.catalog c
-            WHERE ae.conn_id = $1
-              AND c.conn_id = ae.conn_id
-              AND c.source_schema = ae.source_schema
-              AND c.source_table = ae.source_table
-              AND c.catalog_id = $3::bigint
-              AND c.conn_id = $1
-              AND c.db_engine = $2::cdc_catalog.db_engine
-              AND c.active = true
-              AND c.needs_full_load = false
-              AND NOT c.cdc_enabled
-              AND c.status NOT IN ('skipped', 'disabled')
-              AND c.last_full_load_at IS NOT NULL
-            )",
-            3,
-            nullptr,
-            dedup_vals,
-            nullptr,
-            nullptr,
-            0);
-        if (dedup && PQresultStatus(dedup) == PGRES_COMMAND_OK) {
-            stats.dedup_deleted = std::atoll(PQcmdTuples(dedup));
-        } else {
-            stats.errors += 1;
-        }
-        if (dedup) {
-            PQclear(dedup);
-        }
-    } else {
-        const char* dedup_vals[] = {conn_id.c_str(), db_engine.c_str()};
-        PGresult* dedup = PQexecParams(
-            pg,
-            R"(
-            DELETE FROM cdc_catalog.cdc_applied_events ae
-            USING cdc_catalog.catalog c
-            WHERE ae.conn_id = $1
-              AND c.conn_id = ae.conn_id
-              AND c.source_schema = ae.source_schema
-              AND c.source_table = ae.source_table
-              AND c.conn_id = $1
-              AND c.db_engine = $2::cdc_catalog.db_engine
-              AND c.active = true
-              AND c.needs_full_load = false
-              AND NOT c.cdc_enabled
-              AND c.status NOT IN ('skipped', 'disabled')
-              AND c.last_full_load_at IS NOT NULL
-            )",
-            2,
-            nullptr,
-            dedup_vals,
-            nullptr,
-            nullptr,
-            0);
-        if (dedup && PQresultStatus(dedup) == PGRES_COMMAND_OK) {
-            stats.dedup_deleted = std::atoll(PQcmdTuples(dedup));
-        } else {
-            stats.errors += 1;
-        }
-        if (dedup) {
-            PQclear(dedup);
-        }
     }
 
     log_write(pg, {
@@ -3060,13 +2954,12 @@ void ensure_capture_kafka_topics(
     const std::string& batch_id,
     const std::string& conn_id,
     const CaptureRuntimeConfig& rcfg,
-    const std::vector<std::pair<std::string, std::string>>& tables,
-    const std::set<std::pair<std::string, std::string>>& hot_tables) {
+    const std::vector<std::pair<std::string, std::string>>& tables) {
     if (tables.empty()) {
         return;
     }
     const auto topics =
-        topics_for_tables(rcfg.topic_prefix, tables, rcfg.topic_mode, rcfg.topic_buckets, hot_tables);
+        topics_for_tables(rcfg.topic_prefix, tables, rcfg.topic_mode, rcfg.topic_buckets);
     try {
         ensure_kafka_topics_exist(rcfg.bootstrap, topics, rcfg.topic_partitions, 1);
     } catch (const std::exception& ex) {
@@ -3227,7 +3120,6 @@ void ensure_capture_kafka_topics(
     const std::string&,
     const std::string&,
     const CaptureRuntimeConfig&,
-    const std::vector<std::pair<std::string, std::string>>&,
-    const std::set<std::pair<std::string, std::string>>&) {}
+    const std::vector<std::pair<std::string, std::string>>&) {}
 
 #endif

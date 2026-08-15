@@ -10,10 +10,10 @@ Pipeline robusto 24/7: `MariaDB/MSSQL/Mongo → C++ capture → Kafka → C++ ap
 
 | DB | Rol |
 |----|-----|
-| **DataSync** | catalog, runtime_config, logs (cdc_catalog), dedup, apply_position |
+| **DataSync** | catalog, logs, connections, apply_position, apply_batch_stats (no `runtime_config`, no `cdc_applied_events`, no `reconciliation`, no `schema_migrations`) |
 | **DataLake** | tablas lake (COPY/INSERT destino) |
 
-Config: **`config.json`** en raíz del repo (PG DataSync + DataLake). Fuentes OLTP en `cdc_catalog.connections`. Tuning en `runtime_config`.
+Config: **`config.json`** = PG credentials + `cdc` slice. Fuentes OLTP en `cdc_catalog.connections`. Tuning en **`cpp/include/pipeline_defaults.hpp`** (rebuild). Schema = app off + `sql/manual/`.
 
 ## Completado
 
@@ -62,7 +62,6 @@ Onboard manual por tier (`catalog.hot`):
 ```bash
 docker compose run --rm datasync onboard-pending --conn-id MARIADB_LOCAL --hot-only
 docker compose run --rm datasync onboard-pending --cold-only
-docker compose run --rm datasync reconcile-lite --conn-id MARIADB_LOCAL --hot-only
 ```
 
 ## Onboard (prod)
@@ -81,7 +80,6 @@ psql ... -d DataLake -f sql/031_datasync_connections.sql
 Manual full-load (opcional):
 ```bash
 ./cpp/build/DataSync full-load --tier bronze --conn-id MARIADB_LOCAL
-./cpp/build/DataSync reconcile-lite --hot-only
 ```
 
 ## Sprint reciente — P0+P1 post-auditoría ronda 2 (2025-06-11)
@@ -172,11 +170,55 @@ Build: Docker `datasync:local` OK. **Migrate + daemon --once** verificados (2025
 - **Daemon:** do not mark `retention_maintenance_last_run_date` when prune hits cap (`backlog_remaining`).
 - **Ops (manual):** `CREATE INDEX CONCURRENTLY cdc_applied_events_applied_at_event_id_idx`; catch-up prune; `REINDEX TABLE CONCURRENTLY apply_position`. SQL: `sql-queries/monitoring/datasync/sql/pg_phase2_applied_events_prune_ops.sql`.
 
+## Sprint — PG apply CPU/RAM (migration 065, 2026-08-14)
+
+- **Workers:** cold `apply_worker_count` **12 → 6** (24 Kafka partitions / 6). Hot stays 3. Example `slice_max_seconds` **60 → 180**.
+- **Connections:** long-lived datasync+lake `PgConn` per apply worker (reconnect on failure); `work_mem`/`temp_buffers` 16MB; `log_pg` = datasync.
+- **Stats:** `apply_batch_stats` only for tables with events/flush (no idle rows). `ensure_apply_positions` only worker 0.
+- **Logs:** dropped per-slice started / tables-selected / per-batch flushing.
+- **Lake staging:** reuse TEMP tables (`TRUNCATE`) per session; delete+insert by business PK unchanged (partition key = `_dl_load_timestamp`).
+- **Dropped `cdc_applied_events`:** Kafka offset + lake PK idempotency.
+- **Prod `config.json`:** set `cdc.slice_max_seconds` to 180 on the host (file not in git).
+- **Build:** `./install.sh` / Docker image on the Linux host (`HAVE_RDKAFKA`). This Windows workstation has no Docker/CMake.
+
+## Sprint — hardcoded knobs + no auto-migrate (2026-08-14)
+
+- **Deleted `cdc_catalog.runtime_config`.** All knobs in `pipeline_defaults.hpp`. Manual DROP: `sql/manual/2026-08-14_drop_runtime_config.sql` (app off).
+- **Deleted migrate:** no `DataSync migrate`, no `schema_migrate.cpp`, no `prod_ops_embedded.hpp`, no startup migrate, no `DATASYNC_RUN_MIGRATIONS`. Schema = app off + psql.
+- **No hot apply path:** one pool of **4** workers; bucketed topics only; `catalog.hot` is onboard filter only.
+- **Workers/batches:** apply **8000**; full-load COPY **20000**; Kafka fetch **50MB / 10MB**; producer queue **500k / 1GB**; lake `statement_timeout` **10 min**.
+- **Retention “already ran today”:** `cdc_catalog.logs` (`retention_maintenance` / `scheduled batched retention prune completed`). No knobs table.
+- **Keep:** long-lived apply PgConn, 16MB work_mem, idle stats skip, TEMP TRUNCATE reuse, lake delete+insert by business PK.
+
+## Sprint — long-lived Kafka consumer + partition lag (2026-08-14)
+
+- **Consumer:** daemon `apply_worker_loop` holds `KafkaApplySession`; `rd_kafka_new` / subscribe / `ensure_topics` only on first slice or topic-set change. Reset on Kafka/fatal only (not per-table apply errors).
+- **Lag:** dropped exact table scan (`datasync-table-lag-scan` extra consumer). Slice end uses `high watermark − offset` on the apply consumer, cached per partition. `lag_kind=partition` in `apply_batch_stats.context`.
+- **Logs:** removed `kafka poll progress` every 100 events, first-message, and first-table parse. One `kafka-apply completed` per slice remains.
+- **Reports:** `PG/MV/patch_datasync_ops_partition_lag.sql` — `sum_kafka_lag` = SUM of MAX(partition lag) per `(conn, topic, partition)`. Same column names (no Superset remint). Apply on **datasync**.
+- **Build:** `./install.sh` / Docker on Linux (`HAVE_RDKAFKA`). SQL 1 (`runtime_config` / `cdc_applied_events`) already applied by ops.
+
+## Sprint — idle stats skip + catalog-first Health + pg_cron prune (2026-08-14)
+
+- **C++:** `insert_apply_batch_stats` no-ops when events/parse/drop/dedup are all zero. Dropped `lake batch committed` and `kafka poll idle no messages` logs.
+- **Prune:** DataSync daemon **once per CST hour** — idle/zero `apply_batch_stats` then age 3d (shared **1M** row cap) + logs (**1M**). Batches 500. No pg_cron / no Postgres restart. SQL function: `prune_apply_batch_stats_idle_batched`.
+- **Reports:** `PG/MV/patch_datasync_ops_health_catalog_first.sql` — Health = catalog ⋈ apply_position ⋈ capture + last non-zero stats. Quiet = `is_inactive` (no fake GREEN heartbeat). Events/Kafka ignore idle/zero slices. Same chart columns (no remint). Unique Health key = `catalog_id`.
+- **Ops order:** rebuild binary → retention SQL on datasync → Health/Events MV patch on datasync.
+
+## Sprint — drop reconciliation + schema_migrations (2026-08-14)
+
+- **Removed `reconcile-lite`:** no CLI, no `reconciliation` table, no `v_reconciliation_latest` JOIN in apply. Health = catalog + apply_position + capture. `apply_batch_stats.reconcile_row_delta` column kept (writes 0; no ALTER on the fat table).
+- **Dropped `schema_migrations`:** migrate already gone from the binary; ledger is leftover. Manual SQL: `sql/manual/2026-08-14_drop_reconciliation_schema_migrations.sql` (app off).
+- **Deploy:** stop DataSync → apply that SQL on **datasync** → rebuild/restart binary.
+
+## Sprint — drop unused cdc_catalog views (2026-08-14)
+
+- Dropped `v_apply_latest`, `v_apply_stale`, `v_cdc_pipeline_summary`, `v_full_load_progress`, `v_kafka_consumer`, `v_apply_batch_stats_hourly`.
+- Binary and DataSync Ops MVs do not read them. SQL: `sql/manual/2026-08-14_drop_cdc_catalog_legacy_views.sql` (also included in the reconciliation drop script). App can stay up for views-only.
+
 ## Env vars (Docker)
 
 | Variable | Default | Use |
 |----------|---------|-----|
 | `DATASYNC_CONFIG` | `/app/config.json` | PG credentials |
-| `DATASYNC_RUN_MIGRATIONS` | `0` | `1` = baseline + lake DDL on first install only |
-| Incremental migrate | daemon start | `run_cdc_daemon` runs `DataSync migrate` before CDC loop |
 | `KAFKA_BOOTSTRAP` | `127.0.0.1:9092` | Kafka bootstrap (env only; C++ reads via `resolve_kafka_bootstrap`) |

@@ -13,7 +13,6 @@
 #include "mariadb_schema.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
-#include "runtime_config.hpp"
 #include "pipeline_defaults.hpp"
 
 #include <algorithm>
@@ -147,9 +146,7 @@ bool is_integer_pk_type(const MariaDbColumn& col) {
     return lower.find("int") != std::string::npos;
 }
 
-MariaDbRetryOptions mariadb_retry_options(RuntimeConfig& runtime, const std::string& conn_id) {
-    (void)runtime;
-    (void)conn_id;
+MariaDbRetryOptions mariadb_retry_options() {
     MariaDbRetryOptions opts;
     opts.max_attempts = pipeline_defaults::kMariadbReconnectMaxAttempts;
     opts.base_ms = std::max(100, pipeline_defaults::kMariadbReconnectBaseMs);
@@ -731,7 +728,7 @@ void mark_catalog_success(PGconn* pg, long long catalog_id) {
     mark_catalog_full_load_data_ready(pg, catalog_id);
 }
 
-void reactivate_full_load_after_cooldown(PGconn* pg, RuntimeConfig& runtime, const std::string& conn_id) {
+void reactivate_full_load_after_cooldown(PGconn* pg, const std::string& conn_id) {
     const int max_retries = pipeline_defaults::kFullLoadMaxFailRetries;
     const int cooldown_min = pipeline_defaults::kFullLoadFailedCooldownMinutes;
     const std::string max_str = std::to_string(max_retries);
@@ -761,8 +758,7 @@ void mark_catalog_failed(
     long long catalog_id,
     const std::string& conn_id,
     const std::string& error) {
-    RuntimeConfig runtime;
-    runtime.reload(pg);
+    (void)conn_id;
     const int max_retries = pipeline_defaults::kFullLoadMaxFailRetries;
     const std::string trunc = error.substr(0, 950);
     const std::string id = std::to_string(catalog_id);
@@ -902,14 +898,7 @@ TableLoadOutcome load_one_table(
     PgConn app_pg(cfg.datasync.conn_string());
     PgConn lake_pg(cfg.datalake.conn_string());
     MariaDbConn mariadb(source);
-    RuntimeConfig runtime;
-    runtime.reload(app_pg.raw);
-
-    const std::size_t batch_size = runtime.get_size_t(
-        "full_load_batch_size",
-        pipeline_defaults::kFullLoadBatchSizeDefault,
-        "mariadb_load",
-        target.conn_id);
+    const std::size_t batch_size = pipeline_defaults::kFullLoadBatchSizeDefault;
     const int source_sleep_ms = pipeline_defaults::kFullLoadSourceSleepMs;
     const int workers = pipeline_defaults::kFullLoadWorkers;
 
@@ -974,7 +963,7 @@ TableLoadOutcome load_one_table(
         target.source_table,
         resume_checkpoints);
 
-    const MariaDbRetryOptions retry_pre = mariadb_retry_options(runtime, target.conn_id);
+    const MariaDbRetryOptions retry_pre = mariadb_retry_options();
     long long source_rows = fetch_mariadb_row_count(
         mariadb, target.source_schema, target.source_table, retry_pre);
 
@@ -1063,7 +1052,7 @@ TableLoadOutcome load_one_table(
     }
 
     const DdlSyncResult ddl = sync_mariadb_ddl_after_truncate(
-        lake_pg.raw, mariadb.handle, target.source_schema, target.source_table, cols, runtime, target.conn_id);
+        lake_pg.raw, mariadb.handle, target.source_schema, target.source_table, cols);
 
     merge_lake_column_nullability(lake_pg.raw, target.source_schema, target.source_table, cols);
 
@@ -1091,7 +1080,7 @@ TableLoadOutcome load_one_table(
         save_full_load_checkpoint(app_pg.raw, ddl_cp);
     }
 
-    const MariaDbRetryOptions retry = mariadb_retry_options(runtime, target.conn_id);
+    const MariaDbRetryOptions retry = mariadb_retry_options();
     InvalidPkSkipStats skip_stats;
     rows_out = copy_rows_parallel(
         cfg,
@@ -1231,8 +1220,6 @@ FullLoadRunStats run_mariadb_full_load(
     FullLoadRunStats stats;
 
     PgConn app_pg(cfg.datasync.conn_string());
-    RuntimeConfig runtime;
-    runtime.reload(app_pg.raw);
 
     log_fl(
         log_pg,
@@ -1240,9 +1227,7 @@ FullLoadRunStats run_mariadb_full_load(
         LogLevel::Info,
         batch_id,
         "full load started",
-        {{"batch_size",
-          runtime.get_size_t(
-              "full_load_batch_size", pipeline_defaults::kFullLoadBatchSizeDefault, "mariadb_load")},
+        {{"batch_size", pipeline_defaults::kFullLoadBatchSizeDefault},
          {"workers", pipeline_defaults::kFullLoadWorkers},
          {"parallel_tables", kFullLoadParallelTables}});
 
@@ -1311,8 +1296,7 @@ FullLoadRunStats run_mariadb_full_load(
         }
 
         MariaDbConn order_db(*src);
-        runtime.reload(app_pg.raw);
-        reactivate_full_load_after_cooldown(app_pg.raw, runtime, conn_id);
+        reactivate_full_load_after_cooldown(app_pg.raw, conn_id);
 
         const MariaDbPreflightResult preflight = check_mariadb_load_ready(order_db.handle);
         for (const auto& w : preflight.warnings) {

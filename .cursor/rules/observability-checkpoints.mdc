@@ -33,7 +33,7 @@ Every component MUST write to `cdc_catalog.logs` at each checkpoint below. Use s
 
 | Checkpoint | Level |
 |------------|-------|
-| Run start | `info` + runtime batch/workers from `runtime_config` |
+| Run start | `info` + batch/workers from `pipeline_defaults.hpp` |
 | Full load schema batch | `info` + `table_count`, `parallel_tables` |
 | Table start | `info` |
 | After TRUNCATE | `info` |

@@ -15,10 +15,10 @@ Act as **project coordinator with memory**, not a solo implementer. Full playboo
 
 - **10k+ catalog tables** — Kafka `bucketed` mode (64 topics × 6 partitions), not 1 topic/table
 - **700M+ row tables** — apply batch commits (`apply_batch_size`), full-load keyset workers (C++)
-- **Dedup audit** — `cdc_applied_events` + `apply_batch_stats` pruned nightly (03:00 CST, batched); not at apply worker startup
+- **Apply idempotency** — Kafka offset + lake business-PK delete+insert (no `cdc_applied_events` ledger). `apply_batch_stats` + logs pruned hourly by the daemon (1M rows each, batched); not at apply worker startup
 - **Do not regress** — FK defer/retry, fairness, capture fail-fast without advancing binlog
 
-Runtime keys: `prod_ops.sql` incremental (`kafka_topic_mode`, `kafka_topic_buckets`, etc.)
+Knobs: `cpp/include/pipeline_defaults.hpp` (hardcoded). Schema: **app off + manual psql** — no `DataSync migrate`, no `runtime_config`.
 
 ## Session start
 
@@ -63,7 +63,7 @@ Run DEV + QA **in parallel** only for independent work. Delegation prompt must i
 - Python: `cdc_kafka/` — capture, apply, fairness, recovery, `topics.py`
 - Config test: `cpp/config.cdc-test.json` | prod: `cpp/config.json`
 - Install: `./install.sh` | Kafka: `docker-compose.yml` (`localhost:9092`)
-- Scale SQL: `prod_ops.sql` (incremental section)
+- Manual schema SQL: `sql/manual/` (app off)
 
 ## Report format
 

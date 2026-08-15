@@ -9,7 +9,6 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "pipeline_defaults.hpp"
-#include "runtime_config.hpp"
 
 #include <dirent.h>
 
@@ -542,12 +541,7 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
     }
 
     const auto slot = conn_full_load_slot(conn_id);
-    RuntimeConfig runtime;
-    runtime.reload(log_pg);
-    const int timeout_minutes = runtime.get_int(
-        "full_load_daemon_timeout_minutes",
-        pipeline_defaults::kFullLoadDaemonSubprocessTimeoutMinutes,
-        "global");
+    const int timeout_minutes = pipeline_defaults::kFullLoadDaemonSubprocessTimeoutMinutes;
     const int timeout_seconds = timeout_minutes <= 0 ? 0 : timeout_minutes * 60;
     const SpawnWaitResult spawn = spawn_wait_with_timeout(
         args,

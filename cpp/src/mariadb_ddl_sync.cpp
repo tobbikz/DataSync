@@ -2,6 +2,7 @@
 
 #include "lake_columns.hpp"
 #include "mariadb_schema.hpp"
+#include "pipeline_defaults.hpp"
 
 #include <functional>
 #include <map>
@@ -523,18 +524,16 @@ DdlSyncResult sync_mariadb_ddl_after_truncate(
     MYSQL* mysql,
     const std::string& schema,
     const std::string& table,
-    const std::vector<MariaDbColumn>& cols,
-    const RuntimeConfig& cfg,
-    const std::string& conn_id) {
+    const std::vector<MariaDbColumn>& cols) {
     DdlSyncResult result;
     result.columns_added = sync_missing_columns(pg, schema, table, cols);
     result.columns_widened = sync_binary_column_types(pg, schema, table, cols);
     result.columns_widened += sync_integer_column_types(pg, schema, table, cols);
 
-    if (cfg.get_bool("ddl_sync_indexes", true, "mariadb_load", conn_id)) {
+    if (pipeline_defaults::kDdlSyncIndexes) {
         result.indexes_created = sync_indexes(pg, schema, table, fetch_mariadb_indexes(mysql, schema, table));
     }
-    if (cfg.get_bool("ddl_sync_foreign_keys", true, "mariadb_load", conn_id)) {
+    if (pipeline_defaults::kDdlSyncForeignKeys) {
         result.foreign_keys_created =
             sync_foreign_keys(pg, schema, table, fetch_mariadb_foreign_keys_once(mysql, schema, table));
     }
@@ -545,9 +544,7 @@ DdlSyncResult sync_mariadb_columns_to_lake(
     PGconn* pg,
     MYSQL* mysql,
     const std::string& schema,
-    const std::string& table,
-    const RuntimeConfig& /*cfg*/,
-    const std::string& /*conn_id*/) {
+    const std::string& table) {
     const auto cols = fetch_mariadb_columns(mysql, schema, table);
     if (!pg_lake_table_exists(pg, schema, table)) {
         ensure_lake_table_base(pg, schema, table, cols);

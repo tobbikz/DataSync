@@ -21,41 +21,7 @@ struct TableApplyCursor {
     long long kafka_offset{-1};
 };
 
-/** Per-table unresolved message count ahead of slice-start apply offset. */
-class TableLagTracker {
-public:
-    void set_baseline(const TableKey& key, long long offset, TableApplyCursor cursor);
-    const TableApplyCursor* cursor(const TableKey& key) const;
-
-    void on_message_seen(const TableKey& key, long long offset);
-    void on_message_resolved(const TableKey& key, long long offset);
-
-    long long unresolved(const TableKey& key) const;
-
-private:
-    std::map<TableKey, long long> baseline_;
-    std::map<TableKey, long long> unresolved_;
-    std::map<TableKey, TableApplyCursor> cursors_;
-};
-
-struct TableLagScanResult {
-    long long table_lag{0};
-    long long partition_lag{0};
-    bool scan_complete{false};
-};
-
-/** Exact table backlog: count payload matches between consumed_offset+1 and high watermark. */
-TableLagScanResult compute_exact_table_kafka_lag(
-    const std::string& bootstrap,
-    const std::string& topic,
-    int partition,
-    long long consumed_offset,
-    const std::string& lake_schema,
-    const std::string& lake_table,
-    const std::string& db_engine,
-    int timeout_ms,
-    long long max_messages);
-
+/** high_watermark − (consumed_offset + 1); partition-level (shared bucket topics). */
 long long compute_kafka_partition_lag(
     rd_kafka_t* rk,
     const std::string& topic,

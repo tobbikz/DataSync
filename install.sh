@@ -249,82 +249,18 @@ catalog_schema_exists() {
 }
 
 apply_catalog_schema() {
-  [[ "${DATASYNC_RUN_MIGRATIONS:-0}" == "1" ]] || return 0
-  [[ -f "$CONFIG" ]] || return 0
-
-  if ! mapfile -t pg < <(read_pg_cfg); then
-    fail "cdc_catalog: config unreadable"
-  fi
-  export PGPASSWORD="${pg[4]}"
-  apply_pg_sslmode "${pg[5]:-}"
-
-  local db_created
-  db_created="$(ensure_pg_database "${pg[0]}" "${pg[1]}" "${pg[2]}" "${pg[3]}")"
-
-  if catalog_schema_exists "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"; then
-    if [[ "$QUIET" == "1" ]]; then
-      ok "cdc_catalog @ ${pg[2]} (exists)"
-    else
-      log "cdc_catalog @ ${pg[2]} already exists — skip DDL"
-    fi
-    return 0
-  fi
-
-  log "Applying cdc_catalog baseline → ${pg[2]}"
-  "$BIN" migrate --baseline --config "$CONFIG"
-  if [[ "$QUIET" == "1" ]]; then
-    if [[ "$db_created" == "1" ]]; then
-      ok "cdc_catalog @ ${pg[2]} (created db + schema)"
-    else
-      ok "cdc_catalog @ ${pg[2]} (applied)"
-    fi
-  fi
+  return 0
 }
 
 apply_lake_schema() {
-  [[ "${DATASYNC_RUN_MIGRATIONS:-0}" == "1" ]] || return 0
-  [[ -f "$CONFIG" ]] || return 0
-
-  if ! mapfile -t pg < <(read_datalake_cfg); then
-    fail "lake schema: config unreadable"
-  fi
-  export PGPASSWORD="${pg[4]}"
-  apply_pg_sslmode "${pg[5]:-}"
-
-  local db_created
-  db_created="$(ensure_pg_database "${pg[0]}" "${pg[1]}" "${pg[2]}" "${pg[3]}")"
-
-  local exists
-  exists=$(psql -h "${pg[0]}" -p "${pg[1]}" -U "${pg[3]}" -d "${pg[2]}" -tAc \
-    "SELECT 1 FROM pg_proc p
-     JOIN pg_namespace n ON n.oid = p.pronamespace
-     WHERE n.nspname = 'lake' AND p.proname = 'ensure_monthly_partitions'" 2>/dev/null || true)
-
-  if [[ "$exists" == "1" ]]; then
-    if [[ "$QUIET" == "1" ]]; then
-      ok "lake @ ${pg[2]} (exists)"
-    else
-      log "lake @ ${pg[2]} already exists — skip"
-    fi
-    return 0
-  fi
-
-  log "Applying lake schema → ${pg[2]}"
-  "$BIN" migrate --lake --config "$CONFIG"
-  if [[ "$QUIET" == "1" ]]; then
-    if [[ "$db_created" == "1" ]]; then
-      ok "lake @ ${pg[2]} (created db + schema)"
-    else
-      ok "lake @ ${pg[2]} (applied)"
-    fi
-  fi
+  return 0
 }
 
 verify_catalog_integrity() {
   local host="$1" port="$2" user="$3" db="$4"
   local missing=""
   local tbl
-  for tbl in catalog logs connections runtime_config; do
+  for tbl in catalog logs connections apply_position; do
     local found
     found=$(psql -h "$host" -p "$port" -U "$user" -d "$db" -tAc \
       "SELECT 1 FROM information_schema.tables
@@ -335,7 +271,7 @@ verify_catalog_integrity() {
   done
 
   if [[ -n "$missing" ]]; then
-    fail "partial cdc_catalog schema — missing:${missing} (re-run with DATASYNC_RUN_MIGRATIONS=1 or restore from backup SQL)"
+    fail "partial cdc_catalog schema — missing:${missing} (restore from backup SQL; binary does not migrate)"
   fi
 }
 
@@ -348,7 +284,7 @@ check_pg_auth() {
 check_catalog_integrity() {
   local host="$1" port="$2" user="$3" db="$4"
   local tbl found
-  for tbl in catalog logs connections runtime_config; do
+  for tbl in catalog logs connections apply_position; do
     found=$(psql -h "$host" -p "$port" -U "$user" -d "$db" -tAc \
       "SELECT 1 FROM information_schema.tables
        WHERE table_schema = 'cdc_catalog' AND table_name = '${tbl}'" 2>/dev/null || true)
@@ -357,26 +293,11 @@ check_catalog_integrity() {
 }
 
 apply_catalog_incremental() {
-  log "Applying schema incremental (DataSync migrate)"
-  "$BIN" migrate --config "$CONFIG"
+  return 0
 }
 
 post_schema_bootstrap() {
-  [[ "${DATASYNC_RUN_MIGRATIONS:-0}" == "1" ]] || return 0
-  [[ -f "$CONFIG" ]] || return 0
-
-  if ! mapfile -t pg < <(read_pg_cfg); then
-    fail "post-schema bootstrap: config unreadable"
-  fi
-  export PGPASSWORD="${pg[4]}"
-  apply_pg_sslmode "${pg[5]:-}"
-
-  if ! catalog_schema_exists "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"; then
-    fail "cdc_catalog schema missing after apply — check PostgreSQL logs"
-  fi
-
-  verify_catalog_integrity "${pg[0]}" "${pg[1]}" "${pg[3]}" "${pg[2]}"
-  apply_catalog_incremental
+  return 0
 }
 
 lake_schema_ok() {
@@ -471,21 +392,7 @@ if [[ "${1:-}" == "health-only" ]]; then
   exit $?
 fi
 
-if [[ -f "$CONFIG" ]] && [[ "${DATASYNC_RUN_MIGRATIONS:-0}" == "1" ]]; then
-  if mapfile -t pg < <(read_pg_cfg); then
-    export PGPASSWORD="${pg[4]}"
-    apply_pg_sslmode "${pg[5]:-}"
-    warn_createdb_privilege "${pg[0]}" "${pg[1]}" "${pg[3]}"
-    verify_pg_auth "${pg[0]}" "${pg[1]}" "${pg[3]}"
-    if [[ "$QUIET" == "1" ]]; then
-      ok "PostgreSQL ${pg[3]}@${pg[0]}:${pg[1]}"
-    else
-      log "PostgreSQL auth ok"
-    fi
-  else
-    warn "could not read PostgreSQL settings from $CONFIG"
-  fi
-elif [[ -f "$CONFIG" ]]; then
+if [[ -f "$CONFIG" ]]; then
   if mapfile -t pg < <(read_pg_cfg); then
     export PGPASSWORD="${pg[4]}"
     apply_pg_sslmode "${pg[5]:-}"
@@ -519,7 +426,7 @@ if [[ "${1:-}" == "schema-only" ]]; then
 fi
 
 if [[ "${1:-}" == "diagnose-only" ]]; then
-  exec "$BIN" migrate --diagnostics --config "$CONFIG"
+  fail "schema diagnostics are manual (app off + psql); binary has no migrate command"
 fi
 
 cd "$ROOT"
@@ -597,7 +504,6 @@ run_host_discover() {
     return 1
   fi
   docker_compose run --rm --no-deps \
-    -e DATASYNC_RUN_MIGRATIONS="${DATASYNC_RUN_MIGRATIONS:-0}" \
     datasync discover || return 1
 }
 

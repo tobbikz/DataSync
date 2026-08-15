@@ -2,7 +2,6 @@
 
 #include "config.hpp"
 #include "pipeline_defaults.hpp"
-#include "runtime_config.hpp"
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
@@ -79,18 +78,12 @@ void mark_capture_position_failed(
 int refresh_capture_position_health(PGconn* pg, int staleness_seconds);
 
 CaptureRuntimeConfig load_mariadb_capture_runtime(
-    RuntimeConfig& runtime,
-    PGconn* pg,
     const std::string& conn_id,
     const CdcConfig* cdc = nullptr);
 CaptureRuntimeConfig load_mssql_capture_runtime(
-    RuntimeConfig& runtime,
-    PGconn* pg,
     const std::string& conn_id,
     const CdcConfig* cdc = nullptr);
 CaptureRuntimeConfig load_mongo_capture_runtime(
-    RuntimeConfig& runtime,
-    PGconn* pg,
     const std::string& conn_id,
     const CdcConfig* cdc = nullptr);
 
@@ -118,7 +111,7 @@ void rotate_capture_catalog_tables(
     std::vector<CaptureCatalogTable>& tables,
     const std::string& conn_id);
 
-/** Topic prefix is always conn_id (not runtime_config). */
+/** Topic prefix is always conn_id. */
 inline std::string topic_prefix_for_conn(const std::string& conn_id) {
     if (conn_id.empty()) {
         return "UNKNOWN_CONN";
@@ -140,12 +133,10 @@ using pipeline_defaults::kCaptureWorkerCount;
 using pipeline_defaults::kFullLoadParallelTables;
 
 // Per-conn suffix + -w{N} when worker_count > 1 (independent Kafka offsets per worker).
-// hot_path=true → separate consumer group (datalake-cdc-apply-hot-…).
 std::string kafka_apply_consumer_group(
     const std::string& conn_id,
     int worker_id = 0,
-    int worker_count = 1,
-    bool hot_path = false);
+    int worker_count = 1);
 
 inline std::vector<CaptureCatalogTable> fetch_capture_catalog_tables(
     PGconn* pg,
@@ -169,8 +160,7 @@ void ensure_capture_kafka_topics(
     const std::string& batch_id,
     const std::string& conn_id,
     const CaptureRuntimeConfig& rcfg,
-    const std::vector<std::pair<std::string, std::string>>& tables,
-    const std::set<std::pair<std::string, std::string>>& hot_tables = {});
+    const std::vector<std::pair<std::string, std::string>>& tables);
 
 #ifdef HAVE_RDKAFKA
 long long reset_apply_offset_to_end(

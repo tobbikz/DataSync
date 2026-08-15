@@ -21,15 +21,12 @@
   ```
   Hoy `quarantine_apply_position()` existe; recovery solo vía SQL manual. Enum `rebootstrap_pending` sin uso en C++.
 
-- [x] **Reconcile lite** — `DataSync reconcile-lite` + tabla `cdc_catalog.reconciliation` (052)
-  ```bash
-  DataSync reconcile-lite [--conn-id ID] [--hot-only|--cold-only] [--sample-pct N]
-  ```
+- [x] **Reconcile lite (removed 2026-08-14)** — table + CLI dropped; health stays on `apply_batch_stats`
 
 - [ ] **Alertas externas** (fan-out desde RED/AMBER; logs siguen siendo source of truth)
   - Webhook Slack/Teams/PagerDuty, o
   - Exporter Prometheus, o
-  - Airflow sensor sobre `v_apply_stale`
+  - Airflow sensor sobre DataSync Ops MVs / apply_position (no `v_apply_stale`)
 
 - [ ] **Full-load selectivo por tabla**
   ```bash
@@ -84,8 +81,8 @@
 ## P2 — Plataforma / integración
 
 - [ ] **`DataSync status`** — health CLI (JSON + exit code)
-  - RAG por conn (`v_cdc_pipeline_summary`)
-  - Cuarentena, full-load activo (`v_full_load_progress`)
+  - RAG por conn (`cdc_catalog.mv_tab_health_latest_3d`)
+  - Cuarentena, full-load (`full_load_checkpoint` / catalog)
   - Capture lag; exit ≠ 0 si RED
 
 - [ ] **`DataSync pause` / `resume`**
@@ -152,7 +149,7 @@
 
 ## Limpieza técnica (deuda)
 
-- [ ] Eliminar o revivir tablas `reconciliation_*` (decisión reconcile lite)
+- [x] Eliminadas tablas `reconciliation*` + `schema_migrations` (2026-08-14)
 - [ ] Usar o borrar enum `rebootstrap_pending`
 - [ ] Documentar eliminación de `apply_catchup_*` del runtime_config
 - [ ] Ampliar tests unitarios (hoy solo `kafka_apply_cell_test.cpp`)

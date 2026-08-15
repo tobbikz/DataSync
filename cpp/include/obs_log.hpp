@@ -45,7 +45,7 @@ inline LogEvent make_log(
 bool log_write(PGconn* pg, const LogEvent& event);
 
 // Deletes rows older than retention_days via batched+locked purge_logs_batched.
-// Prefer daemon scheduled retention (03:00 CST); safe to call ad-hoc (skips if lock held).
+// Prefer daemon hourly retention (CST hour bucket, 1M rows/prune); safe to call ad-hoc (skips if lock held).
 // Returns rows deleted, 0 if skipped/noop, -1 on error.
 long long purge_logs(PGconn* pg, int retention_days = 7);
 
