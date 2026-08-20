@@ -326,145 +326,6 @@ void spawn_daemon_full_load_background(
     g_background_threads.push_back(std::move(t));
 }
 
-void scan_apply_health_alerts(PGconn* pg, const std::string& batch_id) {
-    const int lookback = pipeline_defaults::kApplyHealthAlertLookbackMinutes;
-    const std::string lookback_str = std::to_string(lookback);
-    const char* vals[] = {lookback_str.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        SELECT DISTINCT ON (conn_id, source_schema, source_table)
-            conn_id,
-            source_schema,
-            source_table,
-            apply_health_rag,
-            health_reason,
-            kafka_consumer_lag,
-            is_stale,
-            logged_at
-        FROM cdc_catalog.apply_batch_stats
-        WHERE apply_health_rag IN ('RED', 'AMBER')
-          AND logged_at >= now() - ($1::int * interval '1 minute')
-        ORDER BY conn_id, source_schema, source_table, logged_at DESC
-        )",
-        1,
-        nullptr,
-        vals,
-        nullptr,
-        nullptr,
-        0);
-    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (res) {
-            PQclear(res);
-        }
-        return;
-    }
-
-    for (int i = 0; i < PQntuples(res); ++i) {
-        const std::string rag = PQgetvalue(res, i, 3);
-        log_write(pg, {
-            .level = rag == "RED" ? LogLevel::Error : LogLevel::Warning,
-            .component = "cdc_kafka_health",
-            .message = rag == "RED" ? "apply health RED" : "apply health AMBER",
-            .batch_id = batch_id,
-            .conn_id = PQgetvalue(res, i, 0),
-            .source_schema = PQgetvalue(res, i, 1),
-            .source_table = PQgetvalue(res, i, 2),
-            .context = {
-                {"apply_health_rag", rag},
-                {"health_reason", PQgetisnull(res, i, 4) ? "" : PQgetvalue(res, i, 4)},
-                {"kafka_consumer_lag", PQgetisnull(res, i, 5) ? 0 : std::atoll(PQgetvalue(res, i, 5))},
-                {"is_stale", PQgetisnull(res, i, 6) ? false : (PQgetvalue(res, i, 6)[0] == 't')},
-                {"lookback_minutes", lookback},
-            },
-        });
-    }
-    PQclear(res);
-}
-
-void scan_capture_health_alerts(PGconn* pg, const std::string& batch_id) {
-    const int warn_seconds = pipeline_defaults::kCaptureHealthAlertStaleSeconds;
-    const int fail_seconds = pipeline_defaults::kCaptureHealthAlertFailSeconds;
-    refresh_capture_position_health(pg, warn_seconds);
-
-    const std::string warn = std::to_string(warn_seconds);
-    const char* vals[] = {warn.c_str()};
-    PGresult* res = PQexecParams(
-        pg,
-        R"(
-        SELECT
-            conn_id,
-            COALESCE(binlog_file, ''),
-            status::text,
-            COALESCE(last_error, ''),
-            extract(epoch FROM (now() - updated_at))::integer AS silent_seconds,
-            extract(epoch FROM (now() - COALESCE(last_event_ts, updated_at)))::integer AS event_silent_seconds
-        FROM cdc_catalog.capture_position
-        WHERE extract(epoch FROM (now() - updated_at)) > $1::integer
-        ORDER BY silent_seconds DESC
-        )",
-        1,
-        nullptr,
-        vals,
-        nullptr,
-        nullptr,
-        0);
-    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (res) {
-            PQclear(res);
-        }
-        return;
-    }
-
-    for (int i = 0; i < PQntuples(res); ++i) {
-        const std::string conn_id = PQgetvalue(res, i, 0);
-        const int silent_seconds = PQgetisnull(res, i, 4) ? 0 : std::atoi(PQgetvalue(res, i, 4));
-        const int event_silent_seconds =
-            PQgetisnull(res, i, 5) ? silent_seconds : std::atoi(PQgetvalue(res, i, 5));
-        const std::string rag = silent_seconds >= fail_seconds ? "RED" : "AMBER";
-        const std::string db_engine = conn_db_engine_from_pg(pg, conn_id);
-        const bool capture_gate_blocked =
-            db_engine.empty()
-                ? full_load_gate_blocks_onboard(pg, conn_id)
-                : full_load_gate_blocks_capture(pg, conn_id, db_engine);
-        const bool copy_checkpoint = conn_has_active_copy_checkpoints(pg, conn_id);
-        const bool subprocess = full_load_subprocess_running(conn_id);
-        std::string health_reason = "capture_stale";
-        if (capture_gate_blocked && copy_checkpoint && !subprocess) {
-            health_reason = "capture_gate_orphan_checkpoint";
-        } else if (capture_gate_blocked && subprocess) {
-            health_reason = "capture_gate_full_load";
-        } else if (capture_gate_blocked) {
-            health_reason = "capture_gate_blocked";
-        }
-
-        log_write(pg, {
-            .level = rag == "RED" ? LogLevel::Error : LogLevel::Warning,
-            .component = "cdc_kafka_health",
-            .message = rag == "RED" ? "capture health RED" : "capture health AMBER",
-            .batch_id = batch_id,
-            .conn_id = conn_id,
-            .source_schema = std::nullopt,
-            .source_table = std::nullopt,
-            .context = {
-                {"capture_health_rag", rag},
-                {"health_reason", health_reason},
-                {"silent_seconds", silent_seconds},
-                {"event_silent_seconds", event_silent_seconds},
-                {"capture_status", PQgetisnull(res, i, 2) ? "" : PQgetvalue(res, i, 2)},
-                {"binlog_file", PQgetisnull(res, i, 1) ? "" : PQgetvalue(res, i, 1)},
-                {"last_error", PQgetisnull(res, i, 3) ? "" : PQgetvalue(res, i, 3)},
-                {"full_load_gate_active", capture_gate_blocked},
-                {"copy_checkpoint_active", copy_checkpoint},
-                {"full_load_subprocess_active", subprocess},
-                {"stale_warn_seconds", warn_seconds},
-                {"stale_fail_seconds", fail_seconds},
-            },
-        });
-    }
-    PQclear(res);
-}
-
 int run_one_cycle(
     const AppConfig& cfg,
     PGconn* log_pg,
@@ -869,8 +730,8 @@ int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::strin
     {
         PgConn health_pg(cfg.datasync.conn_string());
         if (health_pg.raw) {
-            scan_apply_health_alerts(health_pg.raw, round_batch_id);
-            scan_capture_health_alerts(health_pg.raw, round_batch_id);
+            refresh_capture_position_health(
+                health_pg.raw, pipeline_defaults::kCaptureHealthAlertStaleSeconds);
         }
     }
 

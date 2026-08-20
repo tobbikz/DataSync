@@ -216,6 +216,12 @@ Build: Docker `datasync:local` OK. **Migrate + daemon --once** verificados (2025
 - Dropped `v_apply_latest`, `v_apply_stale`, `v_cdc_pipeline_summary`, `v_full_load_progress`, `v_kafka_consumer`, `v_apply_batch_stats_hourly`.
 - Binary and DataSync Ops MVs do not read them. SQL: `sql/manual/2026-08-14_drop_cdc_catalog_legacy_views.sql` (also included in the reconciliation drop script). App can stay up for views-only.
 
+## Sprint — drop cdc_kafka_health log spam (2026-08-20)
+
+- Daemon no longer INSERT `cdc_catalog.logs` for apply/capture RED/AMBER every round (`cdc_kafka_health`).
+- RAG stays in `apply_batch_stats` + DataSync Ops Health / Apply slices. Capture stale still UPDATE `capture_position` (no log).
+- Removed `kApplyHealthAlertLookbackMinutes` / `kCaptureHealthAlertFailSeconds`. Rebuild binary on Linux.
+
 ## Env vars (Docker)
 
 | Variable | Default | Use |

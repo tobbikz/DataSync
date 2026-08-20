@@ -110,16 +110,13 @@ constexpr int kCatalogBatchSleepMs = 200;
 constexpr std::size_t kCatalogFetchPageSize = 2000;
 constexpr std::size_t kCatalogDiscoverPageSize = 5000;
 
-// Apply health alerts (from apply_batch_stats / apply_health_rag — not reconcile)
-constexpr int kApplyHealthAlertLookbackMinutes = 15;
 /** Partition kafka lag (high watermark − offset) at/above this → apply_health_rag AMBER. */
 constexpr long long kKafkaConsumerLagWarnMessages = 1000;
 /** Partition kafka lag at/above this → apply_health_rag RED. */
 constexpr long long kKafkaConsumerLagRedMessages = 50000;
 
-// Capture health alerts (capture_position.updated_at staleness)
+/** Capture position silent this long → status stale (Health DB, not logs). */
 constexpr int kCaptureHealthAlertStaleSeconds = 300;
-constexpr int kCaptureHealthAlertFailSeconds = 3600;
 
 // Apply / full-load batch sizes (smaller = less RAM per COPY, more commits)
 constexpr std::size_t kFullLoadBatchSizeDefault = 20000;

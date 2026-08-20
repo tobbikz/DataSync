@@ -189,4 +189,4 @@
 - Vistas monitoring: `prod_ops_embedded.hpp` → `monitoring_views()`
 - Checkpoints full-load: migración 050, `full_load_checkpoint.hpp`
 - Outbox lake-first: migración 051
-- Health alerts: `scan_apply_health_alerts()` en `cdc_daemon.cpp`
+- Health: `apply_batch_stats.apply_health_rag` + DataSync Ops (no `cdc_kafka_health` logs)
