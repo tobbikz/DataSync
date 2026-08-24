@@ -103,7 +103,6 @@ CREATE TABLE IF NOT EXISTS cdc_catalog.catalog (
   last_error text,
   engine_meta jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(engine_meta) = 'object'),
   capture_during_full_load boolean NOT NULL DEFAULT false,
-  hot boolean NOT NULL DEFAULT false,
   CONSTRAINT catalog_source_object_uk
     UNIQUE (conn_id, db_engine, source_database, source_schema, source_table),
   CONSTRAINT catalog_pk_columns_when_has_pk
@@ -239,6 +238,8 @@ ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS last_cdc_at timestamptz
 ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS last_error_at timestamptz;
 ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS last_error text;
 ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS capture_during_full_load boolean NOT NULL DEFAULT false;
+DROP INDEX IF EXISTS cdc_catalog.idx_catalog_hot;
+ALTER TABLE cdc_catalog.catalog DROP COLUMN IF EXISTS hot;
 
 ALTER TABLE cdc_catalog.apply_batch_stats ADD COLUMN IF NOT EXISTS events_inserts bigint NOT NULL DEFAULT 0;
 ALTER TABLE cdc_catalog.apply_batch_stats ADD COLUMN IF NOT EXISTS events_updates bigint NOT NULL DEFAULT 0;
@@ -377,9 +378,6 @@ CREATE INDEX IF NOT EXISTS ix_catalog_schema_table_conn_active
   ON cdc_catalog.catalog (source_schema, source_table, conn_id, active DESC, cdc_enabled DESC, updated_at DESC);
 CREATE INDEX IF NOT EXISTS catalog_conn_table_idx
   ON cdc_catalog.catalog (conn_id, source_schema, source_table);
-CREATE INDEX IF NOT EXISTS idx_catalog_hot
-  ON cdc_catalog.catalog (conn_id)
-  WHERE hot = true AND active = true AND cdc_enabled = true;
 CREATE INDEX IF NOT EXISTS catalog_active_cdc_idx
   ON cdc_catalog.catalog (conn_id)
   WHERE active = true AND cdc_enabled = true AND needs_full_load = false;
@@ -617,7 +615,6 @@ SELECT
   c.cdc_enabled,
   c.needs_full_load,
   c.status::text AS status,
-  c.hot,
   c.discovered_at,
   c.updated_at,
   c.last_full_load_at,

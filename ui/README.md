@@ -35,7 +35,7 @@ UI: http://localhost:3000
 | `/dashboard/catalog` | `cdc_catalog.catalog` |
 | `/dashboard/logs` | `cdc_catalog.logs` |
 
-**Actions** (Overview + Connections): `discover`, `onboard-pending --hot-only`, `full-load --conn-id` — spawned via local binary or `docker compose run datasync`.
+**Actions** (Overview + Connections): `discover`, `onboard-pending`, `full-load --conn-id` — spawned via local binary or `docker compose run datasync`.
 
 ## Environment
 

@@ -2,7 +2,6 @@ import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
-import type { OnboardTier } from "./pipeline-actions";
 
 export type ActionKind =
   | "discover"
@@ -21,8 +20,6 @@ export interface ActionJob {
   finishedAt?: string;
   exitCode?: number;
   connId?: string;
-  hotOnly?: boolean;
-  coldOnly?: boolean;
   skipOnboard?: boolean;
   schema?: string;
   table?: string;
@@ -116,9 +113,6 @@ export function validateSchemaTable(value: string): boolean {
 export function startAction(input: {
   action: ActionKind;
   connId?: string;
-  hotOnly?: boolean;
-  coldOnly?: boolean;
-  onboardTier?: OnboardTier;
   skipOnboard?: boolean;
   schema?: string;
   table?: string;
@@ -152,10 +146,6 @@ export function startAction(input: {
     return { error: "Invalid table" };
   }
 
-  if (input.hotOnly && input.coldOnly) {
-    return { error: "Use only one of hot-only or cold-only" };
-  }
-
   const args = [...runner.prefix];
 
   if (runner.prefix.length === 0) {
@@ -170,15 +160,6 @@ export function startAction(input: {
 
   if (input.action === "full-load" && input.skipOnboard) {
     args.push("--skip-onboard");
-  }
-
-  const tier = input.onboardTier;
-  if (input.action === "onboard-pending") {
-    if (input.hotOnly || tier === "hot") {
-      args.push("--hot-only");
-    } else if (input.coldOnly || tier === "cold") {
-      args.push("--cold-only");
-    }
   }
 
   if (input.action === "ddl-sync") {
@@ -197,8 +178,6 @@ export function startAction(input: {
     status: "running",
     startedAt: new Date().toISOString(),
     connId: input.connId,
-    hotOnly: input.hotOnly || tier === "hot",
-    coldOnly: input.coldOnly || tier === "cold",
     skipOnboard: input.skipOnboard,
     schema: input.schema,
     table: input.table,

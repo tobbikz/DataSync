@@ -19,7 +19,6 @@ interface ConfirmState {
   title: string;
   description: string;
   connId?: string;
-  hotOnly?: boolean;
 }
 
 export function ActionsPanel({ connId }: { connId?: string }) {
@@ -55,7 +54,6 @@ export function ActionsPanel({ connId }: { connId?: string }) {
       body: JSON.stringify({
         action: state.action,
         connId: state.connId,
-        hotOnly: state.hotOnly,
         confirm: true,
       }),
     });
@@ -78,11 +76,10 @@ export function ActionsPanel({ connId }: { connId?: string }) {
             "Runs DataSync full-load for this connection. May take a long time and reload lake tables.",
         },
         {
-          label: "Onboard hot",
+          label: "Onboard pending",
           action: "onboard-pending" as const,
-          title: `Onboard pending (hot) — ${connId}`,
-          description: "Onboards hot-tier pending tables for this connection.",
-          hotOnly: true,
+          title: `Onboard pending — ${connId}`,
+          description: "Onboards all pending tables for this connection.",
         },
       ]
     : [
@@ -94,11 +91,10 @@ export function ActionsPanel({ connId }: { connId?: string }) {
             "Scans all active connections and upserts catalog entries. Safe to run periodically.",
         },
         {
-          label: "Onboard hot",
+          label: "Onboard pending",
           action: "onboard-pending" as const,
-          title: "Onboard pending (hot)",
-          description: "Onboards all hot-tier tables waiting for CDC setup.",
-          hotOnly: true,
+          title: "Onboard pending",
+          description: "Onboards all pending tables waiting for CDC setup.",
         },
       ];
 
@@ -133,7 +129,6 @@ export function ActionsPanel({ connId }: { connId?: string }) {
                   title: a.title,
                   description: a.description,
                   connId,
-                  hotOnly: a.hotOnly,
                 })
               }
               className="btn-primary"

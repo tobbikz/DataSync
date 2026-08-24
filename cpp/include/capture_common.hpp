@@ -33,11 +33,7 @@ struct CaptureCatalogTable {
     nlohmann::json engine_meta = nlohmann::json::object();
     std::string lake_schema;
     std::string lake_table;
-    bool hot{false};
 };
-
-/** Which catalog.hot rows to include in capture/apply table fetch. */
-enum class CatalogHotTier { All, ColdOnly, HotOnly };
 
 struct CaptureRuntimeConfig {
     int max_seconds{300};
@@ -109,8 +105,7 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
     int worker_id,
     int worker_count,
     const std::string& db_engine,
-    CatalogPipeline pipeline,
-    CatalogHotTier hot_tier = CatalogHotTier::All);
+    CatalogPipeline pipeline);
 
 /** Round-robin table order per conn so capture slices visit different tables first. */
 void rotate_capture_catalog_tables(
@@ -195,8 +190,7 @@ void enable_cdc_after_full_load(
     const std::string& conn_id,
     const std::string& db_engine,
     const std::string& batch_id,
-    bool expect_updates = false,
-    CatalogHotTier hot_tier = CatalogHotTier::All);
+    bool expect_updates = false);
 
 bool enable_cdc_after_full_load_table(
     PGconn* pg,
@@ -312,8 +306,7 @@ int count_full_load_pending(
 int count_full_load_pending_onboard(
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& db_engine,
-    CatalogHotTier hot_tier = CatalogHotTier::All);
+    const std::string& db_engine);
 
 struct ApplySkipReasonCounts {
     int active_total{0};
@@ -340,8 +333,7 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine,
-    const std::string& batch_id,
-    CatalogHotTier hot_tier = CatalogHotTier::All);
+    const std::string& batch_id);
 
 FullLoadKafkaResetStats reset_kafka_apply_after_full_load_table(
     PGconn* pg,
@@ -365,17 +357,15 @@ bool onboard_conn_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine,
-    const std::string& batch_id,
-    CatalogHotTier hot_tier = CatalogHotTier::All);
+    const std::string& batch_id);
 
-std::vector<std::string> list_conn_ids_pending_onboard(PGconn* pg, CatalogHotTier hot_tier);
+std::vector<std::string> list_conn_ids_pending_onboard(PGconn* pg);
 
 int run_onboard_pending(
     const AppConfig& cfg,
     PGconn* pg,
     const std::string& batch_id,
-    const std::optional<std::string>& conn_id_filter,
-    CatalogHotTier hot_tier);
+    const std::optional<std::string>& conn_id_filter);
 
 void cdc_attach_row_tx(CdcEvent& event, long long tx_id);
 

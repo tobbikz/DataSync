@@ -38,7 +38,6 @@ function buildQuery(
     status: string;
     rag: string;
     cdc: string;
-    hot: string;
     quarantined: string;
     needsFullLoad: string;
   },
@@ -50,7 +49,6 @@ function buildQuery(
   if (filters.status) params.set("status", filters.status);
   if (filters.rag) params.set("rag", filters.rag);
   if (filters.cdc) params.set("cdc", filters.cdc);
-  if (filters.hot) params.set("hot", filters.hot);
   if (filters.quarantined) params.set("quarantined", filters.quarantined);
   if (filters.needsFullLoad) params.set("needs_full_load", filters.needsFullLoad);
   params.set("page", String(page));
@@ -224,7 +222,6 @@ export function CatalogTable() {
   const [status, setStatus] = useState("");
   const [rag, setRag] = useState("");
   const [cdc, setCdc] = useState("");
-  const [hot, setHot] = useState("");
   const [quarantined, setQuarantined] = useState("");
   const [needsFullLoad, setNeedsFullLoad] = useState("");
   const [page, setPage] = useState(1);
@@ -256,13 +253,13 @@ export function CatalogTable() {
   const queryString = useMemo(
     () =>
       buildQuery(
-        { q, conn, status, rag, cdc, hot, quarantined, needsFullLoad },
+        { q, conn, status, rag, cdc, quarantined, needsFullLoad },
         page,
       ),
-    [q, conn, status, rag, cdc, hot, quarantined, needsFullLoad, page],
+    [q, conn, status, rag, cdc, quarantined, needsFullLoad, page],
   );
 
-  const filterKey = `${q}|${conn}|${status}|${rag}|${cdc}|${hot}|${quarantined}|${needsFullLoad}`;
+  const filterKey = `${q}|${conn}|${status}|${rag}|${cdc}|${quarantined}|${needsFullLoad}`;
 
   useEffect(() => {
     setPage(1);
@@ -410,15 +407,6 @@ export function CatalogTable() {
             <option value="false">cdc off</option>
           </select>
           <select
-            value={hot}
-            onChange={(e) => setHot(e.target.value)}
-            className={selectClass}
-          >
-            <option value="">hot any</option>
-            <option value="true">hot</option>
-            <option value="false">cold</option>
-          </select>
-          <select
             value={quarantined}
             onChange={(e) => setQuarantined(e.target.value)}
             className={selectClass}
@@ -509,7 +497,6 @@ export function CatalogTable() {
                     <div className="text-right">
                       <div className="resource-row__mono text-[10px]">
                         cdc {row.cdc_enabled ? "on" : "off"}
-                        {row.hot ? " · hot" : ""}
                         {row.needs_full_load ? " · needs load" : ""}
                       </div>
                       <div

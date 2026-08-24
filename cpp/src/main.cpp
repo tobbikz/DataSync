@@ -210,7 +210,7 @@ void print_usage(const char* prog) {
     std::cerr << "Usage:\n"
               << "  " << prog << " discover\n"
               << "  " << prog << " full-load [--conn-id ID] [--skip-onboard]\n"
-              << "  " << prog << " onboard-pending [--conn-id ID] [--hot-only|--cold-only]\n"
+              << "  " << prog << " onboard-pending [--conn-id ID]\n"
               << "  " << prog << " ddl-sync --conn-id ID [--schema S] [--table T]\n"
               << "  " << prog << " kafka-apply --conn-id ID\n"
               << "  " << prog << " capture --conn-id ID\n"
@@ -232,8 +232,6 @@ int main(int argc, char** argv) {
     std::optional<std::string> source_table;
     bool once = false;
     bool skip_onboard = false;
-    bool hot_only = false;
-    bool cold_only = false;
     bool apply_flags = false;
     std::string config_path;
 
@@ -249,10 +247,6 @@ int main(int argc, char** argv) {
             once = true;
         } else if (arg == "--skip-onboard") {
             skip_onboard = true;
-        } else if (arg == "--hot-only") {
-            hot_only = true;
-        } else if (arg == "--cold-only") {
-            cold_only = true;
         } else if (arg == "--apply") {
             apply_flags = true;
         } else if (arg == "--config" && i + 1 < argc) {
@@ -275,11 +269,6 @@ int main(int argc, char** argv) {
         command != "lake-schema-only" && command != "coercion-audit" &&
         command != "catalog-schema-only") {
         print_usage(argv[0]);
-        return 2;
-    }
-
-    if (hot_only && cold_only) {
-        std::cerr << "use only one of --hot-only or --cold-only\n";
         return 2;
     }
 
@@ -327,15 +316,11 @@ int main(int argc, char** argv) {
                 skip_onboard);
         }
         if (command == "onboard-pending") {
-            const CatalogHotTier tier = hot_only ? CatalogHotTier::HotOnly
-                                                 : (cold_only ? CatalogHotTier::ColdOnly
-                                                              : CatalogHotTier::All);
             return run_onboard_pending(
                 cfg,
                 log_pg.raw,
                 batch_id,
-                conn_id.empty() ? std::nullopt : std::optional(conn_id),
-                tier);
+                conn_id.empty() ? std::nullopt : std::optional(conn_id));
         }
         if (command == "ddl-sync") {
             return run_ddl_sync(cfg, log_pg.raw, conn_id, source_schema, source_table);

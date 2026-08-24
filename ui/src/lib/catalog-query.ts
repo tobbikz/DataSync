@@ -28,7 +28,6 @@ const BASE_COLUMNS = `
   c.status::text AS status,
   c.needs_full_load,
   c.last_full_load_at,
-  c.hot,
   stats.kafka_consumer_lag,
   stats.capture_lag_seconds AS stats_capture_lag_seconds,
   stats.apply_lag_seconds AS stats_apply_lag_seconds,
@@ -86,7 +85,6 @@ export const CATALOG_ROW_SELECT = `
   status,
   needs_full_load,
   last_full_load_at,
-  hot,
   health_rag,
   kafka_lag,
   capture_lag_seconds,
@@ -136,11 +134,6 @@ export function buildCatalogListQuery(filters: CatalogFilters) {
     where.push("c.cdc_enabled = true");
   } else if (filters.cdc === false) {
     where.push("c.cdc_enabled = false");
-  }
-  if (filters.hot === true) {
-    where.push("c.hot = true");
-  } else if (filters.hot === false) {
-    where.push("c.hot = false");
   }
   if (filters.needsFullLoad === true) {
     where.push("c.needs_full_load = true");

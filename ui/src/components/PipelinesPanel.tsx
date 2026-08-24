@@ -6,7 +6,6 @@ import { PageMeta, PanelSkeleton } from "./DashboardShell";
 import { Pagination } from "./Pagination";
 import {
   PIPELINE_ACTIONS,
-  type OnboardTier,
   type PipelineActionDef,
 } from "@/lib/pipeline-actions";
 import type { ActionKind } from "@/lib/actions";
@@ -22,8 +21,6 @@ interface ActionJob {
   command: string;
   output?: string;
   skipOnboard?: boolean;
-  hotOnly?: boolean;
-  coldOnly?: boolean;
   schema?: string;
   table?: string;
 }
@@ -34,7 +31,6 @@ interface ConnectionOption {
 
 interface RunForm {
   connId: string;
-  onboardTier: OnboardTier;
   skipOnboard: boolean;
   schema: string;
   table: string;
@@ -42,7 +38,6 @@ interface RunForm {
 
 const defaultForm: RunForm = {
   connId: "",
-  onboardTier: "hot",
   skipOnboard: false,
   schema: "",
   table: "",
@@ -63,8 +58,6 @@ function statusTone(status: ActionJob["status"]) {
 function jobTarget(job: ActionJob) {
   const parts: string[] = [];
   if (job.connId) parts.push(job.connId);
-  if (job.hotOnly) parts.push("hot");
-  if (job.coldOnly) parts.push("cold");
   if (job.skipOnboard) parts.push("skip onboard");
   if (job.schema) parts.push(job.schema);
   if (job.table) parts.push(job.table);
@@ -131,9 +124,6 @@ export function PipelinesPanel() {
     }
     if (pending.supportsSkipOnboard && form.skipOnboard) {
       payload.skipOnboard = true;
-    }
-    if (pending.supportsOnboardTier) {
-      payload.onboardTier = form.onboardTier;
     }
     if (pending.supportsSchemaTable) {
       if (form.schema) payload.schema = form.schema;
@@ -378,28 +368,6 @@ export function PipelinesPanel() {
                   </select>
                 </label>
               )}
-
-              {pending.supportsOnboardTier ? (
-                <label className="block space-y-1">
-                  <span className="text-[10px] font-semibold uppercase tracking-wide text-foreground-muted">
-                    Tier
-                  </span>
-                  <select
-                    className="input-field font-mono text-[11px]"
-                    value={form.onboardTier}
-                    onChange={(e) =>
-                      setForm((f) => ({
-                        ...f,
-                        onboardTier: e.target.value as OnboardTier,
-                      }))
-                    }
-                  >
-                    <option value="hot">hot only</option>
-                    <option value="cold">cold only</option>
-                    <option value="all">all pending</option>
-                  </select>
-                </label>
-              ) : null}
 
               {pending.supportsSkipOnboard ? (
                 <label className="flex items-center gap-2 text-[12px]">

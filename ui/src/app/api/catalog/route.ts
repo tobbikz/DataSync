@@ -9,7 +9,6 @@ type CatalogListRow = CatalogRow & { total_count: string };
 function parseFilters(searchParams: URLSearchParams): CatalogFilters {
   const { limit, offset } = parsePagination(searchParams);
   const cdc = searchParams.get("cdc");
-  const hot = searchParams.get("hot");
   const quarantined = searchParams.get("quarantined");
   const needsFullLoad = searchParams.get("needs_full_load");
 
@@ -17,7 +16,6 @@ function parseFilters(searchParams: URLSearchParams): CatalogFilters {
     conn: searchParams.get("conn") ?? undefined,
     status: searchParams.get("status") ?? undefined,
     cdc: cdc === "true" ? true : cdc === "false" ? false : undefined,
-    hot: hot === "true" ? true : hot === "false" ? false : undefined,
     rag: searchParams.get("rag") ?? undefined,
     quarantined:
       quarantined === "true"

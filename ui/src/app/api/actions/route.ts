@@ -28,9 +28,6 @@ export async function POST(request: NextRequest) {
   const body = (await request.json()) as {
     action?: ActionKind;
     connId?: string;
-    hotOnly?: boolean;
-    coldOnly?: boolean;
-    onboardTier?: "all" | "hot" | "cold";
     skipOnboard?: boolean;
     schema?: string;
     table?: string;
@@ -65,9 +62,6 @@ export async function POST(request: NextRequest) {
   const result = startAction({
     action,
     connId,
-    hotOnly: body.hotOnly,
-    coldOnly: body.coldOnly,
-    onboardTier: body.onboardTier,
     skipOnboard: body.skipOnboard,
     schema: body.schema?.trim() || undefined,
     table: body.table?.trim() || undefined,

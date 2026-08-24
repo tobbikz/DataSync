@@ -1,7 +1,5 @@
 import type { ActionKind } from "./actions";
 
-export type OnboardTier = "all" | "hot" | "cold";
-
 export interface PipelineActionDef {
   id: ActionKind;
   label: string;
@@ -11,7 +9,6 @@ export interface PipelineActionDef {
   requiresConn: boolean;
   connOptional?: boolean;
   supportsSkipOnboard?: boolean;
-  supportsOnboardTier?: boolean;
   supportsSchemaTable?: boolean;
   daemonOnce?: boolean;
   danger: "low" | "medium" | "high";
@@ -41,12 +38,11 @@ export const PIPELINE_ACTIONS: PipelineActionDef[] = [
   {
     id: "onboard-pending",
     label: "Onboard pending",
-    cli: "onboard-pending [--conn-id ID] [--hot-only|--cold-only]",
+    cli: "onboard-pending [--conn-id ID]",
     description: "Enable CDC capture for catalog tables waiting onboarding.",
-    impact: "Prepares pending tables for capture. Choose hot, cold, or all tier.",
+    impact: "Prepares all pending tables for capture (Kafka reset + cdc enable).",
     requiresConn: false,
     connOptional: true,
-    supportsOnboardTier: true,
     danger: "medium",
   },
   {

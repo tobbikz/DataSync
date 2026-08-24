@@ -10,7 +10,6 @@ export interface CatalogRow {
   status: string;
   needs_full_load: boolean;
   last_full_load_at: string | null;
-  hot: boolean;
   health_rag: string;
   kafka_lag: number | null;
   capture_lag_seconds: number | null;
@@ -60,7 +59,6 @@ export interface CatalogFilters {
   conn?: string;
   status?: string;
   cdc?: boolean;
-  hot?: boolean;
   rag?: string;
   quarantined?: boolean;
   needsFullLoad?: boolean;

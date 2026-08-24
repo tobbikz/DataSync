@@ -489,8 +489,7 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
     int worker_id,
     int worker_count,
     const std::string& db_engine,
-    CatalogPipeline pipeline,
-    CatalogHotTier hot_tier) {
+    CatalogPipeline pipeline) {
     // Apply: only tables with baseline snapshot in lake.
     // Capture: MariaDB/Mongo may stream binlog during full load (capture_during_full_load).
     // MSSQL fn_cdc_get_all_changes scans LSN ranges — only capture tables that finished initial COPY.
@@ -514,7 +513,7 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
 
     if (db_engine == "mssql") {
         sql << R"(
-            SELECT catalog_id, conn_id, source_database, source_schema, source_table, pk_columns, engine_meta::text, hot
+            SELECT catalog_id, conn_id, source_database, source_schema, source_table, pk_columns, engine_meta::text
             FROM cdc_catalog.catalog
             WHERE db_engine = 'mssql'
               AND conn_id = $1
@@ -526,7 +525,7 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
         )";
     } else if (db_engine == "mongodb") {
         sql << R"(
-            SELECT catalog_id, conn_id, source_database, source_schema, source_table, pk_columns, '{}'::text, hot
+            SELECT catalog_id, conn_id, source_database, source_schema, source_table, pk_columns, '{}'::text
             FROM cdc_catalog.catalog
             WHERE db_engine = 'mongodb'
               AND conn_id = $1
@@ -538,7 +537,7 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
         )";
     } else {
         sql << R"(
-            SELECT catalog_id, conn_id, '' AS source_database, source_schema, source_table, pk_columns, '{}'::text, hot
+            SELECT catalog_id, conn_id, '' AS source_database, source_schema, source_table, pk_columns, '{}'::text
             FROM cdc_catalog.catalog
             WHERE db_engine = 'mariadb'
               AND conn_id = $1
@@ -548,12 +547,6 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
               AND has_pk = true
               AND status NOT IN ('skipped', 'disabled')
         )";
-    }
-
-    if (hot_tier == CatalogHotTier::ColdOnly) {
-        sql << " AND hot = false";
-    } else if (hot_tier == CatalogHotTier::HotOnly) {
-        sql << " AND hot = true";
     }
 
     if (worker_count > 1) {
@@ -623,8 +616,6 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
                     row.engine_meta = nlohmann::json::object();
                 }
             }
-            const char* hot_val = PQgetvalue(res, i, 7);
-            row.hot = hot_val && (hot_val[0] == 't' || hot_val[0] == 'T' || hot_val[0] == '1');
             if (db_engine == "mssql") {
                 row.lake_schema = mssql_pg_schema_name(row.source_database, row.source_schema);
                 row.lake_table = mssql_pg_table_name(row.source_table);
@@ -664,16 +655,6 @@ void rotate_capture_catalog_tables(
 }
 
 namespace {
-
-std::string catalog_hot_filter_sql(CatalogHotTier tier, const std::string& alias) {
-    if (tier == CatalogHotTier::HotOnly) {
-        return " AND " + alias + ".hot = true";
-    }
-    if (tier == CatalogHotTier::ColdOnly) {
-        return " AND " + alias + ".hot = false";
-    }
-    return "";
-}
 
 /** Full-load COPY done; awaiting onboard (cdc_enabled flip). Status may stay success/cdc_in_progress during long capture_during_full_load runs. */
 std::string catalog_pending_cdc_enable_sql(const std::string& alias) {
@@ -1156,8 +1137,7 @@ void enable_cdc_after_full_load(
     const std::string& conn_id,
     const std::string& db_engine,
     const std::string& batch_id,
-    bool expect_updates,
-    CatalogHotTier hot_tier) {
+    bool expect_updates) {
     const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
     std::ostringstream sql;
     sql << R"(
@@ -1171,7 +1151,6 @@ void enable_cdc_after_full_load(
           AND c.has_pk = true
     )";
     sql << catalog_pending_cdc_enable_sql("c");
-    sql << catalog_hot_filter_sql(hot_tier, "c");
     PGresult* res = PQexecParams(
         pg,
         sql.str().c_str(),
@@ -1607,8 +1586,7 @@ int count_full_load_pending(
 int count_full_load_pending_onboard(
     PGconn* pg,
     const std::string& conn_id,
-    const std::string& db_engine,
-    CatalogHotTier hot_tier) {
+    const std::string& db_engine) {
     const char* vals[] = {conn_id.c_str(), db_engine.c_str()};
     std::ostringstream sql;
     sql << R"(
@@ -1619,7 +1597,6 @@ int count_full_load_pending_onboard(
           AND c.active = true
     )";
     sql << catalog_pending_cdc_enable_sql("c");
-    sql << catalog_hot_filter_sql(hot_tier, "c");
     PGresult* res = PQexecParams(
         pg,
         sql.str().c_str(),
@@ -2703,8 +2680,7 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine,
-    const std::string& batch_id,
-    CatalogHotTier hot_tier) {
+    const std::string& batch_id) {
     FullLoadKafkaResetStats stats;
 
     const KafkaBootstrapResolved kafka = resolve_kafka_bootstrap();
@@ -2722,7 +2698,6 @@ FullLoadKafkaResetStats reset_kafka_apply_after_full_load(
           AND c.active = true
     )";
     sql << catalog_pending_cdc_enable_sql("c");
-    sql << catalog_hot_filter_sql(hot_tier, "c");
     sql << " ORDER BY ap.source_schema, ap.source_table";
     PGresult* res = PQexecParams(
         pg,
@@ -2801,8 +2776,7 @@ bool onboard_conn_after_full_load(
     PGconn* pg,
     const std::string& conn_id,
     const std::string& db_engine,
-    const std::string& batch_id,
-    CatalogHotTier hot_tier) {
+    const std::string& batch_id) {
 #ifdef HAVE_FREETDS
     if (db_engine == "mssql") {
         seed_mssql_cdc_lsn_for_conn(cfg, pg, conn_id, batch_id);
@@ -2813,9 +2787,9 @@ bool onboard_conn_after_full_load(
         seed_mongo_cdc_resume_for_conn(cfg, pg, conn_id, batch_id);
     }
 #endif
-    const auto stats = reset_kafka_apply_after_full_load(pg, conn_id, db_engine, batch_id, hot_tier);
-    enable_cdc_after_full_load(pg, conn_id, db_engine, batch_id, false, hot_tier);
-    const int pending = count_full_load_pending_onboard(pg, conn_id, db_engine, CatalogHotTier::All);
+    const auto stats = reset_kafka_apply_after_full_load(pg, conn_id, db_engine, batch_id);
+    enable_cdc_after_full_load(pg, conn_id, db_engine, batch_id, false);
+    const int pending = count_full_load_pending_onboard(pg, conn_id, db_engine);
     if (stats.errors > 0) {
         log_write(pg, {
             .level = pending > 0 ? LogLevel::Warning : LogLevel::Info,
@@ -2838,7 +2812,7 @@ bool onboard_conn_after_full_load(
     return pending == 0;
 }
 
-std::vector<std::string> list_conn_ids_pending_onboard(PGconn* pg, CatalogHotTier hot_tier) {
+std::vector<std::string> list_conn_ids_pending_onboard(PGconn* pg) {
     std::ostringstream sql;
     sql << R"(
         SELECT DISTINCT conn_id
@@ -2846,7 +2820,6 @@ std::vector<std::string> list_conn_ids_pending_onboard(PGconn* pg, CatalogHotTie
         WHERE c.active = true
     )";
     sql << catalog_pending_cdc_enable_sql("c");
-    sql << catalog_hot_filter_sql(hot_tier, "c");
     sql << " ORDER BY conn_id";
 
     PGresult* res = PQexec(pg, sql.str().c_str());
@@ -2869,11 +2842,7 @@ int run_onboard_pending(
     const AppConfig& cfg,
     PGconn* pg,
     const std::string& batch_id,
-    const std::optional<std::string>& conn_id_filter,
-    CatalogHotTier hot_tier) {
-    const char* tier_label =
-        hot_tier == CatalogHotTier::HotOnly ? "hot"
-                                            : (hot_tier == CatalogHotTier::ColdOnly ? "cold" : "all");
+    const std::optional<std::string>& conn_id_filter) {
     log_write(pg, {
         .level = LogLevel::Info,
         .component = "cdc_catalog_onboard",
@@ -2882,20 +2851,20 @@ int run_onboard_pending(
         .conn_id = conn_id_filter,
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
-        .context = {{"tier", tier_label}},
+        .context = nlohmann::json::object(),
     });
 
     std::vector<std::string> conn_ids;
     if (conn_id_filter && !conn_id_filter->empty()) {
         conn_ids.push_back(*conn_id_filter);
     } else {
-        conn_ids = list_conn_ids_pending_onboard(pg, hot_tier);
+        conn_ids = list_conn_ids_pending_onboard(pg);
     }
 
     int failures = 0;
     int conn_ok = 0;
     for (const auto& cid : conn_ids) {
-        if (!onboard_conn_after_full_load(cfg, pg, cid, conn_engine(cfg, cid), batch_id, hot_tier)) {
+        if (!onboard_conn_after_full_load(cfg, pg, cid, conn_engine(cfg, cid), batch_id)) {
             failures += 1;
         } else {
             conn_ok += 1;
@@ -2911,7 +2880,6 @@ int run_onboard_pending(
         .source_schema = std::nullopt,
         .source_table = std::nullopt,
         .context = {
-            {"tier", tier_label},
             {"conn_count", static_cast<int>(conn_ids.size())},
             {"conn_ok", conn_ok},
             {"failures", failures},
