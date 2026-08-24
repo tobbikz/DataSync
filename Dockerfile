@@ -1,5 +1,5 @@
 # DataSync — multi-stage image (C++ CDC daemon + CLI)
-# Host: ./install.sh  |  Image build is part of install.sh
+# Host: ./install.sh initial | start | stop  |  Image build is part of start/initial
 
 FROM debian:bookworm-slim AS builder
 
@@ -66,9 +66,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /opt/rdkafka/lib /opt/rdkafka/lib
 COPY --from=builder /src/cpp/build/DataSync /usr/local/bin/DataSync
-COPY install.sh /app/
+COPY docker-entrypoint.sh /app/
 
-RUN chmod +x /app/install.sh
+RUN chmod +x /app/docker-entrypoint.sh
 
 ENV LD_LIBRARY_PATH=/opt/rdkafka/lib
 ENV DATASYNC_ROOT=/app
@@ -78,5 +78,5 @@ ENV PATH="/usr/local/bin:${PATH}"
 
 WORKDIR /app
 
-ENTRYPOINT ["/app/install.sh", "container"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["daemon"]

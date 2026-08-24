@@ -27,3 +27,18 @@ venv/
 
 # Kafka KRaft log dir (bind mount from docker-compose)
 kafka-data/
+
+# Next.js UI
+ui/node_modules/
+ui/.next/
+ui/.env.local
+
+# Docs and Cursor rules live in Obsidian — only obsidian-first stays in repo
+docs/
+scripts/
+ui/superset-export/
+ui/tsconfig.tsbuildinfo
+.cursor/*
+!.cursor/rules/
+.cursor/rules/*
+!.cursor/rules/obsidian-first.mdc

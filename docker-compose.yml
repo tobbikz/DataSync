@@ -1,7 +1,8 @@
-# DataSync — Kafka (KRaft) + CDC daemon in one compose stack.
-# Host: ./install.sh start  |  Systemd: DataSync.service → install.sh start/stop
+# DataSync — Kafka (KRaft) + CDC daemon + ops UI in one compose stack.
+# Host: ./install.sh initial (first time) | start | stop
 # host network: daemon reaches OLTP on host (MariaDB :3306, PG :5432, etc.)
-# No MariaDB/MSSQL/Mongo server containers — only Kafka + DataSync daemon.
+# UI: http://127.0.0.1:3000  (DATASYNC_UI_USER / DATASYNC_UI_PASSWORD)
+# No MariaDB/MSSQL/Mongo server containers — only Kafka + DataSync daemon + UI.
 # on rootful Docker and rootless Podman (no rootlessport bridge gap).
 # Kafka data: ./kafka-data (bind mount; install.sh creates it with mode 777). Migration:
 # ./install.sh stop, copy kafka-data/ to the new host (same CLUSTER_ID below), ./install.sh start.
@@ -81,3 +82,35 @@ services:
       kafka:
         condition: service_healthy
     command: ["daemon"]
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    image: datasync-ui:local
+    network_mode: host
+    restart: unless-stopped
+    user: "${DATASYNC_UID:-1000}:${DATASYNC_GID:-1000}"
+    environment:
+      DATASYNC_ROOT: /stack
+      DATASYNC_CONFIG: /stack/config.json
+      DATASYNC_COMPOSE_FILE: /stack/docker-compose.yml
+      DATASYNC_CONTAINER_CMD: ${DATASYNC_CONTAINER_CMD:-docker}
+      DOCKER_HOST: ${DOCKER_HOST:-}
+      KAFKA_BOOTSTRAP: 127.0.0.1:9092
+      DATASYNC_UI_USER: ${DATASYNC_UI_USER:-admin}
+      DATASYNC_UI_PASSWORD: ${DATASYNC_UI_PASSWORD:-datasync}
+      DATASYNC_UI_SECRET: ${DATASYNC_UI_SECRET:-change-me-in-production}
+      PORT: "3000"
+      NODE_ENV: production
+    volumes:
+      - .:/stack:ro,z
+      - ${DATASYNC_CONTAINER_BIN:-/usr/bin/false}:/usr/local/bin/container:ro,z
+      - ${DATASYNC_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    depends_on:
+      - datasync

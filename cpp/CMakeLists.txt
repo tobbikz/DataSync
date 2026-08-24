@@ -51,6 +51,7 @@ set(DATASYNC_SOURCES
     src/mongo_full_load.cpp
     src/obs_log.cpp
     src/retention_maintenance.cpp
+    src/schema_migrate.cpp
 )
 
 find_path(FREETDS_INCLUDE_DIR NAMES sybdb.h)

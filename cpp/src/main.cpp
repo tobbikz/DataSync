@@ -16,6 +16,7 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "pipeline_defaults.hpp"
+#include "schema_migrate.hpp"
 
 #ifdef HAVE_MONGOC
 #include "mongo_conn.hpp"
@@ -262,7 +263,8 @@ int main(int argc, char** argv) {
 
     if (command != "discover" && command != "full-load" && command != "ddl-sync" &&
         command != "kafka-apply" && command != "capture" &&
-        command != "daemon" && command != "onboard-pending") {
+        command != "daemon" && command != "onboard-pending" &&
+        command != "lake-schema-only") {
         print_usage(argv[0]);
         return 2;
     }
@@ -286,8 +288,16 @@ int main(int argc, char** argv) {
         } mongo_shutdown;
 #endif
         AppConfig cfg = config_path.empty() ? load_config_auto(argv[0]) : load_config(config_path);
+
+        if (command == "lake-schema-only") {
+            PgConn lake_pg(cfg.datalake.conn_string());
+            ensure_lake_schema(lake_pg.raw);
+            return 0;
+        }
+
         const std::string batch_id = make_batch_id();
         PgConn log_pg(cfg.datasync.conn_string());
+        ensure_cdc_catalog_schema(log_pg.raw);
         reload_connections(log_pg.raw, cfg);
 
         if (command == "discover") {
