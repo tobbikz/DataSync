@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# Smoke: mid-COPY full-load checkpoint resume (MSSQL + MongoDB).
+# Kill full-load after first copy batch checkpoint, re-run, assert resume log + row parity.
+# Usage: ./tools/smoke-full-load-resume.sh [mssql|mongo|all]
+set -euo pipefail
+
+ROOT="${DATASYNC_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$ROOT"
+CONFIG="${DATASYNC_CONFIG:-$ROOT/config.json}"
+IMAGE="${DATASYNC_IMAGE:-datasync:local}"
+MSSQL_SA_PASSWORD="${MSSQL_SA_PASSWORD:-DataSync_Dev1!}"
+ROW_TARGET="${ROW_TARGET:-200000}"
+TARGET="${1:-all}"
+
+log() { printf '[resume-smoke] %s\n' "$*"; }
+fail() { log "FAIL: $*"; exit 1; }
+
+read -r DS_HOST DS_PORT DS_DB DS_USER DS_PASS <<< "$(
+  python3 - "$CONFIG" <<'PY'
+import json, sys
+ds = json.load(open(sys.argv[1]))["datasync"]
+print(ds["host"], ds["port"], ds["database"], ds["user"], ds["password"])
+PY
+)"
+read -r DL_HOST DL_PORT DL_DB DL_USER DL_PASS <<< "$(
+  python3 - "$CONFIG" <<'PY'
+import json, sys
+dl = json.load(open(sys.argv[1]))["datalake"]
+print(dl["host"], dl["port"], dl["database"], dl["user"], dl["password"])
+PY
+)"
+
+catalog_sql() {
+  PGPASSWORD="$DS_PASS" psql -h "$DS_HOST" -p "$DS_PORT" -U "$DS_USER" -d "$DS_DB" -v ON_ERROR_STOP=1 -tA -c "$1"
+}
+
+lake_sql() {
+  PGPASSWORD="$DL_PASS" psql -h "$DL_HOST" -p "$DL_PORT" -U "$DL_USER" -d "$DL_DB" -v ON_ERROR_STOP=1 -tA -c "$1"
+}
+
+run_ds_bg() {
+  local cname="datasync-fl-resume-$$-$RANDOM"
+  docker run -d --name "$cname" --network host \
+    -v "$CONFIG:/app/config.json:ro" \
+    -e KAFKA_BOOTSTRAP=127.0.0.1:9092 \
+    -e DATASYNC_CONFIG=/app/config.json \
+    "$IMAGE" "$@" >/dev/null
+  echo "$cname"
+}
+
+run_ds() {
+  docker run --rm --network host \
+    -v "$CONFIG:/app/config.json:ro" \
+    -e KAFKA_BOOTSTRAP=127.0.0.1:9092 \
+    -e DATASYNC_CONFIG=/app/config.json \
+    "$IMAGE" "$@"
+}
+
+kill_ds_container() {
+  local cname="$1"
+  docker kill "$cname" >/dev/null 2>&1 || true
+  docker rm -f "$cname" >/dev/null 2>&1 || true
+}
+
+seed_mssql_customers() {
+  local cur
+  cur=$(docker exec datasync-mssql-test /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1,1433 -U sa -P "$MSSQL_SA_PASSWORD" -C -h -1 -W -Q \
+    "SET NOCOUNT ON; SELECT COUNT(*) FROM testdb.dbo.customers;" | tr -d '[:space:]')
+  log "mssql source rows before seed: ${cur:-0}"
+  if [[ "${cur:-0}" -ge "$ROW_TARGET" ]]; then
+    return 0
+  fi
+  local need=$((ROW_TARGET - cur))
+  log "mssql seeding $need rows (target=$ROW_TARGET)"
+  docker exec datasync-mssql-test /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1,1433 -U sa -P "$MSSQL_SA_PASSWORD" -C -b -Q "
+SET NOCOUNT ON;
+DECLARE @need INT = $need;
+INSERT INTO testdb.dbo.customers (name, active)
+SELECT TOP (@need)
+  N'resume_seed_' + CAST(n AS NVARCHAR(20)),
+  CASE WHEN n % 2 = 0 THEN 0 ELSE 1 END
+FROM (
+  SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+  FROM sys.all_objects a CROSS JOIN sys.all_objects b
+) x;
+" >/dev/null
+}
+
+seed_mongo_customers() {
+  docker exec datasync-mongodb-test mongosh --quiet --eval "
+const target = $ROW_TARGET;
+const coll = db.getSiblingDB('mongotest').customers;
+let n = coll.countDocuments();
+print('mongo source rows before seed: ' + n);
+if (n >= target) quit(0);
+const batch = 2000;
+while (n < target) {
+  const docs = [];
+  for (let i = 0; i < batch && n < target; i++, n++) {
+    docs.push({ name: 'resume_seed_' + n, active: n % 2 === 0, updated_at: new Date() });
+  }
+  coll.insertMany(docs);
+}
+print('mongo seeded to ' + coll.countDocuments());
+" >/dev/null
+}
+
+prepare_catalog() {
+  local conn_id="$1"
+  local source_table="$2"
+  local catalog_id
+  catalog_id=$(catalog_sql "
+SELECT catalog_id FROM cdc_catalog.catalog
+WHERE conn_id = '$conn_id' AND source_table = '$source_table' AND active
+LIMIT 1;
+")
+  [[ -n "$catalog_id" ]] || fail "catalog row missing for $conn_id.$source_table"
+  catalog_sql "
+UPDATE cdc_catalog.catalog
+SET needs_full_load = false, status = 'success', updated_at = now()
+WHERE conn_id = '$conn_id' AND source_table <> '$source_table';
+DELETE FROM cdc_catalog.full_load_checkpoint WHERE catalog_id = $catalog_id;
+UPDATE cdc_catalog.catalog
+SET needs_full_load = true, status = 'pending', last_error = NULL, updated_at = now()
+WHERE catalog_id = $catalog_id;
+" >/dev/null
+  echo "$catalog_id"
+}
+
+wait_resumable_copy_checkpoint() {
+  local catalog_id="$1"
+  local min_workers="${2:-1}"
+  local deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    local row
+    row=$(catalog_sql "
+SELECT COALESCE(MAX(source_rows), 0)::text || '|' ||
+       COALESCE(SUM(rows_loaded) FILTER (WHERE phase = 'copy'), 0)::text || '|' ||
+       COUNT(*) FILTER (
+         WHERE phase = 'copy'
+           AND last_pk IS NOT NULL
+           AND last_pk::text <> '[]'
+       )::text
+FROM cdc_catalog.full_load_checkpoint
+WHERE catalog_id = $catalog_id;
+")
+    local source_rows="${row%%|*}"
+    local rest="${row#*|}"
+    local rows_loaded="${rest%%|*}"
+    local copy_cp="${rest##*|}"
+    if [[ "${copy_cp:-0}" -ge "$min_workers" && "${rows_loaded:-0}" -ge $((20000 * min_workers)) ]]; then
+      local target_rows="${source_rows:-0}"
+      if [[ "$target_rows" -le 0 ]]; then
+        target_rows="$ROW_TARGET"
+      fi
+      if [[ "${rows_loaded:-0}" -lt $((target_rows - 5000)) ]]; then
+        log "copy checkpoint ready catalog_id=$catalog_id rows_loaded=$rows_loaded source_rows=$target_rows workers=$copy_cp (min=$min_workers)"
+        return 0
+      fi
+    fi
+    sleep 0.02
+  done
+  return 1
+}
+
+assert_resume_log() {
+  local conn_id="$1"
+  catalog_sql "
+SELECT 1 FROM cdc_catalog.logs
+WHERE conn_id = '$conn_id'
+  AND message = 'full load resumed from checkpoint'
+  AND logged_at > now() - interval '10 minutes'
+LIMIT 1;
+" | grep -qx 1 || fail "missing resume log for $conn_id"
+}
+
+assert_catalog_success() {
+  local catalog_id="$1"
+  catalog_sql "
+SELECT status FROM cdc_catalog.catalog WHERE catalog_id = $catalog_id;
+" | grep -qx success || fail "catalog $catalog_id not success after resume"
+  catalog_sql "
+SELECT COUNT(*) FROM cdc_catalog.full_load_checkpoint WHERE catalog_id = $catalog_id;
+" | grep -qx 0 || fail "checkpoints not cleared for catalog $catalog_id"
+}
+
+run_engine_smoke() {
+  local engine="$1"
+  local conn_id source_table lake_schema source_count_cmd min_workers
+  case "$engine" in
+    mssql)
+      conn_id=MSSQLTEST
+      source_table=customers
+      lake_schema=testdb_dbo
+      min_workers=2
+      source_count_cmd='docker exec datasync-mssql-test /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1,1433 -U sa -P '"$MSSQL_SA_PASSWORD"' -C -h -1 -W -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM testdb.dbo.customers;" | tr -d "[:space:]"'
+      seed_mssql_customers
+      ;;
+    mongo)
+      conn_id=MONGOTEST
+      source_table=customers
+      lake_schema=mongotest
+      min_workers=1
+      source_count_cmd='docker exec datasync-mongodb-test mongosh --quiet --eval "db.getSiblingDB('"'"'mongotest'"'"').customers.countDocuments()" | tr -d "[:space:]"'
+      seed_mongo_customers
+      ;;
+    *)
+      fail "unknown engine: $engine (use mssql|mongo|all)"
+      ;;
+  esac
+
+  log "=== $engine resume smoke (conn=$conn_id table=$source_table) ==="
+  local catalog_id
+  catalog_id=$(prepare_catalog "$conn_id" "$source_table")
+
+  local cname
+  cname=$(run_ds_bg full-load --conn-id "$conn_id")
+  if ! wait_resumable_copy_checkpoint "$catalog_id" "$min_workers"; then
+    kill_ds_container "$cname"
+    fail "$engine: no resumable copy checkpoint within 120s (increase ROW_TARGET?)"
+  fi
+  kill_ds_container "$cname"
+  log "$engine: killed mid-COPY container=$cname"
+
+  catalog_sql "
+SELECT status FROM cdc_catalog.catalog WHERE catalog_id = $catalog_id;
+" | grep -qxE 'full_load_in_progress|pending' || fail "$engine: expected in-progress catalog after kill"
+
+  local partial_lake
+  partial_lake=$(lake_sql "SELECT COUNT(*)::text FROM ${lake_schema}.customers;" || echo 0)
+  [[ "${partial_lake:-0}" -gt 0 ]] || fail "$engine: lake empty after interrupted COPY"
+
+  log "$engine: re-run full-load (expect resume)"
+  run_ds full-load --conn-id "$conn_id" >/dev/null
+
+  assert_resume_log "$conn_id"
+  assert_catalog_success "$catalog_id"
+
+  local source_rows lake_rows
+  source_rows=$(eval "$source_count_cmd")
+  lake_rows=$(lake_sql "SELECT COUNT(*)::text FROM ${lake_schema}.customers;")
+  log "$engine: source_rows=$source_rows lake_rows=$lake_rows"
+  [[ "$source_rows" == "$lake_rows" ]] || fail "$engine: row mismatch source=$source_rows lake=$lake_rows"
+  log "$engine resume-smoke OK"
+}
+
+log "ensure dev engines up"
+"$ROOT/tools/start-dev-engines.sh" >/dev/null
+
+case "$TARGET" in
+  mssql) run_engine_smoke mssql ;;
+  mongo) run_engine_smoke mongo ;;
+  all)
+    run_engine_smoke mssql
+    run_engine_smoke mongo
+    ;;
+  *)
+    fail "usage: $0 [mssql|mongo|all]"
+    ;;
+esac
+
+log "resume-smoke OK ($TARGET)"
