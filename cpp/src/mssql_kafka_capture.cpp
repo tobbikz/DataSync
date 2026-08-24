@@ -2,6 +2,7 @@
 
 #include "capture_common.hpp"
 #include "cdc_envelope.hpp"
+#include "cdc_gap.hpp"
 #include "kafka_producer.hpp"
 #include "kafka_topics.hpp"
 #include "mssql_conn.hpp"
@@ -271,6 +272,25 @@ bool recover_purged_lsn(
             {"capture_instance", capture_instance},
         },
     });
+    record_gap_event(
+        log_pg,
+        conn_id,
+        "mssql",
+        GapSide::Capture,
+        GapKind::MssqlLsnPurged,
+        "cdc lsn purged: auto full-load reboot",
+        nlohmann::json{
+            {"from_lsn", lsn_hex(from_lsn)},
+            {"min_lsn", lsn_hex(min_lsn)},
+            {"capture_instance", capture_instance},
+            {"catalog_id", tbl.catalog_id},
+        },
+        "needs_full_load",
+        1,
+        batch_id,
+        tbl.catalog_id,
+        tbl.source_schema,
+        tbl.source_table);
     return true;
 }
 
@@ -544,9 +564,54 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         const auto& col_names = result.columns;
         std::vector<uint8_t> last_sl;
         std::vector<uint8_t> last_sq;
+        std::optional<std::string> active_tx_lsn;
+        std::optional<long long> active_tx_id;
+
+        const auto close_active_tx = [&]() {
+            if (!active_tx_id) {
+                return;
+            }
+            cdc_publish_tx_marker(
+                producer,
+                rcfg.topic_prefix,
+                conn_id,
+                "mssql",
+                "commit",
+                *active_tx_id,
+                [&](CdcEvent& marker) {
+                    if (active_tx_lsn) {
+                        marker.gtid = *active_tx_lsn;
+                    }
+                });
+            active_tx_id.reset();
+            active_tx_lsn.reset();
+        };
+
+        const auto open_tx = [&](const std::string& lsn) {
+            if (lsn.empty()) {
+                return;
+            }
+            const long long tx_id = cdc_tx_id_from_hex(lsn);
+            if (active_tx_lsn && *active_tx_lsn != lsn) {
+                close_active_tx();
+            }
+            if (!active_tx_id) {
+                cdc_publish_tx_marker(
+                    producer,
+                    rcfg.topic_prefix,
+                    conn_id,
+                    "mssql",
+                    "begin",
+                    tx_id,
+                    [&](CdcEvent& marker) { marker.gtid = lsn; });
+                active_tx_lsn = lsn;
+                active_tx_id = tx_id;
+            }
+        };
 
         for (const auto& raw : result.rows) {
             if (published >= rcfg.max_events || std::chrono::steady_clock::now() >= deadline) {
+                close_active_tx();
                 break;
             }
             nlohmann::json data = nlohmann::json::object();
@@ -598,6 +663,11 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             event.after = after;
             event.gtid = sl.empty() ? "" : lsn_hex(sl);
             event.mssql_seqval = sq.empty() ? "" : lsn_hex(sq);
+            if (!sl.empty()) {
+                const std::string lsn_str = lsn_hex(sl);
+                open_tx(lsn_str);
+                cdc_attach_row_tx(event, active_tx_id.value_or(cdc_tx_id_from_hex(lsn_str)));
+            }
             event.ts_ms = now_ms();
             event.ingestion_ts = utc_iso_timestamp_now();
 
@@ -627,6 +697,8 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             published += 1;
             last_heartbeat = std::chrono::steady_clock::now();
         }
+
+        close_active_tx();
 
         MssqlPendingCommit pending;
         pending.catalog_id = tbl.catalog_id;

@@ -303,6 +303,69 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
         }
 
         const bson_t* change = nullptr;
+        std::optional<long long> active_tx_id;
+
+        const auto close_active_tx = [&]() {
+            if (!active_tx_id) {
+                return;
+            }
+            cdc_publish_tx_marker(
+                producer,
+                rcfg.topic_prefix,
+                conn_id,
+                "mongodb",
+                "commit",
+                *active_tx_id);
+            active_tx_id.reset();
+        };
+
+        const auto resolve_mongo_tx_id = [](const nlohmann::json& change_json) -> std::optional<long long> {
+            if (change_json.contains("txnNumber") && change_json["txnNumber"].is_number_integer()) {
+                return change_json["txnNumber"].get<long long>();
+            }
+            if (change_json.contains("lsid") && change_json["lsid"].is_object()) {
+                const auto& lsid = change_json["lsid"];
+                if (lsid.contains("id")) {
+                    if (lsid["id"].is_string()) {
+                        return cdc_tx_id_from_hex(lsid["id"].get<std::string>());
+                    }
+                    return cdc_tx_id_from_hex(lsid["id"].dump());
+                }
+            }
+            if (change_json.contains("clusterTime") && change_json["clusterTime"].is_object()) {
+                const auto& ct = change_json["clusterTime"];
+                if (ct.contains("t") && ct["t"].is_number()) {
+                    return ct["t"].get<long long>();
+                }
+            }
+            return std::nullopt;
+        };
+
+        const auto attach_mongo_tx = [&](const nlohmann::json& change_json, CdcEvent& event) {
+            const auto tx_id_opt = resolve_mongo_tx_id(change_json);
+            if (!tx_id_opt) {
+                return;
+            }
+            const long long tx_id = *tx_id_opt;
+            const bool transactional = change_json.contains("txnNumber");
+            if (transactional) {
+                if (active_tx_id && *active_tx_id != tx_id) {
+                    close_active_tx();
+                }
+                if (!active_tx_id) {
+                    cdc_publish_tx_marker(
+                        producer,
+                        rcfg.topic_prefix,
+                        conn_id,
+                        "mongodb",
+                        "begin",
+                        tx_id);
+                    active_tx_id = tx_id;
+                }
+            }
+            cdc_attach_row_tx(event, tx_id);
+        };
+
         while (published < rcfg.max_events && std::chrono::steady_clock::now() < deadline) {
             if (!mongoc_change_stream_next(stream, &change)) {
                 bson_error_t stream_err;
@@ -426,6 +489,7 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
                 event.gtid = last_token.is_null() ? "" : last_token.dump();
             }
             event.resume_token = last_token;
+            attach_mongo_tx(change_json, event);
             event.ts_ms = now_ms();
             event.ingestion_ts = utc_iso_timestamp_now();
 
@@ -454,6 +518,8 @@ MongoCaptureStats run_mongo_kafka_capture_slice(
             }
             published += 1;
         }
+
+        close_active_tx();
 
         if (!coll_failed && stream && mongoc_change_stream_error_document(stream, nullptr, nullptr)) {
             coll_failed = true;

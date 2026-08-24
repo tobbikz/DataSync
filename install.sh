@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Host only:
-#   ./install.sh initial — first install: config, discover, health (+ build + stack)
+#   ./install.sh initial — first install: config, discover (+ build + stack)
 #   ./install.sh start   — pull/restart workflow: rebuild images + recreate stack
 #   ./install.sh stop    — stop Kafka + daemon + UI
 set -euo pipefail
@@ -198,10 +198,6 @@ ensure_config() {
   return 1
 }
 
-run_health_checks() {
-  docker_compose run --rm --no-deps datasync health-only
-}
-
 export_compose_ui_env() {
   export DATASYNC_UID="$(id -u)"
   export DATASYNC_GID="$(id -g)"
@@ -253,8 +249,6 @@ host_stack_initial() {
   wait_kafka_compose || exit 1
   docker_compose up -d --force-recreate --remove-orphans datasync ui
   run_host_discover || exit 1
-  docker_compose run --rm --no-deps datasync schema-only || true
-  run_health_checks || exit 1
   docker_compose ps
   printf '✔ initial setup complete — UI http://127.0.0.1:3000\n'
 }

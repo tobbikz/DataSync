@@ -1,4 +1,4 @@
-export type CatalogReplicationMode = "enable" | "disable";
+export type CatalogReplicationMode = "enable" | "disable" | "reset";
 
 export const ENABLE_CATALOG_REPLICATION_SQL = `
   UPDATE cdc_catalog.catalog

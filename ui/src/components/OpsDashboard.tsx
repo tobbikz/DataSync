@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
   Bar,
@@ -22,6 +23,7 @@ import { Badge } from "./Badge";
 import { usePolling } from "@/lib/use-polling";
 import { PageMeta } from "./DashboardShell";
 import { CHART, chartAxisTick, chartGrid, chartGridHorizontal, chartTooltip } from "@/lib/chart-theme";
+import { isMainOpsTab } from "@/lib/ops-nav";
 
 interface OpsPayload {
   kpis: {
@@ -73,6 +75,21 @@ interface OpsPayload {
     duration_ms: string;
     kafka_consumer_lag: string;
     health_reason: string;
+  }[];
+  gapEvents: {
+    gap_id: number;
+    detected_at: string;
+    conn_id: string;
+    db_engine: string;
+    gap_side: string;
+    gap_kind: string;
+    source_schema: string | null;
+    source_table: string | null;
+    detail: string | null;
+    remediation: string;
+    tables_flagged: number;
+    resolved_at: string | null;
+    batch_id: string | null;
   }[];
 }
 
@@ -214,7 +231,10 @@ function buildEventsByConn(data: OpsPayload["eventsHourly"]) {
 }
 
 export function OpsDashboard() {
-  const [mainTab, setMainTab] = useState<MainTab>("health");
+  const searchParams = useSearchParams();
+  const tabFromUrl = searchParams.get("tab");
+  const initialTab: MainTab = isMainOpsTab(tabFromUrl) ? tabFromUrl : "health";
+  const [mainTab, setMainTab] = useState<MainTab>(initialTab);
   const [eventsSubTab, setEventsSubTab] = useState<EventsSubTab>("overview");
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null);
 
@@ -222,6 +242,12 @@ export function OpsDashboard() {
     () => fetch("/api/ops").then((r) => r.json()),
     60_000,
   );
+
+  useEffect(() => {
+    if (isMainOpsTab(tabFromUrl)) {
+      setMainTab(tabFromUrl);
+    }
+  }, [tabFromUrl]);
 
   if (!data?.kpis) {
     return (
@@ -273,6 +299,58 @@ export function OpsDashboard() {
         <div className="p-4">
           {mainTab === "health" ? (
             <div className="space-y-4">
+              {(data.gapEvents?.length ?? 0) > 0 ? (
+                <section className="panel overflow-hidden">
+                  <div className="panel-header py-2">
+                    <p className="text-[11px] font-medium uppercase tracking-wide text-foreground-muted">
+                      Gap events (recent)
+                    </p>
+                    <p className="font-mono text-[10px] text-foreground-muted">
+                      cdc_catalog.gap_events · automated playbook audit
+                    </p>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full font-mono text-[11px]">
+                      <thead>
+                        <tr className="border-b border-border text-left text-foreground-muted">
+                          <th className="px-3 py-2">When</th>
+                          <th className="px-3 py-2">Conn</th>
+                          <th className="px-3 py-2">Side</th>
+                          <th className="px-3 py-2">Kind</th>
+                          <th className="px-3 py-2">Remediation</th>
+                          <th className="px-3 py-2">Detail</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {data.gapEvents.map((row) => (
+                          <tr key={row.gap_id} className="border-b border-border/60">
+                            <td className="px-3 py-2 whitespace-nowrap">
+                              {new Date(row.detected_at).toLocaleString(undefined, {
+                                month: "short",
+                                day: "numeric",
+                                hour: "2-digit",
+                                minute: "2-digit",
+                              })}
+                            </td>
+                            <td className="px-3 py-2">{row.conn_id}</td>
+                            <td className="px-3 py-2">{row.gap_side}</td>
+                            <td className="px-3 py-2">{row.gap_kind}</td>
+                            <td className="px-3 py-2">
+                              <Badge tone={row.resolved_at ? "success" : "warning"}>
+                                {row.remediation}
+                              </Badge>
+                            </td>
+                            <td className="max-w-xs truncate px-3 py-2 text-foreground-secondary">
+                              {row.detail ?? "—"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+              ) : null}
+
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 <StatCard label="CDC ready tables" value={String(data.kpis.cdcReady)} />
                 <StatCard label="Apply GREEN" value={String(data.kpis.applyGreen)} />

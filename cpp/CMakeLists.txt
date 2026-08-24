@@ -38,6 +38,7 @@ set(DATASYNC_SOURCES
     src/kafka_table_lag.cpp
     src/kafka_producer.cpp
     src/cdc_envelope.cpp
+    src/cdc_tx.cpp
     src/capture_common.cpp
     src/mariadb_kafka_capture.cpp
     src/mssql_kafka_capture.cpp
@@ -52,6 +53,7 @@ set(DATASYNC_SOURCES
     src/obs_log.cpp
     src/retention_maintenance.cpp
     src/schema_migrate.cpp
+    src/cdc_gap.cpp
 )
 
 find_path(FREETDS_INCLUDE_DIR NAMES sybdb.h)
@@ -132,3 +134,40 @@ if(HAVE_MONGOC)
 endif()
 
 target_compile_options(DataSync PRIVATE -Wall -Wextra)
+
+option(BUILD_TESTING "Build DataSync unit tests" ON)
+if(BUILD_TESTING)
+    enable_testing()
+    add_executable(datasync_boolean_tests tests/boolean_tests.cpp src/mariadb_boolean.cpp)
+    target_include_directories(datasync_boolean_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(datasync_boolean_tests PRIVATE -Wall -Wextra)
+    add_test(NAME boolean_tests COMMAND datasync_boolean_tests)
+
+    add_executable(datasync_envelope_tests
+        tests/envelope_tests.cpp
+        src/cdc_envelope.cpp
+        src/mariadb_schema.cpp
+        src/mariadb_boolean.cpp
+        src/mariadb_datetime.cpp
+    )
+    target_include_directories(datasync_envelope_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${MARIADB_INCLUDE_DIRS}
+    )
+    target_link_libraries(datasync_envelope_tests PRIVATE ${MARIADB_LIBRARIES})
+    if(nlohmann_json_FOUND)
+        target_link_libraries(datasync_envelope_tests PRIVATE nlohmann_json::nlohmann_json)
+    endif()
+    target_compile_options(datasync_envelope_tests PRIVATE -Wall -Wextra)
+    add_test(NAME envelope_tests COMMAND datasync_envelope_tests)
+
+    add_executable(datasync_tx_id_tests tests/tx_id_tests.cpp src/cdc_tx.cpp)
+    target_include_directories(datasync_tx_id_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(datasync_tx_id_tests PRIVATE -Wall -Wextra)
+    add_test(NAME tx_id_tests COMMAND datasync_tx_id_tests)
+
+    add_executable(datasync_gap_kind_tests tests/gap_kind_tests.cpp)
+    target_include_directories(datasync_gap_kind_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(datasync_gap_kind_tests PRIVATE -Wall -Wextra)
+    add_test(NAME gap_kind_tests COMMAND datasync_gap_kind_tests)
+endif()

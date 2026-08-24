@@ -6,6 +6,7 @@ import {
   OPS_ENGINE_MIX_SQL,
   OPS_ERRORS_BY_COMPONENT_SQL,
   OPS_EVENTS_HOURLY_SQL,
+  OPS_GAP_EVENTS_SQL,
   OPS_KPIS_SQL,
   OPS_PIPELINE_TABLES_SQL,
   OPS_RECENT_ERRORS_SQL,
@@ -39,6 +40,7 @@ export async function GET(request: Request) {
     recentErrors,
     applyTail,
     pipelineTables,
+    gapEvents,
   ] = await Promise.all([
     query(OPS_KPIS_SQL),
     query(OPS_EVENTS_HOURLY_SQL),
@@ -49,6 +51,7 @@ export async function GET(request: Request) {
     query(OPS_RECENT_ERRORS_SQL),
     query(OPS_APPLY_TAIL_SQL),
     query(OPS_PIPELINE_TABLES_SQL),
+    query(OPS_GAP_EVENTS_SQL),
   ]);
 
   if (!kpis.ok) {
@@ -77,6 +80,7 @@ export async function GET(request: Request) {
     recentErrors: recentErrors.ok ? recentErrors.rows : [],
     applyTail: applyTail.ok ? applyTail.rows : [],
     pipelineTables: pipelineTables.ok ? pipelineTables.rows : [],
+    gapEvents: gapEvents.ok ? gapEvents.rows : [],
     refreshed: refresh,
   });
 }

@@ -12,16 +12,16 @@ struct Script {
 };
 
 inline std::string_view k000_reset() {
-    return R"__cdc_k000_reset__(
+    return R"cdc000(
 -- Destructive reset: only run when DATASYNC_SCHEMA_RESET=1 or applied manually.
 DROP SCHEMA IF EXISTS cdc_catalog CASCADE;
 CREATE SCHEMA cdc_catalog;
 
-)__cdc_k000_reset__";
+)cdc000";
 }
 
 inline std::string_view k010_enums() {
-    return R"__cdc_k010_enums__(
+    return R"cdc010(
 -- cdc_catalog enum types (idempotent).
 
 DO $$ BEGIN
@@ -61,11 +61,11 @@ ALTER TYPE cdc_catalog.cdc_health_status ADD VALUE IF NOT EXISTS 'stale';
 ALTER TYPE cdc_catalog.cdc_health_status ADD VALUE IF NOT EXISTS 'lagging';
 ALTER TYPE cdc_catalog.cdc_health_status ADD VALUE IF NOT EXISTS 'gap_detected';
 
-)__cdc_k010_enums__";
+)cdc010";
 }
 
 inline std::string_view k020_tables() {
-    return R"__cdc_k020_tables__(
+    return R"cdc020(
 -- Core cdc_catalog tables (production shape).
 
 CREATE TABLE IF NOT EXISTS cdc_catalog.connections (
@@ -299,11 +299,34 @@ COMMENT ON TABLE cdc_catalog.connections IS
 COMMENT ON TABLE cdc_catalog.logs IS
   'Append-only application log for all pipeline components.';
 
-)__cdc_k020_tables__";
+DROP TABLE IF EXISTS cdc_catalog.fleet_status;
+
+CREATE TABLE IF NOT EXISTS cdc_catalog.gap_events (
+  gap_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  detected_at timestamptz NOT NULL DEFAULT now(),
+  conn_id text NOT NULL,
+  db_engine cdc_catalog.db_engine NOT NULL,
+  gap_side text NOT NULL CHECK (gap_side IN ('capture', 'apply')),
+  gap_kind text NOT NULL,
+  catalog_id bigint REFERENCES cdc_catalog.catalog (catalog_id) ON DELETE SET NULL,
+  source_schema text,
+  source_table text,
+  detail text,
+  context jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(context) = 'object'),
+  remediation text NOT NULL DEFAULT 'pending',
+  tables_flagged integer NOT NULL DEFAULT 0,
+  resolved_at timestamptz,
+  batch_id text
+);
+
+COMMENT ON TABLE cdc_catalog.gap_events IS
+  'Audit trail for binlog/GTID/offset gaps and automated remediation playbook.';
+
+)cdc020";
 }
 
 inline std::string_view k030_indexes() {
-    return R"__cdc_k030_indexes__(
+    return R"cdc030(
 -- Indexes (idempotent).
 
 CREATE INDEX IF NOT EXISTS apply_batch_stats_table_idx
@@ -337,6 +360,12 @@ CREATE INDEX IF NOT EXISTS apply_position_stale_idx
   WHERE status = ANY (ARRAY ['stale'::cdc_catalog.cdc_health_status, 'lagging'::cdc_catalog.cdc_health_status, 'gap_detected'::cdc_catalog.cdc_health_status]);
 CREATE INDEX IF NOT EXISTS apply_position_conn_status_idx
   ON cdc_catalog.apply_position (conn_id, status);
+
+CREATE INDEX IF NOT EXISTS gap_events_conn_detected_idx
+  ON cdc_catalog.gap_events (conn_id, detected_at DESC);
+CREATE INDEX IF NOT EXISTS gap_events_unresolved_idx
+  ON cdc_catalog.gap_events (detected_at DESC)
+  WHERE resolved_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS catalog_engine_meta_gin
   ON cdc_catalog.catalog USING gin (engine_meta jsonb_path_ops);
@@ -397,11 +426,11 @@ CREATE INDEX IF NOT EXISTS cdc_mssql_lsn_updated_idx
 CREATE INDEX IF NOT EXISTS full_load_checkpoint_updated_idx
   ON cdc_catalog.full_load_checkpoint (updated_at DESC);
 
-)__cdc_k030_indexes__";
+)cdc030";
 }
 
 inline std::string_view k040_functions() {
-    return R"__cdc_k040_functions__(
+    return R"cdc040(
 -- Retention / purge helpers used by the C++ daemon.
 
 CREATE OR REPLACE FUNCTION cdc_catalog.purge_logs(retention_days integer)
@@ -514,11 +543,11 @@ BEGIN
 END;
 $$;
 
-)__cdc_k040_functions__";
+)cdc040";
 }
 
 inline std::string_view k050_views() {
-    return R"__cdc_k050_views__(
+    return R"cdc050(
 -- Superset Ops dashboard materialized views (DataSync Ops v10).
 
 DROP MATERIALIZED VIEW IF EXISTS cdc_catalog.mv_tab_health_latest_3d CASCADE;
@@ -688,7 +717,7 @@ GROUP BY 1, 2, 3, 4;
 CREATE INDEX IF NOT EXISTS mv_tab_logs_hourly_3d_component_idx
   ON cdc_catalog.mv_tab_logs_hourly_3d (component, event_ts DESC);
 
-)__cdc_k050_views__";
+)cdc050";
 }
 
 inline std::vector<Script> cdc_catalog_scripts() {
@@ -703,7 +732,7 @@ inline std::vector<Script> cdc_catalog_scripts() {
 }
 
 inline std::string_view k_lake_helpers() {
-    return R"__cdc_k_lake_helpers__(
+    return R"lake001(
 -- Lake helper schema for datalake DB (partition management).
 -- Applied via install.sh → apply_lake_schema (config.json → datalake).
 
@@ -780,7 +809,7 @@ BEGIN
 END;
 $$;
 
-)__cdc_k_lake_helpers__";
+)lake001";
 }
 
 inline std::string_view lake_helpers_sql() { return k_lake_helpers(); }

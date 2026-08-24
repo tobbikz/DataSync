@@ -3,6 +3,7 @@
 #include "capture_common.hpp"
 #include "config.hpp"
 #include "full_load_checkpoint.hpp"
+#include "full_load_common.hpp"
 #include "mariadb_full_load.hpp"
 #include "mongo_full_load.hpp"
 #include "mssql_full_load.hpp"

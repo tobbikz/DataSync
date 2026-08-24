@@ -1,19 +1,18 @@
 ---
-description: Read Obsidian vault rules before any DataSync work — sole repo rule
+description: Read Obsidian vault rules and indexes before any DataSync work — sole repo rule
 alwaysApply: true
 ---
 
 # Obsidian-first (mandatory)
 
-**All project rules, skills, and agent docs live in Obsidian — not in this repo.**
+**All project rules and docs live in Obsidian — not in this repo.**
 
-Before coding, designing, operating, or delegating on DataSync:
+Before coding, designing, or operating on DataSync:
 
-1. Open **`/home/iks/Documents/Obsidian Vault/DataSync/Cursor Rules Hub.md`** (rules, skills, index)
-2. Product / repo reference: **`/home/iks/Documents/Obsidian Vault/DataSync/DataSync.md`** (deploy files, C++ hubs)
-3. Read the rules relevant to your task (observability, pipeline knobs, orchestrator, UI design, etc.)
-4. For CDC sprints: read **`DataSync/Skills/CDC Orchestrator/PROJECT-STATE.md`**
+1. Open **`/home/iks/Documents/Obsidian Vault/DataSync/Cursor Rules Hub.md`** — workflow, indexes (mini-RAG), rules
+2. Read **`/home/iks/Documents/Obsidian Vault/DataSync/DataSync.md`** and the relevant index pages (deploy notes, C++ hubs) for your task
+3. Apply the rules that match your task (observability, pipeline knobs, documentation, etc.)
 
-After meaningful changes, update Obsidian per **Rules/Obsidian Project Docs** — link from `DataSync/DataSync.md` when adding topics.
+After **every meaningful change**, update Obsidian per **`DataSync/Rules/Obsidian Project Docs.md`** — link new topics from `DataSync/DataSync.md`.
 
-Do **not** recreate `.cursor/rules/` or `docs/` in the repo. The vault is the single source of truth.
+Do **not** recreate `.cursor/rules/` (except this file) or `docs/` in the repo. The vault is the single source of truth.

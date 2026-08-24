@@ -50,21 +50,23 @@ const ENRICHED_SELECT = `
       OR b.apply_status = 'quarantined'
       OR COALESCE(b.stats_quarantined, false)
     ) AS quarantined,
-    COALESCE(
-      NULLIF(b.apply_health_rag, ''),
-      CASE
-        WHEN b.status = 'quarantined' OR b.apply_status = 'quarantined'
-          OR COALESCE(b.stats_quarantined, false) THEN 'RED'
-        WHEN b.status = 'error' THEN 'RED'
-        WHEN b.needs_full_load
-          OR b.status IN ('needs_full_load', 'full_load_in_progress', 'pending') THEN 'AMBER'
-        WHEN NOT b.cdc_enabled THEN 'UNKNOWN'
-        WHEN b.kafka_consumer_lag >= 50000 THEN 'RED'
-        WHEN b.kafka_consumer_lag >= 1000 THEN 'AMBER'
-        WHEN b.status IN ('syncing', 'success') AND b.cdc_enabled THEN 'GREEN'
-        ELSE 'UNKNOWN'
-      END
-    ) AS health_rag,
+    CASE
+      WHEN b.status = 'quarantined' OR b.apply_status = 'quarantined'
+        OR COALESCE(b.stats_quarantined, false) THEN 'RED'
+      WHEN b.status = 'error' THEN 'RED'
+      WHEN b.needs_full_load
+        OR b.status IN ('needs_full_load', 'full_load_in_progress', 'pending') THEN
+        CASE COALESCE(NULLIF(b.apply_health_rag, ''), 'UNKNOWN')
+          WHEN 'RED' THEN 'RED'
+          ELSE 'AMBER'
+        END
+      WHEN NOT b.cdc_enabled THEN 'UNKNOWN'
+      WHEN COALESCE(NULLIF(b.apply_health_rag, ''), '') <> '' THEN b.apply_health_rag
+      WHEN b.kafka_consumer_lag >= 50000 THEN 'RED'
+      WHEN b.kafka_consumer_lag >= 1000 THEN 'AMBER'
+      WHEN b.status IN ('syncing', 'success') AND b.cdc_enabled THEN 'GREEN'
+      ELSE 'UNKNOWN'
+    END AS health_rag,
     b.kafka_consumer_lag AS kafka_lag,
     b.stats_capture_lag_seconds AS capture_lag_seconds,
     COALESCE(b.stats_apply_lag_seconds, b.position_apply_lag_seconds) AS apply_lag_seconds,
@@ -92,7 +94,16 @@ export const CATALOG_ROW_SELECT = `
   quarantined,
   quarantine_reason_resolved AS quarantine_reason,
   last_applied_at AS last_apply_at,
-  health_reason
+  CASE
+    WHEN needs_full_load
+      OR status IN ('needs_full_load', 'full_load_in_progress', 'pending') THEN
+      CASE
+        WHEN health_reason IS NULL OR TRIM(health_reason) = '' OR health_reason = 'healthy'
+          THEN 'needs full-load reboot'
+        ELSE health_reason || ' · needs full-load reboot'
+      END
+    ELSE health_reason
+  END AS health_reason
 `;
 
 function catalogFromClause(whereSql: string) {

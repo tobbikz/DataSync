@@ -5,6 +5,7 @@
 #include "kafka_table_lag.hpp"
 #include "kafka_topics.hpp"
 #include "capture_common.hpp"
+#include "cdc_gap.hpp"
 #include "lake_apply_index.hpp"
 
 #include "config.hpp"
@@ -1043,11 +1044,65 @@ int run_kafka_apply_native_cli(
                     empty_polls += 1;
                     continue;
                 }
-                std::string kerr = rd_kafka_message_errstr(msg);
+                const std::string kerr = rd_kafka_message_errstr(msg);
                 if (kerr.find("Subscribed topic not available") != std::string::npos) {
                     rd_kafka_message_destroy(msg);
                     empty_polls += 1;
                     continue;
+                }
+                if (msg->err == RD_KAFKA_RESP_ERR_OFFSET_OUT_OF_RANGE ||
+                    kerr.find("Offset out of range") != std::string::npos ||
+                    kerr.find("offset out of range") != std::string::npos) {
+                    const std::string topic = msg->rkt ? rd_kafka_topic_name(msg->rkt) : "";
+                    const int partition = msg->partition;
+                    const long long bad_offset = msg->offset;
+                    rd_kafka_message_destroy(msg);
+                    int flagged = 0;
+                    for (const auto& [key, meta] : meta_by_key) {
+                        const std::string tbl_topic = topic_for_catalog(
+                            topic_prefix, key.first, key.second, topic_mode, topic_buckets);
+                        if (tbl_topic != topic) {
+                            continue;
+                        }
+                        const std::string detail =
+                            "kafka offset out of range partition " + std::to_string(partition) +
+                            " offset " + std::to_string(bad_offset) + ": " + kerr;
+                        mark_apply_position_gap_detected(app_pg, meta.catalog_id, detail);
+                        if (recover_apply_table_gap(
+                                app_pg,
+                                meta.catalog_id,
+                                conn_id,
+                                db_engine,
+                                GapKind::KafkaOffsetLost,
+                                detail,
+                                batch_id,
+                                json{
+                                    {"topic", topic},
+                                    {"partition", partition},
+                                    {"offset", bad_offset},
+                                    {"kafka_error", kerr},
+                                })) {
+                            flagged += 1;
+                        }
+                    }
+                    log_write(log_pg, {
+                        .level = LogLevel::Warning,
+                        .component = "cdc_kafka_apply",
+                        .message = "apply kafka offset gap remediated",
+                        .batch_id = batch_id,
+                        .conn_id = conn_id,
+                        .source_schema = std::nullopt,
+                        .source_table = std::nullopt,
+                        .context = {
+                            {"topic", topic},
+                            {"partition", partition},
+                            {"offset", bad_offset},
+                            {"tables_flagged", flagged},
+                        },
+                    });
+                    stop_reason = "gap_detected";
+                    loop_exited_early = true;
+                    break;
                 }
                 rd_kafka_message_destroy(msg);
                 throw std::runtime_error(kerr);

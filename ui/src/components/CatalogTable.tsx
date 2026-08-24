@@ -67,11 +67,13 @@ function CatalogDetailPanel({
   busy,
   onEnable,
   onDisable,
+  onReset,
 }: {
   detail: CatalogDetailResponse;
   busy: boolean;
   onEnable: () => void;
   onDisable: () => void;
+  onReset: () => void;
 }) {
   const { catalog, apply_position, recent_stats, recent_logs } = detail;
   const replicationOn =
@@ -96,6 +98,17 @@ function CatalogDetailPanel({
         >
           DISABLE REPLICATION
         </button>
+        {catalog.needs_full_load ? (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onReset}
+            className="btn-secondary py-1 text-[11px] border-warning/40 text-warning"
+            title="Re-run enable replication (full-load reboot)"
+          >
+            RESET
+          </button>
+        ) : null}
         <span className="font-mono text-[10px] text-foreground-muted">
           active={catalog.active ? "true" : "false"} · cdc=
           {catalog.cdc_enabled ? "on" : "off"} · cap-during-fl=
@@ -292,7 +305,7 @@ export function CatalogTable() {
 
   async function setReplication(
     catalogId: number,
-    mode: "enable" | "disable",
+    mode: "enable" | "disable" | "reset",
     reloadDetail = false,
   ) {
     setReplicationBusy(catalogId);
@@ -522,6 +535,20 @@ export function CatalogTable() {
                         >
                           DISABLE REPLICATION
                         </button>
+                        {row.needs_full_load ? (
+                          <>
+                            <span className="table-action-sep">·</span>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => setReplication(row.catalog_id, "reset", isOpen)}
+                              className="table-action text-[10px] text-warning"
+                              title="Re-run enable replication (full-load reboot)"
+                            >
+                              RESET
+                            </button>
+                          </>
+                        ) : null}
                       </div>
                     </div>
                   </div>
@@ -541,6 +568,9 @@ export function CatalogTable() {
                           }
                           onDisable={() =>
                             setReplication(row.catalog_id, "disable", true)
+                          }
+                          onReset={() =>
+                            setReplication(row.catalog_id, "reset", true)
                           }
                         />
                       ) : (

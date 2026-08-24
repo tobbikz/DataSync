@@ -1,5 +1,6 @@
 #include "mariadb_kafka_capture.hpp"
 
+#include "cdc_gap.hpp"
 #include "capture_common.hpp"
 #include "cdc_envelope.hpp"
 #include "kafka_producer.hpp"
@@ -467,6 +468,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 "healthy",
                 "");
         } else {
+            const std::string detail =
+                "server_uuid changed " + start_pos.server_uuid + " -> " + live_uuid;
             upsert_capture_position(
                 log_pg,
                 conn_id,
@@ -474,8 +477,21 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 start_pos.binlog_position,
                 live_uuid,
                 "gap_detected",
-                "server_uuid changed " + start_pos.server_uuid + " -> " + live_uuid);
-            throw std::runtime_error("server_uuid changed; gap_detected — run recovery");
+                detail);
+            rollback_cdc_in_progress_ids(log_pg, cdc_in_progress_ids);
+            const auto reboot = recover_mariadb_capture_gap(
+                log_pg,
+                mariadb.handle,
+                conn_id,
+                batch_id,
+                GapKind::ServerUuidChanged,
+                detail,
+                nlohmann::json{
+                    {"stored_uuid", start_pos.server_uuid},
+                    {"live_uuid", live_uuid},
+                });
+            stats.errors = reboot.ran ? 0 : 1;
+            return stats;
         }
     }
 
@@ -555,13 +571,28 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     int schema_mismatch_logs = 0;
     int utf8_skipped_events = 0;
     std::set<TableKey> schema_mismatch_samples;
+    const auto publish_tx = [&](const std::string& tx_event, long long tx_id, long long event_position) {
+        cdc_publish_tx_marker(
+            producer,
+            rcfg.topic_prefix,
+            conn_id,
+            "mariadb",
+            tx_event,
+            tx_id,
+            [&](CdcEvent& event) {
+                event.binlog_file = binlog_start.file;
+                event.binlog_pos = event_position > 0 ? event_position : binlog_start.position;
+            });
+    };
+
     const auto publish_row = [&](
                                const std::string& schema,
                                const std::string& table,
                                const std::string& op,
                                const std::vector<std::string>& col_values,
                                const std::vector<std::string>* before_col_values,
-                               long long event_position) {
+                               long long event_position,
+                               const std::optional<long long>& tx_id) {
         const CaptureBinlogResolver::ResolveResult resolved = binlog_resolver.resolve(schema, table);
         if (resolved.kind == CaptureBinlogResolver::ResolveKind::NoMatch) {
             unwatched_binlog_events += 1;
@@ -663,6 +694,9 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         event.after = after;
         event.binlog_file = binlog_start.file;
         event.binlog_pos = event_position > 0 ? event_position : binlog_start.position;
+        if (tx_id.has_value()) {
+            cdc_attach_row_tx(event, *tx_id);
+        }
         event.ts_ms = now_ms();
         event.ingestion_ts = utc_iso_timestamp_now();
 
@@ -802,7 +836,8 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             chunk_sec,
             static_cast<int>(std::min<long long>(events_left, 2147483647)),
             publish_row,
-            [&]() { return std::chrono::steady_clock::now() >= slice_deadline; });
+            [&]() { return std::chrono::steady_clock::now() >= slice_deadline; },
+            publish_tx);
 
         read_stats.events += chunk.events;
         read_stats.upserts += chunk.upserts;
@@ -930,7 +965,13 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
             if (cli_failed) {
                 const std::string cli_err = chunk.stderr_tail.substr(0, 2000);
                 if (is_mariadb_binlog_purged_error(cli_err)) {
-                    const auto reboot = reboot_conn_after_mariadb_binlog_gap(log_pg, mariadb.handle, conn_id, batch_id);
+                    const auto reboot = recover_mariadb_capture_gap(
+                        log_pg,
+                        mariadb.handle,
+                        conn_id,
+                        batch_id,
+                        GapKind::BinlogPurged,
+                        cli_err);
                     rollback_cdc_in_progress_ids(log_pg, cdc_in_progress_ids);
                     stats.errors = reboot.ran ? 0 : 1;
                     return stats;
@@ -1116,8 +1157,13 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     } catch (const std::exception& ex) {
         if (is_mariadb_binlog_purged_error(ex.what())) {
             MariaDbConn recovery_conn(*source);
-            const auto reboot =
-                reboot_conn_after_mariadb_binlog_gap(log_pg, recovery_conn.handle, conn_id, batch_id);
+            const auto reboot = recover_mariadb_capture_gap(
+                log_pg,
+                recovery_conn.handle,
+                conn_id,
+                batch_id,
+                GapKind::BinlogPurged,
+                ex.what());
             rollback_cdc_in_progress_ids(log_pg, cdc_in_progress_ids);
             stats.errors = reboot.ran ? 0 : 1;
             log_write(log_pg, {

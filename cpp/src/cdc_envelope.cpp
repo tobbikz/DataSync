@@ -159,6 +159,10 @@ std::string cdc_event_kafka_payload(const CdcEvent& event) {
     if (!event.resume_token.is_null()) {
         safe.resume_token = json_sanitize_for_kafka(event.resume_token);
     }
+    if (event.tx_id.has_value()) {
+        safe.tx_id = event.tx_id;
+    }
+    safe.tx_event = sanitize_utf8_for_json(event.tx_event);
     return json_dump_for_kafka(json_sanitize_for_kafka(safe.to_kafka_dict()));
 }
 
@@ -200,7 +204,18 @@ nlohmann::json CdcEvent::to_kafka_dict() const {
     const nlohmann::json before_json = before.is_null() ? nullptr : json_sanitize_for_kafka(before);
     const nlohmann::json after_json = after.is_null() ? nullptr : json_sanitize_for_kafka(after);
 
-    return {
+    nlohmann::json tx = nullptr;
+    if (tx_id.has_value() || !tx_event.empty()) {
+        tx = nlohmann::json::object();
+        if (tx_id.has_value()) {
+            tx["id"] = *tx_id;
+        }
+        if (!tx_event.empty()) {
+            tx["event"] = sanitize_utf8_for_json(tx_event);
+        }
+    }
+
+    nlohmann::json payload = {
         {"op", sanitize_utf8_for_json(op)},
         {"conn_id", sanitize_utf8_for_json(conn_id)},
         {"db_engine", sanitize_utf8_for_json(db_engine)},
@@ -212,4 +227,8 @@ nlohmann::json CdcEvent::to_kafka_dict() const {
         {"source", source},
         {"ingestion_ts", sanitize_utf8_for_json(ingestion_ts.empty() ? utc_iso_timestamp_now() : ingestion_ts)},
     };
+    if (!tx.is_null()) {
+        payload["tx"] = tx;
+    }
+    return payload;
 }

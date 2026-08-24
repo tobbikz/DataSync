@@ -1,6 +1,7 @@
 #include "cdc_daemon.hpp"
 #include "capture_common.hpp"
 #include "catalog_sync.hpp"
+#include "cdc_gap.hpp"
 #include "cdc_pre_apply.hpp"
 #include "config.hpp"
 #include "connections.hpp"
@@ -549,6 +550,33 @@ int run_parallel_daemon_round(const AppConfig& cfg, const std::vector<std::strin
     std::atomic<int> failures{0};
     const std::string round_batch_id = make_batch_id();
     const int round = g_catalog_sync_round.fetch_add(1) + 1;
+
+    {
+        PgConn gap_pg(cfg.datasync.conn_string());
+        if (gap_pg.raw) {
+            const GapSweepResult gap_sweep = run_gap_playbook_sweep(cfg, gap_pg.raw, round_batch_id);
+            if (gap_sweep.capture_recovered > 0 || gap_sweep.apply_recovered > 0 ||
+                gap_sweep.unresolved_capture > 0 || gap_sweep.unresolved_apply > 0) {
+                log_write(gap_pg.raw, {
+                    .level = (gap_sweep.unresolved_capture > 0 || gap_sweep.unresolved_apply > 0)
+                                 ? LogLevel::Warning
+                                 : LogLevel::Info,
+                    .component = "cdc_daemon",
+                    .message = "gap playbook sweep",
+                    .batch_id = round_batch_id,
+                    .conn_id = std::nullopt,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {
+                        {"capture_recovered", gap_sweep.capture_recovered},
+                        {"apply_recovered", gap_sweep.apply_recovered},
+                        {"unresolved_capture", gap_sweep.unresolved_capture},
+                        {"unresolved_apply", gap_sweep.unresolved_apply},
+                    },
+                });
+            }
+        }
+    }
 
     {
         PgConn catalog_pg(cfg.datasync.conn_string());

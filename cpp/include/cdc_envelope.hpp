@@ -23,6 +23,9 @@ struct CdcEvent {
     nlohmann::json resume_token = nullptr;
     std::string collection;
     std::string ingestion_ts;
+    std::optional<long long> tx_id;
+    /** Empty for row events; "begin" or "commit" for transaction control (op "t"). */
+    std::string tx_event;
 
     nlohmann::json to_kafka_dict() const;
 };

@@ -23,6 +23,17 @@ export function usePolling<T>(
     }
   }, []);
 
+  const refreshWith = useCallback(async (overrideFetcher: () => Promise<T>) => {
+    setLoading(true);
+    try {
+      const result = await overrideFetcher();
+      setData(result);
+      setLastUpdated(new Date());
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (!enabled) return;
     refresh();
@@ -30,5 +41,5 @@ export function usePolling<T>(
     return () => clearInterval(id);
   }, [enabled, intervalMs, refresh]);
 
-  return { data, loading, lastUpdated, refresh };
+  return { data, loading, lastUpdated, refresh, refreshWith };
 }

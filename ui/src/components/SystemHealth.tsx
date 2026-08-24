@@ -9,12 +9,12 @@ export function SystemHealth() {
     30_000,
   );
 
-  const allOk = health
-    ? health.datasync.ok &&
-      health.datalake.ok &&
-      health.kafka.ok &&
-      health.cli.ok
+  const infraOk = health
+    ? health.datasync.ok && health.datalake.ok && health.kafka.ok && health.cli.ok
     : false;
+
+  const pipelineOk = health?.pipelineOk ?? true;
+  const allOk = health ? infraOk && pipelineOk : false;
 
   return (
     <div className="panel inline-flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2">

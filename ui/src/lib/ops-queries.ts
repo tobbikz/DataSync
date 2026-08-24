@@ -164,3 +164,24 @@ export const REFRESH_OPS_VIEWS_SQL = `
   REFRESH MATERIALIZED VIEW CONCURRENTLY cdc_catalog.mv_tab_kafka_hourly_3d;
   REFRESH MATERIALIZED VIEW CONCURRENTLY cdc_catalog.mv_tab_logs_hourly_3d;
 `;
+
+export const OPS_GAP_EVENTS_SQL = `
+  SELECT
+    gap_id,
+    detected_at,
+    conn_id,
+    db_engine::text,
+    gap_side,
+    gap_kind,
+    source_schema,
+    source_table,
+    detail,
+    remediation,
+    tables_flagged::int,
+    resolved_at,
+    batch_id
+  FROM cdc_catalog.gap_events
+  WHERE resolved_at IS NULL
+  ORDER BY detected_at DESC
+  LIMIT 25
+`;

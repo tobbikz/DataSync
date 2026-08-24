@@ -1,5 +1,6 @@
 #include "capture_common.hpp"
 
+#include "cdc_tx.hpp"
 #include "connections.hpp"
 #include "pipeline_defaults.hpp"
 
@@ -16,6 +17,7 @@ std::atomic<bool> g_shutdown{false};
 #endif
 #include "kafka_topics.hpp"
 #include "cdc_envelope.hpp"
+#include "kafka_producer.hpp"
 #include "mariadb_binlog.hpp"
 #include "mariadb_conn.hpp"
 #include "mariadb_schema.hpp"
@@ -24,6 +26,7 @@ std::atomic<bool> g_shutdown{false};
 #include "obs_log.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <chrono>
 #include <fstream>
@@ -3123,3 +3126,37 @@ void ensure_capture_kafka_topics(
     const std::vector<std::pair<std::string, std::string>>&) {}
 
 #endif
+
+void cdc_attach_row_tx(CdcEvent& event, long long tx_id) {
+    if (tx_id != 0) {
+        event.tx_id = tx_id;
+        event.tx_event = "data";
+    }
+}
+
+void cdc_publish_tx_marker(
+    KafkaProducer& producer,
+    const std::string& topic_prefix,
+    const std::string& conn_id,
+    const std::string& db_engine,
+    const std::string& tx_event,
+    long long tx_id,
+    const std::function<void(CdcEvent&)>& enrich) {
+    const long long ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+    CdcEvent event;
+    event.op = "t";
+    event.conn_id = conn_id;
+    event.db_engine = db_engine;
+    event.tx_id = tx_id;
+    event.tx_event = tx_event;
+    event.ts_ms = ts_ms;
+    event.ingestion_ts = utc_iso_timestamp_now();
+    if (enrich) {
+        enrich(event);
+    }
+    const std::string topic = topic_prefix + ".__transaction";
+    producer.produce(topic, std::to_string(tx_id), cdc_event_kafka_payload(event), 0);
+}
+

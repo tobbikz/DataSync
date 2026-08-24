@@ -155,17 +155,17 @@ export async function PATCH(
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  if (body.mode !== "enable" && body.mode !== "disable") {
+  if (body.mode !== "enable" && body.mode !== "disable" && body.mode !== "reset") {
     return NextResponse.json(
-      { error: 'mode must be "enable" or "disable"' },
+      { error: 'mode must be "enable", "disable", or "reset"' },
       { status: 400 },
     );
   }
 
   const sql =
-    body.mode === "enable"
-      ? ENABLE_CATALOG_REPLICATION_SQL
-      : DISABLE_CATALOG_REPLICATION_SQL;
+    body.mode === "disable"
+      ? DISABLE_CATALOG_REPLICATION_SQL
+      : ENABLE_CATALOG_REPLICATION_SQL;
 
   const result = await mutate<ReplicationRow>(sql, [id]);
   if (!result.ok) {
@@ -179,7 +179,9 @@ export async function PATCH(
   const message =
     body.mode === "enable"
       ? "catalog replication enabled (active, cdc_enabled, capture_during_full_load)"
-      : "catalog replication disabled";
+      : body.mode === "reset"
+        ? "catalog replication reset (full-load reboot requested)"
+        : "catalog replication disabled";
 
   await mutate(LOG_CATALOG_REPLICATION_SQL, [
     message,

@@ -129,7 +129,8 @@ BinlogCliStats read_remote_binlog_cli(
     int max_seconds,
     int max_events,
     const BinlogRowHandler& on_row,
-    const std::function<bool()>& should_stop) {
+    const std::function<bool()>& should_stop,
+    const BinlogTxHandler& on_tx) {
     BinlogCliStats stats;
     stats.last_file = start.file;
     stats.last_position = start.position;
@@ -184,6 +185,7 @@ BinlogCliStats read_remote_binlog_cli(
     bool in_set = false;
     std::map<int, std::string> where_cols;
     std::map<int, std::string> set_cols;
+    std::optional<long long> current_tx_id;
 
     auto flush_row = [&]() {
         if (pending_schema.empty() || pending_table.empty() || pending_op.empty()) {
@@ -238,7 +240,7 @@ BinlogCliStats read_remote_binlog_cli(
             before_values = &before_vec;
         }
 
-        on_row(pending_schema, pending_table, pending_op, values, before_values, stats.last_position);
+        on_row(pending_schema, pending_table, pending_op, values, before_values, stats.last_position, current_tx_id);
         stats.events += 1;
         if (pending_op == "DELETE") {
             stats.deletes += 1;
@@ -327,6 +329,24 @@ BinlogCliStats read_remote_binlog_cli(
                 where_cols[idx] = val;
             } else if (pending_op == "INSERT") {
                 set_cols[idx] = val;
+            }
+            continue;
+        }
+
+        if (line == "BEGIN") {
+            if (on_tx) {
+                on_tx("begin", current_tx_id.value_or(0LL), stats.last_position);
+            }
+            continue;
+        }
+        if (line.rfind("Xid = ", 0) == 0) {
+            try {
+                const long long xid = std::stoll(trim(line.substr(6)));
+                current_tx_id = xid;
+                if (on_tx) {
+                    on_tx("commit", xid, stats.last_position);
+                }
+            } catch (...) {
             }
             continue;
         }

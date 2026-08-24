@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cdc_envelope.hpp"
+#include "cdc_tx.hpp"
 #include "config.hpp"
 #include "pipeline_defaults.hpp"
 
@@ -7,10 +9,14 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <functional>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
+
+class KafkaProducer;
 
 extern std::atomic<bool> g_shutdown;
 
@@ -370,3 +376,14 @@ int run_onboard_pending(
     const std::string& batch_id,
     const std::optional<std::string>& conn_id_filter,
     CatalogHotTier hot_tier);
+
+void cdc_attach_row_tx(CdcEvent& event, long long tx_id);
+
+void cdc_publish_tx_marker(
+    KafkaProducer& producer,
+    const std::string& topic_prefix,
+    const std::string& conn_id,
+    const std::string& db_engine,
+    const std::string& tx_event,
+    long long tx_id,
+    const std::function<void(CdcEvent&)>& enrich = {});

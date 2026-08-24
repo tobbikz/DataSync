@@ -29,6 +29,12 @@ using BinlogRowHandler = std::function<void(
     const std::string& op,
     const std::vector<std::string>& col_values,
     const std::vector<std::string>* before_col_values,
+    long long event_position,
+    const std::optional<long long>& tx_id)>;
+
+using BinlogTxHandler = std::function<void(
+    const std::string& tx_event,
+    long long tx_id,
     long long event_position)>;
 
 BinlogCliStats read_remote_binlog_cli(
@@ -37,4 +43,5 @@ BinlogCliStats read_remote_binlog_cli(
     int max_seconds,
     int max_events,
     const BinlogRowHandler& on_row,
-    const std::function<bool()>& should_stop);
+    const std::function<bool()>& should_stop,
+    const BinlogTxHandler& on_tx = {});

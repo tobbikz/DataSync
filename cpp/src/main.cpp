@@ -16,6 +16,7 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "pipeline_defaults.hpp"
+#include "retention_maintenance.hpp"
 #include "schema_migrate.hpp"
 
 #ifdef HAVE_MONGOC
