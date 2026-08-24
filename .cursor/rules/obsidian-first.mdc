@@ -9,11 +9,11 @@ alwaysApply: true
 
 Before coding, designing, operating, or delegating on DataSync:
 
-1. Open **`/home/iks/Documents/Obsidian Vault/DataLake/Cursor Rules Hub.md`** (rules, skills, index)
+1. Open **`/home/iks/Documents/Obsidian Vault/DataSync/Cursor Rules Hub.md`** (rules, skills, index)
 2. Product / repo reference: **`/home/iks/Documents/Obsidian Vault/DataSync/DataSync.md`** (deploy files, C++ hubs)
 3. Read the rules relevant to your task (observability, pipeline knobs, orchestrator, UI design, etc.)
-4. For CDC sprints: read **`DataLake/Skills/CDC Orchestrator/PROJECT-STATE.md`**
+4. For CDC sprints: read **`DataSync/Skills/CDC Orchestrator/PROJECT-STATE.md`**
 
-After meaningful changes, update Obsidian per **Rules/Obsidian Project Docs** — link from `DataLake/DataLake ETL (C++).md` when adding topics.
+After meaningful changes, update Obsidian per **Rules/Obsidian Project Docs** — link from `DataSync/DataSync.md` when adding topics.
 
 Do **not** recreate `.cursor/rules/` or `docs/` in the repo. The vault is the single source of truth.
