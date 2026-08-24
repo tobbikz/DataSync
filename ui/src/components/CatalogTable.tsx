@@ -66,12 +66,14 @@ function CatalogDetailPanel({
   onEnable,
   onDisable,
   onReset,
+  onUnquarantine,
 }: {
   detail: CatalogDetailResponse;
   busy: boolean;
   onEnable: () => void;
   onDisable: () => void;
   onReset: () => void;
+  onUnquarantine: () => void;
 }) {
   const { catalog, apply_position, recent_stats, recent_logs } = detail;
   const replicationOn =
@@ -105,6 +107,17 @@ function CatalogDetailPanel({
             title="Re-run enable replication (full-load reboot)"
           >
             RESET
+          </button>
+        ) : null}
+        {catalog.quarantined ? (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onUnquarantine}
+            className="btn-secondary py-1 text-[11px] border-error/40 text-error"
+            title="Clear apply quarantine and resume Kafka apply for this table"
+          >
+            UNQUARANTINE
           </button>
         ) : null}
         <span className="font-mono text-[10px] text-foreground-muted">
@@ -302,7 +315,7 @@ export function CatalogTable() {
 
   async function setReplication(
     catalogId: number,
-    mode: "enable" | "disable" | "reset",
+    mode: "enable" | "disable" | "reset" | "unquarantine",
     reloadDetail = false,
   ) {
     setReplicationBusy(catalogId);
@@ -536,6 +549,22 @@ export function CatalogTable() {
                             </button>
                           </>
                         ) : null}
+                        {row.quarantined ? (
+                          <>
+                            <span className="table-action-sep">·</span>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() =>
+                                setReplication(row.catalog_id, "unquarantine", isOpen)
+                              }
+                              className="table-action text-[10px] text-error"
+                              title="Clear apply quarantine and resume Kafka apply"
+                            >
+                              UNQUARANTINE
+                            </button>
+                          </>
+                        ) : null}
                       </div>
                     </div>
                   </div>
@@ -558,6 +587,9 @@ export function CatalogTable() {
                           }
                           onReset={() =>
                             setReplication(row.catalog_id, "reset", true)
+                          }
+                          onUnquarantine={() =>
+                            setReplication(row.catalog_id, "unquarantine", true)
                           }
                         />
                       ) : (

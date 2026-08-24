@@ -5,6 +5,7 @@ import {
   DISABLE_CATALOG_REPLICATION_SQL,
   ENABLE_CATALOG_REPLICATION_SQL,
   LOG_CATALOG_REPLICATION_SQL,
+  UNQUARANTINE_CATALOG_SQL,
   type CatalogReplicationMode,
 } from "@/lib/catalog-replication";
 import { mutate, query } from "@/lib/db";
@@ -155,11 +156,57 @@ export async function PATCH(
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  if (body.mode !== "enable" && body.mode !== "disable" && body.mode !== "reset") {
+  if (
+    body.mode !== "enable" &&
+    body.mode !== "disable" &&
+    body.mode !== "reset" &&
+    body.mode !== "unquarantine"
+  ) {
     return NextResponse.json(
-      { error: 'mode must be "enable", "disable", or "reset"' },
+      { error: 'mode must be "enable", "disable", "reset", or "unquarantine"' },
       { status: 400 },
     );
+  }
+
+  if (body.mode === "unquarantine") {
+    const result = await mutate<
+      ReplicationRow & { apply_rows: number; catalog_rows: number }
+    >(UNQUARANTINE_CATALOG_SQL, [id]);
+    if (!result.ok) {
+      return NextResponse.json({ error: result.error }, { status: 500 });
+    }
+    if (result.rows.length === 0) {
+      return NextResponse.json({ error: "Catalog entry not found" }, { status: 404 });
+    }
+    const row = result.rows[0];
+    const cleared = Number(row.apply_rows ?? 0) + Number(row.catalog_rows ?? 0);
+    if (cleared === 0) {
+      return NextResponse.json(
+        { error: "Table is not quarantined (apply_position or catalog)" },
+        { status: 409 },
+      );
+    }
+
+    await mutate(LOG_CATALOG_REPLICATION_SQL, [
+      "catalog unquarantined (apply resumed)",
+      row.conn_id,
+      row.source_schema,
+      row.source_table,
+      JSON.stringify({
+        catalog_id: row.catalog_id,
+        apply_rows: row.apply_rows,
+        catalog_rows: row.catalog_rows,
+        via: "ui",
+      }),
+    ]);
+
+    return NextResponse.json({
+      ok: true,
+      mode: body.mode,
+      apply_rows: row.apply_rows,
+      catalog_rows: row.catalog_rows,
+      catalog: row,
+    });
   }
 
   const sql =
