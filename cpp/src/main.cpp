@@ -215,6 +215,8 @@ void print_usage(const char* prog) {
               << "  " << prog << " kafka-apply --conn-id ID\n"
               << "  " << prog << " capture --conn-id ID\n"
               << "  " << prog << " coercion-audit [--conn-id ID] [--apply]\n"
+              << "  " << prog << " catalog-schema-only\n"
+              << "  " << prog << " lake-schema-only\n"
               << "  " << prog << " daemon [--once]\n"
               << "  " << prog << " [--config PATH] <command> ...\n"
               << "  PG: config.json at project root (datasync + datalake)\n"
@@ -270,7 +272,8 @@ int main(int argc, char** argv) {
     if (command != "discover" && command != "full-load" && command != "ddl-sync" &&
         command != "kafka-apply" && command != "capture" &&
         command != "daemon" && command != "onboard-pending" &&
-        command != "lake-schema-only" && command != "coercion-audit") {
+        command != "lake-schema-only" && command != "coercion-audit" &&
+        command != "catalog-schema-only") {
         print_usage(argv[0]);
         return 2;
     }
@@ -298,6 +301,12 @@ int main(int argc, char** argv) {
         if (command == "lake-schema-only") {
             PgConn lake_pg(cfg.datalake.conn_string());
             ensure_lake_schema(lake_pg.raw);
+            return 0;
+        }
+
+        if (command == "catalog-schema-only") {
+            PgConn log_pg(cfg.datasync.conn_string());
+            ensure_cdc_catalog_schema(log_pg.raw);
             return 0;
         }
 
