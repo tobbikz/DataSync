@@ -21,6 +21,7 @@ std::atomic<bool> g_shutdown{false};
 #include "mariadb_binlog.hpp"
 #include "mariadb_conn.hpp"
 #include "mariadb_schema.hpp"
+#include "type_coercion.hpp"
 #include "mssql_lake.hpp"
 #include "mongo_lake.hpp"
 #include "obs_log.hpp"
@@ -2673,6 +2674,9 @@ bool onboard_table_after_full_load(
     }
     const bool enabled = enable_cdc_after_full_load_table(
         pg, catalog_id, batch_id, conn_id, source_schema, source_table);
+    if (enabled && db_engine == "mariadb") {
+        stamp_mariadb_coercion_version(pg, catalog_id);
+    }
     if (stats.errors > 0) {
         log_write(pg, {
             .level = LogLevel::Warning,

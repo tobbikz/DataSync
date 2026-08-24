@@ -18,6 +18,7 @@
 #include "pipeline_defaults.hpp"
 #include "retention_maintenance.hpp"
 #include "schema_migrate.hpp"
+#include "type_coercion.hpp"
 
 #ifdef HAVE_MONGOC
 #include "mongo_conn.hpp"
@@ -213,6 +214,7 @@ void print_usage(const char* prog) {
               << "  " << prog << " ddl-sync --conn-id ID [--schema S] [--table T]\n"
               << "  " << prog << " kafka-apply --conn-id ID\n"
               << "  " << prog << " capture --conn-id ID\n"
+              << "  " << prog << " coercion-audit [--conn-id ID] [--apply]\n"
               << "  " << prog << " daemon [--once]\n"
               << "  " << prog << " [--config PATH] <command> ...\n"
               << "  PG: config.json at project root (datasync + datalake)\n"
@@ -230,6 +232,7 @@ int main(int argc, char** argv) {
     bool skip_onboard = false;
     bool hot_only = false;
     bool cold_only = false;
+    bool apply_flags = false;
     std::string config_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -248,6 +251,8 @@ int main(int argc, char** argv) {
             hot_only = true;
         } else if (arg == "--cold-only") {
             cold_only = true;
+        } else if (arg == "--apply") {
+            apply_flags = true;
         } else if (arg == "--config" && i + 1 < argc) {
             config_path = argv[++i];
         } else if (arg == "-h" || arg == "--help") {
@@ -265,7 +270,7 @@ int main(int argc, char** argv) {
     if (command != "discover" && command != "full-load" && command != "ddl-sync" &&
         command != "kafka-apply" && command != "capture" &&
         command != "daemon" && command != "onboard-pending" &&
-        command != "lake-schema-only") {
+        command != "lake-schema-only" && command != "coercion-audit") {
         print_usage(argv[0]);
         return 2;
     }
@@ -364,6 +369,15 @@ int main(int argc, char** argv) {
         }
         if (command == "capture") {
             return run_capture_cli(cfg, log_pg.raw, conn_id, 0, kCaptureWorkerCount);
+        }
+        if (command == "coercion-audit") {
+            PgConn lake_pg(cfg.datalake.conn_string());
+            return run_coercion_audit_cli(
+                cfg,
+                log_pg.raw,
+                lake_pg.raw,
+                conn_id.empty() ? std::nullopt : std::optional(conn_id),
+                apply_flags);
         }
         if (command == "daemon") {
             return run_cdc_daemon(cfg, log_pg.raw, once);

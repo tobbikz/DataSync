@@ -54,6 +54,7 @@ set(DATASYNC_SOURCES
     src/retention_maintenance.cpp
     src/schema_migrate.cpp
     src/cdc_gap.cpp
+    src/type_coercion.cpp
 )
 
 find_path(FREETDS_INCLUDE_DIR NAMES sybdb.h)
@@ -170,4 +171,12 @@ if(BUILD_TESTING)
     target_include_directories(datasync_gap_kind_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(datasync_gap_kind_tests PRIVATE -Wall -Wextra)
     add_test(NAME gap_kind_tests COMMAND datasync_gap_kind_tests)
+
+    add_executable(datasync_coercion_sensitive_tests tests/coercion_sensitive_tests.cpp)
+    target_include_directories(datasync_coercion_sensitive_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    if(nlohmann_json_FOUND)
+        target_link_libraries(datasync_coercion_sensitive_tests PRIVATE nlohmann_json::nlohmann_json)
+    endif()
+    target_compile_options(datasync_coercion_sensitive_tests PRIVATE -Wall -Wextra)
+    add_test(NAME coercion_sensitive_tests COMMAND datasync_coercion_sensitive_tests)
 endif()
