@@ -2674,8 +2674,8 @@ bool onboard_table_after_full_load(
     }
     const bool enabled = enable_cdc_after_full_load_table(
         pg, catalog_id, batch_id, conn_id, source_schema, source_table);
-    if (enabled && db_engine == "mariadb") {
-        stamp_mariadb_coercion_version(pg, catalog_id);
+    if (enabled) {
+        stamp_coercion_version_for_engine(pg, catalog_id, db_engine);
     }
     if (stats.errors > 0) {
         log_write(pg, {
