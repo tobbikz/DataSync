@@ -241,25 +241,10 @@ MssqlRetryOptions mssql_retry_options() {
     return opts;
 }
 
-struct PkRange {
-    bool active{false};
-    std::string lower_inclusive;
-    std::string upper_exclusive;
-    bool numeric{false};
+struct PkBounds {
+    long long min_v{0};
+    long long max_v{0};
 };
-
-PkRange pk_range_for_keyset(const PkRange& bounds) {
-    PkRange range = bounds;
-    if (!range.active || !range.numeric || range.upper_exclusive.empty()) {
-        return range;
-    }
-    try {
-        const long long max_v = std::stoll(range.upper_exclusive);
-        range.upper_exclusive = (max_v < LLONG_MAX) ? std::to_string(max_v + 1) : range.upper_exclusive;
-    } catch (...) {
-    }
-    return range;
-}
 
 std::string pk_sql_literal(const MssqlColumn* col_def, const std::string& value) {
     if (col_def && is_integer_pk_type(*col_def)) {
@@ -268,24 +253,22 @@ std::string pk_sql_literal(const MssqlColumn* col_def, const std::string& value)
     return sql_quote(value);
 }
 
-std::string pk_range_clause(
-    const std::string& pk_col,
-    const PkRange& range,
-    const MssqlColumn* col_def,
-    bool upper_exclusive = true) {
-    if (!range.active) {
-        return {};
-    }
-    std::ostringstream clause;
-    if (!range.lower_inclusive.empty()) {
-        clause << " AND " << brack(pk_col) << " >= "
-               << (range.numeric ? range.lower_inclusive : pk_sql_literal(col_def, range.lower_inclusive));
-    }
-    if (!range.upper_exclusive.empty()) {
-        clause << " AND " << brack(pk_col) << " " << (upper_exclusive ? "< " : "<= ")
-               << (range.numeric ? range.upper_exclusive : pk_sql_literal(col_def, range.upper_exclusive));
-    }
-    return clause.str();
+/** Quotes each PK value according to the column type it belongs to. */
+full_load::LiteralQuoter mssql_literal_quoter(
+    const std::vector<std::string>& pk_cols,
+    const std::vector<MssqlColumn>& cols) {
+    return [&pk_cols, &cols](std::size_t idx, const std::string& value) -> std::string {
+        const MssqlColumn* def = nullptr;
+        if (idx < pk_cols.size()) {
+            for (const auto& col : cols) {
+                if (col.name == pk_cols[idx]) {
+                    def = &col;
+                    break;
+                }
+            }
+        }
+        return pk_sql_literal(def, value);
+    };
 }
 
 std::string mssql_keyset_clause(
@@ -295,35 +278,16 @@ std::string mssql_keyset_clause(
     if (last_pk_values.empty()) {
         return {};
     }
-    auto col_def = [&](const std::string& name) -> const MssqlColumn* {
-        for (const auto& col : cols) {
-            if (col.name == name) {
-                return &col;
-            }
-        }
-        return nullptr;
-    };
-
-    std::ostringstream clause;
-    clause << " AND (";
-    for (std::size_t depth = 0; depth < pk_cols.size(); ++depth) {
-        if (depth) {
-            clause << " OR ";
-        }
-        clause << "(";
-        for (std::size_t eq = 0; eq < depth; ++eq) {
-            clause << brack(pk_cols[eq]) << " = "
-                   << pk_sql_literal(col_def(pk_cols[eq]), last_pk_values[eq]) << " AND ";
-        }
-        clause << brack(pk_cols[depth]) << " > "
-               << pk_sql_literal(col_def(pk_cols[depth]), last_pk_values[depth]);
-        clause << ")";
-    }
-    clause << ")";
-    return clause.str();
+    const std::string clause = full_load::lexicographic_tuple_clause(
+        pk_cols,
+        last_pk_values,
+        full_load::TupleOp::Gt,
+        brack,
+        mssql_literal_quoter(pk_cols, cols));
+    return clause.empty() ? std::string() : " AND " + clause;
 }
 
-std::optional<PkRange> fetch_integer_pk_range(
+std::optional<PkBounds> fetch_integer_pk_bounds(
     MssqlConn& mssql,
     const std::string& schema,
     const std::string& table,
@@ -337,20 +301,91 @@ std::optional<PkRange> fetch_integer_pk_range(
         if (result.rows.empty() || result.rows[0].size() < 2) {
             return std::nullopt;
         }
-        const std::string min_v = result.rows[0][0].text;
-        const std::string max_v = result.rows[0][1].text;
-        if (min_v.empty() || max_v.empty()) {
+        const std::string min_text = result.rows[0][0].text;
+        const std::string max_text = result.rows[0][1].text;
+        if (min_text.empty() || max_text.empty()) {
             return std::nullopt;
         }
-        PkRange range;
-        range.active = true;
-        range.numeric = true;
-        range.lower_inclusive = min_v;
-        range.upper_exclusive = max_v;
-        return range;
+        PkBounds bounds;
+        bounds.min_v = std::stoll(min_text);
+        bounds.max_v = std::stoll(max_text);
+        return bounds;
     } catch (...) {
         return std::nullopt;
     }
+}
+
+/** Equal-width split of an integer PK; keeps the cheap single-query path for serial keys. */
+std::vector<full_load::PkSlice> integer_pk_slices(const PkBounds& bounds, int workers) {
+    std::vector<full_load::PkSlice> slices;
+    if (workers <= 1 || bounds.min_v >= bounds.max_v) {
+        slices.emplace_back();
+        return slices;
+    }
+    const unsigned long long total = static_cast<unsigned long long>(bounds.max_v) -
+                                     static_cast<unsigned long long>(bounds.min_v) + 1ULL;
+    const unsigned long long span =
+        (total + static_cast<unsigned long long>(workers) - 1ULL) / static_cast<unsigned long long>(workers);
+
+    std::vector<std::vector<std::string>> boundaries;
+    for (int w = 1; w < workers; ++w) {
+        const unsigned long long edge =
+            static_cast<unsigned long long>(bounds.min_v) + static_cast<unsigned long long>(w) * span;
+        if (edge > static_cast<unsigned long long>(bounds.max_v)) {
+            break;
+        }
+        boundaries.push_back({std::to_string(edge)});
+    }
+    return full_load::slices_from_boundaries(boundaries);
+}
+
+/**
+ * Reads the PK tuples sitting at even row offsets along the PK index.
+ * Runs on the caller connection before the copy loop opens a result set on the same
+ * DB-Library handle. Returns a single unbounded slice when a boundary cannot be read.
+ */
+std::vector<full_load::PkSlice> sample_pk_slices(
+    MssqlConn& mssql,
+    const std::string& schema,
+    const std::string& table,
+    const std::vector<std::string>& pk_cols,
+    long long source_rows,
+    int workers,
+    const MssqlRetryOptions& retry) {
+    std::ostringstream pk_list;
+    for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+        if (i) {
+            pk_list << ", ";
+        }
+        pk_list << brack(pk_cols[i]);
+    }
+
+    std::vector<std::vector<std::string>> boundaries;
+    for (long long offset : full_load::slice_boundary_offsets(source_rows, workers)) {
+        std::ostringstream sql;
+        sql << "SELECT " << pk_list.str() << " FROM " << brack(schema) << "." << brack(table) << " ORDER BY "
+            << pk_list.str() << " OFFSET " << offset << " ROWS FETCH NEXT 1 ROWS ONLY";
+        try {
+            const auto result = mssql.query_retry(sql.str(), retry);
+            if (result.rows.empty() || result.rows[0].size() < pk_cols.size()) {
+                return {full_load::PkSlice{}};
+            }
+            std::vector<std::string> boundary;
+            for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+                const std::string& value = result.rows[0][i].text;
+                // cell_as_text truncates at 4096 bytes, and a truncated bound would slice
+                // the table at the wrong key, so give up and copy with a single worker.
+                if (value.empty() || value.size() >= 4095) {
+                    return {full_load::PkSlice{}};
+                }
+                boundary.push_back(value);
+            }
+            boundaries.push_back(std::move(boundary));
+        } catch (...) {
+            return {full_load::PkSlice{}};
+        }
+    }
+    return full_load::slices_from_boundaries(boundaries);
 }
 
 std::string format_pk_row_sample(
@@ -393,7 +428,7 @@ long long copy_rows_keyset(
     int source_sleep_ms,
     const std::string& snapshot_id,
     const MssqlRetryOptions& retry,
-    const PkRange& pk_range = {},
+    const full_load::PkSlice& pk_slice = {},
     InvalidPkSkipStats* skip_stats = nullptr,
     full_load::CopyCheckpointContext* checkpoint_ctx = nullptr) {
     const std::string load_ts = utc_now_ts();
@@ -427,20 +462,16 @@ long long copy_rows_keyset(
     const std::string fq = pg_ident(pg_schema) + "." + pg_ident(pg_table);
     const std::string copy_sql = "COPY " + fq + " (" + copy_cols.str() + ") FROM STDIN WITH (FORMAT csv)";
 
-    const MssqlColumn* pk_col_def = nullptr;
-    if (pk_cols.size() == 1) {
-        for (const auto& col : cols) {
-            if (col.name == pk_cols[0]) {
-                pk_col_def = &col;
-                break;
-            }
-        }
-    }
+    const std::string slice_clause =
+        full_load::slice_where_clause(pk_cols, pk_slice, brack, mssql_literal_quoter(pk_cols, cols));
 
     long long total_rows = 0;
     std::vector<std::string> last_pk_values;
     if (checkpoint_ctx && !checkpoint_ctx->initial_last_pk.empty()) {
         last_pk_values = checkpoint_ctx->initial_last_pk;
+    }
+    if (checkpoint_ctx) {
+        full_load::adopt_lake_copy_position(*checkpoint_ctx, pg, last_pk_values);
     }
     int batch_num = 0;
     const int progress_interval = pipeline_defaults::kMssqlFullLoadCopyProgressInterval;
@@ -468,9 +499,7 @@ long long copy_rows_keyset(
         std::ostringstream query;
         query << "SELECT TOP (" << batch_size << ") " << select_cols.str() << " FROM " << brack(target.source_schema)
               << "." << brack(target.source_table) << " WHERE 1=1";
-        if (pk_range.active && pk_cols.size() == 1) {
-            query << pk_range_clause(pk_cols[0], pk_range, pk_col_def, true);
-        }
+        query << slice_clause;
         query << mssql_keyset_clause(pk_cols, last_pk_values, cols);
         query << " ORDER BY ";
         for (std::size_t i = 0; i < pk_cols.size(); ++i) {
@@ -532,36 +561,62 @@ long long copy_rows_keyset(
             break;
         }
 
-        PGresult* copy_res = PQexec(pg, copy_sql.c_str());
-        if (!copy_res || PQresultStatus(copy_res) != PGRES_COPY_IN) {
-            const std::string err = PQerrorMessage(pg);
-            if (copy_res) {
-                PQclear(copy_res);
-            }
-            throw std::runtime_error("COPY start failed: " + err);
+        // The position has to land in the same transaction as the rows it points at,
+        // otherwise a crash in between makes a resume replay this batch.
+        const bool transactional = checkpoint_ctx != nullptr;
+        if (transactional) {
+            pg_exec(pg, "BEGIN");
         }
-        PQclear(copy_res);
-
-        for (const auto& line : batch_lines) {
-            if (PQputCopyData(pg, line.c_str(), static_cast<int>(line.size())) != 1) {
-                throw std::runtime_error(std::string("COPY data failed: ") + PQerrorMessage(pg));
-            }
-            if (PQputCopyData(pg, "\n", 1) != 1) {
-                throw std::runtime_error(std::string("COPY newline failed: ") + PQerrorMessage(pg));
-            }
-        }
-        if (PQputCopyEnd(pg, nullptr) != 1) {
-            throw std::runtime_error(std::string("COPY end failed: ") + PQerrorMessage(pg));
-        }
-        PGresult* end_res = PQgetResult(pg);
-        while (end_res) {
-            if (PQresultStatus(end_res) != PGRES_COMMAND_OK) {
+        try {
+            PGresult* copy_res = PQexec(pg, copy_sql.c_str());
+            if (!copy_res || PQresultStatus(copy_res) != PGRES_COPY_IN) {
                 const std::string err = PQerrorMessage(pg);
-                PQclear(end_res);
-                throw std::runtime_error("COPY commit failed: " + err);
+                if (copy_res) {
+                    PQclear(copy_res);
+                }
+                throw std::runtime_error("COPY start failed: " + err);
             }
-            PQclear(end_res);
-            end_res = PQgetResult(pg);
+            PQclear(copy_res);
+
+            for (const auto& line : batch_lines) {
+                if (PQputCopyData(pg, line.c_str(), static_cast<int>(line.size())) != 1) {
+                    throw std::runtime_error(std::string("COPY data failed: ") + PQerrorMessage(pg));
+                }
+                if (PQputCopyData(pg, "\n", 1) != 1) {
+                    throw std::runtime_error(std::string("COPY newline failed: ") + PQerrorMessage(pg));
+                }
+            }
+            if (PQputCopyEnd(pg, nullptr) != 1) {
+                throw std::runtime_error(std::string("COPY end failed: ") + PQerrorMessage(pg));
+            }
+            PGresult* end_res = PQgetResult(pg);
+            while (end_res) {
+                if (PQresultStatus(end_res) != PGRES_COMMAND_OK) {
+                    const std::string err = PQerrorMessage(pg);
+                    PQclear(end_res);
+                    throw std::runtime_error("COPY commit failed: " + err);
+                }
+                PQclear(end_res);
+                end_res = PQgetResult(pg);
+            }
+
+            if (transactional) {
+                full_load::record_lake_copy_position(
+                    pg,
+                    checkpoint_ctx->catalog_id,
+                    checkpoint_ctx->worker_id,
+                    checkpoint_ctx->batch_id,
+                    last_pk_values,
+                    checkpoint_ctx->rows_loaded_session_baseline + total_rows +
+                        static_cast<long long>(batch_lines.size()));
+                pg_exec(pg, "COMMIT");
+            }
+        } catch (...) {
+            pg_abort_copy_in(pg);
+            if (transactional) {
+                PQclear(PQexec(pg, "ROLLBACK"));
+            }
+            throw;
         }
 
         total_rows += static_cast<long long>(batch_lines.size());
@@ -590,12 +645,6 @@ long long copy_rows_keyset(
         if (source_sleep_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(source_sleep_ms));
         }
-    }
-
-    if (total_rows == 0 && skip_stats && skip_stats->count > 0) {
-        throw std::runtime_error(
-            "full load: all scanned rows skipped due to invalid primary key (count=" +
-            std::to_string(skip_stats->count) + ")");
     }
 
     return total_rows;
@@ -668,78 +717,85 @@ long long copy_rows_parallel(
         return ctx;
     };
 
-    if (workers <= 1) {
-        auto ctx = checkpoint_for_worker(0);
-        return copy_rows_keyset(
-            mssql,
-            pg,
-            log_pg,
-            log_mtx,
-            target,
-            cols,
-            pk_cols,
-            pg_schema,
-            pg_table,
-            batch_size,
-            source_sleep_ms,
-            snapshot_id,
-            retry,
-            {},
-            skip_stats,
-            &ctx);
+    // A resumed load reuses the persisted split: re-sampling a source that changed since
+    // would move the boundaries and duplicate or skip rows.
+    std::vector<full_load::PkSlice> slices;
+    bool plan_persisted = false;
+    if (resume_checkpoints) {
+        slices = full_load::slice_plan_from_checkpoints(*resume_checkpoints);
+        plan_persisted = !slices.empty();
     }
 
-    if (pk_cols.size() != 1) {
-        log_fl(
-            log_pg,
-            log_mtx,
-            LogLevel::Info,
-            snapshot_id,
-            "parallel copy workers disabled: composite primary key",
-            {{"workers_requested", workers}},
-            target.conn_id,
-            target.source_schema,
-            target.source_table);
-        auto ctx = checkpoint_for_worker(0);
-        return copy_rows_keyset(
-            mssql,
-            pg,
-            log_pg,
-            log_mtx,
-            target,
-            cols,
-            pk_cols,
-            pg_schema,
-            pg_table,
-            batch_size,
-            source_sleep_ms,
-            snapshot_id,
-            retry,
-            {},
-            skip_stats,
-            &ctx);
-    }
-
-    const MssqlColumn* pk_col_def = nullptr;
-    for (const auto& col : cols) {
-        if (col.name == pk_cols[0]) {
-            pk_col_def = &col;
-            break;
+    std::string split_mode = "resumed_plan";
+    if (slices.empty()) {
+        const MssqlColumn* pk_col_def = nullptr;
+        if (pk_cols.size() == 1) {
+            for (const auto& col : cols) {
+                if (col.name == pk_cols[0]) {
+                    pk_col_def = &col;
+                    break;
+                }
+            }
+        }
+        const long long rows = source_rows.value_or(-1);
+        if (workers <= 1 || pk_cols.empty()) {
+            split_mode = "single_worker";
+            slices.emplace_back();
+        } else if (pk_col_def && is_integer_pk_type(*pk_col_def)) {
+            // Serial keys keep the cheap path: one MIN/MAX query instead of sampling.
+            const auto bounds =
+                fetch_integer_pk_bounds(mssql, target.source_schema, target.source_table, pk_cols[0], retry);
+            if (bounds) {
+                split_mode = "integer_bounds";
+                slices = integer_pk_slices(*bounds, workers);
+            } else {
+                split_mode = "single_worker_no_pk_bounds";
+                slices.emplace_back();
+            }
+        } else if (rows >= pipeline_defaults::kFullLoadSliceSampleMinRows) {
+            split_mode = "sampled_boundaries";
+            slices = sample_pk_slices(
+                mssql, target.source_schema, target.source_table, pk_cols, rows, workers, retry);
+        } else {
+            split_mode = rows < 0 ? "single_worker_unknown_row_count" : "single_worker_small_table";
+            slices.emplace_back();
         }
     }
-    if (!pk_col_def || !is_integer_pk_type(*pk_col_def)) {
-        log_fl(
-            log_pg,
-            log_mtx,
-            LogLevel::Info,
-            snapshot_id,
-            "parallel copy workers disabled: non-numeric primary key",
-            {{"workers_requested", workers}},
-            target.conn_id,
-            target.source_schema,
-            target.source_table);
+    if (slices.empty()) {
+        slices.emplace_back();
+    }
+
+    const int worker_count = static_cast<int>(slices.size());
+    if (!plan_persisted && worker_count > 1) {
+        full_load::save_copy_slice_plan(app_pg, target.catalog_id, snapshot_id, slices, source_rows);
+    }
+
+    log_fl(
+        log_pg,
+        log_mtx,
+        LogLevel::Info,
+        snapshot_id,
+        worker_count > 1 ? "parallel copy workers started" : "copy running on a single worker",
+        {{"workers", worker_count},
+         {"workers_requested", workers},
+         {"split_mode", split_mode},
+         {"pk_columns", static_cast<int>(pk_cols.size())},
+         {"source_rows", source_rows.value_or(-1)}},
+        target.conn_id,
+        target.source_schema,
+        target.source_table);
+
+    auto fail_if_only_skips = [&](long long rows) {
+        if (rows == 0 && skip_stats && skip_stats->count > 0) {
+            throw std::runtime_error(
+                "full load: all scanned rows skipped due to invalid primary key (count=" +
+                std::to_string(skip_stats->count) + ")");
+        }
+    };
+
+    if (worker_count == 1) {
         auto ctx = checkpoint_for_worker(0);
-        return copy_rows_keyset(
+        const long long rows = copy_rows_keyset(
             mssql,
             pg,
             log_pg,
@@ -753,145 +809,22 @@ long long copy_rows_parallel(
             source_sleep_ms,
             snapshot_id,
             retry,
-            {},
+            slices[0],
             skip_stats,
             &ctx);
+        fail_if_only_skips(rows);
+        return rows;
     }
 
-    log_fl(
-        log_pg,
-        log_mtx,
-        LogLevel::Info,
-        snapshot_id,
-        "mssql pk bounds query started",
-        {{"pk_column", pk_cols[0]}},
-        target.conn_id,
-        target.source_schema,
-        target.source_table);
-
-    const auto bounds = fetch_integer_pk_range(mssql, target.source_schema, target.source_table, pk_cols[0], retry);
-    if (!bounds) {
-        log_fl(
-            log_pg,
-            log_mtx,
-            LogLevel::Info,
-            snapshot_id,
-            "mssql pk bounds empty; table has no rows or non-integer PK bounds",
-            {},
-            target.conn_id,
-            target.source_schema,
-            target.source_table);
-        return 0;
-    }
-
-    long long min_v = 0;
-    long long max_v = 0;
-    try {
-        min_v = std::stoll(bounds->lower_inclusive);
-        max_v = std::stoll(bounds->upper_exclusive);
-    } catch (...) {
-        log_fl(
-            log_pg,
-            log_mtx,
-            LogLevel::Info,
-            snapshot_id,
-            "parallel copy workers disabled: PK bounds not integer",
-            {{"workers_requested", workers}},
-            target.conn_id,
-            target.source_schema,
-            target.source_table);
-        auto ctx = checkpoint_for_worker(0);
-        return copy_rows_keyset(
-            mssql,
-            pg,
-            log_pg,
-            log_mtx,
-            target,
-            cols,
-            pk_cols,
-            pg_schema,
-            pg_table,
-            batch_size,
-            source_sleep_ms,
-            snapshot_id,
-            retry,
-            pk_range_for_keyset(*bounds),
-            skip_stats,
-            &ctx);
-    }
-
-    log_fl(
-        log_pg,
-        log_mtx,
-        LogLevel::Info,
-        snapshot_id,
-        "mssql pk bounds resolved",
-        {{"pk_min", min_v}, {"pk_max", max_v}},
-        target.conn_id,
-        target.source_schema,
-        target.source_table);
-
-    if (min_v >= max_v) {
-        auto ctx = checkpoint_for_worker(0);
-        return copy_rows_keyset(
-            mssql,
-            pg,
-            log_pg,
-            log_mtx,
-            target,
-            cols,
-            pk_cols,
-            pg_schema,
-            pg_table,
-            batch_size,
-            source_sleep_ms,
-            snapshot_id,
-            retry,
-            pk_range_for_keyset(*bounds),
-            skip_stats,
-            &ctx);
-    }
-
-    const unsigned long long total =
-        static_cast<unsigned long long>(max_v) - static_cast<unsigned long long>(min_v) + 1ULL;
-    const long long span = static_cast<long long>((total + static_cast<unsigned long long>(workers) - 1ULL) /
-                                                  static_cast<unsigned long long>(workers));
-
-    log_fl(
-        log_pg,
-        log_mtx,
-        LogLevel::Info,
-        snapshot_id,
-        "parallel copy workers started",
-        {{"workers", workers}, {"pk_min", min_v}, {"pk_max", max_v}, {"span", span}},
-        target.conn_id,
-        target.source_schema,
-        target.source_table);
-
-    std::vector<long long> row_counts(static_cast<std::size_t>(workers), 0);
-    std::vector<InvalidPkSkipStats> worker_skips(static_cast<std::size_t>(workers));
-    std::vector<std::exception_ptr> errors(static_cast<std::size_t>(workers));
+    std::vector<long long> row_counts(static_cast<std::size_t>(worker_count), 0);
+    std::vector<InvalidPkSkipStats> worker_skips(static_cast<std::size_t>(worker_count));
+    std::vector<std::exception_ptr> errors(static_cast<std::size_t>(worker_count));
     std::vector<std::thread> threads;
-    threads.reserve(static_cast<std::size_t>(workers));
+    threads.reserve(static_cast<std::size_t>(worker_count));
 
-    for (int w = 0; w < workers; ++w) {
+    for (int w = 0; w < worker_count; ++w) {
         threads.emplace_back([&, w]() {
             try {
-                PkRange slice;
-                slice.active = true;
-                slice.numeric = true;
-                const unsigned long long lo =
-                    static_cast<unsigned long long>(min_v) +
-                    static_cast<unsigned long long>(w) * static_cast<unsigned long long>(span);
-                const unsigned long long hi_ex =
-                    (w == workers - 1)
-                        ? (max_v < LLONG_MAX ? static_cast<unsigned long long>(max_v) + 1ULL
-                                             : static_cast<unsigned long long>(max_v))
-                        : static_cast<unsigned long long>(min_v) +
-                              static_cast<unsigned long long>(w + 1) * static_cast<unsigned long long>(span);
-                slice.lower_inclusive = std::to_string(lo);
-                slice.upper_exclusive = std::to_string(hi_ex);
-
                 MssqlConn worker_mssql(source);
                 worker_mssql.use_database(target.source_database);
                 PgConn worker_lake(cfg.datalake.conn_string());
@@ -910,7 +843,7 @@ long long copy_rows_parallel(
                     source_sleep_ms,
                     snapshot_id,
                     retry,
-                    slice,
+                    slices[static_cast<std::size_t>(w)],
                     &worker_skips[static_cast<std::size_t>(w)],
                     &ctx);
             } catch (...) {
@@ -923,21 +856,25 @@ long long copy_rows_parallel(
         thread.join();
     }
 
+    long long total_rows = 0;
+    for (long long n : row_counts) {
+        total_rows += n;
+    }
+    // Merge skips before rethrowing so a failing worker does not hide why rows were dropped.
+    if (skip_stats) {
+        for (const auto& worker_skip : worker_skips) {
+            skip_stats->merge(worker_skip);
+        }
+    }
+
     for (const auto& err : errors) {
         if (err) {
             std::rethrow_exception(err);
         }
     }
 
-    long long total_rows = 0;
-    for (long long n : row_counts) {
-        total_rows += n;
-    }
-    if (skip_stats) {
-        for (const auto& worker_skip : worker_skips) {
-            skip_stats->merge(worker_skip);
-        }
-    }
+    // A slice can legitimately be empty, so this only fails when no worker copied anything.
+    fail_if_only_skips(total_rows);
     return total_rows;
 }
 
@@ -1253,6 +1190,7 @@ TableLoadOutcome load_one_table(
             target.source_table);
     } else {
         clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
+        full_load::clear_lake_copy_positions(lake_pg.raw, target.catalog_id);
         const auto trunc = full_load::truncate_lake_table_verified(
             lake_pg.raw,
             pg_schema,
@@ -1417,6 +1355,7 @@ TableLoadOutcome load_one_table(
 
     mark_catalog_success(app_pg.raw, target.catalog_id);
     clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
+    full_load::clear_lake_copy_positions(lake_pg.raw, target.catalog_id);
 
     try {
         if (seed_mssql_cdc_lsn_t0_for_table(

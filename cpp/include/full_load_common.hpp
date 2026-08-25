@@ -1,6 +1,7 @@
 #pragma once
 
 #include "full_load_checkpoint.hpp"
+#include "full_load_slice.hpp"
 #include "obs_log.hpp"
 
 #include <libpq-fe.h>
@@ -109,6 +110,65 @@ void save_copy_batch_checkpoint(
     CopyCheckpointContext& ctx,
     const std::vector<std::string>& last_pk_values,
     long long rows_loaded_total);
+
+/** Worker COPY position as committed in the lake, in lake.full_load_position. */
+struct LakeCopyPosition {
+    std::vector<std::string> last_pk;
+    long long rows_loaded{0};
+};
+
+/**
+ * Upserts the worker position. Must run inside the transaction that carries the COPY it
+ * describes, so that data and position can never disagree.
+ */
+void record_lake_copy_position(
+    PGconn* lake_pg,
+    long long catalog_id,
+    int worker_id,
+    const std::string& batch_id,
+    const std::vector<std::string>& last_pk,
+    long long rows_loaded);
+
+/**
+ * Where a resuming worker has to restart. Absent when the worker never committed a batch,
+ * or when the deployment predates lake.full_load_position.
+ */
+std::optional<LakeCopyPosition> load_lake_copy_position(
+    PGconn* lake_pg,
+    long long catalog_id,
+    int worker_id);
+
+void clear_lake_copy_positions(PGconn* lake_pg, long long catalog_id);
+
+/**
+ * Moves a resuming worker onto the lake position when there is one.
+ * The catalog checkpoint is written after the COPY commits, so it can be a batch behind;
+ * replaying from it is what used to duplicate rows.
+ */
+void adopt_lake_copy_position(
+    CopyCheckpointContext& ctx,
+    PGconn* lake_pg,
+    std::vector<std::string>& last_pk_values);
+
+/**
+ * Persists the per-worker PK ranges before any worker starts.
+ * Sampled boundaries depend on row positions, so a resume must reuse the stored split
+ * instead of re-sampling a source that may have changed meanwhile.
+ */
+void save_copy_slice_plan(
+    PGconn* app_pg,
+    long long catalog_id,
+    const std::string& batch_id,
+    const std::vector<PkSlice>& slices,
+    std::optional<long long> source_rows);
+
+/**
+ * Slice plan written by a previous run, empty when there is none.
+ * A resumed load keeps this split even if the worker count knob changed since, because
+ * re-splitting the table against a different worker count would duplicate or skip rows.
+ */
+std::vector<PkSlice> slice_plan_from_checkpoints(
+    const std::vector<FullLoadCheckpoint>& checkpoints);
 
 bool should_resume_from_copy_checkpoint(
     PGconn* app_pg,

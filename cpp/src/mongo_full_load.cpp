@@ -22,6 +22,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -84,10 +85,11 @@ using full_load::utc_now_ts;
 using full_load::acquire_full_load_table_lock;
 using full_load::release_full_load_table_lock;
 
-bson_value_t* mongo_id_text_to_bson_value(const std::string& id_text) {
-    if (id_text.empty()) {
-        return nullptr;
-    }
+/**
+ * Checkpoints written before typed encoding stored a bare ObjectId hex or the raw string,
+ * leaving the type to be guessed from the shape. Kept only to resume those.
+ */
+bson_value_t* mongo_id_legacy_text_to_bson_value(const std::string& id_text) {
     auto* out = new bson_value_t();
     if (id_text.size() == 24 &&
         std::all_of(id_text.begin(), id_text.end(), [](unsigned char c) {
@@ -107,20 +109,74 @@ bson_value_t* mongo_id_text_to_bson_value(const std::string& id_text) {
     return out;
 }
 
+bson_value_t* mongo_id_text_to_bson_value(const std::string& id_text) {
+    if (id_text.empty()) {
+        return nullptr;
+    }
+    if (id_text.front() == '{') {
+        bson_error_t err;
+        bson_t* doc = bson_new_from_json(
+            reinterpret_cast<const uint8_t*>(id_text.data()),
+            static_cast<ssize_t>(id_text.size()),
+            &err);
+        if (doc) {
+            bson_value_t* out = nullptr;
+            bson_iter_t iter;
+            if (bson_iter_init_find(&iter, doc, "v")) {
+                const bson_value_t* value = bson_iter_value(&iter);
+                if (value) {
+                    out = new bson_value_t();
+                    bson_value_copy(value, out);
+                }
+            }
+            bson_destroy(doc);
+            if (out) {
+                return out;
+            }
+        }
+    }
+    return mongo_id_legacy_text_to_bson_value(id_text);
+}
+
+/**
+ * Canonical Extended JSON of a single-key wrapper, e.g. {"v":{"$oid":"..."}}.
+ * Carrying the BSON type keeps _id values that are not ObjectId or string resumable, and
+ * stops a 24-hex string _id from coming back as an ObjectId, which would sort past every
+ * remaining string key and silently copy nothing.
+ */
 std::string mongo_id_text_from_bson_value(const bson_value_t* value) {
     if (!value) {
         return {};
     }
-    if (value->value_type == BSON_TYPE_OID) {
-        char hex[25];
-        bson_oid_to_string(&value->value.v_oid, hex);
-        return std::string(hex);
+    bson_t doc = BSON_INITIALIZER;
+    if (!bson_append_value(&doc, "v", 1, value)) {
+        bson_destroy(&doc);
+        return {};
     }
-    if (value->value_type == BSON_TYPE_UTF8) {
-        return std::string(value->value.v_utf8.str, static_cast<std::size_t>(value->value.v_utf8.len));
+    char* json = bson_as_canonical_extended_json(&doc, nullptr);
+    bson_destroy(&doc);
+    if (!json) {
+        return {};
     }
-    return {};
+    std::string out(json);
+    bson_free(json);
+    return out;
 }
+
+/**
+ * Column set shared by the copy workers.
+ * Mongo evolves the lake schema mid-copy, so the map and the DDL that follows it have to
+ * be serialized: two workers seeing the same new field would both issue ADD COLUMN, and
+ * ALTER COLUMN TYPE takes ACCESS EXCLUSIVE on a partitioned table, which must not land
+ * while another worker sits inside a COPY.
+ */
+struct MongoSchemaState {
+    std::shared_mutex ddl_mtx;
+    std::mutex meta_mtx;
+    std::map<std::string, std::string> pg_cols;
+    std::vector<std::string> all_cols;
+    unsigned long long version{0};
+};
 
 long long fetch_mongo_collection_count(mongoc_collection_t* coll) {
     bson_t empty = BSON_INITIALIZER;
@@ -233,18 +289,18 @@ long long copy_collection_batches(
     const MongoCatalogTableRow& target,
     const std::string& pg_schema,
     const std::string& pg_table,
-    std::vector<std::string>& all_cols,
-    std::map<std::string, std::string>& pg_cols,
+    MongoSchemaState& schema,
     std::size_t batch_size,
     int source_sleep_ms,
     const std::string& snapshot_id,
+    const full_load::PkSlice& id_slice = {},
     full_load::CopyCheckpointContext* checkpoint_ctx = nullptr) {
     const std::string load_ts = utc_now_ts();
     const std::string load_date = utc_now_date();
 
-    auto rebuild_copy_sql = [&]() {
+    auto rebuild_copy_sql = [&](const std::vector<std::string>& cols) {
         std::ostringstream copy_cols;
-        for (const auto& c : all_cols) {
+        for (const auto& c : cols) {
             copy_cols << pg_ident(c) << ", ";
         }
         copy_cols << pg_ident("_dl_load_timestamp") << ", " << pg_ident("_dl_load_date") << ", "
@@ -253,34 +309,73 @@ long long copy_collection_batches(
         return std::string("COPY ") + fq + " (" + copy_cols.str() + ") FROM STDIN WITH (FORMAT csv)";
     };
 
-    std::string copy_sql = rebuild_copy_sql();
+    // Local view of the shared column set, refreshed only when another worker moved it.
+    std::vector<std::string> local_cols;
+    unsigned long long local_version = 0;
+    std::string copy_sql;
+    auto refresh_local_schema = [&]() {
+        std::lock_guard<std::mutex> meta(schema.meta_mtx);
+        if (!copy_sql.empty() && local_version == schema.version) {
+            return;
+        }
+        local_version = schema.version;
+        local_cols = schema.all_cols;
+        copy_sql = rebuild_copy_sql(local_cols);
+    };
+    refresh_local_schema();
 
     long long total_rows = 0;
     bson_value_t* last_id_value = nullptr;
     std::string last_mongo_id_text;
 
-    if (checkpoint_ctx && !checkpoint_ctx->initial_last_pk.empty()) {
-        last_mongo_id_text = checkpoint_ctx->initial_last_pk.front();
-        last_id_value = mongo_id_text_to_bson_value(last_mongo_id_text);
+    if (checkpoint_ctx) {
+        std::vector<std::string> resume_pk = checkpoint_ctx->initial_last_pk;
+        full_load::adopt_lake_copy_position(*checkpoint_ctx, pg, resume_pk);
+        if (!resume_pk.empty() && !resume_pk.front().empty()) {
+            last_mongo_id_text = resume_pk.front();
+            last_id_value = mongo_id_text_to_bson_value(last_mongo_id_text);
+        }
     }
 
-    auto cleanup_last_id = [&]() {
-        if (last_id_value) {
-            bson_value_destroy(last_id_value);
-            delete last_id_value;
-            last_id_value = nullptr;
+    bson_value_t* slice_begin_value =
+        id_slice.has_begin && !id_slice.begin.empty() ? mongo_id_text_to_bson_value(id_slice.begin.front()) : nullptr;
+    bson_value_t* slice_end_value =
+        id_slice.has_end && !id_slice.end.empty() ? mongo_id_text_to_bson_value(id_slice.end.front()) : nullptr;
+
+    auto destroy_value = [](bson_value_t*& value) {
+        if (value) {
+            bson_value_destroy(value);
+            delete value;
+            value = nullptr;
         }
     };
+    auto cleanup_last_id = [&]() {
+        destroy_value(last_id_value);
+    };
+    auto cleanup_slice = [&]() {
+        destroy_value(slice_begin_value);
+        destroy_value(slice_end_value);
+    };
 
+    try {
     while (true) {
         if (g_shutdown.load()) {
             break;
         }
         bson_t query = BSON_INITIALIZER;
-        if (last_id_value) {
+        // Resume position wins over the slice lower bound; both are the same edge, but the
+        // resume one is exclusive because that document is already in the lake.
+        const bson_value_t* lower = last_id_value ? last_id_value : slice_begin_value;
+        const char* lower_op = last_id_value ? "$gt" : "$gte";
+        if (lower || slice_end_value) {
             bson_t id_wrap;
             bson_append_document_begin(&query, "_id", 3, &id_wrap);
-            bson_append_value(&id_wrap, "$gt", 3, last_id_value);
+            if (lower) {
+                bson_append_value(&id_wrap, lower_op, static_cast<int>(std::strlen(lower_op)), lower);
+            }
+            if (slice_end_value) {
+                bson_append_value(&id_wrap, "$lt", 3, slice_end_value);
+            }
             bson_append_document_end(&query, &id_wrap);
         }
 
@@ -328,44 +423,55 @@ long long copy_collection_batches(
 
         const auto batch_schema = infer_schema_from_flat_rows(batch_flats, batch_flats.size());
         bool schema_changed = false;
-        for (const auto& [name, pg_type] : batch_schema) {
-            if (name == "mongo_id") {
-                continue;
-            }
-            const auto it = pg_cols.find(name);
-            if (it == pg_cols.end()) {
-                pg_cols[name] = pg_type;
-                schema_changed = true;
-            } else {
-                std::set<std::string> type_set;
-                type_set.insert(it->second);
-                type_set.insert(pg_type);
-                const std::string merged = resolve_pg_type_from_type_set(type_set);
-                if (merged != it->second) {
-                    it->second = merged;
-                    schema_changed = true;
+        std::map<std::string, std::string> cols_after_merge;
+        {
+            std::lock_guard<std::mutex> meta(schema.meta_mtx);
+            for (const auto& [name, pg_type] : batch_schema) {
+                if (name == "mongo_id") {
+                    continue;
                 }
+                const auto it = schema.pg_cols.find(name);
+                if (it == schema.pg_cols.end()) {
+                    schema.pg_cols[name] = pg_type;
+                    schema_changed = true;
+                } else {
+                    std::set<std::string> type_set;
+                    type_set.insert(it->second);
+                    type_set.insert(pg_type);
+                    const std::string merged = resolve_pg_type_from_type_set(type_set);
+                    if (merged != it->second) {
+                        it->second = merged;
+                        schema_changed = true;
+                    }
+                }
+            }
+            if (schema_changed) {
+                cols_after_merge = schema.pg_cols;
             }
         }
         if (schema_changed) {
-            sync_missing_mongo_columns(pg, pg_schema, pg_table, pg_cols);
-            sync_mongo_column_types(pg, pg_schema, pg_table, pg_cols);
-            all_cols = {"mongo_id"};
-            for (const auto& [name, _] : pg_cols) {
+            // Exclusive: ALTER TABLE must not run while any worker holds a COPY open.
+            std::unique_lock<std::shared_mutex> ddl(schema.ddl_mtx);
+            sync_missing_mongo_columns(pg, pg_schema, pg_table, cols_after_merge);
+            sync_mongo_column_types(pg, pg_schema, pg_table, cols_after_merge);
+            std::lock_guard<std::mutex> meta(schema.meta_mtx);
+            schema.all_cols = {"mongo_id"};
+            for (const auto& [name, _] : schema.pg_cols) {
                 if (name != "mongo_id") {
-                    all_cols.push_back(name);
+                    schema.all_cols.push_back(name);
                 }
             }
-            copy_sql = rebuild_copy_sql();
+            schema.version += 1;
         }
+        refresh_local_schema();
 
         for (const auto& flat : batch_flats) {
             std::ostringstream line;
-            for (std::size_t i = 0; i < all_cols.size(); ++i) {
+            for (std::size_t i = 0; i < local_cols.size(); ++i) {
                 if (i) {
                     line << ',';
                 }
-                const auto it = flat.find(all_cols[i]);
+                const auto it = flat.find(local_cols[i]);
                 if (it != flat.end()) {
                     line << json_cell_csv(it->second);
                 }
@@ -374,47 +480,73 @@ long long copy_collection_batches(
             batch_lines.push_back(line.str());
         }
 
-        PGresult* copy_res = PQexec(pg, copy_sql.c_str());
-        if (!copy_res || PQresultStatus(copy_res) != PGRES_COPY_IN) {
-            const std::string err = PQerrorMessage(pg);
-            if (copy_res) {
-                PQclear(copy_res);
-            }
-            cleanup_last_id();
-            throw std::runtime_error("COPY start failed: " + err);
-        }
-        PQclear(copy_res);
-
-        for (const auto& line : batch_lines) {
-            if (PQputCopyData(pg, line.c_str(), static_cast<int>(line.size())) != 1) {
-                cleanup_last_id();
-                throw std::runtime_error(std::string("COPY data failed: ") + PQerrorMessage(pg));
-            }
-            if (PQputCopyData(pg, "\n", 1) != 1) {
-                cleanup_last_id();
-                throw std::runtime_error(std::string("COPY newline failed: ") + PQerrorMessage(pg));
-            }
-        }
-        if (PQputCopyEnd(pg, nullptr) != 1) {
-            cleanup_last_id();
-            throw std::runtime_error(std::string("COPY end failed: ") + PQerrorMessage(pg));
-        }
-        PGresult* end_res = PQgetResult(pg);
-        while (end_res) {
-            if (PQresultStatus(end_res) != PGRES_COMMAND_OK) {
-                const std::string err = PQerrorMessage(pg);
-                PQclear(end_res);
-                cleanup_last_id();
-                throw std::runtime_error("COPY commit failed: " + err);
-            }
-            PQclear(end_res);
-            end_res = PQgetResult(pg);
-        }
-
-        total_rows += static_cast<long long>(batch_lines.size());
         if (last_id_value) {
             last_mongo_id_text = mongo_id_text_from_bson_value(last_id_value);
         }
+        // The position has to land in the same transaction as the rows it points at,
+        // otherwise a crash in between makes a resume replay this batch.
+        const bool transactional = checkpoint_ctx && !last_mongo_id_text.empty();
+
+        {
+            // Shared: concurrent COPYs are fine, they only have to exclude schema DDL.
+            std::shared_lock<std::shared_mutex> copy_guard(schema.ddl_mtx);
+            if (transactional) {
+                pg_exec(pg, "BEGIN");
+            }
+            try {
+                PGresult* copy_res = PQexec(pg, copy_sql.c_str());
+                if (!copy_res || PQresultStatus(copy_res) != PGRES_COPY_IN) {
+                    const std::string err = PQerrorMessage(pg);
+                    if (copy_res) {
+                        PQclear(copy_res);
+                    }
+                    throw std::runtime_error("COPY start failed: " + err);
+                }
+                PQclear(copy_res);
+
+                for (const auto& line : batch_lines) {
+                    if (PQputCopyData(pg, line.c_str(), static_cast<int>(line.size())) != 1) {
+                        throw std::runtime_error(std::string("COPY data failed: ") + PQerrorMessage(pg));
+                    }
+                    if (PQputCopyData(pg, "\n", 1) != 1) {
+                        throw std::runtime_error(std::string("COPY newline failed: ") + PQerrorMessage(pg));
+                    }
+                }
+                if (PQputCopyEnd(pg, nullptr) != 1) {
+                    throw std::runtime_error(std::string("COPY end failed: ") + PQerrorMessage(pg));
+                }
+                PGresult* end_res = PQgetResult(pg);
+                while (end_res) {
+                    if (PQresultStatus(end_res) != PGRES_COMMAND_OK) {
+                        const std::string err = PQerrorMessage(pg);
+                        PQclear(end_res);
+                        throw std::runtime_error("COPY commit failed: " + err);
+                    }
+                    PQclear(end_res);
+                    end_res = PQgetResult(pg);
+                }
+
+                if (transactional) {
+                    full_load::record_lake_copy_position(
+                        pg,
+                        checkpoint_ctx->catalog_id,
+                        checkpoint_ctx->worker_id,
+                        checkpoint_ctx->batch_id,
+                        {last_mongo_id_text},
+                        checkpoint_ctx->rows_loaded_session_baseline + total_rows +
+                            static_cast<long long>(batch_lines.size()));
+                    pg_exec(pg, "COMMIT");
+                }
+            } catch (...) {
+                pg_abort_copy_in(pg);
+                if (transactional) {
+                    PQclear(PQexec(pg, "ROLLBACK"));
+                }
+                throw;
+            }
+        }
+
+        total_rows += static_cast<long long>(batch_lines.size());
         if (checkpoint_ctx && !last_mongo_id_text.empty()) {
             full_load::save_copy_batch_checkpoint(
                 *checkpoint_ctx,
@@ -428,9 +560,62 @@ long long copy_collection_batches(
             std::this_thread::sleep_for(std::chrono::milliseconds(source_sleep_ms));
         }
     }
+    } catch (...) {
+        cleanup_last_id();
+        cleanup_slice();
+        throw;
+    }
 
     cleanup_last_id();
+    cleanup_slice();
     return total_rows;
+}
+
+/**
+ * Reads the _id values sitting at even document offsets along the _id index.
+ * Returns a single unbounded slice when a boundary cannot be read, so an unexpected
+ * collection shape degrades to the previous single-worker behaviour.
+ */
+std::vector<full_load::PkSlice> sample_mongo_id_slices(
+    mongoc_collection_t* coll,
+    long long source_rows,
+    int workers) {
+    std::vector<std::vector<std::string>> boundaries;
+    for (long long offset : full_load::slice_boundary_offsets(source_rows, workers)) {
+        bson_t query = BSON_INITIALIZER;
+        bson_t opts = BSON_INITIALIZER;
+        bson_t sort_doc;
+        BSON_APPEND_DOCUMENT_BEGIN(&opts, "sort", &sort_doc);
+        BSON_APPEND_INT32(&sort_doc, "_id", 1);
+        bson_append_document_end(&opts, &sort_doc);
+        bson_t projection;
+        BSON_APPEND_DOCUMENT_BEGIN(&opts, "projection", &projection);
+        BSON_APPEND_INT32(&projection, "_id", 1);
+        bson_append_document_end(&opts, &projection);
+        BSON_APPEND_INT64(&opts, "skip", offset);
+        BSON_APPEND_INT32(&opts, "limit", 1);
+
+        mongoc_cursor_t* cursor = mongoc_collection_find_with_opts(coll, &query, &opts, nullptr);
+        bson_destroy(&query);
+        bson_destroy(&opts);
+
+        std::string boundary;
+        const bson_t* doc = nullptr;
+        if (cursor && mongoc_cursor_next(cursor, &doc)) {
+            bson_iter_t iter;
+            if (bson_iter_init_find(&iter, doc, "_id")) {
+                boundary = mongo_id_text_from_bson_value(bson_iter_value(&iter));
+            }
+        }
+        if (cursor) {
+            mongoc_cursor_destroy(cursor);
+        }
+        if (boundary.empty()) {
+            return {full_load::PkSlice{}};
+        }
+        boundaries.push_back({boundary});
+    }
+    return full_load::slices_from_boundaries(boundaries);
 }
 
 bool load_one_collection(
@@ -576,6 +761,7 @@ bool load_one_collection(
             target.source_table);
     } else {
         clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
+        full_load::clear_lake_copy_positions(lake_pg.raw, target.catalog_id);
         const auto trunc = full_load::truncate_lake_table_verified(
             lake_pg.raw,
             pg_schema,
@@ -649,54 +835,162 @@ bool load_one_collection(
         save_full_load_checkpoint(app_pg.raw, ddl_cp);
     }
 
-    std::vector<std::string> all_cols = {"mongo_id"};
+    MongoSchemaState schema_state;
+    schema_state.pg_cols = pg_cols;
+    schema_state.all_cols = {"mongo_id"};
     for (const auto& [name, _] : pg_cols) {
         if (name != "mongo_id") {
-            all_cols.push_back(name);
+            schema_state.all_cols.push_back(name);
         }
+    }
+
+    const std::optional<long long> source_rows_opt =
+        source_rows >= 0 ? std::optional<long long>(source_rows) : std::nullopt;
+
+    // A resumed load reuses the persisted split: re-sampling a collection that changed
+    // since would move the boundaries and duplicate or skip documents.
+    std::vector<full_load::PkSlice> slices;
+    bool plan_persisted = false;
+    if (resume_copy) {
+        slices = full_load::slice_plan_from_checkpoints(resume_checkpoints);
+        plan_persisted = !slices.empty();
+    }
+    std::string split_mode = "resumed_plan";
+    if (slices.empty()) {
+        const int workers = pipeline_defaults::kMongoFullLoadWorkers;
+        if (workers <= 1) {
+            split_mode = "single_worker";
+            slices.emplace_back();
+        } else if (source_rows >= pipeline_defaults::kFullLoadSliceSampleMinRows) {
+            split_mode = "sampled_boundaries";
+            slices = sample_mongo_id_slices(coll, source_rows, workers);
+        } else {
+            split_mode = source_rows < 0 ? "single_worker_unknown_row_count" : "single_worker_small_table";
+            slices.emplace_back();
+        }
+    }
+    if (slices.empty()) {
+        slices.emplace_back();
+    }
+
+    const int worker_count = static_cast<int>(slices.size());
+    if (!plan_persisted && worker_count > 1) {
+        full_load::save_copy_slice_plan(
+            app_pg.raw, target.catalog_id, batch_id, slices, source_rows_opt);
     }
 
     std::mutex checkpoint_mtx;
-    full_load::CopyCheckpointContext copy_ctx;
-    copy_ctx.app_pg = app_pg.raw;
-    copy_ctx.log_pg = log_pg;
-    copy_ctx.log_mtx = log_mtx;
-    copy_ctx.catalog_id = target.catalog_id;
-    copy_ctx.worker_id = 0;
-    copy_ctx.batch_id = batch_id;
-    copy_ctx.conn_id = target.conn_id;
-    copy_ctx.source_schema = target.source_database;
-    copy_ctx.source_table = target.source_table;
-    copy_ctx.log_component = "mongo_load";
-    copy_ctx.checkpoint_mtx = &checkpoint_mtx;
-    copy_ctx.progress_log_interval = pipeline_defaults::kFullLoadCopyProgressLogInterval;
-    if (source_rows >= 0) {
-        copy_ctx.source_rows = source_rows;
-    }
-    if (resume_copy) {
-        for (const auto& cp : resume_checkpoints) {
-            if (cp.worker_id == 0 && cp.phase == FullLoadPhase::Copy) {
-                copy_ctx.initial_last_pk = last_pk_from_json(cp.last_pk);
-                copy_ctx.rows_loaded_session_baseline = cp.rows_loaded;
-                break;
+    auto checkpoint_for_worker = [&](int worker_id) -> full_load::CopyCheckpointContext {
+        full_load::CopyCheckpointContext ctx;
+        ctx.app_pg = app_pg.raw;
+        ctx.log_pg = log_pg;
+        ctx.log_mtx = log_mtx;
+        ctx.catalog_id = target.catalog_id;
+        ctx.worker_id = worker_id;
+        ctx.batch_id = batch_id;
+        ctx.conn_id = target.conn_id;
+        ctx.source_schema = target.source_database;
+        ctx.source_table = target.source_table;
+        ctx.log_component = "mongo_load";
+        ctx.checkpoint_mtx = &checkpoint_mtx;
+        ctx.progress_log_interval = pipeline_defaults::kFullLoadCopyProgressLogInterval;
+        ctx.source_rows = source_rows_opt;
+        if (resume_copy) {
+            for (const auto& cp : resume_checkpoints) {
+                if (cp.worker_id == worker_id && cp.phase == FullLoadPhase::Copy) {
+                    ctx.initial_last_pk = last_pk_from_json(cp.last_pk);
+                    ctx.rows_loaded_session_baseline = cp.rows_loaded;
+                    break;
+                }
             }
         }
-    }
+        return ctx;
+    };
 
-    rows_out = copy_collection_batches(
-        coll,
-        lake_pg.raw,
+    log_fl(
         log_pg,
         log_mtx,
-        target,
-        pg_schema,
-        pg_table,
-        all_cols,
-        pg_cols,
-        batch_size,
-        source_sleep_ms,
+        LogLevel::Info,
         batch_id,
-        &copy_ctx);
+        worker_count > 1 ? "parallel copy workers started" : "copy running on a single worker",
+        {{"workers", worker_count},
+         {"workers_requested", pipeline_defaults::kMongoFullLoadWorkers},
+         {"split_mode", split_mode},
+         {"source_rows", source_rows}},
+        target.conn_id,
+        target.source_database,
+        target.source_table);
+
+    if (worker_count == 1) {
+        auto ctx = checkpoint_for_worker(0);
+        rows_out = copy_collection_batches(
+            coll,
+            lake_pg.raw,
+            log_pg,
+            log_mtx,
+            target,
+            pg_schema,
+            pg_table,
+            schema_state,
+            batch_size,
+            source_sleep_ms,
+            batch_id,
+            slices[0],
+            &ctx);
+    } else {
+        std::vector<long long> row_counts(static_cast<std::size_t>(worker_count), 0);
+        std::vector<std::exception_ptr> errors(static_cast<std::size_t>(worker_count));
+        std::vector<std::thread> threads;
+        threads.reserve(static_cast<std::size_t>(worker_count));
+
+        for (int w = 0; w < worker_count; ++w) {
+            threads.emplace_back([&, w]() {
+                try {
+                    MongoConn worker_mongo(source);
+                    PgConn worker_lake(cfg.datalake.conn_string());
+                    // Destroyed inside this scope: the collection borrows worker_mongo's client.
+                    mongoc_collection_t* worker_coll =
+                        worker_mongo.collection(target.source_database, target.source_table);
+                    try {
+                        auto ctx = checkpoint_for_worker(w);
+                        row_counts[static_cast<std::size_t>(w)] = copy_collection_batches(
+                            worker_coll,
+                            worker_lake.raw,
+                            log_pg,
+                            log_mtx,
+                            target,
+                            pg_schema,
+                            pg_table,
+                            schema_state,
+                            batch_size,
+                            source_sleep_ms,
+                            batch_id,
+                            slices[static_cast<std::size_t>(w)],
+                            &ctx);
+                    } catch (...) {
+                        mongoc_collection_destroy(worker_coll);
+                        throw;
+                    }
+                    mongoc_collection_destroy(worker_coll);
+                } catch (...) {
+                    errors[static_cast<std::size_t>(w)] = std::current_exception();
+                }
+            });
+        }
+
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        for (const auto& err : errors) {
+            if (err) {
+                std::rethrow_exception(err);
+            }
+        }
+        rows_out = 0;
+        for (long long n : row_counts) {
+            rows_out += n;
+        }
+    }
 
     destroy_coll();
 
@@ -725,6 +1019,7 @@ bool load_one_collection(
 
     mark_catalog_success(app_pg.raw, target.catalog_id);
     clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
+    full_load::clear_lake_copy_positions(lake_pg.raw, target.catalog_id);
 
     if (!onboard_table_after_full_load(
             app_pg.raw,

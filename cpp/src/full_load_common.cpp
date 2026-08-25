@@ -463,6 +463,150 @@ void save_copy_batch_checkpoint(
         ctx.source_table);
 }
 
+void record_lake_copy_position(
+    PGconn* lake_pg,
+    long long catalog_id,
+    int worker_id,
+    const std::string& batch_id,
+    const std::vector<std::string>& last_pk,
+    long long rows_loaded) {
+    if (!lake_pg || catalog_id <= 0) {
+        return;
+    }
+    const std::string cid = std::to_string(catalog_id);
+    const std::string wid = std::to_string(worker_id);
+    const std::string pk = pk_values_to_json(last_pk).dump();
+    const std::string rows = std::to_string(rows_loaded);
+    const char* vals[] = {cid.c_str(), wid.c_str(), batch_id.c_str(), pk.c_str(), rows.c_str()};
+    pg_exec_params_simple(
+        lake_pg,
+        R"(
+        INSERT INTO lake.full_load_position
+            (catalog_id, worker_id, batch_id, last_pk, rows_loaded, updated_at)
+        VALUES ($1::bigint, $2::int, $3, $4::jsonb, $5::bigint, now())
+        ON CONFLICT (catalog_id, worker_id) DO UPDATE SET
+            batch_id = EXCLUDED.batch_id,
+            last_pk = EXCLUDED.last_pk,
+            rows_loaded = EXCLUDED.rows_loaded,
+            updated_at = now()
+        )",
+        5,
+        vals);
+}
+
+std::optional<LakeCopyPosition> load_lake_copy_position(
+    PGconn* lake_pg,
+    long long catalog_id,
+    int worker_id) {
+    if (!lake_pg || catalog_id <= 0) {
+        return std::nullopt;
+    }
+    const std::string cid = std::to_string(catalog_id);
+    const std::string wid = std::to_string(worker_id);
+    const char* vals[] = {cid.c_str(), wid.c_str()};
+    PGresult* res = PQexecParams(
+        lake_pg,
+        R"(
+        SELECT last_pk::text, rows_loaded
+        FROM lake.full_load_position
+        WHERE catalog_id = $1::bigint AND worker_id = $2::int
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+        if (res) {
+            PQclear(res);
+        }
+        return std::nullopt;
+    }
+    LakeCopyPosition pos;
+    pos.last_pk = pk_values_from_json(nlohmann::json::parse(PQgetvalue(res, 0, 0), nullptr, false));
+    pos.rows_loaded = std::atoll(PQgetvalue(res, 0, 1));
+    PQclear(res);
+    if (pos.last_pk.empty()) {
+        return std::nullopt;
+    }
+    return pos;
+}
+
+void clear_lake_copy_positions(PGconn* lake_pg, long long catalog_id) {
+    if (!lake_pg || catalog_id <= 0) {
+        return;
+    }
+    const std::string cid = std::to_string(catalog_id);
+    const char* vals[] = {cid.c_str()};
+    pg_exec_params_simple(
+        lake_pg,
+        "DELETE FROM lake.full_load_position WHERE catalog_id = $1::bigint",
+        1,
+        vals);
+}
+
+void adopt_lake_copy_position(
+    CopyCheckpointContext& ctx,
+    PGconn* lake_pg,
+    std::vector<std::string>& last_pk_values) {
+    const auto pos = load_lake_copy_position(lake_pg, ctx.catalog_id, ctx.worker_id);
+    if (!pos) {
+        return;
+    }
+    last_pk_values = pos->last_pk;
+    ctx.rows_loaded_session_baseline = pos->rows_loaded;
+}
+
+void save_copy_slice_plan(
+    PGconn* app_pg,
+    long long catalog_id,
+    const std::string& batch_id,
+    const std::vector<PkSlice>& slices,
+    std::optional<long long> source_rows) {
+    if (!app_pg || catalog_id <= 0 || slices.size() < 2) {
+        return;
+    }
+    for (std::size_t w = 0; w < slices.size(); ++w) {
+        FullLoadCheckpoint cp;
+        cp.catalog_id = catalog_id;
+        cp.worker_id = static_cast<int>(w);
+        cp.batch_id = batch_id;
+        cp.phase = FullLoadPhase::Copy;
+        cp.rows_loaded = 0;
+        cp.source_rows = source_rows;
+        cp.slice_begin = slice_bound_to_json(slices[w].begin, slices[w].has_begin);
+        cp.slice_end = slice_bound_to_json(slices[w].end, slices[w].has_end);
+        // last_pk stays empty so this plan row does not look like copy progress to
+        // should_resume_from_copy_checkpoint().
+        save_full_load_checkpoint(app_pg, cp);
+    }
+}
+
+std::vector<PkSlice> slice_plan_from_checkpoints(
+    const std::vector<FullLoadCheckpoint>& checkpoints) {
+    std::vector<PkSlice> slices;
+    for (const auto& cp : checkpoints) {
+        if (cp.phase != FullLoadPhase::Copy) {
+            continue;
+        }
+        PkSlice slice;
+        if (!cp.slice_begin.is_null()) {
+            slice.begin = pk_values_from_json(cp.slice_begin);
+            slice.has_begin = !slice.begin.empty();
+        }
+        if (!cp.slice_end.is_null()) {
+            slice.end = pk_values_from_json(cp.slice_end);
+            slice.has_end = !slice.end.empty();
+        }
+        slices.push_back(std::move(slice));
+    }
+    if (slices.size() < 2) {
+        return {};
+    }
+    return slices;
+}
+
 bool should_resume_from_copy_checkpoint(
     PGconn* app_pg,
     PGconn* lake_pg,
@@ -486,6 +630,7 @@ bool should_resume_from_copy_checkpoint(
     }
     if (!lake_table_has_rows(lake_pg, lake_schema, lake_table)) {
         clear_full_load_checkpoints(app_pg, catalog_id);
+        clear_lake_copy_positions(lake_pg, catalog_id);
         checkpoints_out.clear();
         return false;
     }

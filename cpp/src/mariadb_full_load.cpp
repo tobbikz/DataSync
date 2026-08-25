@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <map>
 #include <mutex>
@@ -129,11 +130,9 @@ void apply_catalog_pk_columns(std::vector<MariaDbColumn>& cols, const std::vecto
     }
 }
 
-struct PkRange {
-    bool active{false};
-    std::string lower_inclusive;
-    std::string upper_exclusive;
-    bool numeric{false};
+struct PkBounds {
+    long long min_v{0};
+    long long max_v{0};
 };
 
 bool is_integer_pk_type(const MariaDbColumn& col) {
@@ -154,7 +153,7 @@ MariaDbRetryOptions mariadb_retry_options() {
     return opts;
 }
 
-std::optional<PkRange> fetch_integer_pk_range(
+std::optional<PkBounds> fetch_integer_pk_bounds(
     MariaDbConn& conn,
     const CatalogTableRow& target,
     const std::string& pk_col,
@@ -171,27 +170,17 @@ std::optional<PkRange> fetch_integer_pk_range(
         mysql_free_result(res);
         return std::nullopt;
     }
-    PkRange range;
-    range.active = true;
-    range.numeric = true;
-    range.lower_inclusive = row[0];
-    range.upper_exclusive = row[1];
+    const std::string min_text = row[0];
+    const std::string max_text = row[1];
     mysql_free_result(res);
-    return range;
-}
-
-// MIN/MAX from MariaDB are inclusive; keyset WHERE uses upper_exclusive as id < N.
-PkRange pk_range_for_keyset(const PkRange& bounds) {
-    PkRange range = bounds;
-    if (!range.active || !range.numeric || range.upper_exclusive.empty()) {
-        return range;
-    }
+    PkBounds bounds;
     try {
-        const long long max_v = std::stoll(range.upper_exclusive);
-        range.upper_exclusive = (max_v < LLONG_MAX) ? std::to_string(max_v + 1) : range.upper_exclusive;
+        bounds.min_v = std::stoll(min_text);
+        bounds.max_v = std::stoll(max_text);
     } catch (...) {
+        return std::nullopt;
     }
-    return range;
+    return bounds;
 }
 
 std::string pk_sql_literal(const MariaDbColumn* col_def, const std::string& value) {
@@ -201,6 +190,28 @@ std::string pk_sql_literal(const MariaDbColumn* col_def, const std::string& valu
     return sql_quote(value);
 }
 
+std::string mariadb_ident(const std::string& name) {
+    return "`" + name + "`";
+}
+
+/** Quotes each PK value according to the column type it belongs to. */
+full_load::LiteralQuoter mariadb_literal_quoter(
+    const std::vector<std::string>& pk_cols,
+    const std::vector<MariaDbColumn>& cols) {
+    return [&pk_cols, &cols](std::size_t idx, const std::string& value) -> std::string {
+        const MariaDbColumn* def = nullptr;
+        if (idx < pk_cols.size()) {
+            for (const auto& col : cols) {
+                if (col.name == pk_cols[idx]) {
+                    def = &col;
+                    break;
+                }
+            }
+        }
+        return pk_sql_literal(def, value);
+    };
+}
+
 std::string mariadb_keyset_clause(
     const std::vector<std::string>& pk_cols,
     const std::vector<std::string>& last_pk_values,
@@ -208,53 +219,95 @@ std::string mariadb_keyset_clause(
     if (last_pk_values.empty()) {
         return {};
     }
-    auto col_def = [&](const std::string& name) -> const MariaDbColumn* {
-        for (const auto& col : cols) {
-            if (col.name == name) {
-                return &col;
-            }
-        }
-        return nullptr;
-    };
-
-    std::ostringstream clause;
-    clause << " AND (";
-    for (std::size_t depth = 0; depth < pk_cols.size(); ++depth) {
-        if (depth) {
-            clause << " OR ";
-        }
-        clause << "(";
-        for (std::size_t eq = 0; eq < depth; ++eq) {
-            clause << "`" << pk_cols[eq] << "` = "
-                   << pk_sql_literal(col_def(pk_cols[eq]), last_pk_values[eq]) << " AND ";
-        }
-        clause << "`" << pk_cols[depth] << "` > "
-               << pk_sql_literal(col_def(pk_cols[depth]), last_pk_values[depth]);
-        clause << ")";
-    }
-    clause << ")";
-    return clause.str();
+    const std::string clause = full_load::lexicographic_tuple_clause(
+        pk_cols,
+        last_pk_values,
+        full_load::TupleOp::Gt,
+        mariadb_ident,
+        mariadb_literal_quoter(pk_cols, cols));
+    return clause.empty() ? std::string() : " AND " + clause;
 }
 
-std::string pk_range_clause(
-    const std::string& pk_col,
-    const PkRange& range,
-    const MariaDbColumn* col_def,
-    bool upper_exclusive = true) {
-    if (!range.active) {
-        return {};
+/** Equal-width split of an integer PK; keeps the cheap single-query path for serial keys. */
+std::vector<full_load::PkSlice> integer_pk_slices(const PkBounds& bounds, int workers) {
+    std::vector<full_load::PkSlice> slices;
+    if (workers <= 1 || bounds.min_v >= bounds.max_v) {
+        slices.emplace_back();
+        return slices;
     }
-    std::ostringstream clause;
-    if (!range.lower_inclusive.empty()) {
-        clause << " AND `" << pk_col << "` >= ";
-        clause << (range.numeric ? range.lower_inclusive : pk_sql_literal(col_def, range.lower_inclusive));
+    const unsigned long long total = static_cast<unsigned long long>(bounds.max_v) -
+                                     static_cast<unsigned long long>(bounds.min_v) + 1ULL;
+    const unsigned long long span =
+        (total + static_cast<unsigned long long>(workers) - 1ULL) / static_cast<unsigned long long>(workers);
+
+    std::vector<std::vector<std::string>> boundaries;
+    for (int w = 1; w < workers; ++w) {
+        const unsigned long long edge =
+            static_cast<unsigned long long>(bounds.min_v) + static_cast<unsigned long long>(w) * span;
+        if (edge > static_cast<unsigned long long>(bounds.max_v)) {
+            break;
+        }
+        boundaries.push_back({std::to_string(edge)});
     }
-    if (!range.upper_exclusive.empty()) {
-        clause << " AND `" << pk_col << "` "
-               << (upper_exclusive ? "< " : "<= ");
-        clause << (range.numeric ? range.upper_exclusive : pk_sql_literal(col_def, range.upper_exclusive));
+    return full_load::slices_from_boundaries(boundaries);
+}
+
+/**
+ * Reads the PK tuples sitting at even row offsets along the PK index.
+ * Works for any key shape, which is what composite and non-integer PKs need; returns a
+ * single unbounded slice when a boundary cannot be read.
+ */
+std::vector<full_load::PkSlice> sample_pk_slices(
+    MariaDbConn& conn,
+    const CatalogTableRow& target,
+    const std::vector<std::string>& pk_cols,
+    long long source_rows,
+    int workers,
+    const MariaDbRetryOptions& retry) {
+    std::ostringstream order_by;
+    for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+        if (i) {
+            order_by << ", ";
+        }
+        order_by << mariadb_ident(pk_cols[i]);
     }
-    return clause.str();
+    std::ostringstream select_pk;
+    for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+        if (i) {
+            select_pk << ", ";
+        }
+        select_pk << mariadb_ident(pk_cols[i]);
+    }
+
+    std::vector<std::vector<std::string>> boundaries;
+    for (long long offset : full_load::slice_boundary_offsets(source_rows, workers)) {
+        std::ostringstream sql;
+        sql << "SELECT " << select_pk.str() << " FROM " << mariadb_ident(target.source_schema) << "."
+            << mariadb_ident(target.source_table) << " ORDER BY " << order_by.str() << " LIMIT 1 OFFSET "
+            << offset;
+        MYSQL_RES* res = mariadb_mysql_query_store_retry(conn, sql.str(), retry);
+        if (!res) {
+            return {full_load::PkSlice{}};
+        }
+        MYSQL_ROW row = mysql_fetch_row(res);
+        std::vector<std::string> boundary;
+        bool complete = row != nullptr;
+        if (row) {
+            for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+                if (!row[i]) {
+                    complete = false;
+                    break;
+                }
+                boundary.emplace_back(row[i]);
+            }
+        }
+        mysql_free_result(res);
+        if (!complete) {
+            return {full_load::PkSlice{}};
+        }
+        boundaries.push_back(std::move(boundary));
+    }
+    return full_load::slices_from_boundaries(boundaries);
 }
 
 long long fetch_mariadb_row_count(
@@ -287,7 +340,7 @@ long long copy_rows_keyset(
     int source_sleep_ms,
     const std::string& snapshot_id,
     const MariaDbRetryOptions& retry,
-    const PkRange& pk_range = {},
+    const full_load::PkSlice& pk_slice = {},
     InvalidPkSkipStats* skip_stats = nullptr,
     full_load::CopyCheckpointContext* checkpoint_ctx = nullptr) {
     const std::string load_ts = utc_now_ts();
@@ -321,20 +374,16 @@ long long copy_rows_keyset(
     const std::string fq = pg_ident(target.source_schema) + "." + pg_ident(target.source_table);
     const std::string copy_sql = "COPY " + fq + " (" + copy_cols.str() + ") FROM STDIN WITH (FORMAT csv)";
 
-    const MariaDbColumn* pk_col_def = nullptr;
-    if (pk_cols.size() == 1) {
-        for (const auto& col : cols) {
-            if (col.name == pk_cols[0]) {
-                pk_col_def = &col;
-                break;
-            }
-        }
-    }
+    const std::string slice_clause =
+        full_load::slice_where_clause(pk_cols, pk_slice, mariadb_ident, mariadb_literal_quoter(pk_cols, cols));
 
     long long total_rows = 0;
     std::vector<std::string> last_pk_values;
     if (checkpoint_ctx && !checkpoint_ctx->initial_last_pk.empty()) {
         last_pk_values = checkpoint_ctx->initial_last_pk;
+    }
+    if (checkpoint_ctx) {
+        full_load::adopt_lake_copy_position(*checkpoint_ctx, lake_pg.raw, last_pk_values);
     }
 
     const PgRetryOptions pg_retry{
@@ -350,9 +399,7 @@ long long copy_rows_keyset(
         std::ostringstream query;
         query << "SELECT " << select_cols.str() << " FROM `" << target.source_schema << "`.`" << target.source_table
               << "` WHERE 1=1";
-        if (pk_range.active && pk_cols.size() == 1) {
-            query << pk_range_clause(pk_cols[0], pk_range, pk_col_def, true);
-        }
+        query << slice_clause;
         query << mariadb_keyset_clause(pk_cols, last_pk_values, cols);
         query << " ORDER BY ";
         for (std::size_t i = 0; i < pk_cols.size(); ++i) {
@@ -406,9 +453,22 @@ long long copy_rows_keyset(
             break;
         }
 
-        pg_copy_batch_with_retry(lake_pg, copy_sql, batch_lines, pg_retry);
+        const long long rows_after_batch = total_rows + static_cast<long long>(batch_lines.size());
+        std::function<void(PGconn*)> record_position;
+        if (checkpoint_ctx) {
+            record_position = [&](PGconn* txn_pg) {
+                full_load::record_lake_copy_position(
+                    txn_pg,
+                    checkpoint_ctx->catalog_id,
+                    checkpoint_ctx->worker_id,
+                    checkpoint_ctx->batch_id,
+                    last_pk_values,
+                    checkpoint_ctx->rows_loaded_session_baseline + rows_after_batch);
+            };
+        }
+        pg_copy_batch_with_retry(lake_pg, copy_sql, batch_lines, pg_retry, record_position);
 
-        total_rows += static_cast<long long>(batch_lines.size());
+        total_rows = rows_after_batch;
         if (checkpoint_ctx) {
             full_load::save_copy_batch_checkpoint(*checkpoint_ctx, last_pk_values, total_rows);
         }
@@ -418,12 +478,6 @@ long long copy_rows_keyset(
         if (source_sleep_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(source_sleep_ms));
         }
-    }
-
-    if (total_rows == 0 && skip_stats && skip_stats->count > 0) {
-        throw std::runtime_error(
-            "full load: all scanned rows skipped due to invalid primary key (count=" +
-            std::to_string(skip_stats->count) + ")");
     }
 
     return total_rows;
@@ -476,170 +530,108 @@ long long copy_rows_parallel(
         return ctx;
     };
 
-    if (workers <= 1) {
-        auto ctx = checkpoint_for_worker(0);
-        return copy_rows_keyset(
-            conn,
-            lake_pg,
-            target,
-            cols,
-            pk_cols,
-            batch_size,
-            source_sleep_ms,
-            snapshot_id,
-            retry,
-            {},
-            skip_stats,
-            &ctx);
+    // A resumed load reuses the persisted split: re-sampling a source that changed since
+    // would move the boundaries and duplicate or skip rows.
+    std::vector<full_load::PkSlice> slices;
+    bool plan_persisted = false;
+    if (resume_checkpoints) {
+        slices = full_load::slice_plan_from_checkpoints(*resume_checkpoints);
+        plan_persisted = !slices.empty();
     }
 
-    if (pk_cols.size() != 1) {
-        auto ctx = checkpoint_for_worker(0);
-        log_fl(
-            log_pg,
-            log_mtx,
-            LogLevel::Info,
-            snapshot_id,
-            "parallel copy workers disabled: composite primary key",
-            {{"workers_requested", workers}},
-            target.conn_id,
-            target.source_schema,
-            target.source_table);
-        return copy_rows_keyset(
-            conn,
-            lake_pg,
-            target,
-            cols,
-            pk_cols,
-            batch_size,
-            source_sleep_ms,
-            snapshot_id,
-            retry,
-            {},
-            skip_stats,
-            &ctx);
-    }
-
-    const MariaDbColumn* pk_col_def = nullptr;
-    for (const auto& col : cols) {
-        if (col.name == pk_cols[0]) {
-            pk_col_def = &col;
-            break;
+    std::string split_mode = "resumed_plan";
+    if (slices.empty()) {
+        const MariaDbColumn* pk_col_def = nullptr;
+        if (pk_cols.size() == 1) {
+            for (const auto& col : cols) {
+                if (col.name == pk_cols[0]) {
+                    pk_col_def = &col;
+                    break;
+                }
+            }
+        }
+        const long long rows = source_rows.value_or(-1);
+        if (workers <= 1 || pk_cols.empty()) {
+            split_mode = "single_worker";
+            slices.emplace_back();
+        } else if (pk_col_def && is_integer_pk_type(*pk_col_def)) {
+            // Serial keys keep the cheap path: one MIN/MAX query instead of sampling.
+            const auto bounds = fetch_integer_pk_bounds(conn, target, pk_cols[0], retry);
+            if (bounds) {
+                split_mode = "integer_bounds";
+                slices = integer_pk_slices(*bounds, workers);
+            } else {
+                split_mode = "single_worker_no_pk_bounds";
+                slices.emplace_back();
+            }
+        } else if (rows >= pipeline_defaults::kFullLoadSliceSampleMinRows) {
+            split_mode = "sampled_boundaries";
+            slices = sample_pk_slices(conn, target, pk_cols, rows, workers, retry);
+        } else {
+            split_mode = rows < 0 ? "single_worker_unknown_row_count" : "single_worker_small_table";
+            slices.emplace_back();
         }
     }
-    if (!pk_col_def || !is_integer_pk_type(*pk_col_def)) {
-        auto ctx = checkpoint_for_worker(0);
-        log_fl(
-            log_pg,
-            log_mtx,
-            LogLevel::Info,
-            snapshot_id,
-            "parallel copy workers disabled: non-numeric primary key",
-            {{"workers_requested", workers}},
-            target.conn_id,
-            target.source_schema,
-            target.source_table);
-        return copy_rows_keyset(
-            conn,
-            lake_pg,
-            target,
-            cols,
-            pk_cols,
-            batch_size,
-            source_sleep_ms,
-            snapshot_id,
-            retry,
-            {},
-            skip_stats,
-            &ctx);
+    if (slices.empty()) {
+        slices.emplace_back();
     }
 
-    const auto bounds = fetch_integer_pk_range(conn, target, pk_cols[0], retry);
-    if (!bounds) {
-        return 0;
+    const int worker_count = static_cast<int>(slices.size());
+    if (!plan_persisted && worker_count > 1) {
+        full_load::save_copy_slice_plan(app_pg, target.catalog_id, snapshot_id, slices, source_rows);
     }
-
-    long long min_v = 0;
-    long long max_v = 0;
-    try {
-        min_v = std::stoll(bounds->lower_inclusive);
-        max_v = std::stoll(bounds->upper_exclusive);
-    } catch (...) {
-        auto ctx = checkpoint_for_worker(0);
-        log_fl(
-            log_pg,
-            log_mtx,
-            LogLevel::Info,
-            snapshot_id,
-            "parallel copy workers disabled: PK bounds not integer",
-            {{"workers_requested", workers}},
-            target.conn_id,
-            target.source_schema,
-            target.source_table);
-        return copy_rows_keyset(
-            conn,
-            lake_pg,
-            target,
-            cols,
-            pk_cols,
-            batch_size,
-            source_sleep_ms,
-            snapshot_id,
-            retry,
-            pk_range_for_keyset(*bounds),
-            skip_stats,
-            &ctx);
-    }
-
-    if (min_v >= max_v) {
-        auto ctx = checkpoint_for_worker(0);
-        return copy_rows_keyset(
-            conn,
-            lake_pg,
-            target,
-            cols,
-            pk_cols,
-            batch_size,
-            source_sleep_ms,
-            snapshot_id,
-            retry,
-            pk_range_for_keyset(*bounds),
-            skip_stats,
-            &ctx);
-    }
-
-    const unsigned long long total = static_cast<unsigned long long>(max_v) - static_cast<unsigned long long>(min_v) + 1ULL;
-    const long long span = (total + workers - 1) / workers;
 
     log_fl(
         log_pg,
         log_mtx,
         LogLevel::Info,
         snapshot_id,
-        "parallel copy workers started",
-        {{"workers", workers}, {"pk_min", min_v}, {"pk_max", max_v}, {"span", span}},
+        worker_count > 1 ? "parallel copy workers started" : "copy running on a single worker",
+        {{"workers", worker_count},
+         {"workers_requested", workers},
+         {"split_mode", split_mode},
+         {"pk_columns", static_cast<int>(pk_cols.size())},
+         {"source_rows", source_rows.value_or(-1)}},
         target.conn_id,
         target.source_schema,
         target.source_table);
 
-    std::vector<long long> row_counts(static_cast<std::size_t>(workers), 0);
-    std::vector<InvalidPkSkipStats> worker_skips(static_cast<std::size_t>(workers));
-    std::vector<std::exception_ptr> errors(static_cast<std::size_t>(workers));
-    std::vector<std::thread> threads;
-    threads.reserve(static_cast<std::size_t>(workers));
+    auto fail_if_only_skips = [&](long long rows) {
+        if (rows == 0 && skip_stats && skip_stats->count > 0) {
+            throw std::runtime_error(
+                "full load: all scanned rows skipped due to invalid primary key (count=" +
+                std::to_string(skip_stats->count) + ")");
+        }
+    };
 
-    for (int w = 0; w < workers; ++w) {
+    if (worker_count == 1) {
+        auto ctx = checkpoint_for_worker(0);
+        const long long rows = copy_rows_keyset(
+            conn,
+            lake_pg,
+            target,
+            cols,
+            pk_cols,
+            batch_size,
+            source_sleep_ms,
+            snapshot_id,
+            retry,
+            slices[0],
+            skip_stats,
+            &ctx);
+        fail_if_only_skips(rows);
+        return rows;
+    }
+
+    std::vector<long long> row_counts(static_cast<std::size_t>(worker_count), 0);
+    std::vector<InvalidPkSkipStats> worker_skips(static_cast<std::size_t>(worker_count));
+    std::vector<std::exception_ptr> errors(static_cast<std::size_t>(worker_count));
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(worker_count));
+
+    for (int w = 0; w < worker_count; ++w) {
         threads.emplace_back([&, w]() {
             try {
-                PkRange slice;
-                slice.active = true;
-                slice.numeric = true;
-                const unsigned long long lo = static_cast<unsigned long long>(min_v) + static_cast<unsigned long long>(w) * static_cast<unsigned long long>(span);
-                const unsigned long long hi_ex =
-                    (w == workers - 1) ? (max_v < LLONG_MAX ? static_cast<unsigned long long>(max_v) + 1ULL : static_cast<unsigned long long>(max_v)) : static_cast<unsigned long long>(min_v) + static_cast<unsigned long long>(w + 1) * static_cast<unsigned long long>(span);
-                slice.lower_inclusive = std::to_string(lo);
-                slice.upper_exclusive = std::to_string(hi_ex);
-
                 MariaDbConn worker_db(source);
                 PgConn worker_pg(cfg.datalake.conn_string());
                 auto worker_ctx = checkpoint_for_worker(w);
@@ -653,7 +645,7 @@ long long copy_rows_parallel(
                     source_sleep_ms,
                     snapshot_id,
                     retry,
-                    slice,
+                    slices[static_cast<std::size_t>(w)],
                     &worker_skips[static_cast<std::size_t>(w)],
                     &worker_ctx);
             } catch (...) {
@@ -666,21 +658,25 @@ long long copy_rows_parallel(
         thread.join();
     }
 
+    long long total_rows = 0;
+    for (long long n : row_counts) {
+        total_rows += n;
+    }
+    // Merge skips before rethrowing so a failing worker does not hide why rows were dropped.
+    if (skip_stats) {
+        for (const auto& worker_skip : worker_skips) {
+            skip_stats->merge(worker_skip);
+        }
+    }
+
     for (const auto& err : errors) {
         if (err) {
             std::rethrow_exception(err);
         }
     }
 
-    long long total_rows = 0;
-    for (long long n : row_counts) {
-        total_rows += n;
-    }
-    if (skip_stats) {
-        for (const auto& worker_skip : worker_skips) {
-            skip_stats->merge(worker_skip);
-        }
-    }
+    // A slice can legitimately be empty, so this only fails when no worker copied anything.
+    fail_if_only_skips(total_rows);
     return total_rows;
 }
 
@@ -988,6 +984,7 @@ TableLoadOutcome load_one_table(
             target.source_table);
     } else {
         clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
+        full_load::clear_lake_copy_positions(lake_pg.raw, target.catalog_id);
         const auto trunc = full_load::truncate_lake_table_verified(
             lake_pg.raw,
             target.source_schema,
@@ -1142,6 +1139,7 @@ TableLoadOutcome load_one_table(
 
     mark_catalog_success(app_pg.raw, target.catalog_id);
     clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
+    full_load::clear_lake_copy_positions(lake_pg.raw, target.catalog_id);
 
     if (!onboard_table_after_full_load(
             app_pg.raw,

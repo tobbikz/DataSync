@@ -1,5 +1,6 @@
 #include "full_load_checkpoint.hpp"
 
+#include "full_load_slice.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 
@@ -23,6 +24,12 @@ FullLoadCheckpoint row_to_checkpoint(PGresult* res, int row) {
     cp.rows_loaded = std::atoll(PQgetvalue(res, row, 5));
     if (!PQgetisnull(res, row, 6)) {
         cp.source_rows = std::atoll(PQgetvalue(res, row, 6));
+    }
+    if (!PQgetisnull(res, row, 7)) {
+        cp.slice_begin = nlohmann::json::parse(PQgetvalue(res, row, 7));
+    }
+    if (!PQgetisnull(res, row, 8)) {
+        cp.slice_end = nlohmann::json::parse(PQgetvalue(res, row, 8));
     }
     return cp;
 }
@@ -64,7 +71,8 @@ std::optional<FullLoadCheckpoint> load_full_load_checkpoint(
     PGresult* res = PQexecParams(
         pg,
         R"(
-        SELECT catalog_id, worker_id, batch_id, phase, last_pk, rows_loaded, source_rows
+        SELECT catalog_id, worker_id, batch_id, phase, last_pk, rows_loaded, source_rows,
+               slice_begin, slice_end
         FROM cdc_catalog.full_load_checkpoint
         WHERE catalog_id = $1::bigint AND worker_id = $2::int
         )",
@@ -90,7 +98,8 @@ std::vector<FullLoadCheckpoint> load_full_load_checkpoints(PGconn* pg, long long
     PGresult* res = PQexecParams(
         pg,
         R"(
-        SELECT catalog_id, worker_id, batch_id, phase, last_pk, rows_loaded, source_rows
+        SELECT catalog_id, worker_id, batch_id, phase, last_pk, rows_loaded, source_rows,
+               slice_begin, slice_end
         FROM cdc_catalog.full_load_checkpoint
         WHERE catalog_id = $1::bigint
         ORDER BY worker_id
@@ -119,6 +128,11 @@ void save_full_load_checkpoint(PGconn* pg, const FullLoadCheckpoint& checkpoint)
     const std::string phase = full_load_phase_to_string(checkpoint.phase);
     const std::string rows = std::to_string(checkpoint.rows_loaded);
     const std::string last_pk = checkpoint.last_pk.dump();
+    const std::string source_rows = checkpoint.source_rows ? std::to_string(*checkpoint.source_rows) : std::string();
+    // A jsonb 'null' would win a COALESCE against the stored bound, so an absent bound
+    // has to travel as a SQL NULL for the upsert to keep the persisted slice plan.
+    const std::string slice_begin = checkpoint.slice_begin.is_null() ? std::string() : checkpoint.slice_begin.dump();
+    const std::string slice_end = checkpoint.slice_end.is_null() ? std::string() : checkpoint.slice_end.dump();
     const char* vals[] = {
         cid.c_str(),
         wid.c_str(),
@@ -126,23 +140,29 @@ void save_full_load_checkpoint(PGconn* pg, const FullLoadCheckpoint& checkpoint)
         phase.c_str(),
         last_pk.c_str(),
         rows.c_str(),
-        checkpoint.source_rows ? std::to_string(*checkpoint.source_rows).c_str() : nullptr,
+        checkpoint.source_rows ? source_rows.c_str() : nullptr,
+        slice_begin.empty() ? nullptr : slice_begin.c_str(),
+        slice_end.empty() ? nullptr : slice_end.c_str(),
     };
     pg_exec_params_simple(
         pg,
         R"(
         INSERT INTO cdc_catalog.full_load_checkpoint
-            (catalog_id, worker_id, batch_id, phase, last_pk, rows_loaded, source_rows, updated_at)
-        VALUES ($1::bigint, $2::int, $3, $4, $5::jsonb, $6::bigint, $7::bigint, now())
+            (catalog_id, worker_id, batch_id, phase, last_pk, rows_loaded, source_rows,
+             slice_begin, slice_end, updated_at)
+        VALUES ($1::bigint, $2::int, $3, $4, $5::jsonb, $6::bigint, $7::bigint,
+                $8::jsonb, $9::jsonb, now())
         ON CONFLICT (catalog_id, worker_id) DO UPDATE SET
             batch_id = EXCLUDED.batch_id,
             phase = EXCLUDED.phase,
             last_pk = EXCLUDED.last_pk,
             rows_loaded = EXCLUDED.rows_loaded,
             source_rows = COALESCE(EXCLUDED.source_rows, cdc_catalog.full_load_checkpoint.source_rows),
+            slice_begin = COALESCE(EXCLUDED.slice_begin, cdc_catalog.full_load_checkpoint.slice_begin),
+            slice_end = COALESCE(EXCLUDED.slice_end, cdc_catalog.full_load_checkpoint.slice_end),
             updated_at = now()
         )",
-        7,
+        9,
         vals);
 }
 
@@ -157,32 +177,11 @@ void clear_full_load_checkpoints(PGconn* pg, long long catalog_id) {
 }
 
 std::vector<std::string> last_pk_from_json(const nlohmann::json& last_pk) {
-    std::vector<std::string> out;
-    if (!last_pk.is_array()) {
-        return out;
-    }
-    for (const auto& v : last_pk) {
-        if (v.is_string()) {
-            out.push_back(v.get<std::string>());
-        } else if (v.is_number_integer()) {
-            out.push_back(std::to_string(v.get<long long>()));
-        } else if (v.is_number_unsigned()) {
-            out.push_back(std::to_string(v.get<unsigned long long>()));
-        } else if (v.is_number_float()) {
-            out.push_back(std::to_string(v.get<double>()));
-        } else if (!v.is_null()) {
-            out.push_back(v.dump());
-        }
-    }
-    return out;
+    return full_load::pk_values_from_json(last_pk);
 }
 
 nlohmann::json last_pk_to_json(const std::vector<std::string>& last_pk) {
-    nlohmann::json arr = nlohmann::json::array();
-    for (const auto& v : last_pk) {
-        arr.push_back(v);
-    }
-    return arr;
+    return full_load::pk_values_to_json(last_pk);
 }
 
 bool conn_has_active_copy_checkpoints(PGconn* pg, const std::string& conn_id) {

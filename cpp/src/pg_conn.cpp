@@ -109,12 +109,17 @@ void pg_copy_batch_with_retry(
     PgConn& lake_pg,
     const std::string& copy_sql,
     const std::vector<std::string>& batch_lines,
-    const PgRetryOptions& opts) {
+    const PgRetryOptions& opts,
+    const std::function<void(PGconn*)>& in_txn_after_copy) {
     const int attempts = pg_retry_attempt_limit(opts.max_attempts);
+    const bool transactional = static_cast<bool>(in_txn_after_copy);
     std::string last_err;
 
     for (int attempt = 0; attempt < attempts; ++attempt) {
         try {
+            if (transactional) {
+                pg_exec(lake_pg.raw, "BEGIN");
+            }
             PGresult* copy_res = PQexec(lake_pg.raw, copy_sql.c_str());
             if (!copy_res || PQresultStatus(copy_res) != PGRES_COPY_IN) {
                 last_err = PQerrorMessage(lake_pg.raw);
@@ -153,10 +158,17 @@ void pg_copy_batch_with_retry(
                 PQclear(end_res);
                 end_res = PQgetResult(lake_pg.raw);
             }
+            if (transactional) {
+                in_txn_after_copy(lake_pg.raw);
+                pg_exec(lake_pg.raw, "COMMIT");
+            }
             return;
         } catch (const std::runtime_error& ex) {
             last_err = ex.what();
             pg_abort_copy_in(lake_pg.raw);
+            if (transactional) {
+                PQclear(PQexec(lake_pg.raw, "ROLLBACK"));
+            }
             if (!pg_full_load_error_is_transient(lake_pg.raw, last_err) || attempt + 1 >= attempts) {
                 throw;
             }

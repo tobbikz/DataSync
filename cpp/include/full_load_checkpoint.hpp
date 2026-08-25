@@ -21,6 +21,9 @@ struct FullLoadCheckpoint {
     nlohmann::json last_pk = nlohmann::json::array();
     long long rows_loaded{0};
     std::optional<long long> source_rows;
+    /** Half-open PK range owned by this worker; null bound means unbounded. */
+    nlohmann::json slice_begin = nlohmann::json(nullptr);
+    nlohmann::json slice_end = nlohmann::json(nullptr);
 };
 
 std::string full_load_phase_to_string(FullLoadPhase phase);

@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -52,11 +53,17 @@ struct PgConn {
 void pg_abort_copy_in(PGconn* pg);
 bool pg_full_load_error_is_transient(PGconn* pg, const std::string& err);
 void pg_sleep_retry_backoff(int attempt, const PgRetryOptions& opts);
+/**
+ * COPYs one batch, retrying transient failures on a reconnected session.
+ * When `in_txn_after_copy` is set the COPY and that callback share one transaction, so
+ * whatever the callback records about the batch commits with the batch or not at all.
+ */
 void pg_copy_batch_with_retry(
     PgConn& lake_pg,
     const std::string& copy_sql,
     const std::vector<std::string>& batch_lines,
-    const PgRetryOptions& opts);
+    const PgRetryOptions& opts,
+    const std::function<void(PGconn*)>& in_txn_after_copy = {});
 
 void pg_exec(PGconn* pg, const std::string& sql);
 void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const* vals);

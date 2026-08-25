@@ -14,6 +14,17 @@ constexpr int kFullLoadWorkers = 4;
 constexpr int kMssqlFullLoadParallelTables = 1;
 constexpr int kMssqlFullLoadWorkers = 2;
 constexpr int kMssqlFullLoadCopyProgressInterval = 10;
+/**
+ * Intra-collection copy workers, split by _id range. Lower than the MariaDB count because
+ * each one holds its own MongoDB cursor and lake connection for the whole collection.
+ */
+constexpr int kMongoFullLoadWorkers = 4;
+/**
+ * Composite / non-integer PKs are split by sampling boundary rows along the PK index,
+ * which costs about source_rows × (workers - 1) / 2 index entries. Below this row count
+ * the scan is not worth it and the table is copied by a single worker.
+ */
+constexpr long long kFullLoadSliceSampleMinRows = 100000;
 
 // Kafka
 constexpr std::string_view kKafkaBootstrapDefault = "localhost:9092";

@@ -227,6 +227,8 @@ CREATE TABLE IF NOT EXISTS cdc_catalog.full_load_checkpoint (
   last_pk jsonb,
   rows_loaded bigint NOT NULL DEFAULT 0,
   source_rows bigint,
+  slice_begin jsonb,
+  slice_end jsonb,
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (catalog_id, worker_id)
 );
@@ -239,6 +241,9 @@ ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS last_error_at timestamp
 ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS last_error text;
 ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS capture_during_full_load boolean NOT NULL DEFAULT false;
 DROP INDEX IF EXISTS cdc_catalog.idx_catalog_hot;
+-- The matview below still selects hot on databases upgrading from before it was removed,
+-- and it is recreated further down anyway.
+DROP MATERIALIZED VIEW IF EXISTS cdc_catalog.mv_tab_catalog CASCADE;
 ALTER TABLE cdc_catalog.catalog DROP COLUMN IF EXISTS hot;
 
 ALTER TABLE cdc_catalog.apply_batch_stats ADD COLUMN IF NOT EXISTS events_inserts bigint NOT NULL DEFAULT 0;
@@ -271,6 +276,11 @@ ALTER TABLE cdc_catalog.apply_position ADD COLUMN IF NOT EXISTS quarantined_at t
 
 ALTER TABLE cdc_catalog.capture_position ADD COLUMN IF NOT EXISTS last_failed_source_schema text;
 ALTER TABLE cdc_catalog.capture_position ADD COLUMN IF NOT EXISTS last_failed_source_table text;
+
+-- Half-open PK range owned by each copy worker; NULL means unbounded on that side.
+-- Persisted so a resumed full load reuses the same split instead of re-sampling.
+ALTER TABLE cdc_catalog.full_load_checkpoint ADD COLUMN IF NOT EXISTS slice_begin jsonb;
+ALTER TABLE cdc_catalog.full_load_checkpoint ADD COLUMN IF NOT EXISTS slice_end jsonb;
 
 DO $$
 BEGIN
@@ -734,6 +744,20 @@ inline std::string_view k_lake_helpers() {
 -- Applied via install.sh → apply_lake_schema (config.json → datalake).
 
 CREATE SCHEMA IF NOT EXISTS lake;
+
+-- Authoritative COPY position of a full-load worker.
+-- It lives in the lake because it is written inside the same transaction as the COPY it
+-- describes, which is the only way the two can agree after a crash: the mirror in
+-- cdc_catalog.full_load_checkpoint is a separate database and commits a moment later.
+CREATE TABLE IF NOT EXISTS lake.full_load_position (
+  catalog_id  bigint      NOT NULL,
+  worker_id   integer     NOT NULL DEFAULT 0,
+  batch_id    text        NOT NULL,
+  last_pk     jsonb       NOT NULL,
+  rows_loaded bigint      NOT NULL DEFAULT 0,
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (catalog_id, worker_id)
+);
 
 CREATE OR REPLACE FUNCTION lake.month_bounds(p_month date)
 RETURNS TABLE(month_start timestamptz, month_end timestamptz)
