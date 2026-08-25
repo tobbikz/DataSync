@@ -44,7 +44,8 @@ struct RowCountVerifyRequest {
     long long lake_rows{-1};
     long long rows_loaded{-1};
     std::optional<long long> baseline_source_rows;
-    bool capture_during_full_load{false};
+    /** CDC replays the load window, so the lake may legitimately exceed the truncate baseline. */
+    bool reconciles_load_window{false};
 };
 
 struct RowCountVerifyResult {
@@ -68,13 +69,16 @@ RowCountVerifyResult verify_full_load_row_counts(
     long long lake_rows,
     long long rows_loaded);
 
-/** Load truncate-phase baseline and capture_during_full_load from catalog/checkpoints. */
+/** Load truncate-phase baseline and load-window reconciliation from catalog/checkpoints.
+ *  engine_replays_load_window: engine resumes CDC from an LSN anchored before the COPY
+ *  (MSSQL), as opposed to streaming into Kafka during it (catalog.capture_during_full_load). */
 RowCountVerifyRequest build_row_count_verify_request(
     PGconn* catalog_pg,
     long long catalog_id,
     long long source_rows_live,
     long long lake_rows,
-    long long rows_loaded);
+    long long rows_loaded,
+    bool engine_replays_load_window = false);
 
 /** Structured log context for full-load row count verify checkpoints. */
 nlohmann::json row_count_verify_log_context(

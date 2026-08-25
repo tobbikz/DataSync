@@ -176,7 +176,8 @@ RowCountVerifyResult verify_baseline_streaming_capture(
         return result;
     }
 
-    // lake >= baseline is expected when capture_during_full_load applies CDC during COPY.
+    // lake >= baseline is expected when CDC reconciles the load window (streamed during the
+    // COPY, or replayed afterwards from an LSN anchored before it).
     if (request.source_rows_live >= 0 && exceeds_max_above_reference(
             request.source_rows_live,
             lake,
@@ -272,15 +273,18 @@ RowCountVerifyRequest build_row_count_verify_request(
     long long catalog_id,
     long long source_rows_live,
     long long lake_rows,
-    long long rows_loaded) {
+    long long rows_loaded,
+    bool engine_replays_load_window) {
     RowCountVerifyRequest request;
     request.source_rows_live = source_rows_live;
     request.lake_rows = lake_rows;
     request.rows_loaded = rows_loaded;
+    request.reconciles_load_window = engine_replays_load_window;
     if (!catalog_pg || catalog_id <= 0) {
         return request;
     }
-    request.capture_during_full_load = catalog_capture_during_full_load(catalog_pg, catalog_id);
+    request.reconciles_load_window =
+        engine_replays_load_window || catalog_capture_during_full_load(catalog_pg, catalog_id);
     const auto checkpoints = load_full_load_checkpoints(catalog_pg, catalog_id);
     request.baseline_source_rows = truncate_baseline_source_rows(checkpoints);
     return request;
@@ -296,7 +300,7 @@ RowCountVerifyResult verify_full_load_row_counts(const RowCountVerifyRequest& re
     }
 
     const bool use_baseline =
-        request.capture_during_full_load && request.baseline_source_rows.has_value();
+        request.reconciles_load_window && request.baseline_source_rows.has_value();
     if (use_baseline) {
         return verify_baseline_streaming_capture(request, result);
     }

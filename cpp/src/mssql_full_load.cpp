@@ -1189,6 +1189,40 @@ TableLoadOutcome load_one_table(
             target.source_schema,
             target.source_table);
     } else {
+        // Anchor the CDC cursor before the COPY reads a single row: every change committed
+        // from here on is replayed at onboard, so rows copied early in the window converge
+        // even if they were updated mid-load. A resume keeps the anchor of its first attempt.
+        try {
+            if (seed_mssql_cdc_lsn_t0_for_table(
+                    app_pg.raw,
+                    mssql,
+                    target.conn_id,
+                    target.source_database,
+                    target.source_schema,
+                    target.source_table)) {
+                log_fl(
+                    log_pg,
+                    log_mtx,
+                    LogLevel::Info,
+                    batch_id,
+                    "mssql LSN T0 anchored before full load copy",
+                    {},
+                    target.conn_id,
+                    target.source_schema,
+                    target.source_table);
+            }
+        } catch (const std::exception& ex) {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Warning,
+                batch_id,
+                "mssql LSN T0 anchor before full load copy failed",
+                {{"error", ex.what()}},
+                target.conn_id,
+                target.source_schema,
+                target.source_table);
+        }
         clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
         full_load::clear_lake_copy_positions(lake_pg.raw, target.catalog_id);
         const auto trunc = full_load::truncate_lake_table_verified(
@@ -1332,7 +1366,7 @@ TableLoadOutcome load_one_table(
     const long long lake_rows = full_load::lake_table_row_count(lake_pg.raw, pg_schema, pg_table);
     const auto verify = full_load::verify_full_load_row_counts(
         full_load::build_row_count_verify_request(
-            app_pg.raw, target.catalog_id, source_rows, lake_rows, rows_out));
+            app_pg.raw, target.catalog_id, source_rows, lake_rows, rows_out, true));
     if (!verify.ok) {
         log_fl(
             log_pg,
@@ -1356,38 +1390,6 @@ TableLoadOutcome load_one_table(
     mark_catalog_success(app_pg.raw, target.catalog_id);
     clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
     full_load::clear_lake_copy_positions(lake_pg.raw, target.catalog_id);
-
-    try {
-        if (seed_mssql_cdc_lsn_t0_for_table(
-                app_pg.raw,
-                mssql,
-                target.conn_id,
-                target.source_database,
-                target.source_schema,
-                target.source_table)) {
-            log_fl(
-                log_pg,
-                log_mtx,
-                LogLevel::Info,
-                batch_id,
-                "mssql LSN T0 reset after full load",
-                {},
-                target.conn_id,
-                target.source_schema,
-                target.source_table);
-        }
-    } catch (const std::exception& ex) {
-        log_fl(
-            log_pg,
-            log_mtx,
-            LogLevel::Warning,
-            batch_id,
-            "mssql LSN T0 reset after full load failed",
-            {{"error", ex.what()}},
-            target.conn_id,
-            target.source_schema,
-            target.source_table);
-    }
 
     if (!onboard_table_after_full_load(
             app_pg.raw,
