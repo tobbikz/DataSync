@@ -114,14 +114,16 @@ MssqlPreflightResult check_mssql_cdc_ready(MssqlConn& mssql, const std::string& 
 MssqlPreflightResult check_mssql_agent_ready(MssqlConn& mssql, const std::string& database) {
     MssqlPreflightResult result;
 
+    // Without VIEW SERVER STATE this either throws or silently returns no rows, depending on the
+    // driver; both mean the same thing to the operator.
     std::string agent_status;
+    std::string agent_error;
     try {
         agent_status = first_cell(mssql.query(
             "SELECT TOP 1 status_desc FROM sys.dm_server_services "
             "WHERE servicename LIKE 'SQL Server Agent%'"));
     } catch (const std::exception& ex) {
-        result.warnings.push_back(
-            std::string("SQL Server Agent status unavailable (needs VIEW SERVER STATE): ") + ex.what());
+        agent_error = ex.what();
     }
 
     bool capture_job = false;
@@ -150,6 +152,11 @@ MssqlPreflightResult check_mssql_agent_ready(MssqlConn& mssql, const std::string
     }
 
     if (agent_status.empty()) {
+        std::string detail = "SQL Server Agent status unavailable (needs VIEW SERVER STATE)";
+        if (!agent_error.empty()) {
+            detail += ": " + agent_error;
+        }
+        result.warnings.push_back(detail);
         return result;
     }
     result.facts["sql_server_agent"] = agent_status;
@@ -161,9 +168,10 @@ MssqlPreflightResult check_mssql_agent_ready(MssqlConn& mssql, const std::string
     if (agent_status == "Running") {
         if (capture_job) {
             result.warnings.push_back(
-                "SQL Server Agent is running with the CDC capture job present: it competes with the "
-                "sp_cdc_scan DataSync issues per slice and one of the two will fail with 'another "
-                "instance is already running' (harmless, but noisy). Consider disabling the job");
+                "SQL Server Agent is running with the CDC capture job present: the job holds "
+                "sp_replcmds, so the sp_cdc_scan DataSync issues per slice fails with Msg 22903 and "
+                "the error is discarded. Capture keeps working because the job populates the change "
+                "tables instead, but the scan DataSync thinks it is doing is a no-op");
         }
     } else {
         result.warnings.push_back(

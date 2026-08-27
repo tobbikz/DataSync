@@ -12,6 +12,9 @@ CONFIG="${DATASYNC_CONFIG:-$ROOT/config.json}"
 IMAGE="${DATASYNC_IMAGE:-datasync:local}"
 BOGUS_ALIAS="SMOKE_UNREACHABLE"
 BOGUS_PORT="${BOGUS_PORT:-59999}"
+STANDALONE_ALIAS="SMOKE_MONGO_STANDALONE"
+STANDALONE_NAME="datasync-smoke-mongo-standalone"
+STANDALONE_PORT="${STANDALONE_PORT:-27099}"
 
 log() { printf '[test-connection-smoke] %s\n' "$*"; }
 fail() { log "FAIL: $*"; exit 1; }
@@ -123,5 +126,46 @@ UNKNOWN_EXIT=$?
 set -e
 [[ "$UNKNOWN_EXIT" -eq 2 ]] || fail "unknown conn-id should exit 2, got $UNKNOWN_EXIT"
 log "phase 3 ok (exit 2)"
+
+# The only Mongo check that blocks a discover, so it is worth a real server rather than a
+# hand-written assertion: change streams cannot open on a node outside a replica set.
+log "phase 4: a standalone mongod must be rejected, not merely warned about"
+drop_standalone() {
+  docker rm -f "$STANDALONE_NAME" >/dev/null 2>&1 || true
+  catalog_sql "DELETE FROM cdc_catalog.connections WHERE alias = '$STANDALONE_ALIAS';" >/dev/null 2>&1 || true
+}
+trap 'drop_bogus; cleanup_report; drop_standalone' EXIT
+drop_standalone
+
+if ! docker run -d --name "$STANDALONE_NAME" -p "$STANDALONE_PORT:$STANDALONE_PORT" mongo:7 \
+      mongod --bind_ip_all --port "$STANDALONE_PORT" >/dev/null 2>&1; then
+  log "phase 4 skipped (could not start a standalone mongod)"
+else
+  for _ in $(seq 1 30); do
+    docker exec "$STANDALONE_NAME" mongosh --quiet --port "$STANDALONE_PORT" \
+      --eval 'db.adminCommand("ping").ok' >/dev/null 2>&1 && break
+    sleep 1
+  done
+  catalog_sql "
+  INSERT INTO cdc_catalog.connections (alias, db_engine, host, port, db_name, username, password, active)
+  VALUES ('$STANDALONE_ALIAS', 'mongodb', '127.0.0.1', $STANDALONE_PORT, 'probe', '', '', true);
+  " >/dev/null
+
+  set +e
+  run_ds test-connection --conn-id "$STANDALONE_ALIAS" > "$REPORT_FILE"
+  STANDALONE_EXIT=$?
+  set -e
+  [[ "$STANDALONE_EXIT" -eq 1 ]] || fail "standalone mongod should exit 1, got $STANDALONE_EXIT"
+
+  python3 - "$REPORT_FILE" <<'PY' || fail "phase 4 assertions failed"
+import json, sys
+conn = json.load(open(sys.argv[1]))["connections"][0]
+assert conn["reachable"] is True, "the standalone node answered, so it must be reachable"
+assert conn["ok"] is False, "a standalone node cannot serve change streams"
+assert any("standalone" in e for e in conn["errors"]), f"unexpected errors: {conn['errors']}"
+PY
+  drop_standalone
+  log "phase 4 ok (reachable but rejected, exit 1)"
+fi
 
 log "PASS: test-connection reports, fails and logs as specified"

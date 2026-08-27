@@ -50,12 +50,16 @@ MongoPreflightResult check_mongo_cdc_ready(MongoConn& mongo, const MongoSource& 
     std::string ping_error;
     if (!ping_admin(mongo.client, ping_error)) {
         result.ok = false;
-        result.errors.push_back("admin ping failed: " + ping_error);
+        std::string detail = "admin ping failed: " + ping_error;
+        // replica_set goes into the URI as ?replicaSet=, and the driver refuses to select a node
+        // whose setName differs. A wrong label therefore surfaces here as an opaque "no suitable
+        // servers", never as a reachable-but-mismatched node.
+        if (src.replica_set_in_extras && !src.replica_set.empty()) {
+            detail += " (the connection declares replica_set='" + src.replica_set +
+                      "'; server selection fails outright when that name does not match the server)";
+        }
+        result.errors.push_back(detail);
         return result;
-    }
-
-    if (!src.replica_set_in_extras) {
-        result.warnings.push_back("replica_set missing from connections extras (change streams require a replica set)");
     }
 
     // extras only says what the operator declared; hello says what the server actually is.
@@ -78,14 +82,13 @@ MongoPreflightResult check_mongo_cdc_ready(MongoConn& mongo, const MongoSource& 
     if (!set_name.empty()) {
         result.facts["replica_set"] = set_name;
         result.facts["is_primary"] = is_writable ? "yes" : "no";
-        // The driver already reached this node, so a stale label in extras is a documentation bug,
-        // not a reason to block discover.
-        if (src.replica_set_in_extras && !src.replica_set.empty() && src.replica_set != set_name) {
+        if (!src.replica_set_in_extras) {
             result.warnings.push_back(
-                "replica_set mismatch: extras says '" + src.replica_set + "' but the server reports '" +
-                set_name + "'");
+                "replica_set missing from connections extras (server reports '" + set_name + "')");
         }
     } else if (msg == "isdbgrid") {
+        // A mongos is not a replica set: telling the operator to declare one here would put a
+        // replicaSet= in the URI and break server selection.
         result.facts["topology"] = "sharded (mongos)";
     } else {
         result.ok = false;
