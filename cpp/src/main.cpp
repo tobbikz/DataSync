@@ -2,6 +2,7 @@
 #include "capture_common.hpp"
 #include "cdc_daemon.hpp"
 #include "config.hpp"
+#include "connection_test.hpp"
 #include "connections.hpp"
 #include "daemon_full_load.hpp"
 #include "kafka_apply.hpp"
@@ -214,6 +215,7 @@ void print_usage(const char* prog) {
               << "  " << prog << " ddl-sync --conn-id ID [--schema S] [--table T]\n"
               << "  " << prog << " kafka-apply --conn-id ID\n"
               << "  " << prog << " capture --conn-id ID\n"
+              << "  " << prog << " test-connection [--conn-id ID]\n"
               << "  " << prog << " coercion-audit [--conn-id ID] [--apply]\n"
               << "  " << prog << " catalog-schema-only\n"
               << "  " << prog << " lake-schema-only\n"
@@ -267,7 +269,7 @@ int main(int argc, char** argv) {
         command != "kafka-apply" && command != "capture" &&
         command != "daemon" && command != "onboard-pending" &&
         command != "lake-schema-only" && command != "coercion-audit" &&
-        command != "catalog-schema-only") {
+        command != "test-connection" && command != "catalog-schema-only") {
         print_usage(argv[0]);
         return 2;
     }
@@ -363,6 +365,13 @@ int main(int argc, char** argv) {
         }
         if (command == "capture") {
             return run_capture_cli(cfg, log_pg.raw, conn_id, 0, kCaptureWorkerCount);
+        }
+        if (command == "test-connection") {
+            return run_test_connection_cli(
+                cfg,
+                log_pg.raw,
+                batch_id,
+                conn_id.empty() ? std::nullopt : std::optional(conn_id));
         }
         if (command == "coercion-audit") {
             PgConn lake_pg(cfg.datalake.conn_string());
