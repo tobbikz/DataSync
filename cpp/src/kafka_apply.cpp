@@ -4,6 +4,7 @@
 #include "full_load_common.hpp"
 #include "lake_apply_index.hpp"
 #include "lake_columns.hpp"
+#include "lake_history.hpp"
 #include "mariadb_datetime.hpp"
 #include "mssql_conn.hpp"
 #include "mariadb_boolean.hpp"
@@ -73,6 +74,8 @@ struct TableBatchMeta {
     std::vector<std::string> lake_pk;
     std::vector<std::string> data_cols;
     std::map<std::string, std::string> col_types;
+    /** catalog.scd2_enabled: also mirror every change into `<table>_history`. */
+    bool scd2_enabled{false};
 };
 
 struct TableHealthSnapshot {
@@ -1444,12 +1447,23 @@ long long apply_table_batch(
         ensure_mirror_apply_pk_index(pg, meta.schema_name, meta.table_name, delete_pk_cols);
     }
 
+    const bool scd2 = meta.scd2_enabled && !business_pk.empty();
+    if (scd2) {
+        lake_history::ensure_history_table(
+            pg,
+            meta.schema_name,
+            meta.table_name,
+            business_pk,
+            pipeline_defaults::kLakePartitionMonthsAhead);
+    }
+
     int skipped_missing_pk_deletes = 0;
     if (!deletes.empty() && !delete_pk_cols.empty()) {
         const std::string del_stg = stable_temp_name("cdc_stg_del_", meta.schema_name, meta.table_name);
         const bool mssql_text_del = source_system == "MSSQL";
 
         std::vector<std::string> del_lines;
+        std::vector<std::string> hist_del_lines;
         del_lines.reserve(deletes.size());
         std::unordered_set<std::string> seen_delete_keys;
         for (const auto& e : deletes) {
@@ -1462,6 +1476,19 @@ long long apply_table_batch(
                 continue;
             }
             del_lines.push_back(*pk_line);
+            if (scd2) {
+                hist_del_lines.push_back(
+                    *pk_line + ',' + csv_escape_local(unique_load_timestamptz(e.ts_ms, 0)));
+            }
+        }
+        if (scd2 && !hist_del_lines.empty()) {
+            std::vector<std::string> pk_types;
+            pk_types.reserve(delete_pk_cols.size());
+            for (const auto& col : delete_pk_cols) {
+                pk_types.push_back(meta.col_types.count(col) ? meta.col_types.at(col) : "TEXT");
+            }
+            lake_history::close_history_for_deletes(
+                pg, meta.schema_name, meta.table_name, delete_pk_cols, pk_types, hist_del_lines);
         }
         copy_pk_lines_and_delete_target(pg, fq, del_stg, delete_pk_cols, meta.col_types, del_lines);
     } else if (!deletes.empty()) {
@@ -1607,6 +1634,12 @@ long long apply_table_batch(
             dedup_cols,
             {},
             &kafka_offsets);
+        if (scd2) {
+            // Reads the staging table the mirror was just loaded from, so history sees every
+            // version of the batch and not only the one that survived the dedup.
+            lake_history::record_history_from_staging(
+                pg, meta.schema_name, meta.table_name, pg_ident(staging_name), all_cols, business_pk);
+        }
     } else {
         throw std::runtime_error(
             "apply_table_batch: lake table has no primary key; refusing blind append COPY");
@@ -1629,6 +1662,7 @@ json apply_events_batch(
     thread_local std::unordered_map<std::string, std::vector<std::string>> lake_pk_cache;
     thread_local std::unordered_map<std::string, std::vector<std::string>> lake_data_cols_cache;
     thread_local std::unordered_map<std::string, std::map<std::string, std::string>> lake_col_types_cache;
+    std::unordered_map<long long, bool> scd2_by_catalog;
 
     std::vector<ApplyEvent> working(events.begin(), events.end());
     std::map<std::pair<std::string, std::string>, std::vector<ApplyEvent>> by_table;
@@ -1823,6 +1857,19 @@ json apply_events_batch(
         if (meta.catalog_source_schema.empty()) {
             meta.catalog_source_schema = meta.schema_name;
             meta.catalog_source_table = meta.table_name;
+        }
+        // Resolved per batch rather than cached for the life of the process, so turning SCD2
+        // on for a table takes effect on the next batch instead of the next restart.
+        if (meta.catalog_id > 0) {
+            auto scd2_it = scd2_by_catalog.find(meta.catalog_id);
+            if (scd2_it == scd2_by_catalog.end()) {
+                scd2_it = scd2_by_catalog
+                              .emplace(
+                                  meta.catalog_id,
+                                  lake_history::scd2_enabled_for_catalog(app_pg, meta.catalog_id))
+                              .first;
+            }
+            meta.scd2_enabled = scd2_it->second;
         }
         if (meta.schema_name.empty() && !meta.catalog_source_schema.empty()) {
             meta.schema_name = meta.catalog_source_schema;

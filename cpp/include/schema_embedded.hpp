@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS cdc_catalog.catalog (
   last_error text,
   engine_meta jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(engine_meta) = 'object'),
   capture_during_full_load boolean NOT NULL DEFAULT false,
+  scd2_enabled boolean NOT NULL DEFAULT false,
   CONSTRAINT catalog_source_object_uk
     UNIQUE (conn_id, db_engine, source_database, source_schema, source_table),
   CONSTRAINT catalog_pk_columns_when_has_pk
@@ -240,6 +241,7 @@ ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS last_cdc_at timestamptz
 ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS last_error_at timestamptz;
 ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS last_error text;
 ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS capture_during_full_load boolean NOT NULL DEFAULT false;
+ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS scd2_enabled boolean NOT NULL DEFAULT false;
 DROP INDEX IF EXISTS cdc_catalog.idx_catalog_hot;
 -- The matview below still selects hot on databases upgrading from before it was removed,
 -- and it is recreated further down anyway.

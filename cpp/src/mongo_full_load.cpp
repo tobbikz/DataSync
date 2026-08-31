@@ -1017,6 +1017,23 @@ bool load_one_collection(
         return false;
     }
 
+    // Mongo has no source primary key: the catalog pins pk_columns to the synthetic mongo_id,
+    // which is what the apply and the mirror index already key on.
+    const long long history_rows = full_load::seed_scd2_history(
+        app_pg.raw, lake_pg.raw, target.catalog_id, pg_schema, pg_table, {"mongo_id"});
+    if (history_rows >= 0) {
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Info,
+            batch_id,
+            "scd2 history seeded from full load",
+            {{"versions_opened", history_rows}},
+            target.conn_id,
+            target.source_database,
+            target.source_table);
+    }
+
     mark_catalog_success(app_pg.raw, target.catalog_id);
     clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
     full_load::clear_lake_copy_positions(lake_pg.raw, target.catalog_id);

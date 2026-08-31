@@ -23,6 +23,21 @@ std::string csv_escape(const std::string& value);
 
 long long lake_table_row_count(PGconn* pg, const std::string& schema, const std::string& table);
 
+/**
+ * Open a history version for every row a full load just wrote, when the table opted into
+ * SCD Type 2. Shared by the three engines so the seed happens at the same point of the load
+ * everywhere: after the row count verify, while the table lock is still held.
+ *
+ * Returns the number of versions opened, or -1 when the table is not opted in.
+ */
+long long seed_scd2_history(
+    PGconn* catalog_pg,
+    PGconn* lake_pg,
+    long long catalog_id,
+    const std::string& lake_schema,
+    const std::string& lake_table,
+    const std::vector<std::string>& pk_cols);
+
 /** Fast existence check for resume (avoids COUNT(*) on huge tables). */
 bool lake_table_has_rows(PGconn* pg, const std::string& schema, const std::string& table);
 

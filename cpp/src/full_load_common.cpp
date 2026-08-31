@@ -1,6 +1,7 @@
 #include "full_load_common.hpp"
 
 #include "full_load_checkpoint.hpp"
+#include "lake_history.hpp"
 #include "mariadb_schema.hpp"
 #include "pg_conn.hpp"
 #include "pipeline_defaults.hpp"
@@ -70,6 +71,20 @@ long long lake_table_row_count(PGconn* pg, const std::string& schema, const std:
         PQclear(res);
     }
     return count;
+}
+
+long long seed_scd2_history(
+    PGconn* catalog_pg,
+    PGconn* lake_pg,
+    long long catalog_id,
+    const std::string& lake_schema,
+    const std::string& lake_table,
+    const std::vector<std::string>& pk_cols) {
+    if (!lake_history::scd2_enabled_for_catalog(catalog_pg, catalog_id)) {
+        return -1;
+    }
+    return lake_history::seed_history_from_mirror(
+        lake_pg, lake_schema, lake_table, pk_cols, pipeline_defaults::kLakePartitionMonthsAhead);
 }
 
 bool lake_table_has_rows(PGconn* pg, const std::string& schema, const std::string& table) {
