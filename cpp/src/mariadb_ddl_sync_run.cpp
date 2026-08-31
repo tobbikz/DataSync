@@ -7,6 +7,7 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -15,6 +16,7 @@
 namespace {
 
 struct TableTarget {
+    long long catalog_id{0};
     std::string schema;
     std::string table;
     std::string pk_columns;
@@ -26,7 +28,7 @@ std::vector<TableTarget> fetch_ddl_targets(
     const std::optional<std::string>& source_schema,
     const std::optional<std::string>& source_table) {
     std::string sql = R"(
-        SELECT source_schema, source_table, COALESCE(pk_columns, '')
+        SELECT catalog_id, source_schema, source_table, COALESCE(pk_columns, '')
         FROM cdc_catalog.catalog
         WHERE conn_id = $1
           AND db_engine = 'mariadb'
@@ -69,7 +71,12 @@ std::vector<TableTarget> fetch_ddl_targets(
         return out;
     }
     for (int i = 0; i < PQntuples(res); ++i) {
-        out.push_back({PQgetvalue(res, i, 0), PQgetvalue(res, i, 1), PQgetvalue(res, i, 2)});
+        out.push_back({
+            std::atoll(PQgetvalue(res, i, 0)),
+            PQgetvalue(res, i, 1),
+            PQgetvalue(res, i, 2),
+            PQgetvalue(res, i, 3),
+        });
     }
     PQclear(res);
     return out;
@@ -122,24 +129,46 @@ DdlSyncRunStats run_mariadb_ddl_sync(
     for (const auto& target : targets) {
         stats.tables_processed += 1;
         try {
-            const auto result = sync_mariadb_columns_to_lake(
-                lake_pg.raw, mysql.handle, target.schema, target.table);
             const auto pk_cols = split_pk_columns(target.pk_columns);
+            const auto result = sync_mariadb_columns_to_lake(
+                lake_pg.raw, mysql.handle, target.schema, target.table, app_pg.raw, target.catalog_id, pk_cols);
             if (!pk_cols.empty()) {
                 ensure_mirror_apply_pk_index(lake_pg.raw, target.schema, target.table, pk_cols);
             }
             stats.tables_success += 1;
             stats.columns_added += result.columns_added;
-            if (result.columns_added > 0) {
+            stats.columns_dropped += result.columns_dropped;
+            if (result.full_load_requested) {
+                stats.tables_flagged_for_reload += 1;
+            }
+            if (!result.drift_reason.empty()) {
                 log_write(log_pg, {
-                    .level = LogLevel::Info,
+                    .level = LogLevel::Warning,
                     .component = "mariadb_ddl_sync",
-                    .message = "ddl sync table columns added",
+                    .message = "schema drift needs full-load reboot",
                     .batch_id = batch_id,
                     .conn_id = conn_id,
                     .source_schema = target.schema,
                     .source_table = target.table,
-                    .context = {{"columns_added", result.columns_added}},
+                    .context = {
+                        {"reason", result.drift_reason},
+                        {"flagged", result.full_load_requested},
+                    },
+                });
+            }
+            if (result.columns_added > 0 || result.columns_dropped > 0) {
+                log_write(log_pg, {
+                    .level = LogLevel::Info,
+                    .component = "mariadb_ddl_sync",
+                    .message = "ddl sync table columns changed",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = target.schema,
+                    .source_table = target.table,
+                    .context = {
+                        {"columns_added", result.columns_added},
+                        {"columns_dropped", result.columns_dropped},
+                    },
                 });
             }
         } catch (const std::exception& ex) {
@@ -171,6 +200,8 @@ DdlSyncRunStats run_mariadb_ddl_sync(
             {"tables_success", stats.tables_success},
             {"tables_failed", stats.tables_failed},
             {"columns_added", stats.columns_added},
+            {"columns_dropped", stats.columns_dropped},
+            {"tables_flagged_for_reload", stats.tables_flagged_for_reload},
         },
     });
 
@@ -187,6 +218,8 @@ int run_mariadb_ddl_sync_cli(
     const auto stats = run_mariadb_ddl_sync(cfg, log_pg, batch_id, conn_id, source_schema, source_table);
     std::cout << "{\"batch_id\":\"" << batch_id << "\",\"tables_processed\":" << stats.tables_processed
               << ",\"tables_success\":" << stats.tables_success << ",\"tables_failed\":" << stats.tables_failed
-              << ",\"columns_added\":" << stats.columns_added << "}" << std::endl;
+              << ",\"columns_added\":" << stats.columns_added
+              << ",\"columns_dropped\":" << stats.columns_dropped
+              << ",\"tables_flagged_for_reload\":" << stats.tables_flagged_for_reload << "}" << std::endl;
     return stats.tables_failed == 0 ? 0 : 1;
 }

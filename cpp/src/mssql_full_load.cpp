@@ -1295,7 +1295,8 @@ TableLoadOutcome load_one_table(
             target.source_database,
             target.source_schema,
             target.source_table,
-            cols);
+            cols,
+            source_pk_cols);
     }
 
     merge_lake_column_nullability(lake_pg.raw, pg_schema, pg_table, mariadb_shape_cols);

@@ -3,6 +3,7 @@
 #include "lake_columns.hpp"
 #include "mariadb_schema.hpp"
 #include "pipeline_defaults.hpp"
+#include "schema_drift.hpp"
 
 #include <functional>
 #include <map>
@@ -241,6 +242,15 @@ int sync_missing_columns(
         added += 1;
     }
     return added;
+}
+
+std::vector<std::string> source_column_names(const std::vector<MariaDbColumn>& cols) {
+    std::vector<std::string> names;
+    names.reserve(cols.size());
+    for (const auto& col : cols) {
+        names.push_back(col.name);
+    }
+    return names;
 }
 
 std::string pg_column_data_type(PGconn* pg, const std::string& schema, const std::string& table, const std::string& column) {
@@ -524,11 +534,23 @@ DdlSyncResult sync_mariadb_ddl_after_truncate(
     MYSQL* mysql,
     const std::string& schema,
     const std::string& table,
-    const std::vector<MariaDbColumn>& cols) {
+    const std::vector<MariaDbColumn>& cols,
+    const std::vector<std::string>& pk_cols) {
     DdlSyncResult result;
     result.columns_added = sync_missing_columns(pg, schema, table, cols);
     result.columns_widened = sync_binary_column_types(pg, schema, table, cols);
     result.columns_widened += sync_integer_column_types(pg, schema, table, cols);
+    // Retried here on purpose: a narrowing that did not fit the rows the table held before the
+    // truncate applies cleanly now, and the COPY refills it with data that matches the source.
+    result.columns_widened += migrate_lake_table_schema(pg, schema, table, cols).columns_migrated;
+
+    // The COPY that follows refills every column, so a rename needs no disambiguation here:
+    // whatever the source stopped exposing is stale and goes.
+    const auto plan = plan_schema_drift(
+        source_column_names(cols), fetch_lake_data_columns(pg, schema, table), pk_cols);
+    if (!plan.source_unavailable) {
+        result.columns_dropped = drop_lake_columns(pg, schema, table, droppable_columns(plan, pk_cols));
+    }
 
     if (pipeline_defaults::kDdlSyncIndexes) {
         result.indexes_created = sync_indexes(pg, schema, table, fetch_mariadb_indexes(mysql, schema, table));
@@ -544,15 +566,38 @@ DdlSyncResult sync_mariadb_columns_to_lake(
     PGconn* pg,
     MYSQL* mysql,
     const std::string& schema,
-    const std::string& table) {
+    const std::string& table,
+    PGconn* catalog_pg,
+    long long catalog_id,
+    const std::vector<std::string>& pk_cols) {
     const auto cols = fetch_mariadb_columns(mysql, schema, table);
     if (!pg_lake_table_exists(pg, schema, table)) {
         ensure_lake_table_base(pg, schema, table, cols);
         return {};
     }
+    const auto plan = plan_schema_drift(
+        source_column_names(cols), fetch_lake_data_columns(pg, schema, table), pk_cols);
+
     DdlSyncResult result;
     result.columns_added = sync_missing_columns(pg, schema, table, cols);
     result.columns_widened = sync_binary_column_types(pg, schema, table, cols);
     result.columns_widened += sync_integer_column_types(pg, schema, table, cols);
+
+    const auto migration = migrate_lake_table_schema(pg, schema, table, cols);
+    result.columns_widened += migration.columns_migrated;
+
+    if (plan.needs_full_load()) {
+        // The lake table holds data and a rename cannot be told apart from a drop plus an add,
+        // so nothing is dropped here: the reload rebuilds the table with the right shape.
+        result.drift_reason = plan.reason();
+    } else if (migration.failed()) {
+        result.drift_reason = type_migration_drift_reason(
+            migration.failed_column, migration.from_type, migration.to_type);
+    } else if (plan.drops_in_place()) {
+        result.columns_dropped = drop_lake_columns(pg, schema, table, plan.removed);
+    }
+    if (!result.drift_reason.empty()) {
+        result.full_load_requested = request_full_load_reboot(catalog_pg, catalog_id, result.drift_reason);
+    }
     return result;
 }

@@ -567,13 +567,14 @@ std::string lake_column_data_type(PGconn* pg, const std::string& schema, const s
     return result;
 }
 
-void migrate_lake_table_schema(
+LakeTypeMigration migrate_lake_table_schema(
     PGconn* pg,
     const std::string& schema,
     const std::string& table,
     const std::vector<MariaDbColumn>& cols) {
+    LakeTypeMigration migration;
     if (!pg_lake_table_exists(pg, schema, table)) {
-        return;
+        return migration;
     }
     for (const auto& col : cols) {
         const std::string existing = lake_column_data_type(pg, schema, table, col.name);
@@ -601,18 +602,21 @@ void migrate_lake_table_schema(
                 " USING " + pg_ident(col.name) + "::" + desired;
             try {
                 pg_exec(pg, alter_sql);
+                migration.columns_migrated += 1;
             } catch (const std::exception& ex) {
-                try {
-                    pg_exec(pg, "DROP TABLE IF EXISTS " + fq);
-                } catch (...) {
+                // Existing rows that do not fit the new type. Dropping the table here would
+                // destroy the mirror over a type change, so the column keeps its old type and
+                // the caller reloads: on a truncated table the same ALTER cannot fail.
+                if (!migration.failed()) {
+                    migration.failed_column = col.name;
+                    migration.from_type = existing;
+                    migration.to_type = desired;
+                    migration.error = ex.what();
                 }
-                throw std::runtime_error(
-                    "column type migration failed for " + col.name +
-                    " (" + existing + " -> " + desired + "): " + ex.what() +
-                    "; table dropped for safety");
             }
         }
     }
+    return migration;
 }
 
 void widen_lake_integer_column_to_bigint(

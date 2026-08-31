@@ -1049,7 +1049,7 @@ TableLoadOutcome load_one_table(
     }
 
     const DdlSyncResult ddl = sync_mariadb_ddl_after_truncate(
-        lake_pg.raw, mariadb.handle, target.source_schema, target.source_table, cols);
+        lake_pg.raw, mariadb.handle, target.source_schema, target.source_table, cols, pk_cols);
 
     merge_lake_column_nullability(lake_pg.raw, target.source_schema, target.source_table, cols);
 

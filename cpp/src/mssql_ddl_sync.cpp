@@ -8,7 +8,9 @@
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "pipeline_defaults.hpp"
+#include "schema_drift.hpp"
 
+#include <cstdlib>
 #include <iostream>
 #include <functional>
 #include <map>
@@ -20,10 +22,21 @@
 namespace {
 
 struct MssqlTableTarget {
+    long long catalog_id{0};
     std::string source_database;
     std::string source_schema;
     std::string source_table;
+    std::string pk_columns;
 };
+
+std::vector<std::string> source_column_names(const std::vector<MssqlColumn>& cols) {
+    std::vector<std::string> names;
+    names.reserve(cols.size());
+    for (const auto& col : cols) {
+        names.push_back(col.name);
+    }
+    return names;
+}
 
 std::string object_id_expr(const std::string& schema, const std::string& table) {
     auto esc = [](const std::string& id) {
@@ -329,6 +342,21 @@ int mssql_pg_type_width(const std::string& pg_type) {
     return 50;
 }
 
+/**
+ * Widths only compare inside a family: VARCHAR(5) and INTEGER both score in the same scale but
+ * shrinking one into the other is not a narrowing, it is a different type. Cross-family changes
+ * are left to the reload rather than guessed at with a USING cast.
+ */
+std::string mssql_pg_type_family(const std::string& pg_type) {
+    if (pg_type == "TEXT" || pg_type.rfind("VARCHAR(", 0) == 0) {
+        return "string";
+    }
+    if (pg_type == "INTEGER" || pg_type == "BIGINT") {
+        return "integer";
+    }
+    return pg_type;
+}
+
 std::string mssql_alter_column_using(const std::string& col, const std::string& to_type) {
     const std::string qcol = pg_ident(col);
     if (to_type.rfind("VARCHAR(", 0) == 0 || to_type == "TEXT") {
@@ -337,13 +365,14 @@ std::string mssql_alter_column_using(const std::string& col, const std::string& 
     return qcol + "::" + to_type;
 }
 
-int sync_mssql_column_types(
+LakeTypeMigration sync_mssql_column_types(
     PGconn* pg,
     const std::string& pg_schema,
     const std::string& pg_table,
     const std::vector<MssqlColumn>& cols) {
+    LakeTypeMigration migration;
     if (!pg_table_exists(pg, pg_schema, pg_table)) {
-        return 0;
+        return migration;
     }
     const char* vals[] = {pg_schema.c_str(), pg_table.c_str()};
     PGresult* res = PQexecParams(
@@ -362,7 +391,7 @@ int sync_mssql_column_types(
         if (res) {
             PQclear(res);
         }
-        return 0;
+        return migration;
     }
 
     std::map<std::string, std::string> existing_types;
@@ -375,7 +404,6 @@ int sync_mssql_column_types(
     }
     PQclear(res);
 
-    int widened = 0;
     const std::string fq = pg_ident(pg_schema) + "." + pg_ident(pg_table);
     for (const auto& col : cols) {
         const auto it = existing_types.find(col.name);
@@ -384,17 +412,32 @@ int sync_mssql_column_types(
         }
         const int existing_w = mssql_pg_type_width(it->second);
         const int source_w = mssql_pg_type_width(col.pg_type);
-        if (source_w <= existing_w) {
+        if (source_w == existing_w) {
+            continue;
+        }
+        // Narrowing is attempted too, but only within a family: the source shrank the column and
+        // the mirror follows. Rows that no longer fit make the ALTER fail, which is the signal to
+        // reload rather than to keep a type the source no longer has.
+        if (source_w < existing_w && mssql_pg_type_family(it->second) != mssql_pg_type_family(col.pg_type)) {
             continue;
         }
         const std::string using_expr = mssql_alter_column_using(col.name, col.pg_type);
-        pg_exec(
-            pg,
-            "ALTER TABLE " + fq + " ALTER COLUMN " + pg_ident(col.name) + " TYPE " + col.pg_type + " USING " +
-            using_expr);
-        widened += 1;
+        try {
+            pg_exec(
+                pg,
+                "ALTER TABLE " + fq + " ALTER COLUMN " + pg_ident(col.name) + " TYPE " + col.pg_type +
+                " USING " + using_expr);
+            migration.columns_migrated += 1;
+        } catch (const std::exception& ex) {
+            if (!migration.failed()) {
+                migration.failed_column = col.name;
+                migration.from_type = it->second;
+                migration.to_type = col.pg_type;
+                migration.error = ex.what();
+            }
+        }
     }
-    return widened;
+    return migration;
 }
 
 struct IndexDef {
@@ -560,7 +603,7 @@ std::vector<MssqlTableTarget> fetch_ddl_targets(
     const std::optional<std::string>& source_schema,
     const std::optional<std::string>& source_table) {
     std::string sql = R"(
-        SELECT source_database, source_schema, source_table
+        SELECT catalog_id, source_database, source_schema, source_table, COALESCE(pk_columns, '')
         FROM cdc_catalog.catalog
         WHERE conn_id = $1
           AND db_engine = 'mssql'
@@ -602,7 +645,13 @@ std::vector<MssqlTableTarget> fetch_ddl_targets(
         return out;
     }
     for (int i = 0; i < PQntuples(res); ++i) {
-        out.push_back({PQgetvalue(res, i, 0), PQgetvalue(res, i, 1), PQgetvalue(res, i, 2)});
+        out.push_back({
+            std::atoll(PQgetvalue(res, i, 0)),
+            PQgetvalue(res, i, 1),
+            PQgetvalue(res, i, 2),
+            PQgetvalue(res, i, 3),
+            PQgetvalue(res, i, 4),
+        });
     }
     PQclear(res);
     return out;
@@ -616,7 +665,8 @@ DdlSyncResult sync_mssql_ddl_after_truncate(
     const std::string& source_database,
     const std::string& source_schema,
     const std::string& source_table,
-    const std::vector<MssqlColumn>& cols) {
+    const std::vector<MssqlColumn>& cols,
+    const std::vector<std::string>& pk_cols) {
     DdlSyncResult result;
     const std::string pg_schema = mssql_pg_schema_name(source_database, source_schema);
     const std::string pg_table = mssql_pg_table_name(source_table);
@@ -625,7 +675,18 @@ DdlSyncResult sync_mssql_ddl_after_truncate(
     result.columns_widened = 0;
     if (pipeline_defaults::kDdlSyncColumns) {
         result.columns_added = sync_missing_columns(pg, pg_schema, pg_table, cols);
-        result.columns_widened = sync_mssql_column_types(pg, pg_schema, pg_table, cols);
+        // On the truncated table a narrowing cannot fail on data, so failures here are type
+        // conversions Postgres refuses outright and the reload will recreate the column.
+        result.columns_widened = sync_mssql_column_types(pg, pg_schema, pg_table, cols).columns_migrated;
+
+        // The COPY that follows refills every column, so a rename needs no disambiguation here:
+        // whatever the source stopped exposing is stale and goes.
+        const auto plan = plan_schema_drift(
+            source_column_names(cols), fetch_lake_data_columns(pg, pg_schema, pg_table), pk_cols);
+        if (!plan.source_unavailable) {
+            result.columns_dropped =
+                drop_lake_columns(pg, pg_schema, pg_table, droppable_columns(plan, pk_cols));
+        }
     }
 
     if (pipeline_defaults::kDdlSyncIndexes) {
@@ -648,7 +709,10 @@ DdlSyncResult sync_mssql_columns_to_lake(
     MssqlConn& mssql,
     const std::string& source_database,
     const std::string& source_schema,
-    const std::string& source_table) {
+    const std::string& source_table,
+    PGconn* catalog_pg,
+    long long catalog_id,
+    const std::vector<std::string>& pk_cols) {
     mssql.use_database(source_database);
     const auto cols = fetch_mssql_columns(mssql.handle, source_schema, source_table);
     const std::string pg_schema = mssql_pg_schema_name(source_database, source_schema);
@@ -671,8 +735,27 @@ DdlSyncResult sync_mssql_columns_to_lake(
     }
     DdlSyncResult result;
     if (pipeline_defaults::kDdlSyncColumns) {
+        const auto plan = plan_schema_drift(
+            source_column_names(cols), fetch_lake_data_columns(pg, pg_schema, pg_table), pk_cols);
+
         result.columns_added = sync_missing_columns(pg, pg_schema, pg_table, cols);
-        result.columns_widened = sync_mssql_column_types(pg, pg_schema, pg_table, cols);
+        const auto migration = sync_mssql_column_types(pg, pg_schema, pg_table, cols);
+        result.columns_widened = migration.columns_migrated;
+
+        if (plan.needs_full_load()) {
+            // The lake table holds data and a rename cannot be told apart from a drop plus an
+            // add, so nothing is dropped here: the reload rebuilds it with the right shape.
+            result.drift_reason = plan.reason();
+        } else if (migration.failed()) {
+            result.drift_reason = type_migration_drift_reason(
+                migration.failed_column, migration.from_type, migration.to_type);
+        } else if (plan.drops_in_place()) {
+            result.columns_dropped = drop_lake_columns(pg, pg_schema, pg_table, plan.removed);
+        }
+        if (!result.drift_reason.empty()) {
+            result.full_load_requested =
+                request_full_load_reboot(catalog_pg, catalog_id, result.drift_reason);
+        }
     }
     return result;
 }
@@ -727,10 +810,33 @@ DdlSyncRunStats run_mssql_ddl_sync(
                 mssql,
                 target.source_database,
                 target.source_schema,
-                target.source_table);
+                target.source_table,
+                app_pg.raw,
+                target.catalog_id,
+                split_pk_columns(target.pk_columns));
             stats.tables_success += 1;
             stats.columns_added += result.columns_added;
-            if (result.columns_added > 0 || result.indexes_created > 0 || result.foreign_keys_created > 0) {
+            stats.columns_dropped += result.columns_dropped;
+            if (result.full_load_requested) {
+                stats.tables_flagged_for_reload += 1;
+            }
+            if (!result.drift_reason.empty()) {
+                log_write(log_pg, {
+                    .level = LogLevel::Warning,
+                    .component = "mssql_ddl_sync",
+                    .message = "schema drift needs full-load reboot",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = target.source_schema,
+                    .source_table = target.source_table,
+                    .context = {
+                        {"reason", result.drift_reason},
+                        {"flagged", result.full_load_requested},
+                    },
+                });
+            }
+            if (result.columns_added > 0 || result.columns_dropped > 0 || result.indexes_created > 0 ||
+                result.foreign_keys_created > 0) {
                 log_write(log_pg, {
                     .level = LogLevel::Info,
                     .component = "mssql_ddl_sync",
@@ -741,6 +847,7 @@ DdlSyncRunStats run_mssql_ddl_sync(
                     .source_table = target.source_table,
                     .context = {
                         {"columns_added", result.columns_added},
+                        {"columns_dropped", result.columns_dropped},
                         {"indexes_created", result.indexes_created},
                         {"foreign_keys_created", result.foreign_keys_created},
                     },
@@ -775,6 +882,8 @@ DdlSyncRunStats run_mssql_ddl_sync(
             {"tables_success", stats.tables_success},
             {"tables_failed", stats.tables_failed},
             {"columns_added", stats.columns_added},
+            {"columns_dropped", stats.columns_dropped},
+            {"tables_flagged_for_reload", stats.tables_flagged_for_reload},
         },
     });
 
@@ -792,7 +901,9 @@ int run_mssql_ddl_sync_cli(
         run_mssql_ddl_sync(cfg, log_pg, batch_id, conn_id, source_schema, source_table);
     std::cout << "{\"batch_id\":\"" << batch_id << "\",\"tables_processed\":" << stats.tables_processed
               << ",\"tables_success\":" << stats.tables_success << ",\"tables_failed\":" << stats.tables_failed
-              << ",\"columns_added\":" << stats.columns_added << "}" << std::endl;
+              << ",\"columns_added\":" << stats.columns_added
+              << ",\"columns_dropped\":" << stats.columns_dropped
+              << ",\"tables_flagged_for_reload\":" << stats.tables_flagged_for_reload << "}" << std::endl;
     return stats.tables_failed == 0 ? 0 : 1;
 }
 

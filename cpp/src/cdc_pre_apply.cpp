@@ -19,6 +19,7 @@
 #endif
 
 #include <chrono>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -42,7 +43,7 @@ int sync_mssql_columns_for_conn(
     PGresult* res = PQexecParams(
         log_pg,
         R"(
-        SELECT source_database, source_schema, source_table
+        SELECT source_database, source_schema, source_table, catalog_id, COALESCE(pk_columns, '')
         FROM cdc_catalog.catalog
         WHERE conn_id = $1 AND db_engine = 'mssql' AND active = true
           AND cdc_enabled = true
@@ -70,12 +71,26 @@ int sync_mssql_columns_for_conn(
             const std::string db = PQgetvalue(res, i, 0);
             const std::string schema = PQgetvalue(res, i, 1);
             const std::string table = PQgetvalue(res, i, 2);
+            const long long catalog_id = std::atoll(PQgetvalue(res, i, 3));
+            const auto pk_cols = split_pk_columns(PQgetvalue(res, i, 4));
             if (!pipeline_defaults::kDdlSyncColumns) {
                 continue;
             }
             const auto ddl = sync_mssql_columns_to_lake(
-                lake_pg.raw, mssql, db, schema, table);
-            if (ddl.columns_added > 0 || ddl.columns_widened > 0) {
+                lake_pg.raw, mssql, db, schema, table, log_pg, catalog_id, pk_cols);
+            if (!ddl.drift_reason.empty()) {
+                log_write(log_pg, {
+                    .level = LogLevel::Warning,
+                    .component = "cdc_kafka_mssql_ddl",
+                    .message = "schema drift needs full-load reboot",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = schema,
+                    .source_table = table,
+                    .context = {{"reason", ddl.drift_reason}, {"flagged", ddl.full_load_requested}},
+                });
+            }
+            if (ddl.columns_added > 0 || ddl.columns_widened > 0 || ddl.columns_dropped > 0) {
                 synced += 1;
                 log_write(log_pg, {
                     .level = LogLevel::Info,
@@ -85,7 +100,11 @@ int sync_mssql_columns_for_conn(
                     .conn_id = conn_id,
                     .source_schema = schema,
                     .source_table = table,
-                    .context = {{"columns_added", ddl.columns_added}, {"columns_widened", ddl.columns_widened}},
+                    .context = {
+                        {"columns_added", ddl.columns_added},
+                        {"columns_widened", ddl.columns_widened},
+                        {"columns_dropped", ddl.columns_dropped},
+                    },
                 });
             }
         }

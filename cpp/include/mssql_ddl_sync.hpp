@@ -16,20 +16,26 @@
 
 #ifdef HAVE_FREETDS
 
+// pk_cols guards the apply index: a PK column is never dropped here, only reloaded.
 DdlSyncResult sync_mssql_ddl_after_truncate(
     PGconn* pg,
     MssqlConn& mssql,
     const std::string& source_database,
     const std::string& source_schema,
     const std::string& source_table,
-    const std::vector<MssqlColumn>& cols);
+    const std::vector<MssqlColumn>& cols,
+    const std::vector<std::string>& pk_cols = {});
 
+// catalog_pg/catalog_id let ambiguous drift (possible rename) flag the table for a reload.
 DdlSyncResult sync_mssql_columns_to_lake(
     PGconn* pg,
     MssqlConn& mssql,
     const std::string& source_database,
     const std::string& source_schema,
-    const std::string& source_table);
+    const std::string& source_table,
+    PGconn* catalog_pg = nullptr,
+    long long catalog_id = 0,
+    const std::vector<std::string>& pk_cols = {});
 
 DdlSyncRunStats run_mssql_ddl_sync(
     const AppConfig& cfg,

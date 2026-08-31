@@ -73,8 +73,23 @@ bool pg_lake_table_is_partitioned(PGconn* pg, const std::string& schema, const s
 /** Drop legacy non-partitioned lake shells so PARTITION BY RANGE create can succeed. */
 void drop_lake_table_if_not_partitioned(PGconn* pg, const std::string& schema, const std::string& table);
 
-/** Drop and recreate the lake table if column types changed (e.g., int unsigned → bigint). */
-void migrate_lake_table_schema(
+struct LakeTypeMigration {
+    int columns_migrated{0};
+    /** First column the lake refused to migrate in place; empty when everything went through. */
+    std::string failed_column;
+    std::string from_type;
+    std::string to_type;
+    std::string error;
+
+    bool failed() const { return !failed_column.empty(); }
+};
+
+/**
+ * Align lake column types with the source (e.g. int unsigned → bigint, varchar shrink).
+ * Best effort: a column whose data does not fit the new type is left alone and reported, so
+ * the caller decides — the full load retries it on the truncated table, CDC reloads instead.
+ */
+LakeTypeMigration migrate_lake_table_schema(
     PGconn* pg,
     const std::string& schema,
     const std::string& table,
