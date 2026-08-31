@@ -1,4 +1,24 @@
-export type CatalogReplicationMode = "enable" | "disable" | "reset" | "unquarantine";
+export type CatalogReplicationMode =
+  | "enable"
+  | "disable"
+  | "reset"
+  | "unquarantine"
+  | "scd2-enable"
+  | "scd2-disable";
+
+/**
+ * SCD Type 2 history is deliberately its own switch: a table can replicate for years
+ * without history, and turning history on or off must not disturb whether it replicates.
+ * That is why enable/disable above never touch this column.
+ */
+export const SET_CATALOG_SCD2_SQL = `
+  UPDATE cdc_catalog.catalog
+  SET scd2_enabled = $2::boolean,
+      updated_at = now()
+  WHERE catalog_id = $1::bigint
+  RETURNING catalog_id, conn_id, source_schema, source_table, active, cdc_enabled,
+            capture_during_full_load, scd2_enabled
+`;
 
 export const ENABLE_CATALOG_REPLICATION_SQL = `
   UPDATE cdc_catalog.catalog
@@ -7,7 +27,8 @@ export const ENABLE_CATALOG_REPLICATION_SQL = `
       capture_during_full_load = true,
       updated_at = now()
   WHERE catalog_id = $1::bigint
-  RETURNING catalog_id, conn_id, source_schema, source_table, active, cdc_enabled, capture_during_full_load
+  RETURNING catalog_id, conn_id, source_schema, source_table, active, cdc_enabled,
+            capture_during_full_load, scd2_enabled
 `;
 
 export const DISABLE_CATALOG_REPLICATION_SQL = `
@@ -17,7 +38,8 @@ export const DISABLE_CATALOG_REPLICATION_SQL = `
       capture_during_full_load = false,
       updated_at = now()
   WHERE catalog_id = $1::bigint
-  RETURNING catalog_id, conn_id, source_schema, source_table, active, cdc_enabled, capture_during_full_load
+  RETURNING catalog_id, conn_id, source_schema, source_table, active, cdc_enabled,
+            capture_during_full_load, scd2_enabled
 `;
 
 export const LOG_CATALOG_REPLICATION_SQL = `
@@ -61,7 +83,8 @@ SELECT
   c.source_table,
   c.active,
   c.cdc_enabled,
-  c.capture_during_full_load
+  c.capture_during_full_load,
+  c.scd2_enabled
 FROM cdc_catalog.catalog c
 WHERE c.catalog_id = $1::bigint
 `;

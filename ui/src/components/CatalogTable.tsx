@@ -67,6 +67,7 @@ function CatalogDetailPanel({
   onDisable,
   onReset,
   onUnquarantine,
+  onSetScd2,
 }: {
   detail: CatalogDetailResponse;
   busy: boolean;
@@ -74,6 +75,7 @@ function CatalogDetailPanel({
   onDisable: () => void;
   onReset: () => void;
   onUnquarantine: () => void;
+  onSetScd2: (enabled: boolean) => void;
 }) {
   const { catalog, apply_position, recent_stats, recent_logs } = detail;
   const replicationOn =
@@ -120,10 +122,26 @@ function CatalogDetailPanel({
             UNQUARANTINE
           </button>
         ) : null}
+        {/* Its own switch on purpose: history is independent of whether the table
+            replicates, so it can be turned on or off at any time without touching CDC. */}
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => onSetScd2(!catalog.scd2_enabled)}
+          className="btn-secondary py-1 text-[11px]"
+          title={
+            catalog.scd2_enabled
+              ? `Stop recording versions. ${catalog.source_table}_history keeps what it already has.`
+              : `Record every version of each row in ${catalog.source_table}_history, so a query can ask what a row looked like at any past instant.`
+          }
+        >
+          {catalog.scd2_enabled ? "DISABLE SCD2 HISTORY" : "ENABLE SCD2 HISTORY"}
+        </button>
         <span className="font-mono text-[10px] text-foreground-muted">
           active={catalog.active ? "true" : "false"} · cdc=
           {catalog.cdc_enabled ? "on" : "off"} · cap-during-fl=
-          {catalog.capture_during_full_load ? "true" : "false"}
+          {catalog.capture_during_full_load ? "true" : "false"} · scd2=
+          {catalog.scd2_enabled ? "on" : "off"}
         </span>
       </div>
 
@@ -315,7 +333,13 @@ export function CatalogTable() {
 
   async function setReplication(
     catalogId: number,
-    mode: "enable" | "disable" | "reset" | "unquarantine",
+    mode:
+      | "enable"
+      | "disable"
+      | "reset"
+      | "unquarantine"
+      | "scd2-enable"
+      | "scd2-disable",
     reloadDetail = false,
   ) {
     setReplicationBusy(catalogId);
@@ -590,6 +614,13 @@ export function CatalogTable() {
                           }
                           onUnquarantine={() =>
                             setReplication(row.catalog_id, "unquarantine", true)
+                          }
+                          onSetScd2={(enabled) =>
+                            setReplication(
+                              row.catalog_id,
+                              enabled ? "scd2-enable" : "scd2-disable",
+                              true,
+                            )
                           }
                         />
                       ) : (

@@ -7,6 +7,8 @@ export interface CatalogRow {
   active: boolean;
   cdc_enabled: boolean;
   capture_during_full_load: boolean;
+  /** Opt-in per table, independent of active/cdc_enabled: see the SCD Type 2 history table. */
+  scd2_enabled: boolean;
   status: string;
   needs_full_load: boolean;
   last_full_load_at: string | null;

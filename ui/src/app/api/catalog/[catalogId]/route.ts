@@ -5,6 +5,7 @@ import {
   DISABLE_CATALOG_REPLICATION_SQL,
   ENABLE_CATALOG_REPLICATION_SQL,
   LOG_CATALOG_REPLICATION_SQL,
+  SET_CATALOG_SCD2_SQL,
   UNQUARANTINE_CATALOG_SQL,
   type CatalogReplicationMode,
 } from "@/lib/catalog-replication";
@@ -137,6 +138,7 @@ type ReplicationRow = {
   active: boolean;
   cdc_enabled: boolean;
   capture_during_full_load: boolean;
+  scd2_enabled: boolean;
 };
 
 export async function PATCH(
@@ -160,12 +162,47 @@ export async function PATCH(
     body.mode !== "enable" &&
     body.mode !== "disable" &&
     body.mode !== "reset" &&
-    body.mode !== "unquarantine"
+    body.mode !== "unquarantine" &&
+    body.mode !== "scd2-enable" &&
+    body.mode !== "scd2-disable"
   ) {
     return NextResponse.json(
-      { error: 'mode must be "enable", "disable", "reset", or "unquarantine"' },
+      {
+        error:
+          'mode must be "enable", "disable", "reset", "unquarantine", "scd2-enable", or "scd2-disable"',
+      },
       { status: 400 },
     );
+  }
+
+  // Its own branch, not a field folded into enable/disable: history is opt-in per table and
+  // toggling it must leave replication exactly as it was.
+  if (body.mode === "scd2-enable" || body.mode === "scd2-disable") {
+    const enabled = body.mode === "scd2-enable";
+    const result = await mutate<ReplicationRow>(SET_CATALOG_SCD2_SQL, [id, enabled]);
+    if (!result.ok) {
+      return NextResponse.json({ error: result.error }, { status: 500 });
+    }
+    if (result.rows.length === 0) {
+      return NextResponse.json({ error: "Catalog entry not found" }, { status: 404 });
+    }
+    const row = result.rows[0];
+
+    await mutate(LOG_CATALOG_REPLICATION_SQL, [
+      enabled
+        ? "scd2 history enabled (versions recorded in <table>_history)"
+        : "scd2 history disabled (existing versions kept)",
+      row.conn_id,
+      row.source_schema,
+      row.source_table,
+      JSON.stringify({
+        catalog_id: row.catalog_id,
+        scd2_enabled: row.scd2_enabled,
+        via: "ui",
+      }),
+    ]);
+
+    return NextResponse.json({ ok: true, mode: body.mode, catalog: row });
   }
 
   if (body.mode === "unquarantine") {
