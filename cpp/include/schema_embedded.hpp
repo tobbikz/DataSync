@@ -171,6 +171,42 @@ CREATE TABLE IF NOT EXISTS cdc_catalog.apply_batch_stats (
   health_reason text NOT NULL DEFAULT 'healthy'
 );
 
+-- Rows the apply could not write for a deterministic, data-shaped reason. Parking them
+-- here keeps the table replicating instead of quarantining it over a single bad row,
+-- and preserves the payload, which the old path discarded once offsets were skipped.
+CREATE TABLE IF NOT EXISTS cdc_catalog.apply_dlq (
+  dlq_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  catalog_id bigint REFERENCES cdc_catalog.catalog (catalog_id) ON DELETE CASCADE,
+  conn_id text NOT NULL,
+  db_engine cdc_catalog.db_engine,
+  source_schema text NOT NULL,
+  source_table text NOT NULL,
+  lake_schema text,
+  lake_table text,
+  op text NOT NULL,
+  event_id text,
+  kafka_topic text,
+  kafka_partition integer,
+  kafka_offset bigint,
+  gtid text,
+  event_ts_ms bigint,
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(payload) = 'object'),
+  error_sqlstate text,
+  error_message text NOT NULL,
+  -- 'reason' separates a row rejected by Postgres from an event whose table never
+  -- resolved; the latter used to vanish counted only as dropped_unrecoverable.
+  reason text NOT NULL DEFAULT 'apply_error'
+    CHECK (reason = ANY (ARRAY ['apply_error', 'unresolved_table'])),
+  status text NOT NULL DEFAULT 'parked'
+    CHECK (status = ANY (ARRAY ['parked', 'retried', 'discarded'])),
+  batch_id text,
+  retry_count integer NOT NULL DEFAULT 0,
+  first_seen_at timestamptz NOT NULL DEFAULT now(),
+  logged_at timestamptz NOT NULL DEFAULT now(),
+  resolved_at timestamptz,
+  resolved_by text
+);
+
 CREATE TABLE IF NOT EXISTS cdc_catalog.capture_position (
   conn_id text NOT NULL PRIMARY KEY,
   gtid_set text NOT NULL DEFAULT '',
@@ -374,6 +410,15 @@ CREATE INDEX IF NOT EXISTS apply_position_stale_idx
 CREATE INDEX IF NOT EXISTS apply_position_conn_status_idx
   ON cdc_catalog.apply_position (conn_id, status);
 
+CREATE INDEX IF NOT EXISTS apply_dlq_parked_idx
+  ON cdc_catalog.apply_dlq (conn_id, source_schema, source_table, logged_at DESC)
+  WHERE status = 'parked';
+CREATE INDEX IF NOT EXISTS apply_dlq_catalog_idx
+  ON cdc_catalog.apply_dlq (catalog_id, logged_at DESC);
+-- Prune order, mirroring apply_batch_stats_logged_at_stat_id_idx.
+CREATE INDEX IF NOT EXISTS apply_dlq_logged_at_dlq_id_idx
+  ON cdc_catalog.apply_dlq (logged_at, dlq_id);
+
 CREATE INDEX IF NOT EXISTS gap_events_conn_detected_idx
   ON cdc_catalog.gap_events (conn_id, detected_at DESC);
 CREATE INDEX IF NOT EXISTS gap_events_unresolved_idx
@@ -510,6 +555,41 @@ BEGIN
       SELECT ctid FROM cdc_catalog.apply_batch_stats
       WHERE logged_at < now() - make_interval(days => GREATEST(retention_days, 1))
       ORDER BY logged_at, stat_id
+      LIMIT lim
+    );
+    GET DIAGNOSTICS batch = ROW_COUNT;
+    total := total + batch;
+    EXIT WHEN batch = 0;
+    i := i + 1;
+  END LOOP;
+  RETURN total;
+END;
+$$;
+
+-- Only resolved rows age out. A row still 'parked' is an unattended incident, so it
+-- survives retention rather than disappearing before anyone triages it.
+CREATE OR REPLACE FUNCTION cdc_catalog.prune_apply_dlq_batched(
+  retention_days integer,
+  batch_size integer,
+  max_batches integer
+)
+RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  total bigint := 0;
+  batch bigint;
+  i integer := 0;
+  lim integer := GREATEST(batch_size, 1);
+  maxb integer := GREATEST(max_batches, 1);
+BEGIN
+  WHILE i < maxb LOOP
+    DELETE FROM cdc_catalog.apply_dlq
+    WHERE ctid IN (
+      SELECT ctid FROM cdc_catalog.apply_dlq
+      WHERE logged_at < now() - make_interval(days => GREATEST(retention_days, 1))
+        AND status <> 'parked'
+      ORDER BY logged_at, dlq_id
       LIMIT lim
     );
     GET DIAGNOSTICS batch = ROW_COUNT;

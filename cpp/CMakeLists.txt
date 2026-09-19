@@ -26,6 +26,7 @@ set(DATASYNC_SOURCES
     src/mariadb_ddl_sync.cpp
     src/mariadb_ddl_sync_run.cpp
     src/schema_drift.cpp
+    src/apply_dlq.cpp
     src/lake_history.cpp
     src/full_load_common.cpp
     src/full_load_checkpoint.cpp

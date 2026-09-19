@@ -1,5 +1,6 @@
 #include "kafka_apply_detail.hpp"
 #include "kafka_apply.hpp"
+#include "apply_dlq.hpp"
 #include "capture_common.hpp"
 #include "full_load_common.hpp"
 #include "lake_apply_index.hpp"
@@ -831,11 +832,12 @@ void copy_csv_lines(PGconn* pg, const std::string& copy_sql, const std::vector<s
     while (end_res) {
         if (PQresultStatus(end_res) != PGRES_COMMAND_OK) {
             std::string err = PQerrorMessage(pg);
+            const std::string state = pg_result_sqlstate(end_res);
             PQclear(end_res);
             while (PGresult* r = PQgetResult(pg)) {
                 PQclear(r);
             }
-            throw std::runtime_error("COPY failed: " + err);
+            throw PgError("COPY failed: " + err, state);
         }
         PQclear(end_res);
         end_res = PQgetResult(pg);
@@ -1648,6 +1650,154 @@ long long apply_table_batch(
     return applied_deletes + static_cast<long long>(upserts.size() - skipped_missing_pk);
 }
 
+/** Outcome of trying to salvage a table batch that failed on a data error. */
+struct DlqIsolation {
+    long long applied{0};
+    int parked{0};
+    int attempts{0};
+    /** True when the damage was too broad to be a few bad rows; the caller quarantines. */
+    bool give_up{false};
+    std::string last_error;
+    std::string last_sqlstate;
+};
+
+/**
+ * Splits a failed table batch until the rows Postgres rejects are alone, applies everything
+ * else, and parks the rejects.
+ *
+ * Bisection rather than row-by-row because the expected shape is a handful of bad rows among
+ * thousands of good ones: halving finds one offender in about log2(n) attempts, where
+ * retrying individually would cost n round trips per flush.
+ *
+ * Atomicity narrows here, deliberately. The table batch used to commit as one transaction;
+ * once it has failed, its subsets commit separately, so a caller cannot assume all-or-nothing
+ * for a batch that reached this path. That is the trade being made — partial progress plus a
+ * recorded reject, instead of no progress and a quarantined table.
+ */
+DlqIsolation isolate_and_apply_with_dlq(
+    PGconn* lake_pg,
+    PGconn* app_pg,
+    const std::string& conn_id,
+    const std::string& batch_id,
+    const std::string& db_engine,
+    TableBatchMeta& meta,
+    std::vector<ApplyEvent> deletes,
+    std::vector<ApplyEvent> upserts,
+    int& staging_id,
+    const std::string& source_system) {
+    DlqIsolation out;
+
+    // One sequence so bisection can split at any point, keeping deletes ahead of upserts
+    // because that is the order apply_table_batch applies them in.
+    const std::size_t delete_count = deletes.size();
+    std::vector<ApplyEvent> seq;
+    seq.reserve(deletes.size() + upserts.size());
+    for (auto& e : deletes) {
+        seq.push_back(std::move(e));
+    }
+    for (auto& e : upserts) {
+        seq.push_back(std::move(e));
+    }
+
+    // Applies seq[lo, hi) in its own transaction. Returns empty on success, else the error.
+    auto try_slice = [&](std::size_t lo, std::size_t hi, std::string& sqlstate) -> std::string {
+        std::vector<ApplyEvent> slice_deletes;
+        std::vector<ApplyEvent> slice_upserts;
+        for (std::size_t i = lo; i < hi; ++i) {
+            if (i < delete_count) {
+                slice_deletes.push_back(seq[i]);
+            } else {
+                slice_upserts.push_back(seq[i]);
+            }
+        }
+        out.attempts += 1;
+        PGresult* begin_res = PQexec(lake_pg, "BEGIN");
+        if (begin_res) {
+            PQclear(begin_res);
+        }
+        try {
+            const long long applied = apply_table_batch(
+                lake_pg, app_pg, conn_id, batch_id, meta, slice_upserts, slice_deletes,
+                staging_id++, source_system);
+            PGresult* commit_res = PQexec(lake_pg, "COMMIT");
+            const bool ok = commit_res && PQresultStatus(commit_res) == PGRES_COMMAND_OK;
+            const std::string commit_err = ok ? std::string() : std::string(PQerrorMessage(lake_pg));
+            if (commit_res) {
+                PQclear(commit_res);
+            }
+            if (!ok) {
+                PGresult* rb = PQexec(lake_pg, "ROLLBACK");
+                if (rb) {
+                    PQclear(rb);
+                }
+                sqlstate.clear();
+                return "COMMIT failed: " + commit_err;
+            }
+            out.applied += applied;
+            return {};
+        } catch (const PgError& ex) {
+            PGresult* rb = PQexec(lake_pg, "ROLLBACK");
+            if (rb) {
+                PQclear(rb);
+            }
+            sqlstate = ex.sqlstate;
+            return ex.what();
+        } catch (const std::exception& ex) {
+            PGresult* rb = PQexec(lake_pg, "ROLLBACK");
+            if (rb) {
+                PQclear(rb);
+            }
+            sqlstate.clear();
+            return ex.what();
+        }
+    };
+
+    std::function<void(std::size_t, std::size_t)> descend = [&](std::size_t lo, std::size_t hi) {
+        if (out.give_up || lo >= hi) {
+            return;
+        }
+        std::string sqlstate;
+        const std::string err = try_slice(lo, hi, sqlstate);
+        if (err.empty()) {
+            return;
+        }
+        out.last_error = err;
+        out.last_sqlstate = sqlstate;
+
+        // A transient failure mid-isolation means the environment moved under us. Splitting
+        // further would blame rows for it, so stop and let the caller quarantine as before.
+        if (!apply_dlq::error_is_deterministic(sqlstate, err)) {
+            out.give_up = true;
+            return;
+        }
+
+        if (hi - lo == 1) {
+            const ApplyEvent& bad = seq[lo];
+            if (!apply_dlq::park_event(
+                    app_pg, bad, conn_id, db_engine, meta.catalog_source_schema,
+                    meta.catalog_source_table, meta.schema_name, meta.table_name, batch_id,
+                    sqlstate, err, apply_dlq::Reason::ApplyError)) {
+                // Failing to record the row would discard it silently, which is the exact
+                // failure mode this queue exists to remove.
+                out.give_up = true;
+                return;
+            }
+            out.parked += 1;
+            if (out.parked > pipeline_defaults::kApplyDlqMaxParkedPerBatch) {
+                out.give_up = true;
+            }
+            return;
+        }
+
+        const std::size_t mid = lo + (hi - lo) / 2;
+        descend(lo, mid);
+        descend(mid, hi);
+    };
+
+    descend(0, seq.size());
+    return out;
+}
+
 json apply_events_batch(
     PGconn* app_pg,
     PGconn* lake_pg,
@@ -1667,6 +1817,7 @@ json apply_events_batch(
     std::vector<ApplyEvent> working(events.begin(), events.end());
     std::map<std::pair<std::string, std::string>, std::vector<ApplyEvent>> by_table;
     int dropped_unrecoverable = 0;
+    int dlq_parked_total = 0;
     for (auto& e : working) {
         if (e.catalog_id > 0) {
             resolve_event_lake_key_from_catalog(app_pg, conn_id, e);
@@ -1677,6 +1828,15 @@ json apply_events_batch(
         if (e.schema_name.empty() || e.table_name.empty()) {
             dropped_unrecoverable += 1;
             record_dropped_unrecoverable(app_pg, e, options.dropped_unrecoverable_by_table);
+            // Counting these was the whole record of them: the payload went nowhere and the
+            // offset advanced regardless, so the event was unrecoverable in the literal
+            // sense. Parking it keeps the data addressable once the catalog is fixed.
+            if (apply_dlq::park_event(
+                    app_pg, e, conn_id, db_engine, e.schema_name, e.table_name, "", "",
+                    batch_id, "", "event has no resolvable lake schema/table",
+                    apply_dlq::Reason::UnresolvedTable)) {
+                dlq_parked_total += 1;
+            }
             continue;
         }
         by_table[{e.schema_name, e.table_name}].push_back(std::move(e));
@@ -2000,6 +2160,11 @@ json apply_events_batch(
         }
         pg_exec(lake_pg, "SAVEPOINT sp_lake_apply");
         long long table_applied = 0;
+        bool table_failed = false;
+        std::string table_error;
+        // The isolation path commits its own slices, so it leaves no transaction for the
+        // shared commit below to release and close.
+        bool lake_txn_open = true;
         try {
             table_applied = apply_table_batch(
                 lake_pg,
@@ -2014,6 +2179,66 @@ json apply_events_batch(
             lake_col_types_cache[lake_key] = meta.col_types;
         } catch (const std::exception& ex) {
             { PGresult* r = PQexec(lake_pg, "ROLLBACK"); if (r) PQclear(r); }
+            table_failed = true;
+            table_error = ex.what();
+            lake_txn_open = false;
+
+            // Before treating this as a table-wide failure, find out whether it was really
+            // just some rows. Only data errors are worth isolating: a dropped connection
+            // fails every subset alike, so bisecting it would burn attempts to reach the
+            // same quarantine.
+            const auto* pg_err = dynamic_cast<const PgError*>(&ex);
+            const std::string sqlstate = pg_err ? pg_err->sqlstate : std::string();
+            if (apply_dlq::error_is_deterministic(sqlstate, ex.what())) {
+                const auto rescue = isolate_and_apply_with_dlq(
+                    lake_pg, app_pg, conn_id, batch_id, db_engine, meta, deletes, upserts,
+                    staging_id, options.source_system);
+                if (!rescue.give_up) {
+                    table_applied = rescue.applied;
+                    dlq_parked_total += rescue.parked;
+                    lake_col_types_cache[lake_key] = meta.col_types;
+                    table_failed = false;
+                    log_write(app_pg, {
+                        .level = LogLevel::Warning,
+                        .component = "cdc_kafka_apply",
+                        .message = "apply parked rows in dead-letter queue",
+                        .batch_id = batch_id,
+                        .conn_id = conn_id,
+                        .source_schema = meta.catalog_source_schema,
+                        .source_table = meta.catalog_source_table,
+                        .context = {
+                            {"lake_schema", meta.schema_name},
+                            {"lake_table", meta.table_name},
+                            {"parked", rescue.parked},
+                            {"applied", rescue.applied},
+                            {"isolation_attempts", rescue.attempts},
+                            {"sqlstate", rescue.last_sqlstate},
+                            {"error", rescue.last_error},
+                        },
+                    });
+                } else {
+                    log_write(app_pg, {
+                        .level = LogLevel::Error,
+                        .component = "cdc_kafka_apply",
+                        .message = "dead-letter isolation gave up; quarantining table",
+                        .batch_id = batch_id,
+                        .conn_id = conn_id,
+                        .source_schema = meta.catalog_source_schema,
+                        .source_table = meta.catalog_source_table,
+                        .context = {
+                            {"lake_schema", meta.schema_name},
+                            {"lake_table", meta.table_name},
+                            {"parked_before_giving_up", rescue.parked},
+                            {"max_parked_per_batch", pipeline_defaults::kApplyDlqMaxParkedPerBatch},
+                            {"sqlstate", rescue.last_sqlstate},
+                            {"error", rescue.last_error},
+                        },
+                    });
+                }
+            }
+        }
+
+        if (table_failed) {
             (*table_errors_acc) += 1;
             if (options.failed_events_out) {
                 for (auto& e : deletes) {
@@ -2034,14 +2259,14 @@ json apply_events_batch(
                 .context = {
                     {"lake_schema", meta.schema_name},
                     {"lake_table", meta.table_name},
-                    {"error", ex.what()},
+                    {"error", table_error},
                     {"upserts", static_cast<int>(upserts.size())},
                     {"deletes", static_cast<int>(deletes.size())},
                 },
             });
             if (meta.catalog_id > 0) {
-                mark_catalog_cdc_failed(app_pg, meta.catalog_id, ex.what());
-                quarantine_apply_position(app_pg, meta.catalog_id, ex.what());
+                mark_catalog_cdc_failed(app_pg, meta.catalog_id, table_error);
+                quarantine_apply_position(app_pg, meta.catalog_id, table_error);
             }
             continue;
         }
@@ -2076,19 +2301,22 @@ json apply_events_batch(
         const ApplyEvent* max_kafka = max_kafka_audit_position(audit);
         std::optional<std::pair<std::string, long long>> kafka_offset_out;
 
-        pg_exec(lake_pg, "RELEASE SAVEPOINT sp_lake_apply");
-        bool lake_commit_ok = false;
-        for (int lake_retry = 0; lake_retry < 3; ++lake_retry) {
-            PGresult* lake_commit = PQexec(lake_pg, "COMMIT");
-            lake_commit_ok = lake_commit && PQresultStatus(lake_commit) == PGRES_COMMAND_OK;
-            if (lake_commit) {
-                PQclear(lake_commit);
-            }
-            if (lake_commit_ok) {
-                break;
-            }
-            if (lake_retry < 2) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << lake_retry)));
+        bool lake_commit_ok = true;
+        if (lake_txn_open) {
+            pg_exec(lake_pg, "RELEASE SAVEPOINT sp_lake_apply");
+            lake_commit_ok = false;
+            for (int lake_retry = 0; lake_retry < 3; ++lake_retry) {
+                PGresult* lake_commit = PQexec(lake_pg, "COMMIT");
+                lake_commit_ok = lake_commit && PQresultStatus(lake_commit) == PGRES_COMMAND_OK;
+                if (lake_commit) {
+                    PQclear(lake_commit);
+                }
+                if (lake_commit_ok) {
+                    break;
+                }
+                if (lake_retry < 2) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << lake_retry)));
+                }
             }
         }
         if (!lake_commit_ok) {
@@ -2269,7 +2497,7 @@ json apply_events_batch(
         }
     }
 
-    return json{{"applied", applied}, {"offsets", offsets}, {"errors", *table_errors_acc}, {"dropped_unrecoverable", dropped_unrecoverable}};
+    return json{{"applied", applied}, {"offsets", offsets}, {"errors", *table_errors_acc}, {"dropped_unrecoverable", dropped_unrecoverable}, {"dlq_parked", dlq_parked_total}};
 }
 
 std::map<std::pair<std::string, std::string>, SliceLagTableState> fetch_apply_cursors_for_tables(

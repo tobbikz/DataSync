@@ -65,6 +65,24 @@ void pg_copy_batch_with_retry(
     const PgRetryOptions& opts,
     const std::function<void(PGconn*)>& in_txn_after_copy = {});
 
+/**
+ * A Postgres failure that still carries its SQLSTATE.
+ *
+ * `PQerrorMessage` yields prose, which is enough to log but not to decide with: telling a
+ * constraint violation from a dropped connection by substring is guesswork, and the apply
+ * has to make exactly that call to route a row to the dead-letter queue. Deriving from
+ * `std::runtime_error` keeps every existing `catch (const std::exception&)` working.
+ */
+struct PgError : std::runtime_error {
+    PgError(const std::string& message, std::string state)
+        : std::runtime_error(message), sqlstate(std::move(state)) {}
+    /** Five-character SQLSTATE, empty when the failure had no result to read it from. */
+    std::string sqlstate;
+};
+
+/** SQLSTATE of a failed result, empty when unavailable. */
+std::string pg_result_sqlstate(PGresult* res);
+
 void pg_exec(PGconn* pg, const std::string& sql);
 void pg_exec_params_simple(PGconn* pg, const char* sql, int n, const char* const* vals);
 /** Like pg_exec_params_simple but retries on deadlock (40P01). Issues ROLLBACK between attempts. */

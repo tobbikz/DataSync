@@ -180,14 +180,23 @@ void pg_copy_batch_with_retry(
     throw std::runtime_error("COPY batch retry exhausted: " + last_err);
 }
 
+std::string pg_result_sqlstate(PGresult* res) {
+    if (!res) {
+        return {};
+    }
+    const char* state = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+    return state ? std::string(state) : std::string();
+}
+
 void pg_exec(PGconn* pg, const std::string& sql) {
     PGresult* res = PQexec(pg, sql.c_str());
     if (!res || PQresultStatus(res) != PGRES_COMMAND_OK) {
         const std::string err = pg ? PQerrorMessage(pg) : "null connection";
+        const std::string state = pg_result_sqlstate(res);
         if (res) {
             PQclear(res);
         }
-        throw std::runtime_error("PostgreSQL exec failed: " + err);
+        throw PgError("PostgreSQL exec failed: " + err, state);
     }
     PQclear(res);
 }

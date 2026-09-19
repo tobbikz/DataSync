@@ -34,7 +34,29 @@ export const OPS_KPIS_SQL = `
        FROM cdc_catalog.apply_batch_stats
        WHERE logged_at >= now() - interval '1 hour'
        ORDER BY conn_id, logged_at DESC
-     ) t) AS total_kafka_lag
+     ) t) AS total_kafka_lag,
+    (SELECT COALESCE(SUM(dropped_unrecoverable), 0)::bigint FROM cdc_catalog.apply_batch_stats
+       WHERE logged_at >= now() - interval '24 hours') AS dropped_unrecoverable_24h,
+    (SELECT COALESCE(SUM(parse_skipped), 0)::bigint FROM cdc_catalog.apply_batch_stats
+       WHERE logged_at >= now() - interval '24 hours') AS parse_skipped_24h,
+    (SELECT COALESCE(SUM(dedup_skipped), 0)::bigint FROM cdc_catalog.apply_batch_stats
+       WHERE logged_at >= now() - interval '24 hours') AS dedup_skipped_24h,
+    (SELECT COUNT(*)::int FROM (
+       SELECT DISTINCT ON (s.catalog_id) s.event_loss_status
+       FROM cdc_catalog.apply_batch_stats s
+       WHERE s.logged_at >= now() - interval '3 days'
+       ORDER BY s.catalog_id, s.logged_at DESC
+     ) latest WHERE event_loss_status <> 'ok') AS event_loss_tables,
+    (SELECT COUNT(*)::int FROM cdc_catalog.capture_position
+       WHERE status <> 'healthy'::cdc_catalog.cdc_health_status) AS capture_unhealthy,
+    (SELECT COALESCE(MAX(capture_lag_seconds), 0)::bigint FROM cdc_catalog.capture_position) AS max_capture_lag,
+    (SELECT COUNT(*)::int FROM cdc_catalog.catalog
+       WHERE active = true AND status = 'quarantined'::cdc_catalog.replication_status) AS quarantined_tables,
+    (SELECT COUNT(*)::int FROM cdc_catalog.apply_dlq
+       WHERE status = 'parked') AS dlq_parked,
+    (SELECT COALESCE(
+       EXTRACT(EPOCH FROM (now() - MAX(logged_at)))::bigint, -1)
+       FROM cdc_catalog.apply_batch_stats) AS seconds_since_last_slice
 `;
 
 export const OPS_EVENTS_HOURLY_SQL = `
@@ -183,5 +205,75 @@ export const OPS_GAP_EVENTS_SQL = `
   FROM cdc_catalog.gap_events
   WHERE resolved_at IS NULL
   ORDER BY detected_at DESC
+  LIMIT 25
+`;
+
+/** True hourly apply duration — matches Superset "Apply duration avg / hour". */
+export const OPS_APPLY_DURATION_HOURLY_SQL = `
+  SELECT
+    date_trunc('hour', logged_at) AS event_ts,
+    ROUND(AVG(duration_ms)::numeric, 1) AS avg_duration_ms,
+    MAX(duration_ms)::bigint AS max_duration_ms
+  FROM cdc_catalog.apply_batch_stats
+  WHERE logged_at >= now() - interval '3 days'
+  GROUP BY 1
+  ORDER BY 1 ASC
+`;
+
+export const OPS_QUARANTINE_BY_CONN_SQL = `
+  SELECT conn_id, COUNT(*)::int AS quarantined
+  FROM cdc_catalog.catalog
+  WHERE active = true
+    AND status = 'quarantined'::cdc_catalog.replication_status
+  GROUP BY conn_id
+  ORDER BY quarantined DESC, conn_id
+`;
+
+export const OPS_EVENT_LOSS_MIX_SQL = `
+  SELECT event_loss_status AS status, COUNT(*)::int AS count
+  FROM (
+    SELECT DISTINCT ON (catalog_id) event_loss_status
+    FROM cdc_catalog.apply_batch_stats
+    WHERE logged_at >= now() - interval '3 days'
+    ORDER BY catalog_id, logged_at DESC
+  ) latest
+  GROUP BY event_loss_status
+  ORDER BY count DESC
+`;
+
+export const OPS_TOP_LAG_TABLES_SQL = `
+  SELECT
+    conn_id,
+    source_schema,
+    source_table,
+    kafka_consumer_lag::bigint AS kafka_consumer_lag,
+    apply_health_rag
+  FROM (
+    SELECT DISTINCT ON (catalog_id)
+      conn_id, source_schema, source_table, kafka_consumer_lag, apply_health_rag
+    FROM cdc_catalog.apply_batch_stats
+    WHERE logged_at >= now() - interval '3 days'
+    ORDER BY catalog_id, logged_at DESC
+  ) latest
+  WHERE COALESCE(kafka_consumer_lag, 0) > 0
+  ORDER BY kafka_consumer_lag DESC
+  LIMIT 12
+`;
+
+export const OPS_DLQ_TAIL_SQL = `
+  SELECT
+    dlq_id,
+    logged_at,
+    conn_id,
+    source_schema,
+    source_table,
+    op,
+    reason,
+    error_sqlstate,
+    LEFT(error_message, 240) AS error_message,
+    status
+  FROM cdc_catalog.apply_dlq
+  WHERE status = 'parked'
+  ORDER BY logged_at DESC
   LIMIT 25
 `;

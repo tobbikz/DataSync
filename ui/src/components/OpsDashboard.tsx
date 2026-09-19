@@ -36,6 +36,15 @@ interface OpsPayload {
     applyRed: number;
     errors24h: number;
     totalKafkaLag: number;
+    droppedUnrecoverable24h: number;
+    parseSkipped24h: number;
+    dedupSkipped24h: number;
+    eventLossTables: number;
+    captureUnhealthy: number;
+    maxCaptureLag: number;
+    quarantinedTables: number;
+    dlqParked: number;
+    secondsSinceLastSlice: number;
   };
   eventsHourly: {
     event_ts: string;
@@ -90,6 +99,32 @@ interface OpsPayload {
     tables_flagged: number;
     resolved_at: string | null;
     batch_id: string | null;
+  }[];
+  applyDurationHourly: {
+    event_ts: string;
+    avg_duration_ms: string;
+    max_duration_ms: string;
+  }[];
+  quarantineByConn: { conn_id: string; quarantined: number }[];
+  eventLossMix: { status: string; count: number }[];
+  topLagTables: {
+    conn_id: string;
+    source_schema: string;
+    source_table: string;
+    kafka_consumer_lag: string;
+    apply_health_rag: string;
+  }[];
+  dlqTail: {
+    dlq_id: number;
+    logged_at: string;
+    conn_id: string;
+    source_schema: string;
+    source_table: string;
+    op: string;
+    reason: string;
+    error_sqlstate: string | null;
+    error_message: string;
+    status: string;
   }[];
 }
 
@@ -358,6 +393,138 @@ export function OpsDashboard() {
                 <StatCard label="Apply RED" value={String(data.kpis.applyRed)} />
               </div>
 
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                <StatCard
+                  label="Drop unrecoverable (24h)"
+                  value={String(data.kpis.droppedUnrecoverable24h ?? 0)}
+                  deltaTone={(data.kpis.droppedUnrecoverable24h ?? 0) > 0 ? "warning" : "success"}
+                />
+                <StatCard
+                  label="Parse skipped (24h)"
+                  value={String(data.kpis.parseSkipped24h ?? 0)}
+                  deltaTone={(data.kpis.parseSkipped24h ?? 0) > 0 ? "warning" : undefined}
+                />
+                <StatCard
+                  label="Dedup skipped (24h)"
+                  value={String(data.kpis.dedupSkipped24h ?? 0)}
+                />
+                <StatCard
+                  label="Event-loss tables"
+                  value={String(data.kpis.eventLossTables ?? 0)}
+                  deltaTone={(data.kpis.eventLossTables ?? 0) > 0 ? "warning" : "success"}
+                />
+                <StatCard
+                  label="Capture unhealthy"
+                  value={String(data.kpis.captureUnhealthy ?? 0)}
+                  deltaTone={(data.kpis.captureUnhealthy ?? 0) > 0 ? "warning" : "success"}
+                />
+                <StatCard label="Max capture lag (s)" value={String(data.kpis.maxCaptureLag ?? 0)} />
+                <StatCard
+                  label="Quarantined tables"
+                  value={String(data.kpis.quarantinedTables ?? 0)}
+                  deltaTone={(data.kpis.quarantinedTables ?? 0) > 0 ? "warning" : "success"}
+                />
+                <StatCard
+                  label="DLQ parked"
+                  value={String(data.kpis.dlqParked ?? 0)}
+                  deltaTone={(data.kpis.dlqParked ?? 0) > 0 ? "warning" : "success"}
+                />
+              </div>
+
+              <div className="grid gap-3 xl:grid-cols-3">
+                <section className="panel">
+                  <div className="panel-header py-2">
+                    <p className="text-[11px] font-medium uppercase tracking-wide text-foreground-muted">
+                      Event loss mix
+                    </p>
+                  </div>
+                  <div className="panel-body h-44">
+                    {(data.eventLossMix?.length ?? 0) > 0 ? (
+                      <ResponsiveContainer width="100%" height="100%">
+                        <PieChart>
+                          <Pie data={data.eventLossMix} dataKey="count" nameKey="status" innerRadius={36} outerRadius={64}>
+                            {(data.eventLossMix ?? []).map((_, i) => (
+                              <Cell key={i} fill={CHART.blues[i % CHART.blues.length]} />
+                            ))}
+                          </Pie>
+                          <Tooltip {...chartTooltip} />
+                        </PieChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <EmptyChart label="no event-loss samples" />
+                    )}
+                  </div>
+                </section>
+
+                <section className="panel xl:col-span-2">
+                  <div className="panel-header flex flex-wrap items-center justify-between gap-2 py-2">
+                    <p className="text-[11px] font-medium uppercase tracking-wide text-foreground-muted">
+                      Quarantine by conn
+                    </p>
+                    <Link href="/dashboard/catalog?quarantined=true" className="table-action text-[11px]">
+                      Open catalog →
+                    </Link>
+                  </div>
+                  <div className="panel-body h-44">
+                    {(data.quarantineByConn?.length ?? 0) > 0 ? (
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={data.quarantineByConn} layout="vertical" margin={{ left: 8 }}>
+                          <CartesianGrid {...chartGridHorizontal} />
+                          <XAxis type="number" tick={chartAxisTick} />
+                          <YAxis type="category" dataKey="conn_id" width={72} tick={chartAxisTick} />
+                          <Tooltip {...chartTooltip} />
+                          <Bar dataKey="quarantined" fill={CHART.rag.RED} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <EmptyChart label="no quarantined tables" />
+                    )}
+                  </div>
+                </section>
+              </div>
+
+              {(data.dlqTail?.length ?? 0) > 0 ? (
+                <section className="panel overflow-hidden">
+                  <div className="panel-header py-2">
+                    <p className="text-[11px] font-medium uppercase tracking-wide text-foreground-muted">
+                      Apply DLQ (parked)
+                    </p>
+                    <p className="font-mono text-[10px] text-foreground-muted">
+                      cdc_catalog.apply_dlq · bad rows parked without quarantining the table
+                    </p>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full font-mono text-[11px]">
+                      <thead>
+                        <tr className="border-b border-border text-left text-foreground-muted">
+                          <th className="px-3 py-2">When</th>
+                          <th className="px-3 py-2">Table</th>
+                          <th className="px-3 py-2">Op</th>
+                          <th className="px-3 py-2">Reason</th>
+                          <th className="px-3 py-2">Error</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(data.dlqTail ?? []).map((row) => (
+                          <tr key={row.dlq_id} className="border-b border-border/60">
+                            <td className="px-3 py-2 whitespace-nowrap">{fmtTs(row.logged_at)}</td>
+                            <td className="px-3 py-2">
+                              {row.conn_id} · {row.source_schema}.{row.source_table}
+                            </td>
+                            <td className="px-3 py-2">{row.op}</td>
+                            <td className="px-3 py-2">{row.reason}</td>
+                            <td className="max-w-md truncate px-3 py-2 text-foreground-secondary" title={row.error_message}>
+                              {row.error_sqlstate ? `${row.error_sqlstate}: ` : ""}
+                              {row.error_message}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+              ) : null}
+
               <div className="grid gap-3 xl:grid-cols-2">
                 <section className="panel">
                   <div className="panel-header py-2">
@@ -574,7 +741,7 @@ export function OpsDashboard() {
                       Kafka consumer lag by table
                     </p>
                     <p className="mt-0.5 text-[11px] text-foreground-secondary">
-                      Latest apply slices — DML detail lives in Events.
+                      Latest health sample per table with lag &gt; 0 (Superset parity).
                     </p>
                   </div>
                   <Link href="/dashboard/flow?view=kafka" className="table-action text-[11px]">
@@ -582,16 +749,26 @@ export function OpsDashboard() {
                   </Link>
                 </div>
                 <div className="panel-body h-56">
-                  {data.applyTail.length > 0 ? (
+                  {(data.topLagTables?.length ?? 0) > 0 || data.applyTail.length > 0 ? (
                     <ResponsiveContainer width="100%" height="100%">
                       <BarChart
-                        data={[...data.applyTail]
-                          .sort((a, b) => Number(b.kafka_consumer_lag) - Number(a.kafka_consumer_lag))
-                          .slice(0, 12)
-                          .map((r) => ({
-                            label: `${r.source_table}`,
-                            lag: Number(r.kafka_consumer_lag),
-                          }))}
+                        data={
+                          (data.topLagTables?.length ?? 0) > 0
+                            ? (data.topLagTables ?? []).map((r) => ({
+                                label: r.source_table,
+                                lag: Number(r.kafka_consumer_lag),
+                              }))
+                            : [...data.applyTail]
+                                .sort(
+                                  (a, b) =>
+                                    Number(b.kafka_consumer_lag) - Number(a.kafka_consumer_lag),
+                                )
+                                .slice(0, 12)
+                                .map((r) => ({
+                                  label: `${r.source_table}`,
+                                  lag: Number(r.kafka_consumer_lag),
+                                }))
+                        }
                         layout="vertical"
                         margin={{ left: 8 }}
                       >
@@ -647,23 +824,26 @@ export function OpsDashboard() {
                         </p>
                       </div>
                       <div className="panel-body h-52">
-                        {data.applyTail.length > 0 ? (
+                        {(data.applyDurationHourly?.length ?? 0) > 0 ? (
                           <ResponsiveContainer width="100%" height="100%">
-                            <BarChart
-                              data={data.applyTail.slice(0, 12).map((r) => ({
-                                label: `${r.source_table}`,
-                                ms: Number(r.duration_ms),
+                            <LineChart
+                              data={(data.applyDurationHourly ?? []).slice(-48).map((r) => ({
+                                hour: fmtTs(r.event_ts),
+                                avg: Number(r.avg_duration_ms),
+                                max: Number(r.max_duration_ms),
                               }))}
                             >
                               <CartesianGrid {...chartGrid} />
-                              <XAxis dataKey="label" tick={chartAxisTick} />
+                              <XAxis dataKey="hour" tick={chartAxisTick} />
                               <YAxis tick={chartAxisTick} />
                               <Tooltip {...chartTooltip} />
-                              <Bar dataKey="ms" fill={CHART.accent} />
-                            </BarChart>
+                              <Legend wrapperStyle={{ fontSize: 10 }} />
+                              <Line type="monotone" dataKey="avg" name="avg ms" stroke={CHART.accent} dot={false} strokeWidth={1.5} />
+                              <Line type="monotone" dataKey="max" name="max ms" stroke={CHART.series[2]} dot={false} strokeWidth={1.5} />
+                            </LineChart>
                           </ResponsiveContainer>
                         ) : (
-                          <EmptyChart label="no apply slices" />
+                          <EmptyChart label="no apply duration samples" />
                         )}
                       </div>
                     </section>

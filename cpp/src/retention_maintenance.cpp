@@ -227,13 +227,22 @@ void maybe_run_scheduled_retention_maintenance(PGconn* log_pg) {
         logs_batch_size,
         logs_max_batches,
         pause_ms);
+    // Only retried/discarded rows age out; the function leaves parked ones alone, so an
+    // untriaged incident is never pruned away.
+    const long long dlq_deleted = prune_in_committed_batches(
+        log_pg,
+        "SELECT cdc_catalog.prune_apply_dlq_batched($1::integer, $2::integer, $3::integer)",
+        pipeline_defaults::kApplyDlqRetentionDays,
+        pipeline_defaults::kApplyDlqPruneBatchSizeDefault,
+        pipeline_defaults::kApplyDlqPruneMaxBatchesDefault,
+        pause_ms);
 
     // One run per CST hour (even with backlog) — next hour continues catch-up.
     const long long stats_cap =
         static_cast<long long>(stats_batch_size) * static_cast<long long>(stats_max_batches);
     const long long logs_cap =
         static_cast<long long>(logs_batch_size) * static_cast<long long>(logs_max_batches);
-    const bool any_error = stats_deleted < 0 || logs_deleted < 0;
+    const bool any_error = stats_deleted < 0 || logs_deleted < 0 || dlq_deleted < 0;
     const bool backlog_remaining =
         (!any_error) &&
         ((idle_deleted + std::max(0LL, stats_deleted) >= stats_cap && stats_cap > 0) ||
@@ -255,6 +264,7 @@ void maybe_run_scheduled_retention_maintenance(PGconn* log_pg) {
             {"apply_batch_stats_deleted", stats_deleted},
             {"apply_batch_stats_age_batches", age_batches},
             {"logs_deleted", logs_deleted},
+            {"apply_dlq_deleted", dlq_deleted},
             {"backlog_remaining", backlog_remaining},
             {"row_cap_per_prune", pipeline_defaults::kRetentionPruneMaxRowsPerRun},
         },

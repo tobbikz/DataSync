@@ -54,10 +54,19 @@ constexpr int kApplyEmptyPollQuietThreshold = 3;
 constexpr int kApplyMaxTableStalenessSeconds = 900;
 constexpr int kApplyInactiveSeconds = 3600;
 constexpr int kApplyBatchStatsRetentionDays = 3;
+/** Longer than stats/logs on purpose: a Friday failure must survive until Monday triage. */
+constexpr int kApplyDlqRetentionDays = 30;
+/**
+ * Above this many rows parked from one table batch, the table is broken (dropped column,
+ * narrowed type), not poisoned by a few rows — bisecting further would just retry
+ * thousands of doomed subsets, so fall back to quarantine.
+ */
+constexpr int kApplyDlqMaxParkedPerBatch = 50;
 /** Hourly prune (America/Costa_Rica hour bucket). No pg_cron / no Postgres restart. */
 constexpr long long kRetentionMaintenanceAdvisoryLockKey = 90420055001LL;
 /** Small batches + one commit per C++ call — short statements under scrapers. */
 constexpr int kApplyBatchStatsPruneBatchSizeDefault = 500;
+constexpr int kApplyDlqPruneBatchSizeDefault = 500;
 constexpr int kLogsPurgeBatchSizeDefault = 500;
 /** Cap per prune per hourly run (stats idle+age share this; logs separate). 100k → 200 batches. */
 constexpr int kRetentionPruneMaxRowsPerRun = 1000000;
@@ -65,6 +74,8 @@ constexpr int kApplyBatchStatsPruneMaxBatchesDefault =
     kRetentionPruneMaxRowsPerRun / kApplyBatchStatsPruneBatchSizeDefault;
 constexpr int kLogsPurgeMaxBatchesDefault =
     kRetentionPruneMaxRowsPerRun / kLogsPurgeBatchSizeDefault;
+constexpr int kApplyDlqPruneMaxBatchesDefault =
+    kRetentionPruneMaxRowsPerRun / kApplyDlqPruneBatchSizeDefault;
 /** Pause between single-batch prune commits so apply/upsert can proceed. */
 constexpr int kRetentionPruneBatchPauseMs = 50;
 /** Session-independent xact lock key inside cdc_catalog.purge_logs_batched. */
