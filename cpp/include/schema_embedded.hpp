@@ -510,7 +510,10 @@ CREATE INDEX IF NOT EXISTS full_load_checkpoint_updated_idx
 inline std::string_view k040_functions() {
     return R"cdc040(
 -- Retention / purge helpers used by the C++ daemon.
+-- DROP first: CREATE OR REPLACE cannot rename args (prod had p_retention_days)
+-- or change OUT/return types across bootstrap generations.
 
+DROP FUNCTION IF EXISTS cdc_catalog.purge_logs(integer);
 CREATE OR REPLACE FUNCTION cdc_catalog.purge_logs(retention_days integer)
 RETURNS bigint
 LANGUAGE plpgsql
@@ -525,6 +528,7 @@ BEGIN
 END;
 $$;
 
+DROP FUNCTION IF EXISTS cdc_catalog.purge_logs_batched(integer, integer, integer);
 CREATE OR REPLACE FUNCTION cdc_catalog.purge_logs_batched(
   retention_days integer,
   batch_size integer,
@@ -557,6 +561,7 @@ BEGIN
 END;
 $$;
 
+DROP FUNCTION IF EXISTS cdc_catalog.prune_apply_batch_stats_batched(integer, integer, integer);
 CREATE OR REPLACE FUNCTION cdc_catalog.prune_apply_batch_stats_batched(
   retention_days integer,
   batch_size integer,
@@ -591,6 +596,7 @@ $$;
 
 -- Only resolved rows age out. A row still 'parked' is an unattended incident, so it
 -- survives retention rather than disappearing before anyone triages it.
+DROP FUNCTION IF EXISTS cdc_catalog.prune_apply_dlq_batched(integer, integer, integer);
 CREATE OR REPLACE FUNCTION cdc_catalog.prune_apply_dlq_batched(
   retention_days integer,
   batch_size integer,
@@ -624,6 +630,7 @@ BEGIN
 END;
 $$;
 
+DROP FUNCTION IF EXISTS cdc_catalog.prune_apply_batch_stats_idle_batched(integer, integer);
 CREATE OR REPLACE FUNCTION cdc_catalog.prune_apply_batch_stats_idle_batched(
   batch_size integer,
   max_batches integer
