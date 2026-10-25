@@ -51,11 +51,34 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- Add enum values that may be missing on older bootstrap schemas.
-ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'cdc_in_progress';
+-- Backfill every label: CREATE TYPE is skipped when the enum already exists on
+-- older prod bootstraps, so indexes/views that cast literals (e.g. 'error')
+-- fail unless ADD VALUE runs first for the full current set.
+ALTER TYPE cdc_catalog.db_engine ADD VALUE IF NOT EXISTS 'mariadb';
+ALTER TYPE cdc_catalog.db_engine ADD VALUE IF NOT EXISTS 'mssql';
+ALTER TYPE cdc_catalog.db_engine ADD VALUE IF NOT EXISTS 'mongodb';
+
+ALTER TYPE cdc_catalog.log_level ADD VALUE IF NOT EXISTS 'debug';
+ALTER TYPE cdc_catalog.log_level ADD VALUE IF NOT EXISTS 'info';
+ALTER TYPE cdc_catalog.log_level ADD VALUE IF NOT EXISTS 'warning';
+ALTER TYPE cdc_catalog.log_level ADD VALUE IF NOT EXISTS 'error';
+
+ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'pending';
+ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'success';
+ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'syncing';
+ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'error';
 ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'failed';
+ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'needs_full_load';
+ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'full_load_in_progress';
+ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'cdc_in_progress';
+ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'quarantined';
 ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'skipped';
 ALTER TYPE cdc_catalog.replication_status ADD VALUE IF NOT EXISTS 'disabled';
+
+ALTER TYPE cdc_catalog.cdc_health_status ADD VALUE IF NOT EXISTS 'healthy';
+ALTER TYPE cdc_catalog.cdc_health_status ADD VALUE IF NOT EXISTS 'degraded';
+ALTER TYPE cdc_catalog.cdc_health_status ADD VALUE IF NOT EXISTS 'failed';
+ALTER TYPE cdc_catalog.cdc_health_status ADD VALUE IF NOT EXISTS 'unknown';
 ALTER TYPE cdc_catalog.cdc_health_status ADD VALUE IF NOT EXISTS 'quarantined';
 ALTER TYPE cdc_catalog.cdc_health_status ADD VALUE IF NOT EXISTS 'stale';
 ALTER TYPE cdc_catalog.cdc_health_status ADD VALUE IF NOT EXISTS 'lagging';
