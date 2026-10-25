@@ -751,13 +751,17 @@ SELECT
   ap.kafka_offset,
   ap.quarantine_reason,
   LEFT(ap.last_error, 120) AS last_error_short,
-  CASE WHEN c.status = 'full_load_in_progress' THEN 1 ELSE 0 END AS is_full_load_in_progress,
+  -- Compare via ::text so MV create does not require every enum label to exist yet
+  -- (older prod enums may lag ADD VALUE until 010 commits / rebuild).
+  CASE WHEN c.status::text = 'full_load_in_progress' THEN 1 ELSE 0 END AS is_full_load_in_progress,
   CASE WHEN c.needs_full_load THEN 1 ELSE 0 END AS is_needs_full_load,
-  CASE WHEN c.status = 'cdc_in_progress' THEN 1 ELSE 0 END AS is_cdc_in_progress,
+  CASE WHEN c.status::text = 'cdc_in_progress' THEN 1 ELSE 0 END AS is_cdc_in_progress,
   CASE WHEN c.active AND c.cdc_enabled AND NOT c.needs_full_load THEN 1 ELSE 0 END AS is_cdc_ready,
-  CASE WHEN c.status = 'quarantined' OR ap.status = 'quarantined' THEN 1 ELSE 0 END AS is_quarantined,
-  CASE WHEN c.status = 'success' THEN 1 ELSE 0 END AS is_success,
-  CASE WHEN c.status = 'pending' THEN 1 ELSE 0 END AS is_pending
+  CASE WHEN c.status::text = 'quarantined'
+         OR ap.status::text = 'quarantined'
+         OR COALESCE(ap.is_quarantined, false) THEN 1 ELSE 0 END AS is_quarantined,
+  CASE WHEN c.status::text = 'success' THEN 1 ELSE 0 END AS is_success,
+  CASE WHEN c.status::text = 'pending' THEN 1 ELSE 0 END AS is_pending
 FROM cdc_catalog.catalog c
 LEFT JOIN cdc_catalog.apply_position ap ON ap.catalog_id = c.catalog_id;
 
@@ -772,7 +776,7 @@ SELECT
   cp.capture_lag_seconds,
   LEFT(COALESCE(cp.last_error, ''), 120) AS last_error_short,
   cp.updated_at AS event_ts,
-  CASE WHEN cp.status <> 'healthy'::cdc_catalog.cdc_health_status THEN 1 ELSE 0 END AS is_unhealthy
+  CASE WHEN cp.status::text <> 'healthy' THEN 1 ELSE 0 END AS is_unhealthy
 FROM cdc_catalog.capture_position cp;
 
 CREATE UNIQUE INDEX IF NOT EXISTS mv_tab_capture_latest_conn_id_idx
