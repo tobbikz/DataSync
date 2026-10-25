@@ -841,6 +841,8 @@ CREATE TABLE IF NOT EXISTS lake.full_load_position (
   PRIMARY KEY (catalog_id, worker_id)
 );
 
+-- CREATE OR REPLACE cannot change OUT/return types (prod had start_date/end_date date).
+DROP FUNCTION IF EXISTS lake.month_bounds(date);
 CREATE OR REPLACE FUNCTION lake.month_bounds(p_month date)
 RETURNS TABLE(month_start timestamptz, month_end timestamptz)
 LANGUAGE sql
@@ -850,6 +852,8 @@ AS $$
          (date_trunc('month', p_month::timestamptz) + interval '1 month')::timestamptz;
 $$;
 
+-- Old bootstrap returned integer; current returns void.
+DROP FUNCTION IF EXISTS lake.ensure_monthly_partitions(text, text, integer);
 CREATE OR REPLACE FUNCTION lake.ensure_monthly_partitions(
     p_schema text,
     p_table text,
