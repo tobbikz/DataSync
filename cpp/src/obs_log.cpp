@@ -44,8 +44,11 @@ bool log_write(PGconn* pg, const LogEvent& event) {
     }
 
     // Designated initializers without .context can yield json array [{}] — coerce to object.
-    const nlohmann::json& ctx =
-        event.context.is_object() ? event.context : nlohmann::json::object();
+    nlohmann::json ctx = event.context.is_object() ? event.context : nlohmann::json::object();
+    // M04: propagate batch_id as trace_id for correlation (OpenTelemetry-lite).
+    if (event.batch_id && !event.batch_id->empty() && !ctx.contains("trace_id")) {
+        ctx["trace_id"] = *event.batch_id;
+    }
     const std::string context_json = ctx.empty() ? "{}" : ctx.dump();
 
     static const char* kSql = R"(

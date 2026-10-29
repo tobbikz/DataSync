@@ -10,6 +10,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { ConnectionCaptureControls } from "./ConnectionCaptureControls";
 import { usePolling } from "@/lib/use-polling";
 import { CHART, chartAxisTick, chartGrid, chartTooltip } from "@/lib/chart-theme";
 
@@ -116,8 +117,14 @@ function MiniLineChart({
   );
 }
 
-export function ConnectionDetailPanel({ alias }: { alias: string }) {
-  const { data, loading } = usePolling<ConnectionDetail>(
+export function ConnectionDetailPanel({
+  alias,
+  onChanged,
+}: {
+  alias: string;
+  onChanged?: () => void;
+}) {
+  const { data, loading, refresh } = usePolling<ConnectionDetail>(
     () =>
       fetch(`/api/connections/${encodeURIComponent(alias)}/detail`).then((r) => {
         if (!r.ok) throw new Error("detail fetch failed");
@@ -174,6 +181,15 @@ export function ConnectionDetailPanel({ alias }: { alias: string }) {
           Catalog →
         </Link>
       </div>
+
+      <ConnectionCaptureControls
+        alias={alias}
+        active={data.connection.active}
+        onChanged={() => {
+          refresh();
+          onChanged?.();
+        }}
+      />
 
       <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-5">
         <MetricTile label="Tables" value={catalog.tables_total} />

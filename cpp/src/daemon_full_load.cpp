@@ -2,6 +2,7 @@
 
 #include "capture_common.hpp"
 #include "config.hpp"
+#include "control_plane.hpp"
 #include "full_load_checkpoint.hpp"
 #include "full_load_common.hpp"
 #include "mariadb_full_load.hpp"
@@ -608,6 +609,35 @@ DaemonFullLoadOutcome run_daemon_full_load_isolated(
             {"phase", "full_load"},
         },
     });
+
+    // F07/C05 — durable notification channel for snapshot/full-load milestones.
+    control_plane::notify(
+        log_pg,
+        "snapshot",
+        outcome.exit_code == 0 ? "info" : "warning",
+        outcome.exit_code == 0 ? "full-load completed" : "full-load completed with errors",
+        "Daemon full-load phase finished",
+        conn_id,
+        std::nullopt,
+        {
+            {"db_engine", db_engine},
+            {"tables_loaded", outcome.tables_loaded},
+            {"pending_after", outcome.pending_after},
+            {"exit_code", outcome.exit_code},
+            {"batch_id", batch_id},
+        });
+
+    if (cfg.cdc.openlineage) {
+        control_plane::emit_lineage(
+            log_pg,
+            outcome.exit_code == 0 ? "COMPLETE" : "FAIL",
+            conn_id,
+            std::nullopt,
+            batch_id,
+            nlohmann::json::array({{{"namespace", "datasync"}, {"name", conn_id}}}),
+            nlohmann::json::array({{{"namespace", "datalake"}, {"name", db_engine}}}),
+            {{"tables_loaded", outcome.tables_loaded}, {"exit_code", outcome.exit_code}});
+    }
 
     return outcome;
 }

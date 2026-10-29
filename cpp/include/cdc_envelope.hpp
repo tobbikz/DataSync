@@ -26,6 +26,8 @@ struct CdcEvent {
     std::optional<long long> tx_id;
     /** Empty for row events; "begin" or "commit" for transaction control (op "t"). */
     std::string tx_event;
+    /** E05: optional SQL statement / Query event text (source.query). */
+    std::string query;
 
     nlohmann::json to_kafka_dict() const;
 };
@@ -38,6 +40,12 @@ std::string json_dump_for_kafka(const nlohmann::json& value);
 
 /** Safe Kafka payload JSON (invalid UTF-8 replaced, never throws on dump). */
 std::string cdc_event_kafka_payload(const CdcEvent& event);
+
+/**
+ * R12: optional CloudEvents 1.0 JSON wrap around the CDC payload.
+ * When enabled is false, returns cdc_event_kafka_payload(event) unchanged.
+ */
+std::string cdc_event_kafka_payload_maybe_cloudevents(const CdcEvent& event, bool cloudevents);
 
 std::string utc_iso_timestamp_now();
 

@@ -7,7 +7,9 @@
 #include "kafka_topics.hpp"
 #include "mariadb_binlog.hpp"
 #include "mariadb_binlog_cli.hpp"
+#include "mariadb_binlog_read.hpp"
 #include "mariadb_conn.hpp"
+#include "cdc_routing.hpp"
 #include "mariadb_schema.hpp"
 #include "obs_log.hpp"
 
@@ -571,6 +573,55 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
     int schema_mismatch_logs = 0;
     int utf8_skipped_events = 0;
     std::set<TableKey> schema_mismatch_samples;
+    std::string last_source_query;
+    const auto publish_query = [&](const std::string& sql, long long /*event_position*/) {
+        if (!cfg.cdc.include_source_query || sql.empty()) {
+            return;
+        }
+        last_source_query = sql;
+        if (!cfg.cdc.schema_events) {
+            return;
+        }
+        // D02: also emit DDL-ish statements to __schema (best-effort).
+        const std::string upper = sql.size() > 6 ? sql.substr(0, 6) : sql;
+        auto is_ddl = [&]() {
+            auto ci = [](char a, char b) {
+                return std::tolower(static_cast<unsigned char>(a)) == b;
+            };
+            if (sql.size() >= 5 && ci(sql[0], 'a') && ci(sql[1], 'l') && ci(sql[2], 't')) {
+                return true;
+            }
+            if (sql.size() >= 6 && ci(sql[0], 'c') && ci(sql[1], 'r') && ci(sql[2], 'e')) {
+                return true;
+            }
+            if (sql.size() >= 4 && ci(sql[0], 'd') && ci(sql[1], 'r') && ci(sql[2], 'o')) {
+                return true;
+            }
+            return false;
+        };
+        if (!is_ddl()) {
+            return;
+        }
+        CdcEvent sev;
+        sev.op = "schema";
+        sev.conn_id = conn_id;
+        sev.db_engine = "mariadb";
+        sev.query = sql;
+        sev.ts_ms = now_ms();
+        sev.ingestion_ts = utc_iso_timestamp_now();
+        sev.binlog_file = binlog_start.file;
+        const std::string topic = cdc_routing::schema_change_topic(rcfg.topic_prefix);
+        try {
+            ensure_kafka_topics_exist(rcfg.bootstrap, {topic}, rcfg.topic_partitions, 1);
+            producer.produce(
+                topic,
+                conn_id,
+                cdc_event_kafka_payload_maybe_cloudevents(sev, cfg.cdc.cloudevents),
+                0);
+        } catch (...) {
+        }
+        (void)upper;
+    };
     const auto publish_tx = [&](const std::string& tx_event, long long tx_id, long long event_position) {
         cdc_publish_tx_marker(
             producer,
@@ -669,6 +720,9 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         if (op_char.empty()) {
             return;
         }
+        if (cdc_routing::op_filtered_out(op_char, cfg.cdc.message_filter_exclude_ops)) {
+            return;
+        }
         if (auto cid_it = catalog_id_by_table.find(key); cid_it != catalog_id_by_table.end()) {
             cdc_active_catalog_ids.insert(cid_it->second);
         }
@@ -699,9 +753,14 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         }
         event.ts_ms = now_ms();
         event.ingestion_ts = utc_iso_timestamp_now();
+        if (cfg.cdc.include_source_query && !last_source_query.empty()) {
+            event.query = last_source_query;
+        }
 
-        const std::string topic = topic_for_catalog_table(
+        const std::string base_topic = topic_for_catalog_table(
             rcfg.topic_prefix, key.first, key.second, rcfg.topic_mode, rcfg.topic_buckets);
+        const std::string topic =
+            cdc_routing::topic_with_content_routing(base_topic, event, cfg.cdc.content_routing);
         const nlohmann::json* row_for_key = (op_char == "d") ? &before : &after;
         const long long catalog_id =
             catalog_id_by_table.count(key) ? catalog_id_by_table.at(key) : 0LL;
@@ -710,7 +769,17 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                 key.first, key.second, row_for_key, pk_by_table[key]);
             const int kafka_partition = kafka_produce_partition(
                 catalog_id, rcfg.topic_partitions);
-            producer.produce(topic, msg_key, cdc_event_kafka_payload(event), kafka_partition);
+            if (topic != base_topic) {
+                ensure_kafka_topics_exist(rcfg.bootstrap, {topic}, rcfg.topic_partitions, 1);
+            }
+            producer.produce(
+                topic,
+                msg_key,
+                cdc_event_kafka_payload_maybe_cloudevents(event, cfg.cdc.cloudevents),
+                kafka_partition);
+            if (op_char == "d" && cfg.cdc.kafka_tombstones) {
+                producer.produce_tombstone(topic, msg_key, kafka_partition);
+            }
         } catch (const std::exception& ex) {
             if (is_kafka_utf8_error(ex)) {
                 utf8_skipped_events += 1;
@@ -830,14 +899,16 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
         const long long events_left = rcfg.max_events - read_stats.events;
 
         const BinlogPosition chunk_start = binlog_start;
-        const BinlogCliStats chunk = read_remote_binlog_cli(
+        const BinlogCliStats chunk = read_remote_binlog(
             *source,
             binlog_start,
             chunk_sec,
             static_cast<int>(std::min<long long>(events_left, 2147483647)),
             publish_row,
             [&]() { return std::chrono::steady_clock::now() >= slice_deadline; },
-            publish_tx);
+            publish_tx,
+            cfg.cdc.binlog_mode,
+            publish_query);
 
         read_stats.events += chunk.events;
         read_stats.upserts += chunk.upserts;
@@ -988,6 +1059,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                         rcfg.heartbeat_seconds) {
                     bump_mariadb_capture_heartbeat(mariadb.handle);
                     bump_capture_heartbeat_pg(log_pg, conn_id, "mariadb");
+                    cdc_publish_kafka_heartbeat(producer, rcfg, conn_id, "mariadb");
                     last_heartbeat = now;
                 }
                 break;
@@ -1001,6 +1073,7 @@ MariaDbCaptureStats run_mariadb_kafka_capture_slice(
                     rcfg.heartbeat_seconds) {
                 bump_mariadb_capture_heartbeat(mariadb.handle);
                 bump_capture_heartbeat_pg(log_pg, conn_id, "mariadb");
+                cdc_publish_kafka_heartbeat(producer, rcfg, conn_id, "mariadb");
                 last_heartbeat = now;
             }
             break;

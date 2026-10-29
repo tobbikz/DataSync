@@ -60,7 +60,25 @@ set(DATASYNC_SOURCES
     src/schema_migrate.cpp
     src/cdc_gap.cpp
     src/type_coercion.cpp
+    src/snapshot_signal.cpp
+    src/column_policy.cpp
+    src/mariadb_signal.cpp
+    src/control_plane.cpp
+    src/mariadb_binlog_native.cpp
+    src/mariadb_binlog_read.cpp
+    src/mariadb_reselect.cpp
+    src/cdc_routing.cpp
 )
+
+# S09: optional Connector/C replication API (mariadb_rpl.h).
+find_path(MARIADB_RPL_INCLUDE_DIR NAMES mariadb_rpl.h
+    PATH_SUFFIXES mysql mariadb)
+if(MARIADB_RPL_INCLUDE_DIR)
+    message(STATUS "mariadb_rpl.h found: ${MARIADB_RPL_INCLUDE_DIR}")
+    set(HAVE_MARIADB_RPL TRUE)
+else()
+    message(STATUS "mariadb_rpl.h not found — native binlog path disabled (CLI fallback)")
+endif()
 
 find_path(FREETDS_INCLUDE_DIR NAMES sybdb.h)
 find_library(FREETDS_LIBRARY NAMES sybdb)
@@ -127,6 +145,11 @@ if(HAVE_RDKAFKA)
     target_compile_definitions(DataSync PRIVATE HAVE_RDKAFKA)
 endif()
 
+if(HAVE_MARIADB_RPL)
+    target_compile_definitions(DataSync PRIVATE HAVE_MARIADB_RPL)
+    target_include_directories(DataSync PRIVATE "${MARIADB_RPL_INCLUDE_DIR}")
+endif()
+
 if(HAVE_FREETDS)
     target_compile_definitions(DataSync PRIVATE HAVE_FREETDS)
     target_include_directories(DataSync PRIVATE "${FREETDS_INCLUDE_DIR}")
@@ -144,8 +167,14 @@ target_compile_options(DataSync PRIVATE -Wall -Wextra)
 option(BUILD_TESTING "Build DataSync unit tests" ON)
 if(BUILD_TESTING)
     enable_testing()
+    # Headers under include/ often pull libpq-fe.h; keep includes consistent across unit tests.
+    set(DATASYNC_TEST_INCLUDES
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${LIBPQ_INCLUDE_DIRS}
+        ${MARIADB_INCLUDE_DIRS}
+    )
     add_executable(datasync_boolean_tests tests/boolean_tests.cpp src/mariadb_boolean.cpp)
-    target_include_directories(datasync_boolean_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(datasync_boolean_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
     target_compile_options(datasync_boolean_tests PRIVATE -Wall -Wextra)
     add_test(NAME boolean_tests COMMAND datasync_boolean_tests)
 
@@ -155,12 +184,10 @@ if(BUILD_TESTING)
         src/mariadb_schema.cpp
         src/mariadb_boolean.cpp
         src/mariadb_datetime.cpp
+        src/pg_conn.cpp
     )
-    target_include_directories(datasync_envelope_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${MARIADB_INCLUDE_DIRS}
-    )
-    target_link_libraries(datasync_envelope_tests PRIVATE ${MARIADB_LIBRARIES})
+    target_include_directories(datasync_envelope_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
+    target_link_libraries(datasync_envelope_tests PRIVATE ${MARIADB_LIBRARIES} ${LIBPQ_LIBRARIES})
     if(nlohmann_json_FOUND)
         target_link_libraries(datasync_envelope_tests PRIVATE nlohmann_json::nlohmann_json)
     endif()
@@ -168,17 +195,17 @@ if(BUILD_TESTING)
     add_test(NAME envelope_tests COMMAND datasync_envelope_tests)
 
     add_executable(datasync_tx_id_tests tests/tx_id_tests.cpp src/cdc_tx.cpp)
-    target_include_directories(datasync_tx_id_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(datasync_tx_id_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
     target_compile_options(datasync_tx_id_tests PRIVATE -Wall -Wextra)
     add_test(NAME tx_id_tests COMMAND datasync_tx_id_tests)
 
     add_executable(datasync_gap_kind_tests tests/gap_kind_tests.cpp)
-    target_include_directories(datasync_gap_kind_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(datasync_gap_kind_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
     target_compile_options(datasync_gap_kind_tests PRIVATE -Wall -Wextra)
     add_test(NAME gap_kind_tests COMMAND datasync_gap_kind_tests)
 
     add_executable(datasync_coercion_sensitive_tests tests/coercion_sensitive_tests.cpp)
-    target_include_directories(datasync_coercion_sensitive_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(datasync_coercion_sensitive_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
     if(nlohmann_json_FOUND)
         target_link_libraries(datasync_coercion_sensitive_tests PRIVATE nlohmann_json::nlohmann_json)
     endif()
@@ -189,10 +216,73 @@ if(BUILD_TESTING)
         tests/full_load_slice_tests.cpp
         src/full_load_slice.cpp
     )
-    target_include_directories(datasync_full_load_slice_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(datasync_full_load_slice_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
     if(nlohmann_json_FOUND)
         target_link_libraries(datasync_full_load_slice_tests PRIVATE nlohmann_json::nlohmann_json)
     endif()
     target_compile_options(datasync_full_load_slice_tests PRIVATE -Wall -Wextra)
     add_test(NAME full_load_slice_tests COMMAND datasync_full_load_slice_tests)
+
+    add_executable(datasync_quarantine_hold_tests tests/quarantine_hold_tests.cpp)
+    target_include_directories(datasync_quarantine_hold_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
+    if(nlohmann_json_FOUND)
+        target_link_libraries(datasync_quarantine_hold_tests PRIVATE nlohmann_json::nlohmann_json)
+    endif()
+    target_compile_options(datasync_quarantine_hold_tests PRIVATE -Wall -Wextra)
+    add_test(NAME quarantine_hold_tests COMMAND datasync_quarantine_hold_tests)
+
+    add_executable(datasync_column_policy_tests
+        tests/column_policy_tests.cpp
+        src/column_policy.cpp
+    )
+    target_include_directories(datasync_column_policy_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
+    target_link_libraries(datasync_column_policy_tests PRIVATE crypto)
+    if(nlohmann_json_FOUND)
+        target_link_libraries(datasync_column_policy_tests PRIVATE nlohmann_json::nlohmann_json)
+    endif()
+    target_compile_options(datasync_column_policy_tests PRIVATE -Wall -Wextra)
+    add_test(NAME column_policy_tests COMMAND datasync_column_policy_tests)
+
+    add_executable(datasync_snapshot_signal_tests tests/snapshot_signal_tests.cpp)
+    target_include_directories(datasync_snapshot_signal_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
+    if(nlohmann_json_FOUND)
+        target_link_libraries(datasync_snapshot_signal_tests PRIVATE nlohmann_json::nlohmann_json)
+    endif()
+    target_compile_options(datasync_snapshot_signal_tests PRIVATE -Wall -Wextra)
+    add_test(NAME snapshot_signal_tests COMMAND datasync_snapshot_signal_tests)
+
+    add_executable(datasync_control_plane_tests
+        tests/control_plane_tests.cpp
+        src/control_plane.cpp
+        src/config.cpp
+        src/pg_conn.cpp
+        src/snapshot_signal.cpp
+    )
+    target_include_directories(datasync_control_plane_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
+    target_link_libraries(datasync_control_plane_tests PRIVATE ${LIBPQ_LIBRARIES})
+    if(nlohmann_json_FOUND)
+        target_link_libraries(datasync_control_plane_tests PRIVATE nlohmann_json::nlohmann_json)
+    endif()
+    target_compile_options(datasync_control_plane_tests PRIVATE -Wall -Wextra)
+    add_test(NAME control_plane_tests COMMAND datasync_control_plane_tests)
+
+    # Lightweight: no libpq — verifies CdcConfig defaults used by P2 wiring.
+    add_executable(datasync_cdc_config_tests tests/cdc_config_tests.cpp src/config.cpp)
+    target_include_directories(datasync_cdc_config_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
+    if(nlohmann_json_FOUND)
+        target_link_libraries(datasync_cdc_config_tests PRIVATE nlohmann_json::nlohmann_json)
+    endif()
+    target_compile_options(datasync_cdc_config_tests PRIVATE -Wall -Wextra)
+    add_test(NAME cdc_config_tests COMMAND datasync_cdc_config_tests)
+
+    add_executable(datasync_cdc_routing_tests
+        tests/cdc_routing_tests.cpp
+        src/cdc_routing.cpp
+    )
+    target_include_directories(datasync_cdc_routing_tests PRIVATE ${DATASYNC_TEST_INCLUDES})
+    if(nlohmann_json_FOUND)
+        target_link_libraries(datasync_cdc_routing_tests PRIVATE nlohmann_json::nlohmann_json)
+    endif()
+    target_compile_options(datasync_cdc_routing_tests PRIVATE -Wall -Wextra)
+    add_test(NAME cdc_routing_tests COMMAND datasync_cdc_routing_tests)
 endif()

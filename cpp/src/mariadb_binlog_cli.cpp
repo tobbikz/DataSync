@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <fcntl.h>
 #include <fstream>
 #include <map>
@@ -130,7 +131,8 @@ BinlogCliStats read_remote_binlog_cli(
     int max_events,
     const BinlogRowHandler& on_row,
     const std::function<bool()>& should_stop,
-    const BinlogTxHandler& on_tx) {
+    const BinlogTxHandler& on_tx,
+    const BinlogQueryHandler& on_query) {
     BinlogCliStats stats;
     stats.last_file = start.file;
     stats.last_position = start.position;
@@ -186,6 +188,43 @@ BinlogCliStats read_remote_binlog_cli(
     std::map<int, std::string> where_cols;
     std::map<int, std::string> set_cols;
     std::optional<long long> current_tx_id;
+    bool in_query_event = false;
+    std::string pending_query_sql;
+
+    auto flush_query = [&]() {
+        if (pending_query_sql.empty() || !on_query) {
+            pending_query_sql.clear();
+            in_query_event = false;
+            return;
+        }
+        std::string sql = trim(pending_query_sql);
+        // Strip mysqlbinlog /*!*/ markers.
+        while (!sql.empty() && sql.back() == ';') {
+            sql.pop_back();
+            sql = trim(sql);
+        }
+        const std::string upper = sql.size() > 12 ? sql.substr(0, 12) : sql;
+        auto starts_ci = [](const std::string& s, const char* pfx) {
+            if (s.size() < std::strlen(pfx)) {
+                return false;
+            }
+            for (size_t i = 0; pfx[i]; ++i) {
+                if (std::tolower(static_cast<unsigned char>(s[i])) !=
+                    std::tolower(static_cast<unsigned char>(pfx[i]))) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (!sql.empty() && !starts_ci(sql, "BEGIN") && !starts_ci(sql, "COMMIT") &&
+            !starts_ci(sql, "ROLLBACK") && !starts_ci(sql, "XA ") &&
+            !(starts_ci(sql, "SET ") && sql.find("TIMESTAMP") != std::string::npos)) {
+            on_query(sql, stats.last_position);
+        }
+        pending_query_sql.clear();
+        in_query_event = false;
+        (void)upper;
+    };
 
     auto flush_row = [&]() {
         if (pending_schema.empty() || pending_table.empty() || pending_op.empty()) {
@@ -273,6 +312,7 @@ BinlogCliStats read_remote_binlog_cli(
         }
 
         if (line.rfind("# at ", 0) == 0) {
+            flush_query();
             const std::string pos_str = trim(line.substr(5));
             const auto space = pos_str.find(' ');
             const std::string num = space == std::string::npos ? pos_str : pos_str.substr(0, space);
@@ -283,7 +323,31 @@ BinlogCliStats read_remote_binlog_cli(
             continue;
         }
 
+        // E05: Query event header from mysqlbinlog (comment line containing "Query").
+        if (!line.empty() && line[0] == '#' && line.find(" Query") != std::string::npos) {
+            flush_query();
+            flush_row();
+            in_query_event = true;
+            pending_query_sql.clear();
+            continue;
+        }
+        if (in_query_event) {
+            if (line.rfind("###", 0) == 0 || line.rfind("# at ", 0) == 0) {
+                flush_query();
+                // fall through to row parsing below for ### lines
+            } else if (!line.empty() && line[0] == '#') {
+                continue;
+            } else {
+                if (!pending_query_sql.empty()) {
+                    pending_query_sql.push_back(' ');
+                }
+                pending_query_sql += line;
+                continue;
+            }
+        }
+
         if (line.rfind("### INSERT INTO ", 0) == 0) {
+            flush_query();
             flush_row();
             pending_op = "INSERT";
             parse_table_ref(line.substr(16), pending_schema, pending_table);
@@ -292,6 +356,7 @@ BinlogCliStats read_remote_binlog_cli(
             continue;
         }
         if (line.rfind("### UPDATE ", 0) == 0) {
+            flush_query();
             flush_row();
             pending_op = "UPDATE";
             parse_table_ref(line.substr(11), pending_schema, pending_table);
@@ -300,6 +365,7 @@ BinlogCliStats read_remote_binlog_cli(
             continue;
         }
         if (line.rfind("### DELETE FROM ", 0) == 0) {
+            flush_query();
             flush_row();
             pending_op = "DELETE";
             parse_table_ref(line.substr(16), pending_schema, pending_table);
@@ -334,6 +400,7 @@ BinlogCliStats read_remote_binlog_cli(
         }
 
         if (line == "BEGIN") {
+            flush_query();
             if (on_tx) {
                 on_tx("begin", current_tx_id.value_or(0LL), stats.last_position);
             }
@@ -356,6 +423,7 @@ BinlogCliStats read_remote_binlog_cli(
         }
     }
 
+    flush_query();
     flush_row();
     } catch (...) {
         pclose(pipe);

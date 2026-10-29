@@ -1,5 +1,7 @@
 #include "config.hpp"
 
+#include "pipeline_defaults.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <cstdlib>
@@ -86,6 +88,21 @@ CdcConfig default_cdc_config() {
     cdc.round_idle_seconds = 5;
     cdc.slice_max_seconds = 180;
     cdc.slice_max_events = 10'000'000;
+    cdc.capture_worker_count = pipeline_defaults::kCaptureWorkerCount;
+    cdc.apply_dedup = true;
+    cdc.apply_audit = false;
+    cdc.mssql_replay_on_idle = pipeline_defaults::kMssqlCaptureReplayOnIdle;
+    cdc.kafka_heartbeat = true;
+    cdc.binlog_mode = "auto";
+    cdc.kafka_tombstones = true;
+    cdc.reselect_on_apply = false;
+    cdc.cloudevents = false;
+    cdc.tracing = true;
+    cdc.openlineage = false;
+    cdc.include_source_query = true;
+    cdc.schema_events = true;
+    cdc.content_routing = nlohmann::json::array();
+    cdc.message_filter_exclude_ops = nlohmann::json::array();
     return cdc;
 }
 
@@ -105,6 +122,54 @@ void parse_cdc_config(const nlohmann::json& root, CdcConfig& cdc) {
     }
     if (j.contains("slice_max_events")) {
         cdc.slice_max_events = j["slice_max_events"].get<int>();
+    }
+    if (j.contains("capture_worker_count") && j["capture_worker_count"].is_number_integer()) {
+        cdc.capture_worker_count = std::max(1, j["capture_worker_count"].get<int>());
+    }
+    if (j.contains("apply_dedup") && j["apply_dedup"].is_boolean()) {
+        cdc.apply_dedup = j["apply_dedup"].get<bool>();
+    }
+    if (j.contains("apply_audit") && j["apply_audit"].is_boolean()) {
+        cdc.apply_audit = j["apply_audit"].get<bool>();
+    }
+    if (j.contains("mssql_replay_on_idle") && j["mssql_replay_on_idle"].is_boolean()) {
+        cdc.mssql_replay_on_idle = j["mssql_replay_on_idle"].get<bool>();
+    }
+    if (j.contains("kafka_heartbeat") && j["kafka_heartbeat"].is_boolean()) {
+        cdc.kafka_heartbeat = j["kafka_heartbeat"].get<bool>();
+    }
+    if (j.contains("binlog_mode") && j["binlog_mode"].is_string()) {
+        const std::string mode = j["binlog_mode"].get<std::string>();
+        if (mode == "auto" || mode == "cli" || mode == "native") {
+            cdc.binlog_mode = mode;
+        }
+    }
+    if (j.contains("kafka_tombstones") && j["kafka_tombstones"].is_boolean()) {
+        cdc.kafka_tombstones = j["kafka_tombstones"].get<bool>();
+    }
+    if (j.contains("reselect_on_apply") && j["reselect_on_apply"].is_boolean()) {
+        cdc.reselect_on_apply = j["reselect_on_apply"].get<bool>();
+    }
+    if (j.contains("cloudevents") && j["cloudevents"].is_boolean()) {
+        cdc.cloudevents = j["cloudevents"].get<bool>();
+    }
+    if (j.contains("tracing") && j["tracing"].is_boolean()) {
+        cdc.tracing = j["tracing"].get<bool>();
+    }
+    if (j.contains("openlineage") && j["openlineage"].is_boolean()) {
+        cdc.openlineage = j["openlineage"].get<bool>();
+    }
+    if (j.contains("include_source_query") && j["include_source_query"].is_boolean()) {
+        cdc.include_source_query = j["include_source_query"].get<bool>();
+    }
+    if (j.contains("schema_events") && j["schema_events"].is_boolean()) {
+        cdc.schema_events = j["schema_events"].get<bool>();
+    }
+    if (j.contains("content_routing") && j["content_routing"].is_array()) {
+        cdc.content_routing = j["content_routing"];
+    }
+    if (j.contains("message_filter_exclude_ops") && j["message_filter_exclude_ops"].is_array()) {
+        cdc.message_filter_exclude_ops = j["message_filter_exclude_ops"];
     }
 }
 
@@ -165,6 +230,7 @@ AppConfig load_config(const std::string& path) {
     }
 
     parse_cdc_config(root, cfg.cdc);
+    cfg.config_path = path;
 
     if (const char* env = std::getenv("DATASYNC_PG_PASSWORD")) {
         if (env[0] != '\0') {

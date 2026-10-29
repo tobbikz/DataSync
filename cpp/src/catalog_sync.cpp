@@ -1,5 +1,6 @@
 #include "catalog_sync.hpp"
 
+#include "column_policy.hpp"
 #include "mariadb_conn.hpp"
 #include "mariadb_preflight.hpp"
 #include "mongo_preflight.hpp"
@@ -890,7 +891,32 @@ CatalogSyncStats sync_mariadb_catalog(
         throw std::runtime_error("MariaDB CDC preflight failed for " + source.conn_id);
     }
 
-    const auto discovered = fetch_mariadb_objects(mariadb.handle, source.db_name);
+    auto discovered = fetch_mariadb_objects(mariadb.handle, source.db_name);
+    // T01: connections.extras table_include / table_exclude regex lists.
+    {
+        const auto filter = column_policy::table_filter_from_extras(source.extras);
+        if (!filter.empty()) {
+            std::vector<CatalogObjectKey> kept;
+            kept.reserve(discovered.size());
+            for (const auto& key : discovered) {
+                if (column_policy::table_allowed(filter, key.source_schema, key.source_table)) {
+                    kept.push_back(key);
+                }
+            }
+            discovered.swap(kept);
+        }
+    }
+    // D08: skip gh-ost / pt-osc helper tables unless opted in.
+    if (!column_policy::capture_online_ddl_helpers(source.extras)) {
+        std::vector<CatalogObjectKey> kept;
+        kept.reserve(discovered.size());
+        for (const auto& key : discovered) {
+            if (!column_policy::is_online_ddl_helper_table(key.source_table)) {
+                kept.push_back(key);
+            }
+        }
+        discovered.swap(kept);
+    }
     log_checkpoint(
         log_pg,
         LogLevel::Info,
@@ -958,7 +984,31 @@ CatalogSyncStats sync_mssql_catalog(
         }
     }
 
-    const auto discovered = fetch_mssql_objects(mssql, source.db_name);
+    auto discovered = fetch_mssql_objects(mssql, source.db_name);
+    {
+        const auto filter = column_policy::table_filter_from_extras(source.extras);
+        if (!filter.empty()) {
+            std::vector<MssqlCatalogObject> kept;
+            kept.reserve(discovered.size());
+            for (const auto& obj : discovered) {
+                if (column_policy::table_allowed(
+                        filter, obj.key.source_schema, obj.key.source_table)) {
+                    kept.push_back(obj);
+                }
+            }
+            discovered.swap(kept);
+        }
+    }
+    if (!column_policy::capture_online_ddl_helpers(source.extras)) {
+        std::vector<MssqlCatalogObject> kept;
+        kept.reserve(discovered.size());
+        for (const auto& obj : discovered) {
+            if (!column_policy::is_online_ddl_helper_table(obj.key.source_table)) {
+                kept.push_back(obj);
+            }
+        }
+        discovered.swap(kept);
+    }
     if (discovered.empty()) {
         log_checkpoint(
             log_pg,

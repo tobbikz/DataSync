@@ -1,6 +1,7 @@
 #include "mariadb_full_load.hpp"
 
 #include "capture_common.hpp"
+#include "column_policy.hpp"
 #include "full_load_checkpoint.hpp"
 #include "full_load_common.hpp"
 #include "lake_apply_index.hpp"
@@ -11,9 +12,11 @@
 #include "mariadb_datetime.hpp"
 #include "mariadb_preflight.hpp"
 #include "mariadb_schema.hpp"
+#include "mariadb_signal.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "pipeline_defaults.hpp"
+#include "snapshot_signal.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -57,7 +60,52 @@ struct CatalogTableRow {
     std::string source_table;
     bool has_pk{false};
     std::string pk_columns;
+    std::string snapshot_mode{"when_needed"};
+    nlohmann::json engine_meta = nlohmann::json::object();
+
+    bool wants_incremental() const {
+        if (snapshot_mode == "incremental") {
+            return true;
+        }
+        if (engine_meta.is_object()) {
+            const auto kind = engine_meta.value("snapshot_kind", "");
+            if (kind == "incremental") {
+                return true;
+            }
+        }
+        return false;
+    }
 };
+
+void merge_incremental_staging_batch(
+    PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
+    const std::string& staging,
+    const std::vector<std::string>& pk_cols,
+    const std::vector<std::string>& all_copy_cols) {
+    const std::string fq = pg_ident(schema) + "." + pg_ident(table);
+    const std::string stg = pg_ident(staging);
+    std::ostringstream join_on;
+    for (std::size_t i = 0; i < pk_cols.size(); ++i) {
+        if (i) {
+            join_on << " AND ";
+        }
+        join_on << "t." << pg_ident(pk_cols[i]) << " = s." << pg_ident(pk_cols[i]);
+    }
+    pg_exec(pg, "DELETE FROM " + fq + " t USING " + stg + " s WHERE " + join_on.str());
+    std::ostringstream cols;
+    for (std::size_t i = 0; i < all_copy_cols.size(); ++i) {
+        if (i) {
+            cols << ", ";
+        }
+        cols << pg_ident(all_copy_cols[i]);
+    }
+    pg_exec(
+        pg,
+        "INSERT INTO " + fq + " (" + cols.str() + ") SELECT " + cols.str() + " FROM " + stg);
+    pg_exec(pg, "TRUNCATE " + stg);
+}
 
 void log_fl(
     PGconn* log_pg,
@@ -342,7 +390,9 @@ long long copy_rows_keyset(
     const MariaDbRetryOptions& retry,
     const full_load::PkSlice& pk_slice = {},
     InvalidPkSkipStats* skip_stats = nullptr,
-    full_load::CopyCheckpointContext* checkpoint_ctx = nullptr) {
+    full_load::CopyCheckpointContext* checkpoint_ctx = nullptr,
+    bool incremental = false,
+    PGconn* signal_pg = nullptr) {
     const std::string load_ts = utc_now_ts();
     const std::string load_date = utc_now_date();
 
@@ -372,10 +422,33 @@ long long copy_rows_keyset(
               << pg_ident("_dl_source_system") << ", " << pg_ident("_dl_snapshot_id");
 
     const std::string fq = pg_ident(target.source_schema) + "." + pg_ident(target.source_table);
-    const std::string copy_sql = "COPY " + fq + " (" + copy_cols.str() + ") FROM STDIN WITH (FORMAT csv)";
+    const std::string staging_name = "cdc_incr_stg_" + std::to_string(target.catalog_id);
+    std::string copy_target = fq;
+    std::vector<std::string> all_copy_cols;
+    for (const auto& c : cols) {
+        all_copy_cols.push_back(c.name);
+    }
+    all_copy_cols.push_back("_dl_load_timestamp");
+    all_copy_cols.push_back("_dl_load_date");
+    all_copy_cols.push_back("_dl_source_system");
+    all_copy_cols.push_back("_dl_snapshot_id");
+
+    if (incremental) {
+        const std::string stg = pg_ident(staging_name);
+        pg_exec(
+            lake_pg.raw,
+            "CREATE TEMP TABLE IF NOT EXISTS " + stg + " (LIKE " + fq + " INCLUDING DEFAULTS)");
+        pg_exec(lake_pg.raw, "TRUNCATE " + stg);
+        copy_target = stg;
+    }
+    const std::string copy_sql =
+        "COPY " + copy_target + " (" + copy_cols.str() + ") FROM STDIN WITH (FORMAT csv)";
 
     const std::string slice_clause =
         full_load::slice_where_clause(pk_cols, pk_slice, mariadb_ident, mariadb_literal_quoter(pk_cols, cols));
+
+    // T02/T03: filter + mask columns from engine_meta.
+    const auto col_policy = column_policy::column_filter_from_meta(target.engine_meta);
 
     long long total_rows = 0;
     std::vector<std::string> last_pk_values;
@@ -394,6 +467,10 @@ long long copy_rows_keyset(
 
     while (true) {
         if (g_shutdown.load()) {
+            break;
+        }
+        if (signal_pg &&
+            snapshot_signal::poll_cooperative_stop(signal_pg, target.conn_id, target.catalog_id)) {
             break;
         }
         std::ostringstream query;
@@ -425,10 +502,21 @@ long long copy_rows_keyset(
                 if (i) {
                     line << ',';
                 }
+                if (!column_policy::column_allowed(col_policy, cols[i].name)) {
+                    line << "\\N";
+                    continue;
+                }
                 std::string cell;
                 if (!mariadb_format_copy_cell(row[i], lens ? lens[i] : 0, cols[i], cell)) {
                     row_ok = false;
                     break;
+                }
+                // cell is already CSV-escaped; mask raw then re-escape when hashed.
+                if (!col_policy.mask.empty() && col_policy.mask.count(cols[i].name)) {
+                    const char* raw = row[i] ? row[i] : "";
+                    const std::string masked =
+                        column_policy::maybe_mask_value(col_policy, cols[i].name, raw);
+                    cell = csv_escape(masked);
                 }
                 line << cell;
             }
@@ -466,7 +554,23 @@ long long copy_rows_keyset(
                     checkpoint_ctx->rows_loaded_session_baseline + rows_after_batch);
             };
         }
-        pg_copy_batch_with_retry(lake_pg, copy_sql, batch_lines, pg_retry, record_position);
+        if (incremental) {
+            std::function<void(PGconn*)> after = [&](PGconn* txn_pg) {
+                merge_incremental_staging_batch(
+                    txn_pg,
+                    target.source_schema,
+                    target.source_table,
+                    staging_name,
+                    pk_cols,
+                    all_copy_cols);
+                if (record_position) {
+                    record_position(txn_pg);
+                }
+            };
+            pg_copy_batch_with_retry(lake_pg, copy_sql, batch_lines, pg_retry, after);
+        } else {
+            pg_copy_batch_with_retry(lake_pg, copy_sql, batch_lines, pg_retry, record_position);
+        }
 
         total_rows = rows_after_batch;
         if (checkpoint_ctx) {
@@ -501,7 +605,9 @@ long long copy_rows_parallel(
     const MariaDbRetryOptions& retry,
     InvalidPkSkipStats* skip_stats = nullptr,
     const std::vector<FullLoadCheckpoint>* resume_checkpoints = nullptr,
-    std::optional<long long> source_rows = std::nullopt) {
+    std::optional<long long> source_rows = std::nullopt,
+    bool incremental = false,
+    PGconn* signal_pg = nullptr) {
     std::mutex checkpoint_mtx;
     auto checkpoint_for_worker = [&](int worker_id) -> full_load::CopyCheckpointContext {
         full_load::CopyCheckpointContext ctx;
@@ -618,7 +724,9 @@ long long copy_rows_parallel(
             retry,
             slices[0],
             skip_stats,
-            &ctx);
+            &ctx,
+            incremental,
+            signal_pg);
         fail_if_only_skips(rows);
         return rows;
     }
@@ -647,7 +755,9 @@ long long copy_rows_parallel(
                     retry,
                     slices[static_cast<std::size_t>(w)],
                     &worker_skips[static_cast<std::size_t>(w)],
-                    &worker_ctx);
+                    &worker_ctx,
+                    incremental,
+                    signal_pg);
             } catch (...) {
                 errors[static_cast<std::size_t>(w)] = std::current_exception();
             }
@@ -684,10 +794,12 @@ std::vector<CatalogTableRow> fetch_full_load_targets(PGconn* pg) {
     PGresult* res = PQexec(
         pg,
         R"(
-        SELECT catalog_id, conn_id, source_schema, source_table, has_pk, COALESCE(pk_columns, '')
+        SELECT catalog_id, conn_id, source_schema, source_table, has_pk, COALESCE(pk_columns, ''),
+               COALESCE(snapshot_mode, 'when_needed'), COALESCE(engine_meta::text, '{}')
         FROM cdc_catalog.catalog
         WHERE db_engine = 'mariadb'
           AND active = true
+          AND snapshot_mode <> 'never'
           AND needs_full_load = true
           AND status NOT IN ('skipped', 'disabled')
           AND (
@@ -714,6 +826,12 @@ std::vector<CatalogTableRow> fetch_full_load_targets(PGconn* pg) {
         row.source_table = PQgetvalue(res, i, 3);
         row.has_pk = std::string(PQgetvalue(res, i, 4)) == "t";
         row.pk_columns = PQgetvalue(res, i, 5);
+        row.snapshot_mode = PQgetvalue(res, i, 6);
+        try {
+            row.engine_meta = nlohmann::json::parse(PQgetvalue(res, i, 7));
+        } catch (...) {
+            row.engine_meta = nlohmann::json::object();
+        }
         out.push_back(std::move(row));
     }
     PQclear(res);
@@ -898,13 +1016,17 @@ TableLoadOutcome load_one_table(
     const int source_sleep_ms = pipeline_defaults::kFullLoadSourceSleepMs;
     const int workers = pipeline_defaults::kFullLoadWorkers;
 
+    const bool incremental = target.wants_incremental();
     log_fl(
         log_pg,
         log_mtx,
         LogLevel::Info,
         batch_id,
-        "table full load started",
-        {{"batch_size", batch_size}, {"workers", workers}},
+        incremental ? "table incremental snapshot started" : "table full load started",
+        {{"batch_size", batch_size},
+         {"workers", workers},
+         {"snapshot_mode", target.snapshot_mode},
+         {"incremental", incremental}},
         target.conn_id,
         target.source_schema,
         target.source_table);
@@ -937,6 +1059,22 @@ TableLoadOutcome load_one_table(
     ensure_lake_table_base(lake_pg.raw, target.source_schema, target.source_table, cols, partition_months);
     ensure_mirror_apply_pk_index(lake_pg.raw, target.source_schema, target.source_table, pk_cols);
 
+    // F01 schema_only: DDL/lake shape only, no row copy.
+    if (target.snapshot_mode == "schema_only") {
+        mark_catalog_success(app_pg.raw, target.catalog_id);
+        log_fl(
+            log_pg,
+            log_mtx,
+            LogLevel::Info,
+            batch_id,
+            "schema_only snapshot complete (no row copy)",
+            {},
+            target.conn_id,
+            target.source_schema,
+            target.source_table);
+        return TableLoadOutcome::Success;
+    }
+
     acquire_full_load_table_lock(lake_pg.raw, target.catalog_id);
     bool lock_released = false;
     auto release_lock = [&]() {
@@ -950,6 +1088,41 @@ TableLoadOutcome load_one_table(
     };
 
     try {
+    // F08: open GTID watermark on source before chunked copy.
+    std::string gtid_open;
+    if (incremental) {
+        try {
+            mariadb_signal::ensure_signal_table(mariadb);
+            gtid_open = mariadb_signal::read_gtid_executed(mariadb);
+            const std::string key =
+                target.conn_id + "." + target.source_schema + "." + target.source_table;
+            mariadb_signal::insert_watermark(mariadb, key, "open", gtid_open);
+            nlohmann::json meta = target.engine_meta.is_object() ? target.engine_meta : nlohmann::json::object();
+            meta["snapshot_kind"] = "incremental";
+            meta["gtid_open"] = gtid_open;
+            const std::string meta_s = meta.dump();
+            const std::string cid = std::to_string(target.catalog_id);
+            const char* vals[] = {cid.c_str(), meta_s.c_str()};
+            pg_exec_params_simple(
+                app_pg.raw,
+                "UPDATE cdc_catalog.catalog SET engine_meta = $2::jsonb, capture_during_full_load = true,"
+                " updated_at = now() WHERE catalog_id = $1::bigint",
+                2,
+                vals);
+        } catch (const std::exception& ex) {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Warning,
+                batch_id,
+                "incremental watermark open failed (continuing)",
+                {{"error", ex.what()}},
+                target.conn_id,
+                target.source_schema,
+                target.source_table);
+        }
+    }
+
     std::vector<FullLoadCheckpoint> resume_checkpoints;
     const bool resume_copy = full_load::should_resume_from_copy_checkpoint(
         app_pg.raw,
@@ -985,6 +1158,7 @@ TableLoadOutcome load_one_table(
     } else {
         clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
         full_load::clear_lake_copy_positions(lake_pg.raw, target.catalog_id);
+        if (!incremental) {
         const auto trunc = full_load::truncate_lake_table_verified(
             lake_pg.raw,
             target.source_schema,
@@ -1021,6 +1195,18 @@ TableLoadOutcome load_one_table(
             target.conn_id,
             target.source_schema,
             target.source_table);
+        } else {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Info,
+                batch_id,
+                "incremental snapshot: truncate skipped",
+                {{"gtid_open", gtid_open}},
+                target.conn_id,
+                target.source_schema,
+                target.source_table);
+        }
         FullLoadCheckpoint trunc_cp;
         trunc_cp.catalog_id = target.catalog_id;
         trunc_cp.worker_id = 0;
@@ -1097,7 +1283,52 @@ TableLoadOutcome load_one_table(
         retry,
         &skip_stats,
         resume_copy ? &resume_checkpoints : nullptr,
-        source_rows >= 0 ? std::optional<long long>(source_rows) : std::nullopt);
+        source_rows >= 0 ? std::optional<long long>(source_rows) : std::nullopt,
+        incremental,
+        app_pg.raw);
+
+    if (incremental) {
+        try {
+            const std::string gtid_close = mariadb_signal::read_gtid_executed(mariadb);
+            const std::string key =
+                target.conn_id + "." + target.source_schema + "." + target.source_table;
+            mariadb_signal::insert_watermark(mariadb, key, "close", gtid_close);
+            nlohmann::json meta = target.engine_meta.is_object() ? target.engine_meta : nlohmann::json::object();
+            meta["snapshot_kind"] = "incremental";
+            meta["gtid_open"] = gtid_open;
+            meta["gtid_close"] = gtid_close;
+            const std::string meta_s = meta.dump();
+            const std::string cid = std::to_string(target.catalog_id);
+            const char* vals[] = {cid.c_str(), meta_s.c_str()};
+            pg_exec_params_simple(
+                app_pg.raw,
+                "UPDATE cdc_catalog.catalog SET engine_meta = $2::jsonb, updated_at = now()"
+                " WHERE catalog_id = $1::bigint",
+                2,
+                vals);
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Info,
+                batch_id,
+                "incremental watermark closed",
+                {{"gtid_open", gtid_open}, {"gtid_close", gtid_close}},
+                target.conn_id,
+                target.source_schema,
+                target.source_table);
+        } catch (const std::exception& ex) {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Warning,
+                batch_id,
+                "incremental watermark close failed",
+                {{"error", ex.what()}},
+                target.conn_id,
+                target.source_schema,
+                target.source_table);
+        }
+    }
 
     if (skip_stats.count > 0) {
         log_fl(

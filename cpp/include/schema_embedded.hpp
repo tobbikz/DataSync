@@ -23,6 +23,8 @@ CREATE SCHEMA cdc_catalog;
 inline std::string_view k010_enums() {
     return R"cdc010(
 -- cdc_catalog enum types (idempotent).
+-- Schema create is non-destructive; 000_reset (DROP+CREATE) only runs with DATASYNC_SCHEMA_RESET=1.
+CREATE SCHEMA IF NOT EXISTS cdc_catalog;
 
 DO $$ BEGIN
   CREATE TYPE cdc_catalog.db_engine AS ENUM ('mariadb', 'mssql', 'mongodb');
@@ -127,11 +129,34 @@ CREATE TABLE IF NOT EXISTS cdc_catalog.catalog (
   engine_meta jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(engine_meta) = 'object'),
   capture_during_full_load boolean NOT NULL DEFAULT false,
   scd2_enabled boolean NOT NULL DEFAULT false,
+  /** F01: initial|never|schema_only|incremental|when_needed (default when_needed ≈ needs_full_load). */
+  snapshot_mode text NOT NULL DEFAULT 'when_needed'
+    CHECK (snapshot_mode = ANY (ARRAY [
+      'initial', 'never', 'schema_only', 'incremental', 'when_needed'
+    ])),
   CONSTRAINT catalog_source_object_uk
     UNIQUE (conn_id, db_engine, source_database, source_schema, source_table),
   CONSTRAINT catalog_pk_columns_when_has_pk
     CHECK ((NOT has_pk) OR (pk_columns IS NOT NULL AND length(trim(both from pk_columns)) > 0))
 ) WITH (fillfactor = 80);
+
+-- C02/C03: cooperative snapshot control plane (pause/resume/stop/blocking/incremental).
+CREATE TABLE IF NOT EXISTS cdc_catalog.snapshot_signal (
+  signal_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  requested_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  conn_id text,
+  catalog_id bigint REFERENCES cdc_catalog.catalog (catalog_id) ON DELETE CASCADE,
+  action text NOT NULL CHECK (action = ANY (ARRAY [
+    'execute_incremental', 'execute_blocking', 'pause', 'resume', 'stop',
+    'reload_config', 'log', 'notify'
+  ])),
+  status text NOT NULL DEFAULT 'pending' CHECK (status = ANY (ARRAY [
+    'pending', 'running', 'paused', 'completed', 'cancelled', 'failed'
+  ])),
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(payload) = 'object'),
+  last_error text
+);
 
 CREATE TABLE IF NOT EXISTS cdc_catalog.apply_position (
   catalog_id bigint NOT NULL PRIMARY KEY REFERENCES cdc_catalog.catalog (catalog_id) ON DELETE CASCADE,
@@ -148,6 +173,8 @@ CREATE TABLE IF NOT EXISTS cdc_catalog.apply_position (
   last_error text,
   quarantined_at timestamptz,
   quarantine_reason text,
+  /** When true, next kafka-apply seeks to kafka_offset before consuming (post-unquarantine replay). */
+  kafka_replay_requested boolean NOT NULL DEFAULT false,
   updated_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT apply_position_object_uk UNIQUE (conn_id, source_schema, source_table)
 ) WITH (fillfactor = 70);
@@ -301,6 +328,110 @@ ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS last_error_at timestamp
 ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS last_error text;
 ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS capture_during_full_load boolean NOT NULL DEFAULT false;
 ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS scd2_enabled boolean NOT NULL DEFAULT false;
+ALTER TABLE cdc_catalog.catalog ADD COLUMN IF NOT EXISTS snapshot_mode text NOT NULL DEFAULT 'when_needed';
+DO $$ BEGIN
+  ALTER TABLE cdc_catalog.catalog
+    ADD CONSTRAINT catalog_snapshot_mode_chk
+    CHECK (snapshot_mode = ANY (ARRAY [
+      'initial', 'never', 'schema_only', 'incremental', 'when_needed'
+    ]));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+CREATE TABLE IF NOT EXISTS cdc_catalog.snapshot_signal (
+  signal_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  requested_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  conn_id text,
+  catalog_id bigint REFERENCES cdc_catalog.catalog (catalog_id) ON DELETE CASCADE,
+  action text NOT NULL CHECK (action = ANY (ARRAY [
+    'execute_incremental', 'execute_blocking', 'pause', 'resume', 'stop',
+    'reload_config', 'log', 'notify'
+  ])),
+  status text NOT NULL DEFAULT 'pending' CHECK (status = ANY (ARRAY [
+    'pending', 'running', 'paused', 'completed', 'cancelled', 'failed'
+  ])),
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(payload) = 'object'),
+  last_error text
+);
+CREATE INDEX IF NOT EXISTS snapshot_signal_pending_idx
+  ON cdc_catalog.snapshot_signal (status, requested_at)
+  WHERE status IN ('pending', 'running', 'paused');
+
+-- C01: broaden signal actions (idempotent ADD via CHECK drop/recreate is avoided;
+-- new actions accepted by relaxing CHECK in ALTER below).
+ALTER TABLE cdc_catalog.snapshot_signal DROP CONSTRAINT IF EXISTS snapshot_signal_action_check;
+ALTER TABLE cdc_catalog.snapshot_signal ADD CONSTRAINT snapshot_signal_action_check
+  CHECK (action = ANY (ARRAY [
+    'execute_incremental', 'execute_blocking', 'pause', 'resume', 'stop',
+    'reload_config', 'log', 'notify'
+  ]));
+
+-- C05: notification channel (snapshot/apply progress for UI/Superset).
+CREATE TABLE IF NOT EXISTS cdc_catalog.notifications (
+  notification_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  channel text NOT NULL DEFAULT 'ops' CHECK (channel = ANY (ARRAY ['ops', 'snapshot', 'apply', 'capture'])),
+  severity text NOT NULL DEFAULT 'info' CHECK (severity = ANY (ARRAY ['debug', 'info', 'warning', 'error'])),
+  conn_id text,
+  catalog_id bigint REFERENCES cdc_catalog.catalog (catalog_id) ON DELETE SET NULL,
+  title text NOT NULL,
+  body text NOT NULL DEFAULT '',
+  context jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(context) = 'object'),
+  acked_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS notifications_created_idx
+  ON cdc_catalog.notifications (created_at DESC);
+CREATE INDEX IF NOT EXISTS notifications_unacked_idx
+  ON cdc_catalog.notifications (created_at DESC)
+  WHERE acked_at IS NULL;
+
+-- A07: idempotent apply ledger by event_id (best-effort EOS within house PK upsert).
+CREATE TABLE IF NOT EXISTS cdc_catalog.apply_dedup (
+  catalog_id bigint NOT NULL REFERENCES cdc_catalog.catalog (catalog_id) ON DELETE CASCADE,
+  event_id text NOT NULL,
+  applied_at timestamptz NOT NULL DEFAULT now(),
+  batch_id text,
+  PRIMARY KEY (catalog_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS apply_dedup_applied_idx
+  ON cdc_catalog.apply_dedup (applied_at);
+
+-- A07b: optional audit of applied events (payload summary).
+CREATE TABLE IF NOT EXISTS cdc_catalog.apply_audit (
+  audit_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  logged_at timestamptz NOT NULL DEFAULT now(),
+  catalog_id bigint REFERENCES cdc_catalog.catalog (catalog_id) ON DELETE SET NULL,
+  conn_id text NOT NULL,
+  event_id text,
+  op text,
+  source_schema text,
+  source_table text,
+  kafka_topic text,
+  kafka_partition integer,
+  kafka_offset bigint,
+  batch_id text,
+  context jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS apply_audit_logged_idx
+  ON cdc_catalog.apply_audit (logged_at DESC);
+
+-- R08: lightweight OpenLineage-style run events (house catalog; not a full OL producer).
+CREATE TABLE IF NOT EXISTS cdc_catalog.lineage_events (
+  lineage_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  event_type text NOT NULL,
+  conn_id text,
+  catalog_id bigint REFERENCES cdc_catalog.catalog (catalog_id) ON DELETE SET NULL,
+  job_name text NOT NULL DEFAULT 'datasync',
+  run_id text,
+  inputs jsonb NOT NULL DEFAULT '[]'::jsonb,
+  outputs jsonb NOT NULL DEFAULT '[]'::jsonb,
+  context jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS lineage_events_created_idx
+  ON cdc_catalog.lineage_events (created_at DESC);
+
 DROP INDEX IF EXISTS cdc_catalog.idx_catalog_hot;
 -- The matview below still selects hot on databases upgrading from before it was removed,
 -- and it is recreated further down anyway.
@@ -334,6 +465,8 @@ ALTER TABLE cdc_catalog.apply_batch_stats ADD COLUMN IF NOT EXISTS health_reason
 
 ALTER TABLE cdc_catalog.apply_position ADD COLUMN IF NOT EXISTS last_applied_gtid text;
 ALTER TABLE cdc_catalog.apply_position ADD COLUMN IF NOT EXISTS quarantined_at timestamptz;
+ALTER TABLE cdc_catalog.apply_position
+  ADD COLUMN IF NOT EXISTS kafka_replay_requested boolean NOT NULL DEFAULT false;
 
 ALTER TABLE cdc_catalog.capture_position ADD COLUMN IF NOT EXISTS last_failed_source_schema text;
 ALTER TABLE cdc_catalog.capture_position ADD COLUMN IF NOT EXISTS last_failed_source_table text;
@@ -758,8 +891,7 @@ SELECT
   CASE WHEN c.status::text = 'cdc_in_progress' THEN 1 ELSE 0 END AS is_cdc_in_progress,
   CASE WHEN c.active AND c.cdc_enabled AND NOT c.needs_full_load THEN 1 ELSE 0 END AS is_cdc_ready,
   CASE WHEN c.status::text = 'quarantined'
-         OR ap.status::text = 'quarantined'
-         OR COALESCE(ap.is_quarantined, false) THEN 1 ELSE 0 END AS is_quarantined,
+         OR ap.status::text = 'quarantined' THEN 1 ELSE 0 END AS is_quarantined,
   CASE WHEN c.status::text = 'success' THEN 1 ELSE 0 END AS is_success,
   CASE WHEN c.status::text = 'pending' THEN 1 ELSE 0 END AS is_pending
 FROM cdc_catalog.catalog c

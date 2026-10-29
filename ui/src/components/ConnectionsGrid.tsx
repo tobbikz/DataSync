@@ -161,7 +161,9 @@ export function ConnectionsGrid() {
                           <div
                             role="button"
                             tabIndex={0}
-                            className={`resource-row group cursor-pointer ${expanded ? "is-expanded" : ""}`}
+                            className={`resource-row group cursor-pointer ${expanded ? "is-expanded" : ""} ${
+                              !c.active ? "opacity-70" : ""
+                            }`}
                             onClick={() =>
                               setSelectedAlias((prev) =>
                                 prev === c.alias ? null : c.alias,
@@ -202,8 +204,14 @@ export function ConnectionsGrid() {
                           </div>
 
                           <div>
-                            <span className="resource-row__status text-foreground-muted">
-                              Replicating
+                            <span
+                              className={`resource-row__status ${
+                                c.active
+                                  ? "text-foreground-muted"
+                                  : "text-warning"
+                              }`}
+                            >
+                              {c.active ? "Replicating" : "Paused"}
                             </span>
                           </div>
 
@@ -234,7 +242,10 @@ export function ConnectionsGrid() {
                           </div>
                         </div>
                         {expanded ? (
-                          <ConnectionDetailPanel alias={c.alias} />
+                          <ConnectionDetailPanel
+                            alias={c.alias}
+                            onChanged={refresh}
+                          />
                         ) : null}
                       </Fragment>
                       );

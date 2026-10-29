@@ -183,6 +183,54 @@ void KafkaProducer::produce(const std::string& topic, const std::string& key, co
 #endif
 }
 
+void KafkaProducer::produce_tombstone(const std::string& topic, const std::string& key, int partition) {
+    if (!impl_ || !impl_->body.available) {
+        throw std::runtime_error("Kafka producer unavailable: " + (impl_ ? impl_->body.first_error : "null"));
+    }
+#ifdef HAVE_RDKAFKA
+    rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR__FAIL;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        impl_->body.pending.fetch_add(1);
+        if (partition >= 0) {
+            err = rd_kafka_producev(
+                impl_->body.producer,
+                RD_KAFKA_V_TOPIC(topic.c_str()),
+                RD_KAFKA_V_PARTITION(partition),
+                RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+                RD_KAFKA_V_KEY(const_cast<char*>(key.data()), key.size()),
+                RD_KAFKA_V_VALUE(nullptr, 0),
+                RD_KAFKA_V_END);
+        } else {
+            err = rd_kafka_producev(
+                impl_->body.producer,
+                RD_KAFKA_V_TOPIC(topic.c_str()),
+                RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+                RD_KAFKA_V_KEY(const_cast<char*>(key.data()), key.size()),
+                RD_KAFKA_V_VALUE(nullptr, 0),
+                RD_KAFKA_V_END);
+        }
+        if (err == RD_KAFKA_RESP_ERR_NO_ERROR) {
+            rd_kafka_poll(impl_->body.producer, 0);
+            return;
+        }
+        impl_->body.pending.fetch_sub(1);
+        if (err != RD_KAFKA_RESP_ERR__QUEUE_FULL) {
+            impl_->body.errors.fetch_add(1);
+            throw std::runtime_error(std::string("kafka tombstone failed: ") + rd_kafka_err2str(err));
+        }
+        rd_kafka_poll(impl_->body.producer, 10);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5 + attempt / 4));
+    }
+    impl_->body.errors.fetch_add(1);
+    throw std::runtime_error("kafka tombstone failed after 200 retries (QUEUE_FULL)");
+#else
+    (void)topic;
+    (void)key;
+    (void)partition;
+    throw std::runtime_error("librdkafka not available");
+#endif
+}
+
 int KafkaProducer::flush(int timeout_sec) {
     if (!impl_ || !impl_->body.available) {
         return 0;

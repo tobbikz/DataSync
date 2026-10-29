@@ -137,6 +137,27 @@ std::string json_dump_for_kafka(const nlohmann::json& value) {
     return value.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
+std::string cdc_event_kafka_payload_maybe_cloudevents(const CdcEvent& event, bool cloudevents) {
+    const std::string data = cdc_event_kafka_payload(event);
+    if (!cloudevents) {
+        return data;
+    }
+    nlohmann::json envelope = {
+        {"specversion", "1.0"},
+        {"id", event.ingestion_ts.empty() ? utc_iso_timestamp_now() : event.ingestion_ts},
+        {"source", std::string("datasync/") + event.conn_id},
+        {"type", std::string("com.datasync.cdc.") + (event.op.empty() ? "unknown" : event.op)},
+        {"datacontenttype", "application/json"},
+        {"time", event.ingestion_ts.empty() ? utc_iso_timestamp_now() : event.ingestion_ts},
+        {"subject", event.schema_name + "." + event.table_name},
+        {"data", nlohmann::json::parse(data, nullptr, false)},
+    };
+    if (envelope["data"].is_discarded()) {
+        envelope["data"] = data;
+    }
+    return json_dump_for_kafka(envelope);
+}
+
 std::string cdc_event_kafka_payload(const CdcEvent& event) {
     CdcEvent safe = event;
     safe.conn_id = sanitize_utf8_for_json(event.conn_id);
@@ -163,6 +184,7 @@ std::string cdc_event_kafka_payload(const CdcEvent& event) {
         safe.tx_id = event.tx_id;
     }
     safe.tx_event = sanitize_utf8_for_json(event.tx_event);
+    safe.query = sanitize_utf8_for_json(event.query);
     return json_dump_for_kafka(json_sanitize_for_kafka(safe.to_kafka_dict()));
 }
 
@@ -185,6 +207,7 @@ nlohmann::json CdcEvent::to_kafka_dict() const {
     source["file"] = binlog_file.empty() ? nullptr : nlohmann::json(sanitize_utf8_for_json(binlog_file));
     source["pos"] = binlog_pos.has_value() ? nlohmann::json(*binlog_pos) : nullptr;
     source["ts_ms"] = ts_ms.has_value() ? nlohmann::json(*ts_ms) : nullptr;
+    source["query"] = query.empty() ? nullptr : nlohmann::json(sanitize_utf8_for_json(query));
 
     if (db_engine == "mssql") {
         source["lsn"] = gtid.empty() ? nullptr : nlohmann::json(sanitize_utf8_for_json(gtid));

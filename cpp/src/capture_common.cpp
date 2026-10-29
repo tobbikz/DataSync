@@ -230,6 +230,7 @@ CaptureRuntimeConfig load_mariadb_capture_runtime(
     cfg.idle_poll_seconds = pipeline_defaults::kCaptureIdlePollSeconds;
     cfg.quiet_exit_lagging_chunks = pipeline_defaults::kCaptureQuietExitLaggingChunks;
     cfg.heartbeat_seconds = pipeline_defaults::kCaptureHeartbeatSeconds;
+    cfg.kafka_heartbeat = cdc ? cdc->kafka_heartbeat : true;
     return cfg;
 }
 
@@ -248,7 +249,9 @@ CaptureRuntimeConfig load_mssql_capture_runtime(
     cfg.topic_partitions = pipeline_defaults::kKafkaTopicPartitions;
     cfg.idle_poll_seconds = pipeline_defaults::kCaptureIdlePollSeconds;
     cfg.heartbeat_seconds = pipeline_defaults::kCaptureHeartbeatSeconds;
-    cfg.mssql_replay_on_idle = pipeline_defaults::kMssqlCaptureReplayOnIdle;
+    cfg.mssql_replay_on_idle =
+        cdc ? cdc->mssql_replay_on_idle : pipeline_defaults::kMssqlCaptureReplayOnIdle;
+    cfg.kafka_heartbeat = cdc ? cdc->kafka_heartbeat : true;
     return cfg;
 }
 
@@ -267,6 +270,7 @@ CaptureRuntimeConfig load_mongo_capture_runtime(
     cfg.topic_partitions = pipeline_defaults::kKafkaTopicPartitions;
     cfg.idle_poll_seconds = pipeline_defaults::kCaptureIdlePollSeconds;
     cfg.heartbeat_seconds = pipeline_defaults::kCaptureHeartbeatSeconds;
+    cfg.kafka_heartbeat = cdc ? cdc->kafka_heartbeat : true;
     return cfg;
 }
 
@@ -522,10 +526,16 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
               AND )" << load_filter << R"(
               AND has_pk = true
               AND status NOT IN ('skipped', 'disabled')
+              AND NOT EXISTS (
+                SELECT 1 FROM cdc_catalog.snapshot_signal s
+                WHERE s.catalog_id = catalog.catalog_id
+                  AND s.action = 'execute_blocking'
+                  AND s.status IN ('pending','running','paused')
+              )
         )";
     } else if (db_engine == "mongodb") {
         sql << R"(
-            SELECT catalog_id, conn_id, source_database, source_schema, source_table, pk_columns, '{}'::text
+            SELECT catalog_id, conn_id, source_database, source_schema, source_table, pk_columns, COALESCE(engine_meta::text, '{}')
             FROM cdc_catalog.catalog
             WHERE db_engine = 'mongodb'
               AND conn_id = $1
@@ -534,10 +544,16 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
               AND )" << load_filter << R"(
               AND has_pk = true
               AND status NOT IN ('skipped', 'disabled')
+              AND NOT EXISTS (
+                SELECT 1 FROM cdc_catalog.snapshot_signal s
+                WHERE s.catalog_id = catalog.catalog_id
+                  AND s.action = 'execute_blocking'
+                  AND s.status IN ('pending','running','paused')
+              )
         )";
     } else {
         sql << R"(
-            SELECT catalog_id, conn_id, '' AS source_database, source_schema, source_table, pk_columns, '{}'::text
+            SELECT catalog_id, conn_id, '' AS source_database, source_schema, source_table, pk_columns, COALESCE(engine_meta::text, '{}')
             FROM cdc_catalog.catalog
             WHERE db_engine = 'mariadb'
               AND conn_id = $1
@@ -546,6 +562,12 @@ std::vector<CaptureCatalogTable> fetch_conn_catalog_tables(
               AND )" << load_filter << R"(
               AND has_pk = true
               AND status NOT IN ('skipped', 'disabled')
+              AND NOT EXISTS (
+                SELECT 1 FROM cdc_catalog.snapshot_signal s
+                WHERE s.catalog_id = catalog.catalog_id
+                  AND s.action = 'execute_blocking'
+                  AND s.status IN ('pending','running','paused')
+              )
         )";
     }
 
@@ -1375,12 +1397,69 @@ void quarantine_apply_position(PGconn* pg, long long catalog_id, const std::stri
             quarantined_at = now(),
             quarantine_reason = $2,
             last_error = $2,
+            kafka_replay_requested = false,
             updated_at = now()
         WHERE catalog_id = $1::bigint
           AND status IS DISTINCT FROM 'quarantined'::cdc_catalog.cdc_health_status
         )",
         2,
         vals);
+}
+
+void unquarantine_apply_position(PGconn* pg, long long catalog_id) {
+    if (catalog_id <= 0) {
+        return;
+    }
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.apply_position
+        SET status = 'healthy'::cdc_catalog.cdc_health_status,
+            quarantined_at = NULL,
+            quarantine_reason = NULL,
+            last_error = NULL,
+            kafka_replay_requested = true,
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+        )",
+        1,
+        vals);
+}
+
+bool unquarantine_apply_position_by_source(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& source_schema,
+    const std::string& source_table) {
+    const char* vals[] = {conn_id.c_str(), source_schema.c_str(), source_table.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        UPDATE cdc_catalog.apply_position
+        SET status = 'healthy'::cdc_catalog.cdc_health_status,
+            quarantined_at = NULL,
+            quarantine_reason = NULL,
+            last_error = NULL,
+            kafka_replay_requested = true,
+            updated_at = now()
+        WHERE conn_id = $1
+          AND source_schema = $2
+          AND source_table = $3
+        RETURNING catalog_id
+        )",
+        3,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    const bool ok = res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0;
+    if (res) {
+        PQclear(res);
+    }
+    return ok;
 }
 
 int refresh_apply_position_health(PGconn* pg, const std::string& conn_id, int staleness_seconds) {
@@ -2933,8 +3012,12 @@ void ensure_capture_kafka_topics(
     if (tables.empty()) {
         return;
     }
-    const auto topics =
+    auto topics =
         topics_for_tables(rcfg.topic_prefix, tables, rcfg.topic_mode, rcfg.topic_buckets);
+    topics.push_back(rcfg.topic_prefix + ".__transaction");
+    if (rcfg.kafka_heartbeat) {
+        topics.push_back(rcfg.topic_prefix + ".__heartbeat");
+    }
     try {
         ensure_kafka_topics_exist(rcfg.bootstrap, topics, rcfg.topic_partitions, 1);
     } catch (const std::exception& ex) {
@@ -3130,5 +3213,27 @@ void cdc_publish_tx_marker(
     }
     const std::string topic = topic_prefix + ".__transaction";
     producer.produce(topic, std::to_string(tx_id), cdc_event_kafka_payload(event), 0);
+}
+
+void cdc_publish_kafka_heartbeat(
+    KafkaProducer& producer,
+    const CaptureRuntimeConfig& rcfg,
+    const std::string& conn_id,
+    const std::string& db_engine) {
+    if (!rcfg.kafka_heartbeat || !producer.available()) {
+        return;
+    }
+    const long long ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+    nlohmann::json payload = {
+        {"op", "hb"},
+        {"conn_id", conn_id},
+        {"db_engine", db_engine},
+        {"ts_ms", ts_ms},
+        {"ingestion_ts", utc_iso_timestamp_now()},
+    };
+    const std::string topic = rcfg.topic_prefix + ".__heartbeat";
+    producer.produce(topic, conn_id, payload.dump(), 0);
 }
 

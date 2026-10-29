@@ -2,6 +2,9 @@
 #include "kafka_apply.hpp"
 #include "apply_dlq.hpp"
 #include "capture_common.hpp"
+#include "control_plane.hpp"
+#include "mariadb_reselect.hpp"
+#include "mariadb_conn.hpp"
 #include "full_load_common.hpp"
 #include "lake_apply_index.hpp"
 #include "lake_columns.hpp"
@@ -890,16 +893,67 @@ std::string stable_temp_name(const std::string& prefix, const std::string& schem
     return os.str();
 }
 
+bool temp_staging_matches_lake_columns(
+    PGconn* pg,
+    const std::string& staging_name,
+    const std::string& schema,
+    const std::string& table) {
+    if (!pg) {
+        return false;
+    }
+    const char* vals[] = {staging_name.c_str(), schema.c_str(), table.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT
+          (SELECT count(*)::int
+             FROM pg_attribute a
+             JOIN pg_class c ON c.oid = a.attrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = $1
+              AND n.nspname LIKE 'pg_temp_%'
+              AND a.attnum > 0 AND NOT a.attisdropped
+              AND a.attname <> '_cdc_stg_kafka_offset'),
+          (SELECT count(*)::int
+             FROM information_schema.columns
+            WHERE table_schema = $2 AND table_name = $3)
+        )",
+        3,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    bool match = false;
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+        const int stg = std::atoi(PQgetvalue(res, 0, 0));
+        const int lake = std::atoi(PQgetvalue(res, 0, 1));
+        match = stg == lake && lake > 0;
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return match;
+}
+
 void ensure_temp_table_like(
     PGconn* pg,
     const std::string& staging_name,
-    const std::string& fq,
+    const std::string& schema,
+    const std::string& table,
     bool kafka_offset_col) {
-    // TEMP heap is already unlogged (PG rejects UNLOGGED TEMP). Reuse + TRUNCATE
-    // avoids catalog WAL from CREATE/DROP ON COMMIT every batch.
+    // TEMP heap is already unlogged (PG rejects UNLOGGED TEMP). Reuse + TRUNCATE when
+    // the lake shape is unchanged; DROP + recreate after mid-session ADD COLUMN so COPY
+    // does not fail with "column X of relation cdc_stg_* does not exist".
     const std::string staging = pg_ident(staging_name);
+    const std::string fq = pg_ident(schema) + "." + pg_ident(table);
     if (pg_temp_rel_exists(pg, staging_name)) {
-        pg_exec(pg, "TRUNCATE " + staging);
+        if (temp_staging_matches_lake_columns(pg, staging_name, schema, table)) {
+            pg_exec(pg, "TRUNCATE " + staging);
+        } else {
+            pg_exec(pg, "DROP TABLE IF EXISTS " + staging);
+            pg_exec(pg, "CREATE TEMP TABLE " + staging + " (LIKE " + fq + " INCLUDING DEFAULTS)");
+        }
     } else {
         pg_exec(pg, "CREATE TEMP TABLE " + staging + " (LIKE " + fq + " INCLUDING DEFAULTS)");
     }
@@ -1387,6 +1441,8 @@ void copy_pk_lines_and_delete_target(
 
 void copy_upserts_via_staging(
     PGconn* pg,
+    const std::string& schema,
+    const std::string& table,
     const std::string& fq,
     const std::string& col_list,
     const std::vector<std::string>& lines,
@@ -1400,7 +1456,7 @@ void copy_upserts_via_staging(
     const std::string staging = pg_ident(staging_name);
     const bool use_kafka_offset =
         kafka_offsets != nullptr && kafka_offsets->size() == lines.size() && !dedup_pk_cols.empty();
-    ensure_temp_table_like(pg, staging_name, fq, use_kafka_offset);
+    ensure_temp_table_like(pg, staging_name, schema, table, use_kafka_offset);
     std::string copy_col_list = col_list;
     std::vector<std::string> copy_lines = lines;
     if (use_kafka_offset) {
@@ -1627,6 +1683,8 @@ long long apply_table_batch(
         // Mirror lake: INSERT after PK pre-delete (skinny staging; no DISTINCT on wide upsert staging).
         copy_upserts_via_staging(
             pg,
+            meta.schema_name,
+            meta.table_name,
             fq,
             col_list_str,
             lines,
@@ -1818,7 +1876,13 @@ json apply_events_batch(
     std::map<std::pair<std::string, std::string>, std::vector<ApplyEvent>> by_table;
     int dropped_unrecoverable = 0;
     int dlq_parked_total = 0;
+    int dedup_skipped_total = 0;
     for (auto& e : working) {
+        if (options.apply_dedup && e.catalog_id > 0 && !e.event_id.empty() &&
+            control_plane::apply_event_already_seen(app_pg, e.catalog_id, e.event_id)) {
+            dedup_skipped_total += 1;
+            continue;
+        }
         if (e.catalog_id > 0) {
             resolve_event_lake_key_from_catalog(app_pg, conn_id, e);
         }
@@ -2133,6 +2197,20 @@ json apply_events_batch(
             }
             deletes = std::move(valid_deletes);
         }
+
+        // T12: optional MariaDB reselect to fill null/missing columns before lake write.
+        if (options.reselect_on_apply && options.mariadb_source &&
+            options.source_system == "MariaDB" && !business_pk.empty()) {
+            for (auto& e : upserts) {
+                mariadb_reselect::merge_row_from_source(
+                    *options.mariadb_source,
+                    meta.catalog_source_schema.empty() ? meta.schema_name : meta.catalog_source_schema,
+                    meta.catalog_source_table.empty() ? meta.table_name : meta.catalog_source_table,
+                    business_pk,
+                    e.row);
+            }
+        }
+
         const int total_skipped = skipped_missing_pk + skipped_missing_pk_deletes;
         if (total_skipped > 0) {
             log_write(app_pg, {
@@ -2350,6 +2428,29 @@ json apply_events_batch(
             continue;
         }
 
+        // A07/A07b — record after successful lake commit so failures remain redelivery-safe.
+        if (options.apply_dedup || options.apply_audit) {
+            for (const auto& e : audit) {
+                if (options.apply_dedup) {
+                    control_plane::claim_apply_event(app_pg, e.catalog_id, e.event_id, batch_id);
+                }
+                if (options.apply_audit) {
+                    control_plane::audit_apply_event(
+                        app_pg,
+                        e.catalog_id,
+                        conn_id,
+                        e.event_id,
+                        e.op,
+                        e.schema_name,
+                        e.table_name,
+                        e.topic,
+                        e.partition,
+                        e.offset,
+                        batch_id);
+                }
+            }
+        }
+
         PGresult* app_begin = PQexec(app_pg, "BEGIN");
         if (app_begin) {
             PQclear(app_begin);
@@ -2497,7 +2598,14 @@ json apply_events_batch(
         }
     }
 
-    return json{{"applied", applied}, {"offsets", offsets}, {"errors", *table_errors_acc}, {"dropped_unrecoverable", dropped_unrecoverable}, {"dlq_parked", dlq_parked_total}};
+    return json{
+        {"applied", applied},
+        {"offsets", offsets},
+        {"errors", *table_errors_acc},
+        {"dropped_unrecoverable", dropped_unrecoverable},
+        {"dlq_parked", dlq_parked_total},
+        {"dedup_skipped", dedup_skipped_total},
+    };
 }
 
 std::map<std::pair<std::string, std::string>, SliceLagTableState> fetch_apply_cursors_for_tables(

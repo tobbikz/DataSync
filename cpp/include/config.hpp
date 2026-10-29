@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,7 @@ struct MariaDbSource {
     std::string db_name;
     std::string user;
     std::string password;
+    nlohmann::json extras = nlohmann::json::object();
 };
 
 struct MssqlSource {
@@ -30,6 +32,7 @@ struct MssqlSource {
     std::string db_name;
     std::string user;
     std::string password;
+    nlohmann::json extras = nlohmann::json::object();
 };
 
 struct MongoSource {
@@ -41,13 +44,49 @@ struct MongoSource {
     std::string password;
     std::string replica_set;
     bool replica_set_in_extras{false};
+    nlohmann::json extras = nlohmann::json::object();
 };
 
-/** CDC daemon tuning — config.json only. */
+/** CDC daemon tuning — config.json `cdc` object; hot-reloaded each daemon round (C07). */
 struct CdcConfig {
     int round_idle_seconds{5};
     int slice_max_seconds{180};
     int slice_max_events{10'000'000};
+    /** S13: capture worker shards (mod catalog_id). */
+    int capture_worker_count{1};
+    /** A07: claim event_id in apply_dedup before lake write. */
+    bool apply_dedup{true};
+    /** A07b: write apply_audit rows. */
+    bool apply_audit{false};
+    /** S14: MSSQL idle-slot replay. */
+    bool mssql_replay_on_idle{false};
+    /** M01: publish Kafka heartbeat records on idle capture. */
+    bool kafka_heartbeat{true};
+    /** S09: `auto` | `cli` | `native` — native RPL with CLI fallback when auto. */
+    std::string binlog_mode{"auto"};
+    /** E03: emit Kafka null tombstone after delete events. */
+    bool kafka_tombstones{true};
+    /** T12: MariaDB apply re-SELECT by PK to fill missing/null columns. */
+    bool reselect_on_apply{false};
+    /** R12: wrap CDC JSON in a CloudEvents envelope (Avro/SR out of scope). */
+    bool cloudevents{false};
+    /** M04: inject trace_id (= batch_id) into obs_log context. */
+    bool tracing{true};
+    /** R08: emit rows to cdc_catalog.lineage_events. */
+    bool openlineage{false};
+    /** E05: attach Query/DDL SQL to source.query when seen in binlog. */
+    bool include_source_query{true};
+    /** D02: publish schema-change events to `{prefix}.__schema`. */
+    bool schema_events{true};
+    /**
+     * T05: content-based routing rules (JSON array).
+     * Each rule: {"when":{"op":"d"}|"after.field":"v", "topic_suffix":".deletes"}
+     */
+    nlohmann::json content_routing = nlohmann::json::array();
+    /**
+     * T06: drop events whose op is in this list (e.g. ["d"] to skip deletes at capture).
+     */
+    nlohmann::json message_filter_exclude_ops = nlohmann::json::array();
 };
 
 struct AppConfig {
@@ -59,6 +98,8 @@ struct AppConfig {
     std::vector<MssqlSource> mssql_sources;
     std::vector<MongoSource> mongo_sources;
     CdcConfig cdc;
+    /** Path used for C07 hot-reload of the `cdc` section. */
+    std::string config_path;
 };
 
 CdcConfig default_cdc_config();

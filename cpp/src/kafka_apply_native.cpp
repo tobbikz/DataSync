@@ -9,6 +9,8 @@
 #include "lake_apply_index.hpp"
 
 #include "config.hpp"
+#include "control_plane.hpp"
+#include "mariadb_conn.hpp"
 #include "mariadb_schema.hpp"
 #include "mssql_lake.hpp"
 #include "mongo_lake.hpp"
@@ -541,6 +543,129 @@ void commit_kafka_offsets(rd_kafka_t* rk, const std::map<std::pair<std::string, 
     }
 }
 
+struct KafkaReplayTarget {
+    long long catalog_id{0};
+    std::string source_schema;
+    std::string source_table;
+    std::string kafka_topic;
+    int kafka_partition{0};
+    long long kafka_offset{0};
+};
+
+std::vector<KafkaReplayTarget> fetch_kafka_replay_targets(PGconn* pg, const std::string& conn_id) {
+    std::vector<KafkaReplayTarget> out;
+    const char* vals[] = {conn_id.c_str()};
+    PGresult* res = PQexecParams(
+        pg,
+        R"(
+        SELECT catalog_id, source_schema, source_table, kafka_topic, kafka_partition, kafka_offset
+        FROM cdc_catalog.apply_position
+        WHERE conn_id = $1
+          AND kafka_replay_requested = true
+          AND coalesce(kafka_topic, '') <> ''
+          AND kafka_offset >= 0
+          AND status IS DISTINCT FROM 'quarantined'::cdc_catalog.cdc_health_status
+        )",
+        1,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (res && PQresultStatus(res) == PGRES_TUPLES_OK) {
+        for (int i = 0; i < PQntuples(res); ++i) {
+            KafkaReplayTarget t;
+            t.catalog_id = std::strtoll(PQgetvalue(res, i, 0), nullptr, 10);
+            t.source_schema = PQgetvalue(res, i, 1);
+            t.source_table = PQgetvalue(res, i, 2);
+            t.kafka_topic = PQgetvalue(res, i, 3);
+            t.kafka_partition = std::atoi(PQgetvalue(res, i, 4));
+            t.kafka_offset = std::strtoll(PQgetvalue(res, i, 5), nullptr, 10);
+            out.push_back(std::move(t));
+        }
+    }
+    if (res) {
+        PQclear(res);
+    }
+    return out;
+}
+
+void clear_kafka_replay_requested(PGconn* pg, long long catalog_id) {
+    if (catalog_id <= 0) {
+        return;
+    }
+    const std::string id = std::to_string(catalog_id);
+    const char* vals[] = {id.c_str()};
+    pg_exec_params_simple(
+        pg,
+        R"(
+        UPDATE cdc_catalog.apply_position
+        SET kafka_replay_requested = false,
+            updated_at = now()
+        WHERE catalog_id = $1::bigint
+        )",
+        1,
+        vals);
+}
+
+/** Seek consumer to stored apply_position offsets after unquarantine (A06). */
+int seek_kafka_replay_targets(
+    rd_kafka_t* rk,
+    PGconn* log_pg,
+    const std::string& batch_id,
+    const std::string& conn_id,
+    const std::vector<KafkaReplayTarget>& targets) {
+    if (!rk || targets.empty()) {
+        return 0;
+    }
+    rd_kafka_topic_partition_list_t* parts =
+        rd_kafka_topic_partition_list_new(static_cast<int>(targets.size()));
+    for (const auto& t : targets) {
+        rd_kafka_topic_partition_t* part =
+            rd_kafka_topic_partition_list_add(parts, t.kafka_topic.c_str(), t.kafka_partition);
+        part->offset = t.kafka_offset;
+    }
+    // librdkafka >= 1.9: returns rd_kafka_error_t* (nullptr on success).
+    rd_kafka_error_t* seek_err = rd_kafka_seek_partitions(rk, parts, 15000);
+    rd_kafka_topic_partition_list_destroy(parts);
+    if (seek_err) {
+        const std::string err_msg = rd_kafka_error_string(seek_err);
+        rd_kafka_error_destroy(seek_err);
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_kafka_apply",
+            .message = "kafka seek for quarantine replay failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {
+                {"error", err_msg},
+                {"target_count", static_cast<int>(targets.size())},
+            },
+        });
+        return 0;
+    }
+    for (const auto& t : targets) {
+        log_write(log_pg, {
+            .level = LogLevel::Warning,
+            .component = "cdc_kafka_apply",
+            .message = "kafka seek for quarantine replay",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = t.source_schema,
+            .source_table = t.source_table,
+            .context = {
+                {"catalog_id", t.catalog_id},
+                {"kafka_topic", t.kafka_topic},
+                {"kafka_partition", t.kafka_partition},
+                {"kafka_offset", t.kafka_offset},
+            },
+        });
+    }
+    return static_cast<int>(targets.size());
+}
+
 std::map<std::pair<std::string, int>, long long> flush_pending_batch(
     PGconn* app_pg,
     PGconn* lake_pg,
@@ -560,7 +685,11 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
     const std::string& db_engine = "mariadb",
     int apply_staleness_seconds = 900,
     int apply_inactive_seconds = 3600,
-    rd_kafka_t* rk = nullptr) {
+    rd_kafka_t* rk = nullptr,
+    bool apply_dedup = true,
+    bool apply_audit = false,
+    bool reselect_on_apply = false,
+    const MariaDbSource* mariadb_source = nullptr) {
     (void)rk;
     std::map<std::pair<std::string, int>, long long> batch_offsets;
     if (pending.empty()) {
@@ -578,6 +707,10 @@ std::map<std::pair<std::string, int>, long long> flush_pending_batch(
         options.source_system = source_system;
         options.apply_staleness_seconds = apply_staleness_seconds;
         options.apply_inactive_seconds = apply_inactive_seconds;
+        options.apply_dedup = apply_dedup;
+        options.apply_audit = apply_audit;
+        options.reselect_on_apply = reselect_on_apply;
+        options.mariadb_source = mariadb_source;
         failed_events.clear();
         options.table_errors_out = &batch_table_errors;
         options.failed_events_out = &failed_events;
@@ -916,18 +1049,61 @@ int run_kafka_apply_native_cli(
     long long events_seen = 0;
     long long events_applied = 0;
     long long parse_skipped = 0;
+    long long quarantine_skipped = 0;
     int dropped_unrecoverable_total = 0;
     int errors = 0;
     std::string stop_reason = "unknown";
     bool loop_exited_early = false;
     int empty_polls = 0;
+    /** Inactive / not-wanted skips only — never quarantined (A06). */
     std::map<std::pair<std::string, int>, long long> skipped_shard_offsets;
+    /** Earliest offset per tp that must stay readable while a table is quarantined. */
+    std::map<kafka_apply_detail::KafkaTopicPartition, long long> quarantine_hold_at;
     std::vector<ApplyEvent> pending_batch;
+
+    {
+        const auto replay_targets = fetch_kafka_replay_targets(app_pg, conn_id);
+        if (!replay_targets.empty()) {
+            const int sought =
+                seek_kafka_replay_targets(rk, log_pg, batch_id, conn_id, replay_targets);
+            if (sought > 0) {
+                for (const auto& t : replay_targets) {
+                    clear_kafka_replay_requested(app_pg, t.catalog_id);
+                }
+                stats["kafka_replay_seeks"] = sought;
+            }
+        }
+    }
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(max_seconds);
 
     const std::string source_system =
         (db_engine == "mssql") ? "MSSQL" : (db_engine == "mongodb") ? "MongoDB" : "MariaDB";
+
+    auto commit_clamped = [&](const std::map<std::pair<std::string, int>, long long>& proposed) {
+        const auto safe =
+            kafka_apply_detail::clamp_commits_before_quarantine_holds(proposed, quarantine_hold_at);
+        if (safe.size() != proposed.size() && !quarantine_hold_at.empty()) {
+            log_write(log_pg, {
+                .level = LogLevel::Warning,
+                .component = "cdc_kafka_apply",
+                .message = "kafka commit clamped for quarantine hold",
+                .batch_id = batch_id,
+                .conn_id = conn_id,
+                .source_schema = std::nullopt,
+                .source_table = std::nullopt,
+                .context = {
+                    {"proposed", static_cast<int>(proposed.size())},
+                    {"committed", static_cast<int>(safe.size())},
+                    {"holds", static_cast<int>(quarantine_hold_at.size())},
+                },
+            });
+        }
+        commit_kafka_offsets(rk, safe);
+        for (const auto& [tp, offset] : safe) {
+            last_offsets[tp] = std::max(last_offsets[tp], offset);
+        }
+    };
 
     auto flush_batch = [&]() {
         if (pending_batch.empty()) {
@@ -955,12 +1131,13 @@ int run_kafka_apply_native_cli(
                     db_engine,
                     staleness,
                     inactive_seconds,
-                    rk);
+                    rk,
+                    cfg.cdc.apply_dedup,
+                    cfg.cdc.apply_audit,
+                    cfg.cdc.reselect_on_apply,
+                    find_mariadb_source(cfg, conn_id));
                 dropped_unrecoverable_total += dropped;
-                commit_kafka_offsets(rk, batch_offsets);
-                for (const auto& [tp, offset] : batch_offsets) {
-                    last_offsets[tp] = std::max(last_offsets[tp], offset);
-                }
+                commit_clamped(batch_offsets);
                 return;
             } catch (const std::exception& ex) {
                 if (retry >= 2) {
@@ -1168,7 +1345,14 @@ int run_kafka_apply_native_cli(
                 }
             }
             const TableKey key{schema_name, table_name};
-            if (!wanted.count(key) || quarantined.count(key)) {
+            if (quarantined.count(key)) {
+                // A06: do not advance the consumer past quarantined tables — hold for replay.
+                kafka_apply_detail::note_quarantine_hold(
+                    quarantine_hold_at, topic, partition, offset);
+                quarantine_skipped += 1;
+                continue;
+            }
+            if (!wanted.count(key)) {
                 auto tp = std::make_pair(topic, partition);
                 auto sit = skipped_shard_offsets.find(tp);
                 if (sit == skipped_shard_offsets.end() || offset > sit->second) {
@@ -1219,10 +1403,7 @@ int run_kafka_apply_native_cli(
         flush_batch();
 
         if (!skipped_shard_offsets.empty()) {
-            commit_kafka_offsets(rk, skipped_shard_offsets);
-            for (const auto& [tp, offset] : skipped_shard_offsets) {
-                last_offsets[tp] = std::max(last_offsets[tp], offset);
-            }
+            commit_clamped(skipped_shard_offsets);
         }
 
         if (!loop_exited_early) {
@@ -1261,6 +1442,8 @@ int run_kafka_apply_native_cli(
         stats["events_seen"] = events_seen;
         stats["events_applied"] = events_applied;
         stats["parse_skipped"] = parse_skipped;
+        stats["quarantine_skipped"] = quarantine_skipped;
+        stats["quarantine_holds"] = static_cast<int>(quarantine_hold_at.size());
         stats["errors"] = errors;
         stats["stop_reason"] = stop_reason;
         stats["duration_ms"] = duration_ms;
@@ -1286,6 +1469,18 @@ int run_kafka_apply_native_cli(
                 {"lag_kind", "partition"},
             },
         });
+
+        if (cfg.cdc.openlineage) {
+            control_plane::emit_lineage(
+                app_pg,
+                errors > 0 ? "FAIL" : "COMPLETE",
+                conn_id,
+                std::nullopt,
+                batch_id,
+                nlohmann::json::array({{{"namespace", "kafka"}, {"name", topic_prefix}}}),
+                nlohmann::json::array({{{"namespace", "datalake"}, {"name", conn_id}}}),
+                {{"events_applied", events_applied}, {"events_seen", events_seen}, {"errors", errors}});
+        }
 
     } catch (const std::exception& ex) {
         log_write(log_pg, {

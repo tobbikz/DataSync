@@ -19,13 +19,16 @@
 #include "pipeline_defaults.hpp"
 #include "retention_maintenance.hpp"
 #include "schema_migrate.hpp"
+#include "snapshot_signal.hpp"
 #include "type_coercion.hpp"
 
 #ifdef HAVE_MONGOC
 #include "mongo_conn.hpp"
 #endif
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -214,11 +217,14 @@ void print_usage(const char* prog) {
               << "  " << prog << " onboard-pending [--conn-id ID]\n"
               << "  " << prog << " ddl-sync --conn-id ID [--schema S] [--table T]\n"
               << "  " << prog << " kafka-apply --conn-id ID\n"
+              << "  " << prog << " unquarantine --conn-id ID --schema S --table T\n"
               << "  " << prog << " capture --conn-id ID\n"
               << "  " << prog << " test-connection [--conn-id ID]\n"
               << "  " << prog << " coercion-audit [--conn-id ID] [--apply]\n"
               << "  " << prog << " catalog-schema-only\n"
               << "  " << prog << " lake-schema-only\n"
+              << "  " << prog << " snapshot-signal --action ACTION [--conn-id ID] [--catalog-id N]\n"
+              << "      ACTION: execute_incremental|execute_blocking|pause|resume|stop\n"
               << "  " << prog << " daemon [--once]\n"
               << "  " << prog << " [--config PATH] <command> ...\n"
               << "  PG: config.json at project root (datasync + datalake)\n"
@@ -232,6 +238,8 @@ int main(int argc, char** argv) {
     std::string conn_id;
     std::optional<std::string> source_schema;
     std::optional<std::string> source_table;
+    std::optional<std::string> signal_action;
+    std::optional<long long> catalog_id_opt;
     bool once = false;
     bool skip_onboard = false;
     bool apply_flags = false;
@@ -245,6 +253,10 @@ int main(int argc, char** argv) {
             source_schema = argv[++i];
         } else if (arg == "--table" && i + 1 < argc) {
             source_table = argv[++i];
+        } else if (arg == "--action" && i + 1 < argc) {
+            signal_action = argv[++i];
+        } else if (arg == "--catalog-id" && i + 1 < argc) {
+            catalog_id_opt = std::atoll(argv[++i]);
         } else if (arg == "--once") {
             once = true;
         } else if (arg == "--skip-onboard") {
@@ -266,17 +278,24 @@ int main(int argc, char** argv) {
     }
 
     if (command != "discover" && command != "full-load" && command != "ddl-sync" &&
-        command != "kafka-apply" && command != "capture" &&
+        command != "kafka-apply" && command != "unquarantine" && command != "capture" &&
         command != "daemon" && command != "onboard-pending" &&
         command != "lake-schema-only" && command != "coercion-audit" &&
-        command != "test-connection" && command != "catalog-schema-only") {
+        command != "test-connection" && command != "catalog-schema-only" &&
+        command != "snapshot-signal") {
         print_usage(argv[0]);
         return 2;
     }
 
-    if ((command == "kafka-apply" || command == "ddl-sync" || command == "capture") &&
+    if ((command == "kafka-apply" || command == "ddl-sync" || command == "capture" ||
+         command == "unquarantine") &&
         conn_id.empty()) {
         std::cerr << command << " requires --conn-id\n";
+        print_usage(argv[0]);
+        return 2;
+    }
+    if (command == "unquarantine" && (!source_schema || !source_table)) {
+        std::cerr << "unquarantine requires --schema and --table\n";
         print_usage(argv[0]);
         return 2;
     }
@@ -298,6 +317,75 @@ int main(int argc, char** argv) {
         if (command == "catalog-schema-only") {
             PgConn log_pg(cfg.datasync.conn_string());
             ensure_cdc_catalog_schema(log_pg.raw);
+            return 0;
+        }
+
+        if (command == "snapshot-signal") {
+            if (!signal_action) {
+                std::cerr << "snapshot-signal requires --action\n";
+                print_usage(argv[0]);
+                return 2;
+            }
+            auto action = snapshot_signal::action_from_string(*signal_action);
+            if (!action) {
+                std::cerr << "invalid --action: " << *signal_action << '\n';
+                return 2;
+            }
+            PgConn log_pg(cfg.datasync.conn_string());
+            ensure_cdc_catalog_schema(log_pg.raw);
+            nlohmann::json payload = nlohmann::json::object();
+            const long long sid = snapshot_signal::enqueue(
+                log_pg.raw,
+                *action,
+                conn_id.empty() ? std::nullopt : std::optional(conn_id),
+                catalog_id_opt,
+                payload);
+            // Kick an incremental/blocking load by arming needs_full_load + snapshot_kind.
+            if (*action == snapshot_signal::Action::ExecuteIncremental ||
+                *action == snapshot_signal::Action::ExecuteBlocking) {
+                if (catalog_id_opt) {
+                    const std::string cid = std::to_string(*catalog_id_opt);
+                    const char* mode =
+                        (*action == snapshot_signal::Action::ExecuteIncremental) ? "incremental"
+                                                                                 : "when_needed";
+                    const char* vals[] = {cid.c_str(), mode};
+                    pg_exec_params_simple(
+                        log_pg.raw,
+                        "UPDATE cdc_catalog.catalog SET"
+                        " needs_full_load = true,"
+                        " snapshot_mode = CASE WHEN $2 = 'incremental' THEN 'incremental' ELSE snapshot_mode END,"
+                        " engine_meta = COALESCE(engine_meta,'{}'::jsonb) || jsonb_build_object('snapshot_kind','incremental'),"
+                        " capture_during_full_load = true,"
+                        " status = 'pending',"
+                        " updated_at = now()"
+                        " WHERE catalog_id = $1::bigint",
+                        2,
+                        vals);
+                } else if (!conn_id.empty()) {
+                    const char* vals[] = {conn_id.c_str()};
+                    pg_exec_params_simple(
+                        log_pg.raw,
+                        "UPDATE cdc_catalog.catalog SET"
+                        " needs_full_load = true,"
+                        " snapshot_mode = 'incremental',"
+                        " engine_meta = COALESCE(engine_meta,'{}'::jsonb) || jsonb_build_object('snapshot_kind','incremental'),"
+                        " capture_during_full_load = true,"
+                        " status = 'pending',"
+                        " updated_at = now()"
+                        " WHERE conn_id = $1 AND active = true AND has_pk = true",
+                        1,
+                        vals);
+                }
+                snapshot_signal::set_status(log_pg.raw, sid, snapshot_signal::Status::Running);
+            }
+            nlohmann::json out{
+                {"command", "snapshot-signal"},
+                {"signal_id", sid},
+                {"action", *signal_action},
+                {"conn_id", conn_id},
+                {"catalog_id", catalog_id_opt ? nlohmann::json(*catalog_id_opt) : nullptr},
+            };
+            std::cout << out.dump() << '\n';
             return 0;
         }
 
@@ -326,6 +414,20 @@ int main(int argc, char** argv) {
         }
         if (command == "ddl-sync") {
             return run_ddl_sync(cfg, log_pg.raw, conn_id, source_schema, source_table);
+        }
+        if (command == "unquarantine") {
+            const bool ok = unquarantine_apply_position_by_source(
+                log_pg.raw, conn_id, *source_schema, *source_table);
+            nlohmann::json out{
+                {"command", "unquarantine"},
+                {"conn_id", conn_id},
+                {"source_schema", *source_schema},
+                {"source_table", *source_table},
+                {"ok", ok},
+                {"kafka_replay_requested", ok},
+            };
+            std::cout << out.dump() << '\n';
+            return ok ? 0 : 1;
         }
         if (command == "kafka-apply") {
             int failures = 0;
@@ -364,7 +466,8 @@ int main(int argc, char** argv) {
             return failures > 0 ? 1 : 0;
         }
         if (command == "capture") {
-            return run_capture_cli(cfg, log_pg.raw, conn_id, 0, kCaptureWorkerCount);
+            return run_capture_cli(
+                cfg, log_pg.raw, conn_id, 0, std::max(1, cfg.cdc.capture_worker_count));
         }
         if (command == "test-connection") {
             return run_test_connection_cli(

@@ -87,7 +87,8 @@ constexpr int kApplyPositionUpsertMaxAttempts = 3;
 constexpr int kCatalogUpdateDeadlockMaxAttempts = 5;
 constexpr int kCatalogUpdateDeadlockBaseSleepMs = 25;
 /** Kafka offset + lake business-PK delete+insert; no cdc_applied_events ledger. */
-constexpr bool kApplyDedupEnabled = false;
+/** Prefer config.json `cdc.apply_dedup` / `cdc.apply_audit` (CdcConfig); these are legacy fallbacks. */
+constexpr bool kApplyDedupEnabled = true;
 constexpr bool kApplyAuditEnabled = false;
 constexpr int kApplyQueuedMinMessages = 100000;
 constexpr int kApplyFetchWaitMaxMs = 500;

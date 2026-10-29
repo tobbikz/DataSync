@@ -18,6 +18,21 @@
   "cdc": {
     "round_idle_seconds": 5,
     "slice_max_seconds": 180,
-    "slice_max_events": 10000000
+    "slice_max_events": 10000000,
+    "capture_worker_count": 1,
+    "apply_dedup": true,
+    "apply_audit": false,
+    "mssql_replay_on_idle": false,
+    "kafka_heartbeat": true,
+    "binlog_mode": "auto",
+    "kafka_tombstones": true,
+    "reselect_on_apply": false,
+    "cloudevents": false,
+    "tracing": true,
+    "openlineage": false,
+    "include_source_query": true,
+    "schema_events": true,
+    "content_routing": [],
+    "message_filter_exclude_ops": []
   }
 }

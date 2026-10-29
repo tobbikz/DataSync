@@ -36,8 +36,44 @@ COPY cpp/ cpp/
 # Vendored librdkafka lives under cpp/build/deps (single out-of-tree build dir)
 RUN mkdir -p cpp/build/deps && cp -a /opt/rdkafka cpp/build/deps/rdkafka
 
-RUN cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-    && cmake --build cpp/build --target DataSync -j"$(nproc)"
+ARG BUILD_TESTING=OFF
+ARG PARALLEL_JOBS=
+RUN cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING="${BUILD_TESTING}" \
+    && cmake --build cpp/build --target DataSync -j"${PARALLEL_JOBS:-$(nproc)}"
+
+# Unit-test stage (test binaries only — no DataSync / librdkafka compile):
+#   docker build --target test -t datasync-tests:local --build-arg PARALLEL_JOBS=2 .
+FROM debian:bookworm-slim AS test
+ARG PARALLEL_JOBS=2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    libmariadb-dev \
+    libmongoc-dev \
+    libpq-dev \
+    libssl-dev \
+    nlohmann-json3-dev \
+    pkg-config \
+    freetds-dev \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /usr/include/mysql \
+    && ln -sf ../mariadb/mysql.h /usr/include/mysql/mysql.h
+WORKDIR /src
+COPY cpp/ cpp/
+RUN cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+    && cmake --build cpp/build -j"${PARALLEL_JOBS}" --target \
+         datasync_boolean_tests \
+         datasync_envelope_tests \
+         datasync_tx_id_tests \
+         datasync_gap_kind_tests \
+         datasync_coercion_sensitive_tests \
+         datasync_full_load_slice_tests \
+         datasync_quarantine_hold_tests \
+         datasync_column_policy_tests \
+         datasync_snapshot_signal_tests \
+    && ctest --test-dir cpp/build --output-on-failure --timeout 120
 
 # -----------------------------------------------------------------------------
 

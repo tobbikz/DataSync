@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Windows lab shim: host has no psql — proxy through postgres:16-alpine on host network.
+exec docker run --rm -i --network host \
+  -e PGPASSWORD \
+  -e PGSSLMODE="${PGSSLMODE:-disable}" \
+  postgres:16-alpine \
+  psql "$@"

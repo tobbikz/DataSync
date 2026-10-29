@@ -51,6 +51,8 @@ struct CaptureRuntimeConfig {
     int producer_queue_max_kbytes{1048576};
     int topic_partitions{6};
     bool mssql_replay_on_idle{false};
+    /** M01: emit Kafka heartbeat records when capture is quiet. */
+    bool kafka_heartbeat{true};
 };
 
 /** MariaDB: touch cdc_meta.heartbeat when capture is idle. */
@@ -275,6 +277,19 @@ void mark_catalog_cdc_failed(PGconn* pg, long long catalog_id, const std::string
 /** Set apply_position.status=quarantined (skips further apply until manual reset). */
 void quarantine_apply_position(PGconn* pg, long long catalog_id, const std::string& reason);
 
+/**
+ * Clear apply quarantine and request Kafka seek to apply_position.kafka_offset on next apply
+ * (A06: replay retained window instead of resuming at the tip).
+ */
+void unquarantine_apply_position(PGconn* pg, long long catalog_id);
+
+/** Same as unquarantine_apply_position, resolved by conn + source schema/table. */
+bool unquarantine_apply_position_by_source(
+    PGconn* pg,
+    const std::string& conn_id,
+    const std::string& source_schema,
+    const std::string& source_table);
+
 /** Refresh apply_position lag seconds and stale/lagging status from last_applied_at. */
 int refresh_apply_position_health(PGconn* pg, const std::string& conn_id, int staleness_seconds);
 
@@ -377,3 +392,10 @@ void cdc_publish_tx_marker(
     const std::string& tx_event,
     long long tx_id,
     const std::function<void(CdcEvent&)>& enrich = {});
+
+/** M01: publish idle heartbeat to `{prefix}.__heartbeat`. */
+void cdc_publish_kafka_heartbeat(
+    KafkaProducer& producer,
+    const CaptureRuntimeConfig& rcfg,
+    const std::string& conn_id,
+    const std::string& db_engine);

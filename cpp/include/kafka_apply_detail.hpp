@@ -1,8 +1,11 @@
 #pragma once
 
+#include "config.hpp"
+
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <map>
 #include <string>
@@ -53,6 +56,12 @@ struct ApplyBatchOptions {
     std::string source_system{"MariaDB"};
     int apply_staleness_seconds{900};
     int apply_inactive_seconds{3600};
+    /** A07/A07b — house best-effort idempotency + optional audit ledger. */
+    bool apply_dedup{true};
+    bool apply_audit{false};
+    /** T12: MariaDB reselect missing/null columns from source. */
+    bool reselect_on_apply{false};
+    const MariaDbSource* mariadb_source{nullptr};
     std::unordered_map<std::string, TableSliceState> slice_table_state;
     /** Optional: failed table events re-queued by flush layer (not committed). */
     std::vector<ApplyEvent>* failed_events_out{nullptr};
@@ -164,5 +173,51 @@ std::string json_cell_csv(
     const nlohmann::json& val,
     const std::string& pg_type = "",
     bool mssql_text = false);
+
+/** Kafka topic + partition key for commit / quarantine-hold maps. */
+using KafkaTopicPartition = std::pair<std::string, int>;
+
+/**
+ * Record the earliest offset on a topic/partition that must be re-read because its table
+ * is quarantined. Commits must not advance past this offset (A06 / CDC quarantine recovery).
+ */
+inline void note_quarantine_hold(
+    std::map<KafkaTopicPartition, long long>& quarantine_hold_at,
+    const std::string& topic,
+    int partition,
+    long long offset) {
+    const KafkaTopicPartition tp{topic, partition};
+    const auto it = quarantine_hold_at.find(tp);
+    if (it == quarantine_hold_at.end() || offset < it->second) {
+        quarantine_hold_at[tp] = offset;
+    }
+}
+
+/**
+ * Clamp proposed last-processed offsets so none advance onto or past a quarantine hold.
+ * Kafka commit stores last_processed+1; returning hold-1 keeps the held message readable.
+ * Topic/partitions with nothing safe to commit are omitted.
+ */
+inline std::map<KafkaTopicPartition, long long> clamp_commits_before_quarantine_holds(
+    const std::map<KafkaTopicPartition, long long>& proposed_last_processed,
+    const std::map<KafkaTopicPartition, long long>& quarantine_hold_at) {
+    std::map<KafkaTopicPartition, long long> out;
+    for (const auto& [tp, offset] : proposed_last_processed) {
+        const auto hit = quarantine_hold_at.find(tp);
+        if (hit == quarantine_hold_at.end()) {
+            out[tp] = offset;
+            continue;
+        }
+        const long long hold = hit->second;
+        if (hold <= 0) {
+            continue;
+        }
+        const long long capped = (std::min)(offset, hold - 1);
+        if (capped >= 0) {
+            out[tp] = capped;
+        }
+    }
+    return out;
+}
 
 }  // namespace kafka_apply_detail

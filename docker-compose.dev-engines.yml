@@ -1,10 +1,55 @@
-# Dev OLTP engines for local CDC / type-coercion testing (host network).
+# Dev OLTP + catalog/lake PG for local CDC / smoke testing (host network).
 # Usage: docker compose -f docker-compose.dev-engines.yml up -d
-# See Obsidian: Dev Testing MSSQL.md, Dev Testing MongoDB.md
+# Then: tools/start-dev-engines.sh  |  tools/bootstrap-dev-engines.sh
+# Windows: use Git Bash; smokes expect container names below.
 
 name: datasync-dev-engines
 
 services:
+  postgres-lab:
+    container_name: datasync-postgres-lab
+    image: postgres:16-alpine
+    network_mode: host
+    environment:
+      POSTGRES_USER: datasync
+      POSTGRES_PASSWORD: DataSync_Dev1!
+      POSTGRES_DB: postgres
+    volumes:
+      - datasync-postgres-lab-data:/var/lib/postgresql/data
+      - ./tools/dev-postgres/01-init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U datasync -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  mariadb-test:
+    container_name: datasync-mariadb-test
+    image: mariadb:11
+    network_mode: host
+    environment:
+      MARIADB_ROOT_PASSWORD: DataSync_Dev1!
+      MARIADB_DATABASE: testdb
+    volumes:
+      - datasync-mariadb-test-data:/var/lib/mysql
+      - ./tools/mariadb-dev-cdc.cnf:/etc/mysql/conf.d/datasync-cdc.cnf:ro
+      - ./tools/dev-mariadb/01-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "healthcheck.sh",
+          "--connect",
+          "--innodb_initialized",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 40s
+
   mssql-test:
     container_name: datasync-mssql-test
     image: mcr.microsoft.com/mssql/server:2022-latest
@@ -43,5 +88,7 @@ services:
       start_period: 30s
 
 volumes:
+  datasync-postgres-lab-data:
+  datasync-mariadb-test-data:
   datasync-mssql-test-data:
   datasync-mongodb-test-data:

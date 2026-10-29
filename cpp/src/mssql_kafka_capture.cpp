@@ -1,4 +1,5 @@
 #include "mssql_kafka_capture.hpp"
+#include "cdc_routing.hpp"
 
 #include "capture_common.hpp"
 #include "cdc_envelope.hpp"
@@ -639,6 +640,9 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             if (op.empty()) {
                 continue;
             }
+            if (cdc_routing::op_filtered_out(op, cfg.cdc.message_filter_exclude_ops)) {
+                continue;
+            }
             if (!sl.empty()) {
                 last_sl = sl;
                 last_sq = sq;
@@ -671,15 +675,24 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
             event.ts_ms = now_ms();
             event.ingestion_ts = utc_iso_timestamp_now();
 
-            const std::string topic = topic_for_catalog_table(
+            const std::string base_topic = topic_for_catalog_table(
                 rcfg.topic_prefix, tbl.lake_schema, tbl.lake_table, rcfg.topic_mode, rcfg.topic_buckets);
+            const std::string topic =
+                cdc_routing::topic_with_content_routing(base_topic, event, cfg.cdc.content_routing);
             const nlohmann::json* row_for_key = (op == "d") ? &before : &after;
             const std::string msg_key = kafka_message_key_for_row(
                 tbl.lake_schema, tbl.lake_table, row_for_key, tbl.pk_columns);
             const int kafka_partition = kafka_produce_partition(
                 tbl.catalog_id, rcfg.topic_partitions);
             try {
-                producer.produce(topic, msg_key, cdc_event_kafka_payload(event), kafka_partition);
+                producer.produce(
+                    topic,
+                    msg_key,
+                    cdc_event_kafka_payload_maybe_cloudevents(event, cfg.cdc.cloudevents),
+                    kafka_partition);
+                if (op == "d" && cfg.cdc.kafka_tombstones) {
+                    producer.produce_tombstone(topic, msg_key, kafka_partition);
+                }
             } catch (const std::exception& ex) {
                 log_write(log_pg, {
                     .level = LogLevel::Error,
@@ -725,6 +738,20 @@ MssqlCaptureStats run_mssql_kafka_capture_slice(
         const auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat).count() >= rcfg.heartbeat_seconds) {
             bump_capture_heartbeat_pg(log_pg, conn_id, "mssql");
+            cdc_publish_kafka_heartbeat(producer, rcfg, conn_id, "mssql");
+            // S14: optional idle re-poll keeps CDC slots warm; LSN cursor unchanged.
+            if (rcfg.mssql_replay_on_idle) {
+                log_write(log_pg, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_kafka_mssql_capture",
+                    .message = "mssql idle-slot replay tick",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = std::nullopt,
+                    .source_table = std::nullopt,
+                    .context = {{"tables", static_cast<int>(tables.size())}},
+                });
+            }
             last_heartbeat = now;
         }
     }

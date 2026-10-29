@@ -1225,6 +1225,38 @@ TableLoadOutcome load_one_table(
         }
         clear_full_load_checkpoints(app_pg.raw, target.catalog_id);
         full_load::clear_lake_copy_positions(lake_pg.raw, target.catalog_id);
+        // S03: incremental snapshot_mode / engine_meta.snapshot_kind skips truncate.
+        const bool incremental = [&]() {
+            const std::string cid = std::to_string(target.catalog_id);
+            const char* vals[] = {cid.c_str()};
+            PGresult* res = PQexecParams(
+                app_pg.raw,
+                "SELECT COALESCE(snapshot_mode,''), COALESCE(engine_meta->>'snapshot_kind','')"
+                " FROM cdc_catalog.catalog WHERE catalog_id = $1::bigint",
+                1, nullptr, vals, nullptr, nullptr, 0);
+            bool inc = false;
+            if (res && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+                const std::string mode = PQgetvalue(res, 0, 0);
+                const std::string kind = PQgetvalue(res, 0, 1);
+                inc = (mode == "incremental" || kind == "incremental");
+            }
+            if (res) {
+                PQclear(res);
+            }
+            return inc;
+        }();
+        if (incremental) {
+            log_fl(
+                log_pg,
+                log_mtx,
+                LogLevel::Info,
+                batch_id,
+                "mssql incremental snapshot: truncate skipped",
+                {},
+                target.conn_id,
+                target.source_schema,
+                target.source_table);
+        } else {
         const auto trunc = full_load::truncate_lake_table_verified(
             lake_pg.raw,
             pg_schema,
@@ -1267,6 +1299,7 @@ TableLoadOutcome load_one_table(
         trunc_cp.batch_id = batch_id;
         trunc_cp.phase = FullLoadPhase::Truncate;
         save_full_load_checkpoint(app_pg.raw, trunc_cp);
+        }  // !incremental
     }
 
     {

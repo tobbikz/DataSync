@@ -3,6 +3,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { Badge } from "./Badge";
+import { ColumnPolicyEditor } from "./ColumnPolicyEditor";
 import { PageMeta } from "./DashboardShell";
 import { Pagination } from "./Pagination";
 import { fmtLag, fmtSeconds, HealthDot } from "./HealthDot";
@@ -144,6 +145,8 @@ function CatalogDetailPanel({
           {catalog.scd2_enabled ? "on" : "off"}
         </span>
       </div>
+
+      <ColumnPolicyEditor catalogId={catalog.catalog_id} />
 
       <dl className="grid gap-2 border-l-2 border-accent/30 py-1 pl-3 font-mono text-[11px]">
       <div className="flex gap-2">

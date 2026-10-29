@@ -8,6 +8,8 @@
 #include "mssql_kafka_capture.hpp"
 #include "mssql_lake.hpp"
 #include "mariadb_schema.hpp"
+#include "mariadb_conn.hpp"
+#include "mariadb_ddl_sync.hpp"
 #include "obs_log.hpp"
 #include "pg_conn.hpp"
 #include "pipeline_defaults.hpp"
@@ -18,6 +20,7 @@
 #include "mssql_schema.hpp"
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <map>
@@ -26,6 +29,146 @@
 #include <vector>
 
 namespace {
+
+int sync_mariadb_columns_for_conn(
+    const AppConfig& cfg,
+    PGconn* log_pg,
+    const std::string& conn_id,
+    const std::string& batch_id,
+    int daemon_round) {
+    const MariaDbSource* source = find_mariadb_source(cfg, conn_id);
+    if (!source) {
+        return 0;
+    }
+    if (!pipeline_defaults::kDdlSyncColumns) {
+        return 0;
+    }
+
+    const std::string round_str = std::to_string(daemon_round);
+    const char* vals[] = {conn_id.c_str(), round_str.c_str()};
+    PGresult* res = PQexecParams(
+        log_pg,
+        R"(
+        SELECT source_schema, source_table, catalog_id, COALESCE(pk_columns, '')
+        FROM cdc_catalog.catalog
+        WHERE conn_id = $1 AND db_engine = 'mariadb' AND active = true
+          AND cdc_enabled = true
+          AND (last_error IS NOT NULL OR (catalog_id % 20) = ($2::bigint % 20))
+        )",
+        2,
+        nullptr,
+        vals,
+        nullptr,
+        nullptr,
+        0);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        return 0;
+    }
+
+    int synced = 0;
+    try {
+        MariaDbConn mysql(*source);
+        PgConn lake_pg(cfg.datalake.conn_string());
+        if (!lake_pg.raw) {
+            PQclear(res);
+            return 0;
+        }
+        for (int i = 0; i < PQntuples(res); ++i) {
+            const std::string schema = PQgetvalue(res, i, 0);
+            const std::string table = PQgetvalue(res, i, 1);
+            const long long catalog_id = std::atoll(PQgetvalue(res, i, 2));
+            const auto pk_cols = split_pk_columns(PQgetvalue(res, i, 3));
+            const auto ddl = sync_mariadb_columns_to_lake(
+                lake_pg.raw, mysql.handle, schema, table, log_pg, catalog_id, pk_cols);
+            if (!ddl.drift_reason.empty()) {
+                log_write(log_pg, {
+                    .level = LogLevel::Warning,
+                    .component = "cdc_kafka_mariadb_ddl",
+                    .message = "schema drift needs full-load reboot",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = schema,
+                    .source_table = table,
+                    .context = {{"reason", ddl.drift_reason}, {"flagged", ddl.full_load_requested}},
+                });
+            }
+            if (ddl.columns_added > 0 || ddl.columns_widened > 0 || ddl.columns_dropped > 0) {
+                synced += 1;
+                log_write(log_pg, {
+                    .level = LogLevel::Info,
+                    .component = "cdc_kafka_mariadb_ddl",
+                    .message = "mariadb ddl sync columns updated",
+                    .batch_id = batch_id,
+                    .conn_id = conn_id,
+                    .source_schema = schema,
+                    .source_table = table,
+                    .context = {
+                        {"columns_added", ddl.columns_added},
+                        {"columns_widened", ddl.columns_widened},
+                        {"columns_dropped", ddl.columns_dropped},
+                    },
+                });
+            }
+        }
+        PQclear(res);
+    } catch (const std::exception& ex) {
+        PQclear(res);
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_kafka_mariadb_ddl",
+            .message = "mariadb connect failed during pre-apply ddl sync",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"error", ex.what()}},
+        });
+        return -1;
+    }
+    return synced;
+}
+
+PreApplyCycleResult run_mariadb_pre_apply(
+    const AppConfig& cfg,
+    PGconn* log_pg,
+    const std::string& conn_id,
+    const std::string& batch_id,
+    int daemon_round) {
+    PreApplyCycleResult result;
+    result.payload = {
+        {"batch_id", batch_id},
+        {"conn_id", conn_id},
+        {"db_engine", "mariadb"},
+        {"daemon_round", daemon_round},
+        {"ddl_sync_mode", "incremental"},
+    };
+
+    try {
+        const int ddl_synced =
+            sync_mariadb_columns_for_conn(cfg, log_pg, conn_id, batch_id, daemon_round);
+        if (ddl_synced < 0) {
+            result.errors += 1;
+        } else if (ddl_synced > 0) {
+            result.payload["ddl_sync"] = {{"tables", ddl_synced}};
+        }
+    } catch (const std::exception& ex) {
+        result.errors += 1;
+        log_write(log_pg, {
+            .level = LogLevel::Error,
+            .component = "cdc_kafka_mariadb_ddl",
+            .message = "mariadb pre-apply ddl sync failed",
+            .batch_id = batch_id,
+            .conn_id = conn_id,
+            .source_schema = std::nullopt,
+            .source_table = std::nullopt,
+            .context = {{"error", ex.what()}},
+        });
+    }
+    return result;
+}
 
 #ifdef HAVE_FREETDS
 int sync_mssql_columns_for_conn(
@@ -308,60 +451,55 @@ int run_conn_capture_slice(
         },
     });
 
+    const int workers = std::max(1, cfg.cdc.capture_worker_count);
     int errors = 0;
-    if (db_engine == "mssql") {
+    auto run_one = [&](PGconn* pg, int worker_id) -> int {
         try {
-            const auto stats = run_mssql_kafka_capture_slice(cfg, log_pg, conn_id, batch_id);
-            errors = stats.errors;
+            if (db_engine == "mssql") {
+                return run_mssql_kafka_capture_slice(cfg, pg, conn_id, batch_id, worker_id, workers)
+                    .errors;
+            }
+            if (db_engine == "mongodb") {
+                return run_mongo_kafka_capture_slice(cfg, pg, conn_id, batch_id, worker_id, workers)
+                    .errors;
+            }
+            return run_mariadb_kafka_capture_slice(cfg, pg, conn_id, batch_id, worker_id, workers)
+                .errors;
         } catch (const std::exception& ex) {
-            errors = 1;
-            mark_capture_position_failed(log_pg, conn_id, ex.what());
-            log_write(log_pg, {
+            mark_capture_position_failed(pg, conn_id, ex.what());
+            log_write(pg, {
                 .level = LogLevel::Error,
-                .component = "cdc_kafka_mssql_capture",
-                .message = "mssql capture slice failed",
+                .component = db_engine == "mssql" ? "cdc_kafka_mssql_capture"
+                    : db_engine == "mongodb"      ? "cdc_kafka_mongo_capture"
+                                                  : "cdc_kafka_capture",
+                .message = db_engine + " capture slice failed",
                 .batch_id = batch_id,
                 .conn_id = conn_id,
                 .source_schema = std::nullopt,
                 .source_table = std::nullopt,
-                .context = {{"error", ex.what()}},
+                .context = {{"error", ex.what()}, {"worker_id", worker_id}, {"worker_count", workers}},
             });
+            return 1;
         }
-    } else if (db_engine == "mongodb") {
-        try {
-            const auto stats = run_mongo_kafka_capture_slice(cfg, log_pg, conn_id, batch_id);
-            errors = stats.errors;
-        } catch (const std::exception& ex) {
-            errors = 1;
-            mark_capture_position_failed(log_pg, conn_id, ex.what());
-            log_write(log_pg, {
-                .level = LogLevel::Error,
-                .component = "cdc_kafka_mongo_capture",
-                .message = "mongo capture slice failed",
-                .batch_id = batch_id,
-                .conn_id = conn_id,
-                .source_schema = std::nullopt,
-                .source_table = std::nullopt,
-                .context = {{"error", ex.what()}},
-            });
-        }
+    };
+    if (workers <= 1) {
+        errors = run_one(log_pg, 0);
     } else {
-        try {
-            const auto stats = run_mariadb_kafka_capture_slice(cfg, log_pg, conn_id, batch_id);
-            errors = stats.errors;
-        } catch (const std::exception& ex) {
-            errors = 1;
-            mark_capture_position_failed(log_pg, conn_id, ex.what());
-            log_write(log_pg, {
-                .level = LogLevel::Error,
-                .component = "cdc_kafka_capture",
-                .message = "mariadb capture slice failed",
-                .batch_id = batch_id,
-                .conn_id = conn_id,
-                .source_schema = std::nullopt,
-                .source_table = std::nullopt,
-                .context = {{"error", ex.what()}},
+        std::vector<std::thread> threads;
+        std::mutex err_mu;
+        threads.reserve(static_cast<std::size_t>(workers));
+        for (int w = 0; w < workers; ++w) {
+            threads.emplace_back([&, w]() {
+                PgConn worker_pg(cfg.datasync.conn_string());
+                const int rc = worker_pg.raw ? run_one(worker_pg.raw, w) : 1;
+                if (rc != 0) {
+                    std::lock_guard<std::mutex> lock(err_mu);
+                    errors += rc;
+                }
             });
+        }
+        for (auto& t : threads) {
+            t.join();
         }
     }
 
@@ -409,12 +547,7 @@ PreApplyCycleResult run_pre_apply_cycle(
     } else if (db_engine == "mongodb") {
         result = run_mongo_pre_apply(cfg, log_pg, conn_id, batch_id, daemon_round);
     } else {
-        result.payload = {
-            {"batch_id", batch_id},
-            {"conn_id", conn_id},
-            {"db_engine", "mariadb"},
-            {"daemon_round", daemon_round},
-        };
+        result = run_mariadb_pre_apply(cfg, log_pg, conn_id, batch_id, daemon_round);
     }
 
     result.payload["duration_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -37,6 +37,11 @@ using BinlogTxHandler = std::function<void(
     long long tx_id,
     long long event_position)>;
 
+/** E05: Query/DDL statement text from binlog (not BEGIN/COMMIT). */
+using BinlogQueryHandler = std::function<void(
+    const std::string& sql,
+    long long event_position)>;
+
 BinlogCliStats read_remote_binlog_cli(
     const MariaDbSource& source,
     const BinlogPosition& start,
@@ -44,4 +49,5 @@ BinlogCliStats read_remote_binlog_cli(
     int max_events,
     const BinlogRowHandler& on_row,
     const std::function<bool()>& should_stop,
-    const BinlogTxHandler& on_tx = {});
+    const BinlogTxHandler& on_tx = {},
+    const BinlogQueryHandler& on_query = {});

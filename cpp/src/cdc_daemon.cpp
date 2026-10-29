@@ -5,6 +5,7 @@
 #include "cdc_pre_apply.hpp"
 #include "config.hpp"
 #include "connections.hpp"
+#include "control_plane.hpp"
 #include "daemon_full_load.hpp"
 #include "full_load_checkpoint.hpp"
 #include "kafka_apply.hpp"
@@ -939,6 +940,24 @@ int run_cdc_daemon(AppConfig& cfg, PGconn* log_pg, bool once) {
     });
 
     while (!g_shutdown.load()) {
+        // C07: hot-reload CDC tuning from config.json each round.
+        if (!cfg.config_path.empty() && control_plane::reload_cdc_tuning(cfg, cfg.config_path)) {
+            control_plane::notify(
+                log_pg,
+                "ops",
+                "info",
+                "CDC config hot-reload",
+                "cdc section changed on disk",
+                std::nullopt,
+                std::nullopt,
+                {{"path", cfg.config_path},
+                 {"round_idle_seconds", cfg.cdc.round_idle_seconds},
+                 {"apply_dedup", cfg.cdc.apply_dedup},
+                 {"capture_worker_count", cfg.cdc.capture_worker_count}});
+        }
+        // C01: drain reload_config / log / notify signals.
+        control_plane::drain_control_signals(log_pg, cfg, cfg.config_path);
+
         auto conn_ids = reload_daemon_conn_ids(log_pg, cfg);
         if (conn_ids.empty()) {
             log_write(log_pg, {

@@ -83,7 +83,9 @@ std::optional<bool> try_parse_mariadb_bool_token(std::string_view s) {
         return std::nullopt;
     }
 
-    // Raw single-byte BIT payload from libmysql / drivers.
+    // Raw single-byte BIT payload from libmysql / drivers (NUL / SOH only).
+    // ASCII '0'/'1' must fall through to the textual checks below — they are one
+    // byte wide but are not wire BIT payloads.
     if (s.size() == 1) {
         const auto b = static_cast<unsigned char>(s[0]);
         if (b == 0x00) {
@@ -92,8 +94,6 @@ std::optional<bool> try_parse_mariadb_bool_token(std::string_view s) {
         if (b == 0x01) {
             return true;
         }
-        // Other single bytes are not treated as bool.
-        return std::nullopt;
     }
 
     if (auto hex_bool = try_parse_one_byte_hex(s)) {

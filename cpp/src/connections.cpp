@@ -56,6 +56,10 @@ MariaDbSource row_to_mariadb(PGresult* res, int row) {
     src.port = parse_port(PQgetvalue(res, row, 3), 3306);
     src.db_name = PQgetvalue(res, row, 4) ? PQgetvalue(res, row, 4) : "";
     src.user = PQgetvalue(res, row, 5) ? PQgetvalue(res, row, 5) : "";
+    {
+        const auto extras = nlohmann::json::parse(extras_string(res, row), nullptr, false);
+        src.extras = extras.is_object() ? extras : nlohmann::json::object();
+    }
     return src;
 }
 
@@ -68,6 +72,10 @@ MssqlSource row_to_mssql(PGresult* res, int row) {
     src.db_name = PQgetvalue(res, row, 4) ? PQgetvalue(res, row, 4) : "";
     src.user = PQgetvalue(res, row, 5) ? PQgetvalue(res, row, 5) : "";
     src.password = PQgetvalue(res, row, 6) ? PQgetvalue(res, row, 6) : "";
+    {
+        const auto extras = nlohmann::json::parse(extras_string(res, row), nullptr, false);
+        src.extras = extras.is_object() ? extras : nlohmann::json::object();
+    }
     return src;
 }
 
@@ -82,6 +90,7 @@ MongoSource row_to_mongo(PGresult* res, int row) {
     src.password = PQgetvalue(res, row, 6) ? PQgetvalue(res, row, 6) : "";
     const auto extras = nlohmann::json::parse(extras_string(res, row), nullptr, false);
     if (extras.is_object()) {
+        src.extras = extras;
         if (const auto it = extras.find("replica_set"); it != extras.end() && it->is_string()) {
             src.replica_set = it->get<std::string>();
             src.replica_set_in_extras = true;
