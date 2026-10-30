@@ -73,6 +73,9 @@ RUN cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
          datasync_quarantine_hold_tests \
          datasync_column_policy_tests \
          datasync_snapshot_signal_tests \
+         datasync_control_plane_tests \
+         datasync_cdc_config_tests \
+         datasync_cdc_routing_tests \
     && ctest --test-dir cpp/build --output-on-failure --timeout 120
 
 # -----------------------------------------------------------------------------

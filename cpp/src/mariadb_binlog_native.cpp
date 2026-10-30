@@ -17,6 +17,18 @@
 #endif
 #endif
 
+/* Bookworm libmariadb (Connector/C 3.3): MARIADB_RPL_START, mariadb_free_rpl_event,
+ * mariadb_rpl_close. Newer connectors renamed START_POSITION / mariadb_rpl_free*. */
+#ifdef HAVE_MARIADB_RPL
+#ifndef MARIADB_RPL_START_POSITION
+#ifdef MARIADB_RPL_START
+#define MARIADB_RPL_START_POSITION MARIADB_RPL_START
+#else
+#undef HAVE_MARIADB_RPL
+#endif
+#endif
+#endif
+
 bool mariadb_binlog_native_available() {
 #ifdef HAVE_MARIADB_RPL
     return true;
@@ -37,6 +49,7 @@ BinlogCliStats read_remote_binlog_native(
     const BinlogTxHandler& on_tx) {
     (void)on_row;
     (void)max_events;
+    (void)on_tx;
 
     BinlogCliStats stats;
     stats.last_file = start.file;
@@ -61,12 +74,12 @@ BinlogCliStats read_remote_binlog_native(
             rpl, MARIADB_RPL_START_POSITION, static_cast<unsigned long>(start.position)) ||
         mariadb_rpl_optionsv(rpl, MARIADB_RPL_SERVER_ID, static_cast<unsigned long>(0xDABA))) {
         const std::string err = mysql_error(mariadb.handle);
-        mariadb_rpl_free(rpl);
+        mariadb_rpl_close(rpl);
         throw std::runtime_error("native binlog: rpl options failed: " + err);
     }
     if (mariadb_rpl_open(rpl) != 0) {
         const std::string err = mysql_error(mariadb.handle);
-        mariadb_rpl_free(rpl);
+        mariadb_rpl_close(rpl);
         throw std::runtime_error("native binlog: rpl open failed: " + err);
     }
 
@@ -87,20 +100,15 @@ BinlogCliStats read_remote_binlog_native(
             stats.last_position = static_cast<long long>(ev->next_event_pos);
         }
         const auto et = ev->event_type;
-        if (et == QUERY_EVENT) {
-            if (on_tx) {
-                // Statement text is version-specific; still advance cursor for tx markers.
-            }
-        } else if (
-            et == WRITE_ROWS_EVENT_V1 || et == UPDATE_ROWS_EVENT_V1 || et == DELETE_ROWS_EVENT_V1 ||
+        if (et == WRITE_ROWS_EVENT_V1 || et == UPDATE_ROWS_EVENT_V1 || et == DELETE_ROWS_EVENT_V1 ||
             et == WRITE_ROWS_EVENT || et == UPDATE_ROWS_EVENT || et == DELETE_ROWS_EVENT) {
             saw_rows = true;
-            mariadb_rpl_free_event(ev);
+            mariadb_free_rpl_event(ev);
             break;
         }
-        mariadb_rpl_free_event(ev);
+        mariadb_free_rpl_event(ev);
     }
-    mariadb_rpl_free(rpl);
+    mariadb_rpl_close(rpl);
 
     if (saw_rows) {
         throw std::runtime_error(

@@ -253,6 +253,7 @@ if(BUILD_TESTING)
 
     add_executable(datasync_control_plane_tests
         tests/control_plane_tests.cpp
+        tests/shutdown_stub.cpp
         src/control_plane.cpp
         src/config.cpp
         src/pg_conn.cpp
