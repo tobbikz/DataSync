@@ -50,9 +50,11 @@ npm run dev
 
 ## Checks before a PR
 
+CI (`.github/workflows/ci.yml`) runs the same gates on `main` / PRs:
+
 ```bash
 docker build --target test -t datasync-tests:local .
-cd ui && npm run lint
+cd ui && npm ci && npm run lint
 # Optional lab: ./tools/run-smokes-only.sh  (needs engines + config)
 ```
 

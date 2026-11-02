@@ -144,6 +144,7 @@ config.json.example
 | Doc | Audience |
 |-----|----------|
 | [`INSTALL.md`](INSTALL.md) | Operators — install, config, systemd |
+| [`GO_LIVE.md`](GO_LIVE.md) | First production / pilot cutover |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contributors — layout, gates |
 | [`SECURITY.md`](SECURITY.md) | Vulnerability reporting |
 | [`ui/README.md`](ui/README.md) | UI-only development |
@@ -155,4 +156,4 @@ config.json.example
 
 **Apache License 2.0** — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
-Issues: [github.com/tobbikz/DataSync](https://github.com/tobbikz/DataSync).
+Issues: [github.com/tobbikz/DataSync](https://github.com/tobbikz/DataSync/issues).
