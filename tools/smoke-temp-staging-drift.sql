@@ -1,9 +1,9 @@
 -- Local smoke: prove TEMP staging drift + DROP/recreate fix (no DataSync binary needed).
 \set ON_ERROR_STOP on
 
-DROP SCHEMA IF EXISTS qmetrics CASCADE;
-CREATE SCHEMA qmetrics;
-CREATE TABLE qmetrics.calls_logs (
+DROP SCHEMA IF EXISTS lab_src CASCADE;
+CREATE SCHEMA lab_src;
+CREATE TABLE lab_src.demo_events (
   id bigint PRIMARY KEY,
   agent text,
   _dl_load_timestamp timestamptz,
@@ -12,10 +12,10 @@ CREATE TABLE qmetrics.calls_logs (
   _dl_snapshot_id text
 );
 
-CREATE TEMP TABLE cdc_stg_qmetrics_calls_logs (LIKE qmetrics.calls_logs INCLUDING DEFAULTS);
+CREATE TEMP TABLE cdc_stg_lab_src_demo_events (LIKE lab_src.demo_events INCLUDING DEFAULTS);
 
-ALTER TABLE qmetrics.calls_logs ADD COLUMN agent_account text NULL;
-TRUNCATE cdc_stg_qmetrics_calls_logs;
+ALTER TABLE lab_src.demo_events ADD COLUMN agent_account text NULL;
+TRUNCATE cdc_stg_lab_src_demo_events;
 
 -- Same probe as cpp temp_staging_matches_lake_columns()
 SELECT
@@ -23,13 +23,13 @@ SELECT
      FROM pg_attribute a
      JOIN pg_class c ON c.oid = a.attrelid
      JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.relname = 'cdc_stg_qmetrics_calls_logs'
+    WHERE c.relname = 'cdc_stg_lab_src_demo_events'
       AND n.nspname LIKE 'pg_temp_%'
       AND a.attnum > 0 AND NOT a.attisdropped
       AND a.attname <> '_cdc_stg_kafka_offset') AS stg_cols,
   (SELECT count(*)::int
      FROM information_schema.columns
-    WHERE table_schema = 'qmetrics' AND table_name = 'calls_logs') AS lake_cols;
+    WHERE table_schema = 'lab_src' AND table_name = 'demo_events') AS lake_cols;
 
 -- Stale TEMP must not have agent_account
 SELECT NOT EXISTS (
@@ -37,34 +37,34 @@ SELECT NOT EXISTS (
   FROM pg_attribute a
   JOIN pg_class c ON c.oid = a.attrelid
   JOIN pg_namespace n ON n.oid = c.relnamespace
-  WHERE c.relname = 'cdc_stg_qmetrics_calls_logs'
+  WHERE c.relname = 'cdc_stg_lab_src_demo_events'
     AND n.nspname LIKE 'pg_temp_%'
     AND a.attname = 'agent_account'
     AND a.attnum > 0 AND NOT a.attisdropped
 ) AS stale_missing_agent_account;
 
 -- NEW fix path: DROP + recreate LIKE (what ensure_temp_table_like does on mismatch)
-DROP TABLE IF EXISTS cdc_stg_qmetrics_calls_logs;
-CREATE TEMP TABLE cdc_stg_qmetrics_calls_logs (LIKE qmetrics.calls_logs INCLUDING DEFAULTS);
+DROP TABLE IF EXISTS cdc_stg_lab_src_demo_events;
+CREATE TEMP TABLE cdc_stg_lab_src_demo_events (LIKE lab_src.demo_events INCLUDING DEFAULTS);
 
 SELECT
   (SELECT count(*)::int
      FROM pg_attribute a
      JOIN pg_class c ON c.oid = a.attrelid
      JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.relname = 'cdc_stg_qmetrics_calls_logs'
+    WHERE c.relname = 'cdc_stg_lab_src_demo_events'
       AND n.nspname LIKE 'pg_temp_%'
       AND a.attnum > 0 AND NOT a.attisdropped
       AND a.attname <> '_cdc_stg_kafka_offset') AS stg_cols_after_fix,
   (SELECT count(*)::int
      FROM information_schema.columns
-    WHERE table_schema = 'qmetrics' AND table_name = 'calls_logs') AS lake_cols_after_fix;
+    WHERE table_schema = 'lab_src' AND table_name = 'demo_events') AS lake_cols_after_fix;
 
-COPY cdc_stg_qmetrics_calls_logs
+COPY cdc_stg_lab_src_demo_events
   (id, agent, agent_account, _dl_load_timestamp, _dl_load_date, _dl_source_system, _dl_snapshot_id)
 FROM STDIN WITH (FORMAT csv);
 1,bob,acc1,2026-10-28 12:00:00+00,2026-10-28,MariaDB,batch1
 \.
 
-SELECT id, agent, agent_account FROM cdc_stg_qmetrics_calls_logs;
+SELECT id, agent, agent_account FROM cdc_stg_lab_src_demo_events;
 SELECT 'temp_staging_drift_smoke_ok' AS status;

@@ -3,23 +3,27 @@ config.json
 cpp/config.json
 **/config.cdc-test.json
 
-# C++ build — single out-of-tree dir: cmake -S cpp -B cpp/build
+# C++ build (any out-of-tree cmake dir)
 cpp/build/
-cpp/build-kafka/
+cpp/build-*/
+cpp/build*/
 
-# Python
+# Python / temp audits
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 .pytest_cache/
 *.egg-info/
+_tmp_*.py
+*_audit.py
 
 # IDE / OS
 .idea/
 .vscode/
 *.swp
 .DS_Store
+.cursor/
 
 # Logs / temp
 *.log
@@ -31,14 +35,12 @@ kafka-data/
 # Next.js UI
 ui/node_modules/
 ui/.next/
+ui/.env
 ui/.env.local
-
-# Docs and Cursor rules live in Obsidian — only obsidian-first stays in repo
-docs/
-scripts/
-ui/superset-export/
+ui/.env*.local
 ui/tsconfig.tsbuildinfo
-.cursor/*
-!.cursor/rules/
-.cursor/rules/*
-!.cursor/rules/obsidian-first.mdc
+
+# Local lab dumps / exports
+ui/superset-export/
+*.png
+!ui/public/**

@@ -3,7 +3,7 @@
     "host": "localhost",
     "port": 5432,
     "database": "datasync",
-    "user": "tomy.berrios",
+    "user": "datasync",
     "password": "CHANGE_ME",
     "sslmode": "prefer"
   },
@@ -11,7 +11,7 @@
     "host": "localhost",
     "port": 5432,
     "database": "DataLake",
-    "user": "tomy.berrios",
+    "user": "datasync",
     "password": "CHANGE_ME",
     "sslmode": "prefer"
   },
